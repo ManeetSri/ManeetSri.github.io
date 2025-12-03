@@ -20,7 +20,7 @@ const Skills = () => {
                 <h2 className="text-3xl font-semibold text-slate-50 mb-2">Skills & Expertise</h2>
                 <p className="text-sm text-slate-300 mb-8">Specialized in building complex, high-performance mobile ecosystems.</p>
 
-                <div className="grid md:grid-cols-2 gap-10">
+                <div className="grid md:grid-cols-2 gap-6 md:gap-10">
 
                     {/* Progress Skills */}
                     <div className="glass-card rounded-3xl p-6">

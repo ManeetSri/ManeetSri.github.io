@@ -55,7 +55,7 @@ const Blogs = () => {
                         <div className="w-8 h-8 border-4 border-lavender border-t-transparent rounded-full animate-spin"></div>
                     </div>
                 ) : (
-                    <div className="grid md:grid-cols-3 gap-6">
+                    <div className="grid md:grid-cols-3 gap-6 md:gap-8">
                         {posts.map((post, index) => (
                             <motion.a
                                 key={index}
@@ -67,7 +67,7 @@ const Blogs = () => {
                                 whileHover={{ y: -5 }}
                                 viewport={{ once: true }}
                                 transition={{ duration: 0.5, delay: index * 0.1 }}
-                                className="glass-card rounded-3xl p-6 flex flex-col h-full group"
+                                className="glass-card rounded-3xl p-5 md:p-6 flex flex-col h-full group overflow-hidden"
                             >
                                 <div className="mb-4">
                                     <h3 className="text-lg font-semibold text-slate-50 mb-2 line-clamp-2 group-hover:text-lavender-light transition-colors">

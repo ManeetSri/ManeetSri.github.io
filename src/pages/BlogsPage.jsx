@@ -79,7 +79,7 @@ const BlogsPage = () => {
                                 animate={{ opacity: 1, y: 0 }}
                                 transition={{ delay: index * 0.1 }}
                                 whileHover={{ y: -5 }}
-                                className="glass-card rounded-3xl p-6 flex flex-col h-full group"
+                                className="glass-card rounded-3xl p-5 md:p-6 flex flex-col h-full group overflow-hidden"
                             >
                                 <div className="mb-4">
                                     <h3 className="text-lg font-semibold text-slate-50 mb-2 line-clamp-2 group-hover:text-lavender-light transition-colors">

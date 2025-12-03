@@ -104,7 +104,7 @@ const Navbar = () => {
                         exit={{ height: 0, opacity: 0 }}
                         className="md:hidden bg-[#1d1b26]/95 backdrop-blur-xl border-t border-white/10 overflow-hidden"
                     >
-                        <div className="px-6 py-4 flex flex-col gap-4">
+                        <div className="px-6 py-6 flex flex-col gap-6">
                             {navLinks.map((link) => (
                                 link.href.startsWith('#') ? (
                                     <a

@@ -40,7 +40,7 @@ const Projects = () => {
                     <p className="text-sm text-slate-300">A few products that represent my work.</p>
                 </div>
 
-                <div className="grid lg:grid-cols-2 gap-8">
+                <div className="grid lg:grid-cols-2 gap-6 lg:gap-8">
                     {featuredProjects.map((project, index) => (
                         <motion.article
                             key={index}

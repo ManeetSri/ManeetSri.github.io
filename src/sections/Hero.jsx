@@ -23,7 +23,7 @@ const Hero = () => {
             </div>
 
             <div className="max-w-7xl mx-auto px-4 sm:px-6 py-20 w-full">
-                <div className="grid md:grid-cols-2 gap-12 items-center">
+                <div className="grid md:grid-cols-2 gap-8 md:gap-12 items-center">
 
                     {/* Left Content */}
                     <motion.div
