@@ -1,27 +1,29 @@
 import React from 'react';
 import { motion } from 'framer-motion';
+import { Link } from 'react-router-dom';
+import { ArrowRight } from 'lucide-react';
 
 const Projects = () => {
-    const projects = [
+    const featuredProjects = [
         {
-            title: '🛒 Best Al-Yousif — E-commerce platform',
-            description: 'Kuwait-based retail app with 10,000+ products, advanced discovery, multi-payment support and loyalty mechanics like vouchers, flash deals and cashback.',
-            tags: ['Swift', 'SwiftUI', 'Firebase']
+            title: 'Retail E-commerce Platform',
+            description: 'A comprehensive online shopping application with advanced catalog, search, and loyalty integration.',
+            tags: ['Swift', 'UIKit', 'E-commerce']
         },
         {
-            title: '💼 Imperium Jobs — AI job platform',
-            description: 'AI-powered job discovery with swipe-based matching, video introductions, calendar integration and subscription-based swipe limits.',
-            tags: ['SwiftUI', 'Firebase']
+            title: 'AI Job Discovery Platform',
+            description: 'Innovative job search app using AI matching, video intros, and smart scheduling.',
+            tags: ['SwiftUI', 'AI', 'Business']
         },
         {
-            title: '🚖 Prominence Services & Prompt Driver',
-            description: 'Dual app suite — limousine booking for customers and driver app for chauffeurs, with routes, schedules, earnings and real-time notifications.',
-            tags: ['SwiftUI', 'Firebase']
+            title: 'Corporate Mobility Solution',
+            description: 'Premium ride-hailing app for corporate users with real-time tracking and route optimization.',
+            tags: ['Swift', 'Maps', 'Logistics']
         },
         {
-            title: '🙏 Spiritual Quotient — Prayer & fellowship',
-            description: 'Faith-focused platform that helps users create and track prayers, consume spiritual content and connect with supportive communities.',
-            tags: ['SwiftUI', 'Firebase']
+            title: 'Faith & Community Platform',
+            description: 'Spiritual lifestyle app for building prayer habits and connecting with community.',
+            tags: ['SwiftUI', 'Lifestyle', 'Community']
         }
     ];
 
@@ -33,11 +35,13 @@ const Projects = () => {
                 viewport={{ once: true }}
                 transition={{ duration: 0.6 }}
             >
-                <h2 className="text-3xl font-semibold text-slate-50 mb-2">Highlighted projects</h2>
-                <p className="text-sm text-slate-300 mb-10">A few products that represent my work.</p>
+                <div className="mb-10">
+                    <h2 className="text-3xl font-semibold text-slate-50 mb-2">Highlighted projects</h2>
+                    <p className="text-sm text-slate-300">A few products that represent my work.</p>
+                </div>
 
                 <div className="grid lg:grid-cols-2 gap-8">
-                    {projects.map((project, index) => (
+                    {featuredProjects.map((project, index) => (
                         <motion.article
                             key={index}
                             initial={{ opacity: 0, y: 20 }}
@@ -58,6 +62,15 @@ const Projects = () => {
                             </div>
                         </motion.article>
                     ))}
+                </div>
+
+                <div className="mt-8 text-center">
+                    <Link
+                        to="/projects"
+                        className="inline-flex items-center justify-center rounded-full border border-violet-300/30 text-violet-100 text-sm px-6 py-2 bg-white/5 hover:bg-white/10 transition-colors"
+                    >
+                        View all projects <ArrowRight size={16} className="ml-2" />
+                    </Link>
                 </div>
             </motion.div>
         </section>

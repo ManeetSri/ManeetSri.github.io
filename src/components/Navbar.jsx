@@ -1,10 +1,13 @@
 import React, { useState, useEffect } from 'react';
 import { Menu, X } from 'lucide-react';
 import { motion, AnimatePresence } from 'framer-motion';
+import { Link, useLocation, useNavigate } from 'react-router-dom';
 
 const Navbar = () => {
     const [isOpen, setIsOpen] = useState(false);
     const [scrolled, setScrolled] = useState(false);
+    const location = useLocation();
+    const navigate = useNavigate();
 
     useEffect(() => {
         const handleScroll = () => {
@@ -14,11 +17,28 @@ const Navbar = () => {
         return () => window.removeEventListener('scroll', handleScroll);
     }, []);
 
+    const handleNavClick = (e, href) => {
+        setIsOpen(false);
+        if (href.startsWith('#')) {
+            e.preventDefault();
+            if (location.pathname !== '/') {
+                navigate('/');
+                setTimeout(() => {
+                    const element = document.querySelector(href);
+                    if (element) element.scrollIntoView({ behavior: 'smooth' });
+                }, 100);
+            } else {
+                const element = document.querySelector(href);
+                if (element) element.scrollIntoView({ behavior: 'smooth' });
+            }
+        }
+    };
+
     const navLinks = [
         { name: 'Skills', href: '#skills' },
-        { name: 'Blogs', href: '#blogs' },
-        { name: 'Projects', href: '#projects' },
+        { name: 'Blogs', href: '/blogs' },
         { name: 'Experience', href: '#timeline' },
+        { name: 'Projects', href: '/projects' },
         { name: 'Contact', href: '#contact' },
     ];
 
@@ -32,7 +52,7 @@ const Navbar = () => {
         >
             <div className="max-w-7xl mx-auto px-4 sm:px-6 py-4 flex items-center justify-between">
                 {/* Branding */}
-                <div className="flex items-center gap-3">
+                <Link to="/" className="flex items-center gap-3">
                     <div className="h-9 w-9 rounded-2xl bg-gradient-to-br from-lavender to-lavender-deep text-white flex items-center justify-center text-sm font-semibold shadow-lg">
                         MS
                     </div>
@@ -40,18 +60,29 @@ const Navbar = () => {
                         <span className="text-sm font-semibold text-slate-50">Maneet Srivastav</span>
                         <span className="text-[11px] text-slate-300">Mobile Application Engineer</span>
                     </div>
-                </div>
+                </Link>
 
                 {/* Desktop Nav */}
                 <nav className="hidden md:flex items-center gap-6 text-sm text-slate-200">
                     {navLinks.map((link) => (
-                        <a
-                            key={link.name}
-                            href={link.href}
-                            className="hover:text-lavender-light transition-colors duration-200"
-                        >
-                            {link.name}
-                        </a>
+                        link.href.startsWith('#') ? (
+                            <a
+                                key={link.name}
+                                href={link.href}
+                                onClick={(e) => handleNavClick(e, link.href)}
+                                className="hover:text-lavender-light transition-colors duration-200 cursor-pointer"
+                            >
+                                {link.name}
+                            </a>
+                        ) : (
+                            <Link
+                                key={link.name}
+                                to={link.href}
+                                className="hover:text-lavender-light transition-colors duration-200"
+                            >
+                                {link.name}
+                            </Link>
+                        )
                     ))}
                 </nav>
 
@@ -75,14 +106,25 @@ const Navbar = () => {
                     >
                         <div className="px-6 py-4 flex flex-col gap-4">
                             {navLinks.map((link) => (
-                                <a
-                                    key={link.name}
-                                    href={link.href}
-                                    onClick={() => setIsOpen(false)}
-                                    className="text-slate-200 text-base hover:text-lavender-light transition-colors"
-                                >
-                                    {link.name}
-                                </a>
+                                link.href.startsWith('#') ? (
+                                    <a
+                                        key={link.name}
+                                        href={link.href}
+                                        onClick={(e) => handleNavClick(e, link.href)}
+                                        className="text-slate-200 text-base hover:text-lavender-light transition-colors cursor-pointer"
+                                    >
+                                        {link.name}
+                                    </a>
+                                ) : (
+                                    <Link
+                                        key={link.name}
+                                        to={link.href}
+                                        onClick={() => setIsOpen(false)}
+                                        className="text-slate-200 text-base hover:text-lavender-light transition-colors"
+                                    >
+                                        {link.name}
+                                    </Link>
+                                )
                             ))}
                         </div>
                     </motion.nav>

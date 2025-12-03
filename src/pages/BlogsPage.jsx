@@ -1,21 +1,22 @@
 import React, { useState, useEffect } from 'react';
 import { motion } from 'framer-motion';
-import { ExternalLink, ArrowRight, Calendar, User } from 'lucide-react';
+import { ExternalLink, ArrowLeft, Calendar, User } from 'lucide-react';
 import { Link } from 'react-router-dom';
 
-const Blogs = () => {
+const BlogsPage = () => {
     const [posts, setPosts] = useState([]);
     const [loading, setLoading] = useState(true);
 
     useEffect(() => {
         const fetchPosts = async () => {
             try {
+                // Fetching from Medium RSS via rss2json
                 const response = await fetch(
                     'https://api.rss2json.com/v1/api.json?rss_url=https://medium.com/feed/@maneetsrivastav'
                 );
                 const data = await response.json();
                 if (data.status === 'ok') {
-                    setPosts(data.items.slice(0, 3)); // Display top 3 posts
+                    setPosts(data.items); // Display all posts
                 }
             } catch (error) {
                 console.error('Error fetching Medium posts:', error);
@@ -27,35 +28,47 @@ const Blogs = () => {
         fetchPosts();
     }, []);
 
-    // Helper to strip HTML tags for preview text
     const stripHtml = (html) => {
         const doc = new DOMParser().parseFromString(html, 'text/html');
         return doc.body.textContent || "";
     };
 
-    // Helper to format date
     const formatDate = (dateString) => {
         const options = { year: 'numeric', month: 'short', day: 'numeric' };
         return new Date(dateString).toLocaleDateString(undefined, options);
     };
 
     return (
-        <section id="blogs" className="max-w-7xl mx-auto px-4 sm:px-6 pb-20">
-            <motion.div
-                initial={{ opacity: 0, y: 20 }}
-                whileInView={{ opacity: 1, y: 0 }}
-                viewport={{ once: true }}
-                transition={{ duration: 0.6 }}
-            >
-                <h2 className="text-3xl font-semibold text-slate-50 mb-2">Latest Articles</h2>
-                <p className="text-sm text-slate-300 mb-10">Thoughts on mobile engineering and tech.</p>
+        <div className="min-h-screen bg-[#1d1b26] pt-24 pb-20 px-4 sm:px-6">
+            <div className="max-w-7xl mx-auto">
+                <div className="mb-12">
+                    <Link to="/" className="inline-flex items-center text-lavender-light hover:text-white transition-colors mb-6">
+                        <ArrowLeft size={20} className="mr-2" />
+                        Back to Home
+                    </Link>
+                    <motion.h1
+                        initial={{ opacity: 0, y: 20 }}
+                        animate={{ opacity: 1, y: 0 }}
+                        className="text-4xl font-bold text-slate-50 mb-4"
+                    >
+                        All Articles
+                    </motion.h1>
+                    <motion.p
+                        initial={{ opacity: 0, y: 20 }}
+                        animate={{ opacity: 1, y: 0 }}
+                        transition={{ delay: 0.1 }}
+                        className="text-slate-300 max-w-2xl"
+                    >
+                        Thoughts, tutorials, and insights on mobile engineering, architecture, and technology.
+                    </motion.p>
+                </div>
 
                 {loading ? (
-                    <div className="flex justify-center py-10">
-                        <div className="w-8 h-8 border-4 border-lavender border-t-transparent rounded-full animate-spin"></div>
+                    <div className="flex justify-center py-20">
+                        <div className="w-10 h-10 border-4 border-lavender border-t-transparent rounded-full animate-spin"></div>
                     </div>
                 ) : (
-                    <div className="grid md:grid-cols-3 gap-6">
+                    <div className="grid md:grid-cols-2 lg:grid-cols-3 gap-8">
                         {posts.map((post, index) => (
                             <motion.a
                                 key={index}
@@ -63,10 +76,9 @@ const Blogs = () => {
                                 target="_blank"
                                 rel="noopener noreferrer"
                                 initial={{ opacity: 0, y: 20 }}
-                                whileInView={{ opacity: 1, y: 0 }}
+                                animate={{ opacity: 1, y: 0 }}
+                                transition={{ delay: index * 0.1 }}
                                 whileHover={{ y: -5 }}
-                                viewport={{ once: true }}
-                                transition={{ duration: 0.5, delay: index * 0.1 }}
                                 className="glass-card rounded-3xl p-6 flex flex-col h-full group"
                             >
                                 <div className="mb-4">
@@ -83,7 +95,7 @@ const Blogs = () => {
                                             {post.author}
                                         </span>
                                     </div>
-                                    <p className="text-sm text-slate-200 line-clamp-3 leading-relaxed">
+                                    <p className="text-sm text-slate-200 line-clamp-4 leading-relaxed">
                                         {stripHtml(post.description)}
                                     </p>
                                 </div>
@@ -97,20 +109,11 @@ const Blogs = () => {
                 )}
 
                 {!loading && posts.length === 0 && (
-                    <p className="text-slate-400 text-sm">No articles found at the moment.</p>
+                    <p className="text-slate-400">No articles found.</p>
                 )}
-
-                <div className="mt-8 text-center">
-                    <Link
-                        to="/blogs"
-                        className="inline-flex items-center justify-center rounded-full border border-violet-300/30 text-violet-100 text-sm px-6 py-2 bg-white/5 hover:bg-white/10 transition-colors"
-                    >
-                        View all articles <ArrowRight size={16} className="ml-2" />
-                    </Link>
-                </div>
-            </motion.div>
-        </section>
+            </div>
+        </div>
     );
 };
 
-export default Blogs;
+export default BlogsPage;

@@ -3,10 +3,10 @@ import { motion } from 'framer-motion';
 
 const Skills = () => {
     const skills = [
-        { name: 'Swift / SwiftUI', level: 92, color: 'from-lavender to-lavender-deep' },
-        { name: 'UIKit & iOS ecosystem', level: 88, color: 'from-lavender to-[#f973c7]' },
-        { name: 'Architecture (MVC · MVVM)', level: 90, color: 'from-[#f973c7] to-lavender-deep' },
-        { name: 'Firebase & realtime backends', level: 85, color: 'from-lavender to-[#38bdf8]' },
+        { name: 'Swift / SwiftUI', level: 95, color: 'from-lavender to-lavender-deep' },
+        { name: 'UIKit & iOS Internals', level: 90, color: 'from-lavender to-[#f973c7]' },
+        { name: 'System Design & Architecture', level: 88, color: 'from-[#f973c7] to-lavender-deep' },
+        { name: 'Backend & Cloud Integration', level: 85, color: 'from-lavender to-[#38bdf8]' },
     ];
 
     return (
@@ -18,13 +18,13 @@ const Skills = () => {
                 transition={{ duration: 0.6 }}
             >
                 <h2 className="text-3xl font-semibold text-slate-50 mb-2">Skills & Expertise</h2>
-                <p className="text-sm text-slate-300 mb-8">A blend of mobile engineering, architecture & problem solving.</p>
+                <p className="text-sm text-slate-300 mb-8">Specialized in building complex, high-performance mobile ecosystems.</p>
 
                 <div className="grid md:grid-cols-2 gap-10">
 
                     {/* Progress Skills */}
                     <div className="glass-card rounded-3xl p-6">
-                        <h3 className="text-sm font-semibold text-lavender-light mb-5">Core technical skills</h3>
+                        <h3 className="text-sm font-semibold text-lavender-light mb-5">Core Competencies</h3>
 
                         {skills.map((skill) => (
                             <div key={skill.name} className="mb-5 last:mb-0">
@@ -51,13 +51,20 @@ const Skills = () => {
                             whileHover={{ y: -5 }}
                             className="glass-card rounded-2xl p-6"
                         >
-                            <h3 className="text-sm font-semibold text-lavender-light mb-3">Mobile engineering</h3>
-                            <ul className="text-sm text-slate-200 space-y-1.5">
-                                <li>• End-to-end feature ownership from idea to App Store.</li>
-                                <li>• MapKit, geolocation & live ride tracking flows.</li>
-                                <li>• Push notifications, deep links & background tasks.</li>
-                                <li>• Clean, testable, modular codebases.</li>
-                                <li>• In-app purchases & subscription journeys.</li>
+                            <h3 className="text-sm font-semibold text-lavender-light mb-3">Domain Expertise</h3>
+                            <ul className="text-sm text-slate-200 space-y-2">
+                                <li className="flex gap-2">
+                                    <span className="text-lavender">•</span>
+                                    <span><strong>E-commerce & Payments:</strong> Secure checkout flows, loyalty systems, and complex product catalogs.</span>
+                                </li>
+                                <li className="flex gap-2">
+                                    <span className="text-lavender">•</span>
+                                    <span><strong>Maps & Logistics:</strong> Real-time ride tracking, route optimization, and geolocation services.</span>
+                                </li>
+                                <li className="flex gap-2">
+                                    <span className="text-lavender">•</span>
+                                    <span><strong>AI & Media:</strong> AI-driven matching algorithms, video processing, and smart interfaces.</span>
+                                </li>
                             </ul>
                         </motion.div>
 
@@ -65,12 +72,20 @@ const Skills = () => {
                             whileHover={{ y: -5 }}
                             className="glass-card rounded-2xl p-6"
                         >
-                            <h3 className="text-sm font-semibold text-lavender-light mb-3">Cloud & tools</h3>
-                            <ul className="text-sm text-slate-200 space-y-1.5">
-                                <li>• Firebase (Firestore, Auth, Realtime DB).</li>
-                                <li>• MongoDB, REST APIs & integration patterns.</li>
-                                <li>• Xcode, GitHub, Postman, Android Studio.</li>
-                                <li>• Debugging, profiling & performance tuning.</li>
+                            <h3 className="text-sm font-semibold text-lavender-light mb-3">Advanced Engineering</h3>
+                            <ul className="text-sm text-slate-200 space-y-2">
+                                <li className="flex gap-2">
+                                    <span className="text-lavender">•</span>
+                                    <span><strong>Complex Interactions:</strong> Custom gesture-driven UIs (swipe flows) and smooth animations.</span>
+                                </li>
+                                <li className="flex gap-2">
+                                    <span className="text-lavender">•</span>
+                                    <span><strong>Real-time Systems:</strong> WebSocket integration for chat, live updates, and sync.</span>
+                                </li>
+                                <li className="flex gap-2">
+                                    <span className="text-lavender">•</span>
+                                    <span><strong>App Store Optimization:</strong> Managing full lifecycles for high-traffic apps.</span>
+                                </li>
                             </ul>
                         </motion.div>
                     </div>
