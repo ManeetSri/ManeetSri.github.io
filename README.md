@@ -6,7 +6,7 @@
 
   <p align="center">
     <a href="https://app.netlify.com/sites/maneetsri/deploys">
-      <img src="https://api.netlify.com/api/v1/badges/b5b48601-5221-460d-8386-35359876274e/deploy-status" alt="Netlify Status" />
+      <img src="https://api.netlify.com/api/v1/badges/9cfa77af-411d-4eb4-9731-9cf6cf44f7ab/deploy-status" alt="Netlify Status" />
     </a>
     <a href="https://github.com/ManeetSri/ManeetSri.github.io/blob/main/LICENSE">
       <img src="https://img.shields.io/badge/license-MIT-blue.svg" alt="License" />
