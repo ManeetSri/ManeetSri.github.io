@@ -39,7 +39,6 @@ const Navbar = () => {
         { name: 'Blogs', href: '/blogs' },
         { name: 'Experience', href: '#timeline' },
         { name: 'Projects', href: '/projects' },
-        { name: 'Contact', href: '#contact' },
     ];
 
     return (
@@ -63,27 +62,37 @@ const Navbar = () => {
                 </Link>
 
                 {/* Desktop Nav */}
-                <nav className="hidden md:flex items-center gap-6 text-sm text-slate-200">
-                    {navLinks.map((link) => (
-                        link.href.startsWith('#') ? (
-                            <a
-                                key={link.name}
-                                href={link.href}
-                                onClick={(e) => handleNavClick(e, link.href)}
-                                className="hover:text-lavender-light transition-colors duration-200 cursor-pointer"
-                            >
-                                {link.name}
-                            </a>
-                        ) : (
-                            <Link
-                                key={link.name}
-                                to={link.href}
-                                className="hover:text-lavender-light transition-colors duration-200"
-                            >
-                                {link.name}
-                            </Link>
-                        )
-                    ))}
+                <nav className="hidden md:flex items-center gap-8">
+                    <div className="flex items-center gap-6 text-sm text-slate-200">
+                        {navLinks.map((link) => (
+                            link.href.startsWith('#') ? (
+                                <a
+                                    key={link.name}
+                                    href={link.href}
+                                    onClick={(e) => handleNavClick(e, link.href)}
+                                    className="hover:text-lavender-light transition-colors duration-200 cursor-pointer"
+                                >
+                                    {link.name}
+                                </a>
+                            ) : (
+                                <Link
+                                    key={link.name}
+                                    to={link.href}
+                                    className="hover:text-lavender-light transition-colors duration-200"
+                                >
+                                    {link.name}
+                                </Link>
+                            )
+                        ))}
+                    </div>
+
+                    <a
+                        href="#contact"
+                        onClick={(e) => handleNavClick(e, '#contact')}
+                        className="px-5 py-2.5 rounded-full bg-gradient-to-r from-lavender to-lavender-deep text-white text-sm font-medium hover:shadow-[0_0_20px_rgba(180,151,255,0.3)] transition-all duration-300 hover:scale-105"
+                    >
+                        Get in Touch
+                    </a>
                 </nav>
 
                 {/* Mobile Menu Button */}
@@ -126,6 +135,13 @@ const Navbar = () => {
                                     </Link>
                                 )
                             ))}
+                            <a
+                                href="#contact"
+                                onClick={(e) => handleNavClick(e, '#contact')}
+                                className="px-5 py-3 rounded-lg bg-gradient-to-r from-lavender to-lavender-deep text-white text-base font-medium text-center hover:opacity-90 transition-all"
+                            >
+                                Get in Touch
+                            </a>
                         </div>
                     </motion.nav>
                 )}
