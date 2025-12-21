@@ -1,10 +1,16 @@
 import React from 'react';
 import { motion } from 'framer-motion';
-import { ExternalLink, ArrowLeft } from 'lucide-react';
+import { ExternalLink, ArrowLeft, Github } from 'lucide-react';
 import { Link } from 'react-router-dom';
 
 const ProjectsPage = () => {
     const projects = [
+        {
+            title: 'CountryPicker_SwiftUI',
+            description: 'A pure SwiftUI Country Picker Swift Package that provides an easy-to-use search and selection interface for countries, complete with flags and calling codes.',
+            tags: ['SwiftUI', 'SPM', 'Open Source'],
+            link: 'https://github.com/ManeetSri/CountryPicker_SwiftUI'
+        },
         {
             title: 'Retail E-commerce Platform',
             description: 'A comprehensive online shopping application for a major retailer. Features include a vast product catalog, advanced search and filtering, secure checkout, order tracking, and loyalty program integration. Optimized for performance and user retention.',
@@ -97,7 +103,11 @@ const ProjectsPage = () => {
                                     ))}
                                 </div>
                                 <div className="pt-4 border-t border-white/5 flex items-center text-xs text-lavender-light font-medium gap-1">
-                                    View on App Store <ExternalLink size={12} />
+                                    {project.link.includes('github.com') ? (
+                                        <>View on GitHub <Github size={12} /></>
+                                    ) : (
+                                        <>View on App Store <ExternalLink size={12} /></>
+                                    )}
                                 </div>
                             </div>
                         </motion.a>

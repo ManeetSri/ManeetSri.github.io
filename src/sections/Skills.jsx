@@ -1,5 +1,6 @@
 import React from 'react';
 import { motion } from 'framer-motion';
+import SpotlightCard from '../components/SpotlightCard';
 
 const Skills = () => {
     const skills = [
@@ -23,7 +24,7 @@ const Skills = () => {
                 <div className="grid md:grid-cols-2 gap-6 md:gap-10">
 
                     {/* Progress Skills */}
-                    <div className="glass-card rounded-3xl p-6">
+                    <SpotlightCard className="rounded-3xl p-6">
                         <h3 className="text-sm font-semibold text-lavender-light mb-5">Core Competencies</h3>
 
                         {skills.map((skill) => (
@@ -43,13 +44,12 @@ const Skills = () => {
                                 </div>
                             </div>
                         ))}
-                    </div>
+                    </SpotlightCard>
 
-                    {/* Descriptive Skills */}
                     <div className="grid gap-6">
-                        <motion.div
+                        <SpotlightCard
                             whileHover={{ y: -5 }}
-                            className="glass-card rounded-2xl p-6"
+                            className="rounded-2xl p-6"
                         >
                             <h3 className="text-sm font-semibold text-lavender-light mb-3">Domain Expertise</h3>
                             <ul className="text-sm text-slate-200 space-y-2">
@@ -66,11 +66,11 @@ const Skills = () => {
                                     <span><strong>AI & Media:</strong> AI-driven matching algorithms, video processing, and smart interfaces.</span>
                                 </li>
                             </ul>
-                        </motion.div>
+                        </SpotlightCard>
 
-                        <motion.div
+                        <SpotlightCard
                             whileHover={{ y: -5 }}
-                            className="glass-card rounded-2xl p-6"
+                            className="rounded-2xl p-6"
                         >
                             <h3 className="text-sm font-semibold text-lavender-light mb-3">Advanced Engineering</h3>
                             <ul className="text-sm text-slate-200 space-y-2">
@@ -87,7 +87,7 @@ const Skills = () => {
                                     <span><strong>App Store Optimization:</strong> Managing full lifecycles for high-traffic apps.</span>
                                 </li>
                             </ul>
-                        </motion.div>
+                        </SpotlightCard>
                     </div>
 
                 </div>

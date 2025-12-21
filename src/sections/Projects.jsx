@@ -2,9 +2,15 @@ import React from 'react';
 import { motion } from 'framer-motion';
 import { Link } from 'react-router-dom';
 import { ArrowRight } from 'lucide-react';
+import SpotlightCard from '../components/SpotlightCard';
 
 const Projects = () => {
     const featuredProjects = [
+        {
+            title: 'CountryPicker_SwiftUI',
+            description: 'A pure SwiftUI Country Picker Swift Package with search, flags, and calling codes.',
+            tags: ['SwiftUI', 'SPM', 'Open Source']
+        },
         {
             title: 'Retail E-commerce Platform',
             description: 'A comprehensive online shopping application with advanced catalog, search, and loyalty integration.',
@@ -42,14 +48,14 @@ const Projects = () => {
 
                 <div className="grid lg:grid-cols-2 gap-6 lg:gap-8">
                     {featuredProjects.map((project, index) => (
-                        <motion.article
+                        <SpotlightCard
                             key={index}
                             initial={{ opacity: 0, y: 20 }}
                             whileInView={{ opacity: 1, y: 0 }}
                             whileHover={{ y: -5 }}
                             viewport={{ once: true }}
                             transition={{ duration: 0.5, delay: index * 0.1 }}
-                            className="glass-card rounded-3xl p-6"
+                            className="rounded-3xl p-6"
                         >
                             <h3 className="text-slate-50 font-semibold mb-2">{project.title}</h3>
                             <p className="text-sm text-slate-200 mb-3 leading-relaxed">
@@ -60,7 +66,7 @@ const Projects = () => {
                                     <span key={tag} className="pill">{tag}</span>
                                 ))}
                             </div>
-                        </motion.article>
+                        </SpotlightCard>
                     ))}
                 </div>
 

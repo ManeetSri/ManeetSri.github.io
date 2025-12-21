@@ -46,7 +46,7 @@ This is my personal portfolio website, designed to showcase my skills, experienc
 *   [![Tailwind CSS](https://img.shields.io/badge/Tailwind_CSS-38B2AC?style=for-the-badge&logo=tailwind-css&logoColor=white)](https://tailwindcss.com/)
 *   [![Netlify](https://img.shields.io/badge/Netlify-00C7B7?style=for-the-badge&logo=netlify&logoColor=white)](https://www.netlify.com/)
 *   [![Lucide Icons](https://img.shields.io/badge/Lucide_Icons-F05032?style=for-the-badge&logo=lucide&logoColor=white)](https://lucide.dev/)
-
+[![Netlify Status](https://api.netlify.com/api/v1/badges/9cfa77af-411d-4eb4-9731-9cf6cf44f7ab/deploy-status)](https://app.netlify.com/projects/maneet-srivastav/deploys)
 ## 🏁 Getting Started
 
 To get a local copy up and running, follow these simple steps.
