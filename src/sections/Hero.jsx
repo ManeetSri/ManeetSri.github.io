@@ -50,6 +50,14 @@ const Hero = () => {
 
                         <div className="flex flex-wrap gap-3 mb-6">
                             <a
+                                href="/resume.pdf"
+                                target="_blank"
+                                rel="noopener noreferrer"
+                                className="inline-flex items-center justify-center rounded-full bg-white text-slate-900 text-sm font-medium px-5 py-2.5 shadow-md hover:bg-slate-100 transition-colors"
+                            >
+                                Resume
+                            </a>
+                            <a
                                 href="https://github.com/ManeetSri"
                                 target="_blank"
                                 rel="noreferrer"

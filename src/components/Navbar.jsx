@@ -48,6 +48,7 @@ const Navbar = () => {
         { name: 'Blogs', href: '/blogs' },
         { name: 'Experience', href: '#timeline' },
         { name: 'Projects', href: '/projects' },
+        { name: 'Resume', href: '/resume.pdf', isExternal: true },
     ];
 
     return (
@@ -74,7 +75,17 @@ const Navbar = () => {
                 <nav className="hidden md:flex items-center gap-8">
                     <div className="flex items-center gap-6 text-sm text-slate-200">
                         {navLinks.map((link) => (
-                            link.href.startsWith('#') ? (
+                            link.isExternal ? (
+                                <a
+                                    key={link.name}
+                                    href={link.href}
+                                    target="_blank"
+                                    rel="noopener noreferrer"
+                                    className="hover:text-lavender-light transition-colors duration-200"
+                                >
+                                    {link.name}
+                                </a>
+                            ) : link.href.startsWith('#') ? (
                                 <a
                                     key={link.name}
                                     href={link.href}
@@ -134,7 +145,17 @@ const Navbar = () => {
                                     animate={{ x: 0, opacity: 1 }}
                                     transition={{ delay: 0.1 + (index * 0.1) }}
                                 >
-                                    {link.href.startsWith('#') ? (
+                                    {link.isExternal ? (
+                                        <a
+                                            href={link.href}
+                                            target="_blank"
+                                            rel="noopener noreferrer"
+                                            onClick={() => setIsOpen(false)}
+                                            className="text-slate-300 text-lg font-medium hover:text-white transition-colors block p-2 hover:bg-white/5 rounded-xl"
+                                        >
+                                            {link.name}
+                                        </a>
+                                    ) : link.href.startsWith('#') ? (
                                         <a
                                             href={link.href}
                                             onClick={(e) => handleNavClick(e, link.href)}
