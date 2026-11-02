@@ -1,37 +1,12 @@
 import React from 'react';
 import { motion } from 'framer-motion';
 import { Link } from 'react-router-dom';
-import { ArrowRight } from 'lucide-react';
+import { ArrowRight, ExternalLink, Github } from 'lucide-react';
 import SpotlightCard from '../components/SpotlightCard';
+import { projects } from '../data/projects';
 
 const Projects = () => {
-    const featuredProjects = [
-        {
-            title: 'CountryPicker_SwiftUI',
-            description: 'A pure SwiftUI Country Picker Swift Package with search, flags, and calling codes.',
-            tags: ['SwiftUI', 'SPM', 'Open Source']
-        },
-        {
-            title: 'Retail E-commerce Platform',
-            description: 'A comprehensive online shopping application with advanced catalog, search, and loyalty integration.',
-            tags: ['Swift', 'UIKit', 'E-commerce']
-        },
-        {
-            title: 'AI Job Discovery Platform',
-            description: 'Innovative job search app using AI matching, video intros, and smart scheduling.',
-            tags: ['SwiftUI', 'AI', 'Business']
-        },
-        {
-            title: 'Corporate Mobility Solution',
-            description: 'Premium ride-hailing app for corporate users with real-time tracking and route optimization.',
-            tags: ['Swift', 'Maps', 'Logistics']
-        },
-        {
-            title: 'Faith & Community Platform',
-            description: 'Spiritual lifestyle app for building prayer habits and connecting with community.',
-            tags: ['SwiftUI', 'Lifestyle', 'Community']
-        }
-    ];
+    const featuredProjects = projects.filter((project) => project.featured);
 
     return (
         <section id="projects" className="max-w-7xl mx-auto px-4 sm:px-6 pb-20">
@@ -49,22 +24,34 @@ const Projects = () => {
                 <div className="grid lg:grid-cols-2 gap-6 lg:gap-8">
                     {featuredProjects.map((project, index) => (
                         <SpotlightCard
-                            key={index}
+                            key={project.title}
+                            as={motion.a}
+                            href={project.link}
+                            target="_blank"
+                            rel="noopener noreferrer"
                             initial={{ opacity: 0, y: 20 }}
                             whileInView={{ opacity: 1, y: 0 }}
                             whileHover={{ y: -5 }}
                             viewport={{ once: true }}
                             transition={{ duration: 0.5, delay: index * 0.1 }}
-                            className="rounded-3xl p-6"
+                            className="block rounded-3xl p-6 group"
                         >
-                            <h3 className="text-slate-50 font-semibold mb-2">{project.title}</h3>
+                            <p className="text-xs text-lavender-light mb-1">{project.category}</p>
+                            <h3 className="text-slate-50 font-semibold mb-2 group-hover:text-lavender-light transition-colors">{project.title}</h3>
                             <p className="text-sm text-slate-200 mb-3 leading-relaxed">
-                                {project.description}
+                                {project.summary}
                             </p>
-                            <div className="flex flex-wrap gap-2 text-[11px] text-slate-100">
+                            <div className="flex flex-wrap gap-2 text-xs text-slate-100 mb-4">
                                 {project.tags.map(tag => (
                                     <span key={tag} className="pill">{tag}</span>
                                 ))}
+                            </div>
+                            <div className="flex items-center text-xs text-lavender-light font-medium gap-1">
+                                {project.link.includes('github.com') ? (
+                                    <>View on GitHub <Github size={12} /></>
+                                ) : (
+                                    <>View on App Store <ExternalLink size={12} /></>
+                                )}
                             </div>
                         </SpotlightCard>
                     ))}

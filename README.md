@@ -1,23 +1,20 @@
 <div align="center">
-  <img src="https://raw.githubusercontent.com/ManeetSri/ManeetSri.github.io/main/public/assets/favicon.png" alt="Logo" width="80" height="80" />
+  <img src="https://raw.githubusercontent.com/ManeetSri/ManeetSri.github.io/main/public/assets/apple-touch-icon.png" alt="Logo" width="80" height="80" />
 
   # Maneet Srivastav
   ### Mobile Application Engineer | iOS Expert | React Enthusiast
 
   <p align="center">
-    <a href="https://app.netlify.com/sites/maneetsri/deploys">
+    <a href="https://app.netlify.com/projects/maneet-srivastav/deploys">
       <img src="https://api.netlify.com/api/v1/badges/9cfa77af-411d-4eb4-9731-9cf6cf44f7ab/deploy-status" alt="Netlify Status" />
     </a>
-    <a href="https://github.com/ManeetSri/ManeetSri.github.io/blob/main/LICENSE">
-      <img src="https://img.shields.io/badge/license-MIT-blue.svg" alt="License" />
-    </a>
     <img src="https://img.shields.io/badge/React-19.0-blue?logo=react" alt="React" />
-    <img src="https://img.shields.io/badge/Vite-6.0-purple?logo=vite" alt="Vite" />
+    <img src="https://img.shields.io/badge/Vite-7.0-purple?logo=vite" alt="Vite" />
     <img src="https://img.shields.io/badge/Tailwind-4.0-38B2AC?logo=tailwind-css" alt="Tailwind CSS" />
   </p>
 
   <p align="center">
-    <a href="https://maneetsri.github.io">View Live Portfolio</a>
+    <a href="https://maneet-srivastav.netlify.app">View Live Portfolio</a>
     ·
     <a href="https://github.com/ManeetSri/ManeetSri.github.io/issues">Report Bug</a>
     ·
@@ -46,7 +43,7 @@ This is my personal portfolio website, designed to showcase my skills, experienc
 *   [![Tailwind CSS](https://img.shields.io/badge/Tailwind_CSS-38B2AC?style=for-the-badge&logo=tailwind-css&logoColor=white)](https://tailwindcss.com/)
 *   [![Netlify](https://img.shields.io/badge/Netlify-00C7B7?style=for-the-badge&logo=netlify&logoColor=white)](https://www.netlify.com/)
 *   [![Lucide Icons](https://img.shields.io/badge/Lucide_Icons-F05032?style=for-the-badge&logo=lucide&logoColor=white)](https://lucide.dev/)
-[![Netlify Status](https://api.netlify.com/api/v1/badges/9cfa77af-411d-4eb4-9731-9cf6cf44f7ab/deploy-status)](https://app.netlify.com/projects/maneet-srivastav/deploys)
+
 ## 🏁 Getting Started
 
 To get a local copy up and running, follow these simple steps.

@@ -26,9 +26,10 @@ const Navbar = () => {
                 const element = document.querySelector(href);
                 if (element) {
                     const offsetTop = element.offsetTop - 80; // Adjust for fixed header height
+                    const reduceMotion = window.matchMedia('(prefers-reduced-motion: reduce)').matches;
                     window.scrollTo({
                         top: offsetTop,
-                        behavior: 'smooth'
+                        behavior: reduceMotion ? 'instant' : 'smooth'
                     });
                 }
             };
@@ -44,10 +45,10 @@ const Navbar = () => {
     };
 
     const navLinks = [
-        { name: 'Skills', href: '#skills' },
-        { name: 'Blogs', href: '/blogs' },
         { name: 'Experience', href: '#timeline' },
         { name: 'Projects', href: '/projects' },
+        { name: 'Skills', href: '#skills' },
+        { name: 'Blogs', href: '/blogs' },
         { name: 'Resume', href: '/resume.pdf', isExternal: true },
     ];
 
@@ -67,7 +68,7 @@ const Navbar = () => {
                     </div>
                     <div className="flex flex-col">
                         <span className="text-sm font-semibold text-slate-50">Maneet Srivastav</span>
-                        <span className="text-[11px] text-slate-300">Mobile Application Engineer</span>
+                        <span className="text-xs text-slate-300">Mobile Application Engineer</span>
                     </div>
                 </Link>
 
@@ -117,8 +118,11 @@ const Navbar = () => {
 
                 {/* Mobile Menu Button */}
                 <button
+                    type="button"
                     onClick={() => setIsOpen(!isOpen)}
-                    className="md:hidden text-slate-200 hover:text-white focus:outline-none"
+                    aria-label={isOpen ? 'Close menu' : 'Open menu'}
+                    aria-expanded={isOpen}
+                    className="md:hidden text-slate-200 hover:text-white"
                 >
                     {isOpen ? <X size={28} /> : <Menu size={28} />}
                 </button>

@@ -1,16 +1,25 @@
 import React, { useRef } from 'react';
-import { motion, useScroll, useTransform } from 'framer-motion';
+import { motion, useReducedMotion, useScroll, useTransform } from 'framer-motion';
+
+const CAREER_START = new Date(2022, 10); // Nov 2022
+
+const getYearsOfExperience = () => {
+    const months = (new Date().getFullYear() - CAREER_START.getFullYear()) * 12
+        + new Date().getMonth() - CAREER_START.getMonth();
+    return Math.floor(months / 12);
+};
 
 const Hero = () => {
     const ref = useRef(null);
+    const reduceMotion = useReducedMotion();
     const { scrollY } = useScroll();
-    const y1 = useTransform(scrollY, [0, 500], [0, 100]);
-    const y2 = useTransform(scrollY, [0, 500], [0, -100]);
+    const y1 = useTransform(scrollY, [0, 500], [0, reduceMotion ? 0 : 100]);
+    const y2 = useTransform(scrollY, [0, 500], [0, reduceMotion ? 0 : -100]);
 
     return (
         <section ref={ref} className="relative overflow-hidden min-h-screen flex items-center pt-20">
             {/* Parallax Blobs */}
-            <div className="pointer-events-none absolute inset-0 -z-10 opacity-70">
+            <div className="pointer-events-none absolute inset-0 -z-10 opacity-30">
                 <motion.div
                     style={{ y: y1 }}
                     className="absolute -top-32 -left-16 w-80 h-80 rounded-full bg-lavender blur-3xl"
@@ -31,7 +40,7 @@ const Hero = () => {
                         animate={{ opacity: 1, y: 0 }}
                         transition={{ duration: 0.8, ease: "easeOut" }}
                     >
-                        <p className="text-[11px] tracking-[0.28em] uppercase text-lavender-light mb-3 font-medium">
+                        <p className="text-xs tracking-[0.28em] uppercase text-lavender-light mb-3 font-medium">
                             iOS · Swift · SwiftUI · React Native
                         </p>
 
@@ -61,7 +70,7 @@ const Hero = () => {
                                 href="https://github.com/ManeetSri"
                                 target="_blank"
                                 rel="noreferrer"
-                                className="inline-flex items-center justify-center rounded-full bg-white text-slate-900 text-sm font-medium px-5 py-2.5 shadow-md hover:bg-slate-100 transition-colors"
+                                className="inline-flex items-center justify-center rounded-full border border-violet-300/60 text-violet-50 text-sm px-5 py-2.5 bg-white/5 hover:bg-white/10 transition-colors"
                             >
                                 View GitHub
                             </a>
@@ -90,7 +99,7 @@ const Hero = () => {
                         className="flex justify-center md:justify-end"
                     >
                         <div className="glass-card rounded-3xl p-6 w-full max-w-md transform transition-all hover:scale-[1.02]">
-                            <p className="text-[11px] font-semibold tracking-[0.25em] uppercase text-slate-300 mb-4">
+                            <p className="text-xs font-semibold tracking-[0.25em] uppercase text-slate-300 mb-4">
                                 Snapshot
                             </p>
                             <div className="space-y-4 text-sm text-slate-100">
@@ -102,7 +111,7 @@ const Hero = () => {
                                 </div>
                                 <div className="flex justify-between">
                                     <span className="text-slate-300">Experience</span>
-                                    <span className="font-semibold text-white">3+ years</span>
+                                    <span className="font-semibold text-white">{getYearsOfExperience()}+ years</span>
                                 </div>
                                 <div className="flex justify-between gap-4">
                                     <span className="text-slate-300">Focus</span>
@@ -111,8 +120,8 @@ const Hero = () => {
                                     </span>
                                 </div>
                             </div>
-                            <p className="mt-5 pt-4 border-t border-violet-300/40 text-[11px] text-slate-300">
-                                Previously at Singsys, JamTech & Synclovis — delivering multi-domain mobile apps and mentoring junior engineers.
+                            <p className="mt-5 pt-4 border-t border-violet-300/40 text-xs text-slate-300">
+                                Previously at Codeflies, Singsys, JamTech & Synclovis — delivering multi-domain mobile apps and leading a development team.
                             </p>
                         </div>
                     </motion.div>

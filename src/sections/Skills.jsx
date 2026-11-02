@@ -3,15 +3,16 @@ import { motion } from 'framer-motion';
 import SpotlightCard from '../components/SpotlightCard';
 
 const Skills = () => {
-    const skills = [
-        { name: 'Swift / SwiftUI', level: 95, color: 'from-lavender to-lavender-deep' },
-        { name: 'UIKit & iOS Internals', level: 90, color: 'from-lavender to-[#f973c7]' },
-        { name: 'System Design & Architecture', level: 88, color: 'from-[#f973c7] to-lavender-deep' },
-        { name: 'Backend & Cloud Integration', level: 85, color: 'from-lavender to-[#38bdf8]' },
+    const skillGroups = [
+        { name: 'Languages', items: ['Swift', 'JavaScript'] },
+        { name: 'UI Frameworks', items: ['SwiftUI', 'UIKit', 'React Native'] },
+        { name: 'Architecture', items: ['MVVM', 'MVC', 'Dependency Injection'] },
+        { name: 'Data & Backend', items: ['Core Data', 'Firebase', 'MongoDB', 'APNs', 'Alamofire'] },
+        { name: 'Tools', items: ['Xcode', 'Instruments', 'Swift Package Manager', 'CocoaPods', 'VS Code'] },
     ];
 
     return (
-        <section id="skills" className="max-w-7xl mx-auto px-4 sm:px-6 pb-18 py-20">
+        <section id="skills" className="max-w-7xl mx-auto px-4 sm:px-6 pb-20">
             <motion.div
                 initial={{ opacity: 0, y: 20 }}
                 whileInView={{ opacity: 1, y: 0 }}
@@ -23,24 +24,17 @@ const Skills = () => {
 
                 <div className="grid md:grid-cols-2 gap-6 md:gap-10">
 
-                    {/* Progress Skills */}
+                    {/* Grouped Skills */}
                     <SpotlightCard className="rounded-3xl p-6">
                         <h3 className="text-sm font-semibold text-lavender-light mb-5">Core Competencies</h3>
 
-                        {skills.map((skill) => (
-                            <div key={skill.name} className="mb-5 last:mb-0">
-                                <div className="flex justify-between text-sm mb-1">
-                                    <span className="text-slate-100">{skill.name}</span>
-                                    <span className="text-slate-400">Advanced</span>
-                                </div>
-                                <div className="h-2 rounded-full bg-slate-800 overflow-hidden">
-                                    <motion.div
-                                        initial={{ width: 0 }}
-                                        whileInView={{ width: `${skill.level}%` }}
-                                        viewport={{ once: true }}
-                                        transition={{ duration: 1.2, ease: "easeOut" }}
-                                        className={`h-2 rounded-full bg-gradient-to-r ${skill.color}`}
-                                    />
+                        {skillGroups.map((group) => (
+                            <div key={group.name} className="mb-5 last:mb-0">
+                                <p className="text-sm text-slate-100 mb-2">{group.name}</p>
+                                <div className="flex flex-wrap gap-2">
+                                    {group.items.map((item) => (
+                                        <span key={item} className="pill">{item}</span>
+                                    ))}
                                 </div>
                             </div>
                         ))}
@@ -63,7 +57,7 @@ const Skills = () => {
                                 </li>
                                 <li className="flex gap-2">
                                     <span className="text-lavender">•</span>
-                                    <span><strong>AI & Media:</strong> AI-driven matching algorithms, video processing, and smart interfaces.</span>
+                                    <span><strong>AI & Media:</strong> Interfaces for AI-based job matching and in-app video resume recording.</span>
                                 </li>
                             </ul>
                         </SpotlightCard>
@@ -84,7 +78,7 @@ const Skills = () => {
                                 </li>
                                 <li className="flex gap-2">
                                     <span className="text-lavender">•</span>
-                                    <span><strong>App Store Optimization:</strong> Managing full lifecycles for high-traffic apps.</span>
+                                    <span><strong>App Store Delivery:</strong> Taking apps through submission and release, in line with App Store policies.</span>
                                 </li>
                             </ul>
                         </SpotlightCard>

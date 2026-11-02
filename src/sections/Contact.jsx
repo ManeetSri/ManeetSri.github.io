@@ -31,9 +31,12 @@ const Contact = () => {
         fetch("/", {
             method: "POST",
             headers: { "Content-Type": "application/x-www-form-urlencoded" },
-            body: encode({ "form-name": "contact", ...formData })
+            body: encode({ "form-name": "contact", "bot-field": e.target.elements['bot-field'].value, ...formData })
         })
-            .then(() => {
+            .then((response) => {
+                if (!response.ok) {
+                    throw new Error(`Form submission failed with status ${response.status}`);
+                }
                 setStatus('success');
                 setFormData({ name: '', email: '', message: '' });
                 setTimeout(() => setStatus(''), 3000);
@@ -56,7 +59,7 @@ const Contact = () => {
                     whileInView={{ opacity: 1, y: 0 }}
                     viewport={{ once: true }}
                     transition={{ duration: 0.6 }}
-                    className="grid md:grid-cols-[1fr,1.5fr] gap-12 lg:gap-20 items-start"
+                    className="grid md:grid-cols-[1fr_1.5fr] gap-12 lg:gap-20 items-start"
                 >
                     {/* Left Column - Contact Info */}
                     <div className="space-y-8 pt-4">
@@ -97,7 +100,7 @@ const Contact = () => {
                                         <item.icon size={20} className="text-slate-400 group-hover:text-white transition-colors" />
                                     </div>
                                     <div>
-                                        <span className="text-xs text-slate-500 block mb-0.5">{item.label}</span>
+                                        <span className="text-xs text-slate-400 block mb-0.5">{item.label}</span>
                                         <span className="text-sm font-medium text-slate-200 group-hover:text-white transition-colors">{item.value}</span>
                                     </div>
                                 </motion.a>
@@ -121,14 +124,17 @@ const Contact = () => {
                                 onSubmit={handleSubmit}
                                 name="contact"
                                 data-netlify="true"
+                                data-netlify-honeypot="bot-field"
                                 className="space-y-6"
                             >
                                 <input type="hidden" name="form-name" value="contact" />
+                                {/* Honeypot: hidden from people, filled in by bots */}
+                                <input type="text" name="bot-field" className="hidden" tabIndex={-1} autoComplete="off" aria-hidden="true" />
 
                                 <div className="grid md:grid-cols-2 gap-6">
                                     {['name', 'email'].map((field) => (
                                         <div key={field} className="space-y-2">
-                                            <label htmlFor={field} className="text-sm font-medium text-slate-400 uppercase tracking-wider text-[11px] ml-1">
+                                            <label htmlFor={field} className="text-sm font-medium text-slate-400 uppercase tracking-wider text-xs ml-1">
                                                 {field}
                                             </label>
                                             <div className="relative">
@@ -153,7 +159,7 @@ const Contact = () => {
                                 </div>
 
                                 <div className="space-y-2">
-                                    <label htmlFor="message" className="text-sm font-medium text-slate-400 uppercase tracking-wider text-[11px] ml-1">
+                                    <label htmlFor="message" className="text-sm font-medium text-slate-400 uppercase tracking-wider text-xs ml-1">
                                         Message
                                     </label>
                                     <div className="relative">
@@ -170,7 +176,7 @@ const Contact = () => {
                                                     ? 'border-lavender-light/50 ring-1 ring-lavender-light/50 shadow-[0_0_15px_rgba(200,180,255,0.1)]'
                                                     : 'border-white/10 hover:border-white/20'
                                                 }`}
-                                            placeholder="Tell me about your project..."
+                                            placeholder="Tell me about the role or project..."
                                         ></textarea>
                                     </div>
                                 </div>
@@ -189,6 +195,7 @@ const Contact = () => {
 
                                 {status === 'success' && (
                                     <motion.div
+                                        role="status"
                                         initial={{ opacity: 0, y: 10 }}
                                         animate={{ opacity: 1, y: 0 }}
                                         className="text-green-400 text-sm text-center bg-green-500/10 py-3 rounded-xl border border-green-500/20 flex items-center justify-center gap-2"
@@ -199,11 +206,15 @@ const Contact = () => {
                                 )}
                                 {status === 'error' && (
                                     <motion.div
+                                        role="alert"
                                         initial={{ opacity: 0, y: 10 }}
                                         animate={{ opacity: 1, y: 0 }}
-                                        className="text-red-400 text-sm text-center bg-red-500/10 py-3 rounded-xl border border-red-500/20"
+                                        className="text-red-400 text-sm text-center bg-red-500/10 py-3 px-4 rounded-xl border border-red-500/20"
                                     >
-                                        Something went wrong. Please try again.
+                                        Your message wasn't sent. Please try again or email me at{' '}
+                                        <a href="mailto:srivastavmaneet@gmail.com" className="underline hover:text-red-300">
+                                            srivastavmaneet@gmail.com
+                                        </a>.
                                     </motion.div>
                                 )}
                             </form>
@@ -215,9 +226,9 @@ const Contact = () => {
                     initial={{ opacity: 0 }}
                     whileInView={{ opacity: 1 }}
                     transition={{ delay: 0.8 }}
-                    className="mt-20 text-[11px] text-slate-500 text-center border-t border-white/5 pt-8"
+                    className="mt-20 text-xs text-slate-400 text-center border-t border-white/5 pt-8"
                 >
-                    © 2025 · Designed & built by <span className="text-slate-300 font-medium">Maneet Srivastav</span>
+                    © {new Date().getFullYear()} · Designed & built by <span className="text-slate-300 font-medium">Maneet Srivastav</span>
                 </motion.p>
             </div>
         </section>

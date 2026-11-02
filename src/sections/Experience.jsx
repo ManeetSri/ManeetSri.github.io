@@ -11,16 +11,23 @@ const Experience = () => {
             color: 'from-lavender to-lavender-deep'
         },
         {
-            role: 'Software Engineer',
+            role: 'iOS Developer',
+            company: 'Codeflies Technologies',
+            period: 'June 2025 – Sept 2025 · Noida',
+            description: 'Integrated subscription and purchase models, and deployed apps to the Apple App Store in line with its policies.',
+            color: 'bg-[#f973c7]'
+        },
+        {
+            role: 'Software Engineer – Mobile',
             company: 'Singsys',
             period: 'May 2024 – May 2025 · Lucknow',
             description: 'Delivered multi-domain apps using Swift, SwiftUI & React Native. Architected and shipped a complete ride-hailing ecosystem (user & driver apps) with maps, routing, payments and real-time updates.',
             color: 'bg-lavender-deep'
         },
         {
-            role: 'Associate iOS Developer',
+            role: 'iOS Developer',
             company: 'JamTech Technologies',
-            period: 'Dec 2023 – May 2024 · Lucknow',
+            period: 'Dec 2023 – April 2024 · Lucknow',
             description: 'Developed a job-board iOS app with video resume recording, swipe-based discovery and in-app purchase flows.',
             color: 'bg-[#7dd3fc]'
         },
@@ -54,9 +61,9 @@ const Experience = () => {
                             transition={{ duration: 0.5, delay: index * 0.1 }}
                             className="relative"
                         >
-                            <div className={`absolute -left-[2.65rem] top-1.5 h-3.5 w-3.5 rounded-full border-[3px] border-black/30 outline outline-4 outline-lavender/15 ${exp.color.includes('gradient') ? `bg-gradient-to-br ${exp.color}` : exp.color}`} />
+                            <div className={`absolute -left-10 md:-left-12 top-1.5 h-3.5 w-3.5 rounded-full border-[3px] border-black/30 outline outline-4 outline-lavender/15 ${exp.color.includes('gradient') ? `bg-gradient-to-br ${exp.color}` : exp.color}`} />
 
-                            <p className="text-[11px] uppercase tracking-wide text-slate-400 mb-1 pt-1">
+                            <p className="text-xs uppercase tracking-wide text-slate-400 mb-1 pt-1">
                                 {exp.period}
                             </p>
                             <h3 className="text-sm sm:text-base font-semibold text-slate-50">

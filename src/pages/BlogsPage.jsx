@@ -1,45 +1,16 @@
-import React, { useState, useEffect } from 'react';
+import React from 'react';
 import { motion } from 'framer-motion';
 import { ExternalLink, ArrowLeft, Calendar, User } from 'lucide-react';
 import { Link } from 'react-router-dom';
+import { useMediumPosts, stripHtml, formatDate, MEDIUM_PROFILE_URL } from '../hooks/useMediumPosts';
+import { useDocumentTitle } from '../hooks/useDocumentTitle';
 
 const BlogsPage = () => {
-    const [posts, setPosts] = useState([]);
-    const [loading, setLoading] = useState(true);
-
-    useEffect(() => {
-        const fetchPosts = async () => {
-            try {
-                // Fetching from Medium RSS via rss2json
-                const response = await fetch(
-                    'https://api.rss2json.com/v1/api.json?rss_url=https://medium.com/feed/@maneetsrivastav'
-                );
-                const data = await response.json();
-                if (data.status === 'ok') {
-                    setPosts(data.items); // Display all posts
-                }
-            } catch (error) {
-                console.error('Error fetching Medium posts:', error);
-            } finally {
-                setLoading(false);
-            }
-        };
-
-        fetchPosts();
-    }, []);
-
-    const stripHtml = (html) => {
-        const doc = new DOMParser().parseFromString(html, 'text/html');
-        return doc.body.textContent || "";
-    };
-
-    const formatDate = (dateString) => {
-        const options = { year: 'numeric', month: 'short', day: 'numeric' };
-        return new Date(dateString).toLocaleDateString(undefined, options);
-    };
+    useDocumentTitle('Articles – Maneet Srivastav');
+    const { posts, loading } = useMediumPosts();
 
     return (
-        <div className="min-h-screen bg-[#1d1b26] pt-24 pb-20 px-4 sm:px-6">
+        <div className="min-h-screen pt-24 pb-20 px-4 sm:px-6">
             <div className="max-w-7xl mx-auto">
                 <div className="mb-12">
                     <Link to="/" className="inline-flex items-center text-lavender-light hover:text-white transition-colors mb-6">
@@ -85,7 +56,7 @@ const BlogsPage = () => {
                                     <h3 className="text-lg font-semibold text-slate-50 mb-2 line-clamp-2 group-hover:text-lavender-light transition-colors">
                                         {post.title}
                                     </h3>
-                                    <div className="flex items-center gap-4 text-[11px] text-slate-400 mb-3">
+                                    <div className="flex items-center gap-4 text-xs text-slate-400 mb-3">
                                         <span className="flex items-center gap-1">
                                             <Calendar size={12} />
                                             {formatDate(post.pubDate)}
@@ -109,7 +80,21 @@ const BlogsPage = () => {
                 )}
 
                 {!loading && posts.length === 0 && (
-                    <p className="text-slate-400">No articles found.</p>
+                    <p className="text-slate-400">Articles couldn't be loaded right now.</p>
+                )}
+
+                {/* The feed only returns the 10 newest posts, so older ones live on Medium */}
+                {!loading && (
+                    <div className="mt-10 text-center">
+                        <a
+                            href={MEDIUM_PROFILE_URL}
+                            target="_blank"
+                            rel="noopener noreferrer"
+                            className="inline-flex items-center justify-center rounded-full border border-violet-300/30 text-violet-100 text-sm px-6 py-2 bg-white/5 hover:bg-white/10 transition-colors"
+                        >
+                            See every article on Medium <ExternalLink size={16} className="ml-2" />
+                        </a>
+                    </div>
                 )}
             </div>
         </div>

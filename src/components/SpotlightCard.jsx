@@ -1,7 +1,7 @@
 import React, { useRef, useState } from 'react';
 import { motion } from 'framer-motion';
 
-const SpotlightCard = ({ children, className = "", spotlightColor = "rgba(180, 151, 255, 0.25)", ...props }) => {
+const SpotlightCard = ({ as: Component = motion.div, children, className = "", spotlightColor = "rgba(180, 151, 255, 0.25)", ...props }) => {
     const divRef = useRef(null);
     const [position, setPosition] = useState({ x: 0, y: 0 });
     const [opacity, setOpacity] = useState(0);
@@ -30,7 +30,7 @@ const SpotlightCard = ({ children, className = "", spotlightColor = "rgba(180, 1
     };
 
     return (
-        <motion.div
+        <Component
             ref={divRef}
             onMouseMove={handleMouseMove}
             onFocus={handleFocus}
@@ -50,7 +50,7 @@ const SpotlightCard = ({ children, className = "", spotlightColor = "rgba(180, 1
             <div className="relative h-full">
                 {children}
             </div>
-        </motion.div>
+        </Component>
     );
 };
 
