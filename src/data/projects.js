@@ -12,7 +12,7 @@ export const projects = [
         builtAt: 'Singsys',
         stat: '4.7 ★ from 854 ratings · App Store India, Nov 2026',
         tint: '#30D158',
-        units: 1.3,
+        units: 1.4,
     },
     {
         id: 'empowered',
@@ -25,7 +25,7 @@ export const projects = [
         website: 'https://empoweredhealth.asia',
         icon: '/assets/apps/empowered.jpg',
         tint: '#FF6FA8',
-        units: 1.2,
+        units: 1.3,
     },
     {
         id: 'best',
@@ -38,7 +38,7 @@ export const projects = [
         icon: '/assets/apps/best.jpg',
         builtAt: 'Synclovis',
         tint: '#409CFF',
-        units: 1.2,
+        units: 1.4,
     },
     {
         id: 'imperium',
@@ -50,7 +50,7 @@ export const projects = [
         monogram: 'IJ',
         builtAt: 'JamTech',
         tint: '#BF8CFF',
-        units: 1.1,
+        units: 1.3,
     },
     {
         id: 'spiritual',
@@ -62,7 +62,7 @@ export const projects = [
         link: 'https://apps.apple.com/us/app/spiritual-quotient/id1616868583',
         icon: '/assets/apps/spiritual.jpg',
         tint: '#F5C451',
-        units: 1,
+        units: 1.1,
     },
     {
         id: 'bluewings',
@@ -75,7 +75,7 @@ export const projects = [
         icon: '/assets/apps/bluewings.jpg',
         builtAt: 'Synclovis',
         tint: '#64D2FF',
-        units: 0.8,
+        units: 1,
     },
     {
         id: 'bodyinc',
@@ -87,7 +87,7 @@ export const projects = [
         link: 'https://apps.apple.com/in/app/bodyinc/id1534707316',
         icon: '/assets/apps/bodyinc.jpg',
         tint: '#63E6BE',
-        units: 0.8,
+        units: 1,
     },
     {
         id: 'countrypicker',
@@ -101,6 +101,6 @@ export const projects = [
         snippet: '.package(url: "https://github.com/ManeetSri/CountryPicker_SwiftUI")',
         interactive: true,
         tint: '#FF7A59',
-        units: 1.4,
+        units: 1.5,
     },
 ];

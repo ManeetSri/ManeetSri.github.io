@@ -1,9 +1,15 @@
 import { projects } from './projects';
 
-// Scroll budget, in screen heights, for the home screen before the first app opens
+// Scroll budgets, in screen heights: the home screen before the first app opens,
+// and how long each app takes to open from its icon and to close back into it
 const HOME_UNITS = 0.7;
+const LAUNCH_UNITS = 0.28;
+const CLOSE_UNITS = 0.18;
 
 export const totalUnits = projects.reduce((sum, project) => sum + project.units, HOME_UNITS);
+
+export const LAUNCH = LAUNCH_UNITS / totalUnits;
+export const CLOSE = CLOSE_UNITS / totalUnits;
 
 // Each project's slice of the Work section's 0–1 scroll progress
 export const segments = projects.reduce((list, project) => {

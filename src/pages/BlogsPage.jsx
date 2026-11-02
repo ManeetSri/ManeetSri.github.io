@@ -1,6 +1,6 @@
 import { ArrowLeft, ExternalLink } from 'lucide-react';
 import { Link } from 'react-router-dom';
-import CommitLog from '../components/CommitLog';
+import Articles from '../components/Articles';
 import { MEDIUM_PROFILE_URL } from '../hooks/useMediumPosts';
 import { useDocumentTitle } from '../hooks/useDocumentTitle';
 
@@ -13,13 +13,11 @@ const BlogsPage = () => {
                 <ArrowLeft size={18} aria-hidden="true" /> Back to Home
             </Link>
             <h1 className="mb-10 font-display text-[clamp(2.6rem,6vw,5rem)] font-semibold leading-none tracking-tight">The full log.</h1>
-            <div className="max-w-4xl">
-                <CommitLog />
-                {/* The feed only returns the 10 newest posts, so older ones live on Medium */}
-                <a href={MEDIUM_PROFILE_URL} target="_blank" rel="noopener noreferrer" className="mt-5 inline-flex items-center gap-2 font-medium text-amber hover:underline">
-                    See every article on Medium <ExternalLink size={16} aria-hidden="true" />
-                </a>
-            </div>
+            <Articles />
+            {/* The feed only returns the 10 newest posts, so older ones live on Medium */}
+            <a href={MEDIUM_PROFILE_URL} target="_blank" rel="noopener noreferrer" className="mt-6 inline-flex items-center gap-2 font-medium text-amber hover:underline">
+                See every article on Medium <ExternalLink size={16} aria-hidden="true" />
+            </a>
         </main>
     );
 };

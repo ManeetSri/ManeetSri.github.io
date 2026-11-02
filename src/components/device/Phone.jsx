@@ -25,7 +25,7 @@ const Phone = ({ children, className = '' }) => {
                     className="absolute left-0 top-0 origin-top-left rounded-[3.3rem] border border-white/15 bg-gradient-to-br from-[#3a3d45] via-[#1b1d22] to-[#2b2e35] shadow-[0_40px_120px_-20px_rgba(0,0,0,0.9)]"
                     style={{ width: DEVICE_WIDTH, height: DEVICE_HEIGHT, padding: BEZEL, transform: `scale(${scale})` }}
                 >
-                    <div className="phone-ui relative h-full w-full overflow-hidden rounded-[2.65rem] bg-black text-white">
+                    <div className="phone-ui phone-screen relative h-full w-full overflow-hidden rounded-[2.65rem] bg-black text-white">
                         {children}
                         <div
                             data-island

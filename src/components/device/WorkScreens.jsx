@@ -1,17 +1,19 @@
 import { Suspense } from 'react';
-import { motion, useTransform } from 'framer-motion';
+import { easeIn, easeOut, motion, useTransform } from 'framer-motion';
 import HomeScreen from './HomeScreen';
 import { SCENES } from './scenes';
-import { ICON_SIZE, iconPosition, segments } from '../../data/workTimeline';
+import { CLOSE, ICON_SIZE, LAUNCH, iconPosition, segments } from '../../data/workTimeline';
+
+const holdStill = (value) => value;
+const OPEN_AND_CLOSE = { ease: [easeOut, holdStill, easeIn] };
 
 const SceneLayer = ({ segment, index, p, active, onFocusScene }) => {
     const { start, end, project } = segment;
-    const margin = Math.min(0.14 * (end - start), 0.02);
 
     // Opens from the app's home screen icon and closes back into it
-    const scale = useTransform(p, [start, start + margin, end - margin, end], [0.18, 1, 1, 0.18]);
-    const opacity = useTransform(p, [start, start + margin * 0.5, end - margin * 0.5, end], [0, 1, 1, 0]);
-    const sceneProgress = useTransform(p, [start + margin, end - margin], [0, 1]);
+    const scale = useTransform(p, [start, start + LAUNCH, end - CLOSE, end], [0.18, 1, 1, 0.18], OPEN_AND_CLOSE);
+    const opacity = useTransform(p, [start, start + LAUNCH * 0.4, end - CLOSE * 0.5, end], [0, 1, 1, 0]);
+    const sceneProgress = useTransform(p, [start + LAUNCH, end - CLOSE], [0, 1]);
 
     const { x, y } = iconPosition(index);
     const isActive = active === index;

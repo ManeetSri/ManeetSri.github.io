@@ -3,7 +3,7 @@ import { motion, useScroll, useSpring } from 'framer-motion';
 // The page's scroll position, drawn as an Xcode build progress bar
 const ScrollProgress = () => {
     const { scrollYProgress } = useScroll();
-    const scaleX = useSpring(scrollYProgress, { stiffness: 200, damping: 40 });
+    const scaleX = useSpring(scrollYProgress, { stiffness: 200, damping: 40, restDelta: 0.0002 });
 
     return (
         <motion.div

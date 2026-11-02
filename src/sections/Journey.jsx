@@ -17,7 +17,7 @@ const VersionEntry = ({ entry, isCurrent }) => {
             ref={ref}
             initial={{ opacity: 0, y: 30 }}
             whileInView={{ opacity: 1, y: 0 }}
-            viewport={{ once: true, margin: '-12% 0px' }}
+            viewport={{ once: true, margin: '-5% 0px' }}
             transition={{ duration: 0.6, ease: [0.16, 1, 0.3, 1] }}
             className="relative pb-14 pl-14 sm:pl-16"
         >
@@ -50,10 +50,10 @@ const VersionEntry = ({ entry, isCurrent }) => {
     );
 };
 
-const Journey = ({ ref }) => (
-    <section ref={ref} id="journey" className="px-5 pb-16 pt-24 sm:px-10 lg:pl-[max(2.5rem,5vw)] lg:pr-4">
+const Journey = () => (
+    <section id="journey" className="px-5 pb-16 pt-20 sm:px-10 lg:pl-[max(2.5rem,5vw)] lg:pr-4">
         <p className="mb-3 font-mono text-sm text-swift">What's new</p>
-        <h2 className="mb-14 font-display text-[clamp(2.4rem,5vw,4.5rem)] font-semibold leading-none tracking-tight">Release notes for a career.</h2>
+        <h2 className="mb-10 font-display text-[clamp(2.4rem,5vw,4.5rem)] font-semibold leading-none tracking-tight">Release notes for a career.</h2>
         <ol>
             {career.map((entry, index) => (
                 <VersionEntry key={entry.id} entry={entry} isCurrent={index === career.length - 1} />

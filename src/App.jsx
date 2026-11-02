@@ -21,12 +21,13 @@ const Home = () => {
   const { hash } = useLocation();
   const reduceMotion = useReducedMotion();
   const [loading, setLoading] = useState(() => shouldPlayLoader(hash));
+  const [ready, setReady] = useState(!loading);
 
   return (
     <>
-      {loading && <BuildLoader onDone={() => setLoading(false)} />}
+      {loading && <BuildLoader onReady={() => setReady(true)} onDone={() => setLoading(false)} />}
       <main>
-        {reduceMotion ? <StaticStory /> : <Stage ready={!loading} />}
+        {reduceMotion ? <StaticStory /> : <Stage ready={ready} />}
         <Instruments />
         <Notes />
         <Contact />

@@ -2,7 +2,7 @@ import { motion, useTransform } from 'framer-motion';
 import ProjectPanel from './ProjectPanel';
 import Phone from '../components/device/Phone';
 import WorkScreens from '../components/device/WorkScreens';
-import { segments, totalUnits } from '../data/workTimeline';
+import { CLOSE, LAUNCH, segments, totalUnits } from '../data/workTimeline';
 
 const INTRO_END = segments[0].start;
 
@@ -67,20 +67,17 @@ const Work = ({ ref, p, active, onJump, showPhone }) => (
                             document.getElementById('skills')?.scrollIntoView();
                         }}
                     />
-                    {segments.map(({ project, start, end }, index) => {
-                        const fade = Math.min(0.14 * (end - start), 0.02);
-                        return (
-                            <PanelLayer
-                                key={project.id}
-                                p={p}
-                                range={[start, start + fade, end - fade, end]}
-                                isActive={active === index}
-                                onFocus={() => active !== index && onJump(index)}
-                            >
-                                <article><ProjectPanel project={project} /></article>
-                            </PanelLayer>
-                        );
-                    })}
+                    {segments.map(({ project, start, end }, index) => (
+                        <PanelLayer
+                            key={project.id}
+                            p={p}
+                            range={[start, start + LAUNCH * 0.7, end - CLOSE * 0.7, end]}
+                            isActive={active === index}
+                            onFocus={() => active !== index && onJump(index)}
+                        >
+                            <article><ProjectPanel project={project} /></article>
+                        </PanelLayer>
+                    ))}
                 </div>
             </div>
         </div>

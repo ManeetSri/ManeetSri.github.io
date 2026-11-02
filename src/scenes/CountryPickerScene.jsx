@@ -91,6 +91,13 @@ const CountryPickerScene = ({ p }) => {
                             setQuery(event.target.value);
                             setHighlight(0);
                         }}
+                        onFocus={() => {
+                            // Clear the scroll demo's text, so the visitor starts with an empty box
+                            if (touched.current) return;
+                            touched.current = true;
+                            setQuery('');
+                            setDebounced('');
+                        }}
                         onKeyDown={onKeyDown}
                         className="w-full min-w-0 bg-transparent text-[16px] text-white placeholder:text-white/55 focus:outline-none"
                     />

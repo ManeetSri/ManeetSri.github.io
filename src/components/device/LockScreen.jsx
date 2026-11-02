@@ -46,6 +46,14 @@ const LockScreen = ({ ready = true }) => {
                 ))}
             </div>
             <div className="absolute bottom-2 h-[5px] w-28 rounded-full bg-white/80" />
+
+            {/* The screen stays dark until the loader lands on the Dynamic Island */}
+            <motion.div
+                initial={false}
+                animate={{ opacity: ready ? 0 : 1 }}
+                transition={{ duration: 0.7, ease: 'easeOut' }}
+                className="pointer-events-none absolute inset-0 bg-black"
+            />
         </div>
     );
 };
