@@ -1,7 +1,8 @@
-import { useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import { motion } from 'framer-motion';
 import { ArrowUp, FileText, Github, Linkedin, Mail } from 'lucide-react';
 import { submitNetlifyForm } from '../utils/netlifyForm';
+import { onContactPrefill } from '../utils/contactPrefill';
 
 const BUBBLES = [
     'Hi, thanks for scrolling all the way to the end.',
@@ -24,6 +25,13 @@ const Contact = () => {
     const [formData, setFormData] = useState(EMPTY_FORM);
     const [status, setStatus] = useState('');
     const [sent, setSent] = useState([]);
+    const nameRef = useRef(null);
+
+    // A message started by the app builder, unless the visitor has already written their own
+    useEffect(() => onContactPrefill((message) => {
+        setFormData((current) => (current.message.trim() ? current : { ...current, message }));
+        nameRef.current?.focus({ preventScroll: true });
+    }), []);
 
     const handleChange = (event) => {
         setFormData({ ...formData, [event.target.name]: event.target.value });
@@ -94,7 +102,7 @@ const Contact = () => {
                     <div className="grid gap-3 sm:grid-cols-2">
                         <div>
                             <label htmlFor="name" className="mb-1 block pl-1 text-sm text-muted">Name</label>
-                            <input id="name" name="name" type="text" required autoComplete="name" value={formData.name} onChange={handleChange} className={fieldClass} />
+                            <input ref={nameRef} id="name" name="name" type="text" required autoComplete="name" value={formData.name} onChange={handleChange} className={fieldClass} />
                         </div>
                         <div>
                             <label htmlFor="email" className="mb-1 block pl-1 text-sm text-muted">Email</label>

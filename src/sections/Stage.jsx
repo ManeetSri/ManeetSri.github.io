@@ -8,25 +8,11 @@ import LockScreen from '../components/device/LockScreen';
 import VersionScreen from '../components/device/VersionScreen';
 import WorkScreens from '../components/device/WorkScreens';
 import { preloadScenes } from '../components/device/scenes';
+import { useIsDesktop } from '../hooks/useIsDesktop';
 import { CLOSE, LAUNCH, activeIndexAt, segments } from '../data/workTimeline';
-
-const DESKTOP_QUERY = '(min-width: 1024px)';
 
 // Takes the steps out of mouse-wheel scrolling, without lagging noticeably behind it
 const SMOOTHING = { stiffness: 240, damping: 40, mass: 0.5, restDelta: 0.00005, restSpeed: 0.00005 };
-
-const useIsDesktop = () => {
-    const [isDesktop, setIsDesktop] = useState(() => window.matchMedia(DESKTOP_QUERY).matches);
-
-    useEffect(() => {
-        const media = window.matchMedia(DESKTOP_QUERY);
-        const onChange = (event) => setIsDesktop(event.matches);
-        media.addEventListener('change', onChange);
-        return () => media.removeEventListener('change', onChange);
-    }, []);
-
-    return isDesktop;
-};
 
 const Tint = ({ p, segment }) => {
     const { start, end, project } = segment;
