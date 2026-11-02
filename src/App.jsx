@@ -1,6 +1,7 @@
 import { Suspense, lazy, useState } from 'react';
 import { BrowserRouter as Router, Routes, Route, Navigate, useLocation } from 'react-router-dom';
 import { MotionConfig, useReducedMotion } from 'framer-motion';
+import ErrorBoundary from './components/ErrorBoundary';
 import ScrollToTop from './components/ScrollToTop';
 import ScrollProgress from './components/ScrollProgress';
 import TabBar from './components/TabBar';
@@ -68,7 +69,8 @@ function App() {
       <Router>
         <ScrollToTop />
         <AnalyticsTracker />
-        <Routes>
+        <ErrorBoundary>
+          <Routes>
           <Route path="/" element={<Home />} />
           <Route path="/projects" element={<Navigate to="/#work" replace />} />
           <Route path="/blogs" element={<BlogsPage />} />
@@ -76,6 +78,7 @@ function App() {
           <Route path="/build" element={<Suspense fallback={<div className="min-h-svh bg-ink" />}><BuildPage /></Suspense>} />
           <Route path="*" element={<NotFoundPage />} />
         </Routes>
+        </ErrorBoundary>
         <PortfolioChrome />
         <CookieBanner />
       </Router>

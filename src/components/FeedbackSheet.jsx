@@ -2,7 +2,7 @@ import { useEffect, useRef, useState } from 'react';
 import { AnimatePresence, motion, useDragControls } from 'framer-motion';
 import { ArrowRight, Check, FileText, Github, Linkedin, Mail, MessageSquareHeart, Newspaper, Star, X } from 'lucide-react';
 import { useLocation, useNavigate } from 'react-router-dom';
-import { submitNetlifyForm } from '../utils/netlifyForm';
+import { FIELD_LIMITS, FormCooldownError, submitNetlifyForm } from '../utils/netlifyForm';
 import { track } from '../analytics';
 
 const PROMPTED_KEY = 'maneet-feedback-prompted';
@@ -62,6 +62,10 @@ const FeedbackForm = ({ onConnect }) => {
             setStatus('success');
             track('feedback_submit', { rating, has_message: message.trim().length > 0, has_email: email.trim().length > 0 });
         } catch (error) {
+            if (error instanceof FormCooldownError) {
+                setStatus('cooldown');
+                return;
+            }
             console.error('Error:', error);
             setStatus('error');
             track('form_error', { form: 'feedback' });
@@ -115,6 +119,7 @@ const FeedbackForm = ({ onConnect }) => {
                 <label htmlFor="feedback-message" className="mb-1 block pl-1 text-sm text-muted">What could be better?</label>
                 <textarea
                     id="feedback-message"
+                    maxLength={FIELD_LIMITS.message}
                     rows="3"
                     value={message}
                     onChange={(event) => setMessage(event.target.value)}
@@ -127,6 +132,7 @@ const FeedbackForm = ({ onConnect }) => {
                 <label htmlFor="feedback-email" className="mb-1 block pl-1 text-sm text-muted">Email (optional, if you'd like a reply)</label>
                 <input
                     id="feedback-email"
+                    maxLength={FIELD_LIMITS.email}
                     type="email"
                     autoComplete="email"
                     value={email}
@@ -135,6 +141,11 @@ const FeedbackForm = ({ onConnect }) => {
                 />
             </div>
 
+            {status === 'cooldown' && (
+                <p role="status" className="rounded-2xl border border-line bg-white/5 px-4 py-3 text-sm text-muted">
+                    Please wait a few seconds before sending more feedback.
+                </p>
+            )}
             {status === 'error' && (
                 <p role="alert" className="rounded-2xl border border-[#FF453A]/40 bg-[#FF453A]/10 px-4 py-3 text-sm text-[#FF9D96]">
                     That didn't send. Please try again or email{' '}

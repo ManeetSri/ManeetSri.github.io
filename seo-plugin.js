@@ -87,5 +87,5 @@ export const seoContent = () => ({
     name: 'seo-content',
     transformIndexHtml: (html) => html
         .replace('<!--seo-content-->', renderContent)
-        .replace('<!--seo-jsonld-->', () => `<script type="application/ld+json">${structuredData()}</script>`),
+        .replace('<!--seo-jsonld-->', () => `<script type="application/ld+json">${structuredData().replace(/</g, '\\u003c')}</script>`),
 });

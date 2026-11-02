@@ -2,7 +2,7 @@ import { useEffect, useRef, useState } from 'react';
 import { Link, useLocation, useNavigate } from 'react-router-dom';
 import { motion } from 'framer-motion';
 import { ArrowUp, FileText, Github, Linkedin, Mail } from 'lucide-react';
-import { submitNetlifyForm } from '../utils/netlifyForm';
+import { FIELD_LIMITS, FormCooldownError, submitNetlifyForm } from '../utils/netlifyForm';
 import { track } from '../analytics';
 import { openCookieSettings } from '../analytics/consent';
 
@@ -58,6 +58,10 @@ const Contact = () => {
                 setFormData(EMPTY_FORM);
             })
             .catch((error) => {
+                if (error instanceof FormCooldownError) {
+                    setStatus('cooldown');
+                    return;
+                }
                 console.error('Error:', error);
                 setStatus('error');
                 track('form_error', { form: 'contact' });
@@ -124,11 +128,11 @@ const Contact = () => {
                     <div className="grid gap-3 sm:grid-cols-2">
                         <div>
                             <label htmlFor="name" className="mb-1 block pl-1 text-sm text-muted">Name</label>
-                            <input ref={nameRef} id="name" name="name" type="text" required autoComplete="name" value={formData.name} onChange={handleChange} className={fieldClass} />
+                            <input ref={nameRef} id="name" name="name" type="text" required maxLength={FIELD_LIMITS.name} autoComplete="name" value={formData.name} onChange={handleChange} className={fieldClass} />
                         </div>
                         <div>
                             <label htmlFor="email" className="mb-1 block pl-1 text-sm text-muted">Email</label>
-                            <input id="email" name="email" type="email" required autoComplete="email" value={formData.email} onChange={handleChange} className={fieldClass} />
+                            <input id="email" name="email" type="email" required maxLength={FIELD_LIMITS.email} autoComplete="email" value={formData.email} onChange={handleChange} className={fieldClass} />
                         </div>
                     </div>
 
@@ -139,6 +143,7 @@ const Contact = () => {
                                 id="message"
                                 name="message"
                                 required
+                                maxLength={FIELD_LIMITS.message}
                                 rows="4"
                                 value={formData.message}
                                 onChange={handleChange}
@@ -156,6 +161,11 @@ const Contact = () => {
                         </div>
                     </div>
 
+                    {status === 'cooldown' && (
+                        <p role="status" className="rounded-2xl border border-line bg-white/5 px-4 py-3 text-sm text-muted">
+                            Your last message was just sent. Please wait a few seconds before sending another.
+                        </p>
+                    )}
                     {status === 'error' && (
                         <p role="alert" className="rounded-2xl border border-[#FF453A]/40 bg-[#FF453A]/10 px-4 py-3 text-sm text-[#FF9D96]">
                             Your message wasn't sent. Please try again or email me at{' '}

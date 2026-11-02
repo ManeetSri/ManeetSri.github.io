@@ -1,6 +1,6 @@
-import { initializeApp } from 'firebase/app';
-import { initializeAnalytics, isSupported, logEvent, setAnalyticsCollectionEnabled, setConsent, setUserProperties } from 'firebase/analytics';
-import { getPerformance } from 'firebase/performance';
+import { initializeApp } from '@firebase/app';
+import { initializeAnalytics, isSupported, logEvent, setAnalyticsCollectionEnabled, setConsent, setUserProperties } from '@firebase/analytics';
+import { getPerformance } from '@firebase/performance';
 
 // A Firebase web config identifies the project and isn't a secret. It ships to every browser.
 const firebaseConfig = {
