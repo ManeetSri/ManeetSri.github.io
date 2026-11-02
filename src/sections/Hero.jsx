@@ -1,126 +1,68 @@
-import React, { useRef } from 'react';
-import { motion, useScroll, useTransform } from 'framer-motion';
+import { motion } from 'framer-motion';
+import { ArrowDown, ArrowRight, FileText, Github } from 'lucide-react';
+import Phone from '../components/device/Phone';
+import LockScreen from '../components/device/LockScreen';
+import AppIcon from '../components/device/AppIcon';
+import { getYearsOfExperience } from '../data/career';
+import { projects } from '../data/projects';
 
-const Hero = () => {
-    const ref = useRef(null);
-    const { scrollY } = useScroll();
-    const y1 = useTransform(scrollY, [0, 500], [0, 100]);
-    const y2 = useTransform(scrollY, [0, 500], [0, -100]);
+const rise = (ready, delay) => ({
+    initial: { opacity: 0, y: 26 },
+    animate: ready ? { opacity: 1, y: 0 } : {},
+    transition: { duration: 0.7, delay, ease: [0.16, 1, 0.3, 1] },
+});
 
-    return (
-        <section ref={ref} className="relative overflow-hidden min-h-screen flex items-center pt-20">
-            {/* Parallax Blobs */}
-            <div className="pointer-events-none absolute inset-0 -z-10 opacity-70">
-                <motion.div
-                    style={{ y: y1 }}
-                    className="absolute -top-32 -left-16 w-80 h-80 rounded-full bg-lavender blur-3xl"
-                />
-                <motion.div
-                    style={{ y: y2 }}
-                    className="absolute -bottom-40 right-0 w-96 h-96 rounded-full bg-[#5b3bd9] blur-[110px] opacity-80"
-                />
-                <div className="absolute top-24 right-1/3 w-72 h-72 rounded-full bg-[#ff7fd7] blur-[120px] opacity-75" />
+const secondaryButton = 'inline-flex h-12 items-center justify-center gap-2 rounded-full border border-line bg-white/5 px-5 font-medium transition-colors hover:bg-white/10';
+
+const Hero = ({ ref, ready, showPhone }) => (
+    <section ref={ref} id="top" className="flex min-h-svh flex-col justify-center px-5 pb-24 pt-16 sm:px-10 lg:pl-[max(2.5rem,5vw)] lg:pr-4 lg:pt-8">
+        <motion.p {...rise(ready, 0)} className="mb-4 flex items-center gap-2 font-mono text-sm text-muted">
+            <span className="relative flex h-2.5 w-2.5">
+                <span className="absolute inset-0 animate-ping rounded-full bg-[#30D158] opacity-60 motion-reduce:animate-none" />
+                <span className="relative h-2.5 w-2.5 rounded-full bg-[#30D158]" />
+            </span>
+            iOS & Android developer
+        </motion.p>
+
+        <motion.h1 {...rise(ready, 0.08)} className="font-display text-[clamp(2.7rem,6vw,5.6rem)] font-semibold leading-[0.98] tracking-tight">
+            <span className="swift-gradient-text">iPhone apps</span> for getting around, shopping, school and prayer.
+        </motion.h1>
+
+        <motion.p {...rise(ready, 0.16)} className="mt-5 max-w-2xl text-lg leading-relaxed text-paper/85">
+            I'm <strong className="font-semibold text-paper">Maneet Srivastav</strong>, a mobile app developer with {getYearsOfExperience()}+ years shipping production apps
+            in Swift, SwiftUI, UIKit and React Native. Currently at Mahindra Logistics.
+        </motion.p>
+
+        <motion.div {...rise(ready, 0.24)} className="mt-6 grid grid-cols-2 gap-3 sm:flex sm:flex-wrap">
+            <a href="#work" data-event="cta_click" data-event-cta="see_apps" className="swift-gradient col-span-2 inline-flex h-12 items-center justify-center gap-2 rounded-full px-6 font-semibold text-ink transition-transform hover:scale-[1.03]">
+                See the apps <ArrowRight size={18} aria-hidden="true" />
+            </a>
+            <a href="/resume.pdf" target="_blank" rel="noopener noreferrer" data-event="resume_open" data-event-source="hero" className={secondaryButton}>
+                <FileText size={18} aria-hidden="true" /> Resume
+            </a>
+            <a href="https://github.com/ManeetSri" target="_blank" rel="noopener noreferrer" data-event="profile_click" data-event-profile="github" data-event-source="hero" className={secondaryButton}>
+                <Github size={18} aria-hidden="true" /> GitHub
+            </a>
+        </motion.div>
+
+        <motion.a {...rise(ready, 0.32)} href="#work" data-event="cta_click" data-event-cta="app_icons" aria-label="Open the apps I've worked on" className="mt-7 block w-fit">
+            <span className="flex flex-wrap gap-1.5 sm:gap-2">
+                {projects.map((project) => (
+                    <AppIcon key={project.id} project={project} size={36} />
+                ))}
+            </span>
+        </motion.a>
+
+        {showPhone ? (
+            <div className="mx-auto mt-10 h-[520px] w-full max-w-sm">
+                <Phone><LockScreen ready={ready} /></Phone>
             </div>
-
-            <div className="max-w-7xl mx-auto px-4 sm:px-6 py-20 w-full">
-                <div className="grid md:grid-cols-2 gap-8 md:gap-12 items-center">
-
-                    {/* Left Content */}
-                    <motion.div
-                        initial={{ opacity: 0, y: 30 }}
-                        animate={{ opacity: 1, y: 0 }}
-                        transition={{ duration: 0.8, ease: "easeOut" }}
-                    >
-                        <p className="text-[11px] tracking-[0.28em] uppercase text-lavender-light mb-3 font-medium">
-                            iOS · Swift · SwiftUI · React Native
-                        </p>
-
-                        <h1 className="text-4xl sm:text-5xl font-semibold tracking-tight text-slate-50 mb-4 leading-tight">
-                            Building scalable, elegant & reliable mobile applications.
-                        </h1>
-
-                        <p className="text-[15px] text-slate-200 leading-relaxed mb-7 max-w-xl">
-                            I’m <span className="font-semibold text-white">Maneet Srivastav</span>, currently{' '}
-                            <span className="font-semibold text-white">
-                                Assistant Manager – IT (Mobile Applications) at Mahindra Logistics
-                            </span>.
-                            I design and ship production-grade iOS apps using Swift, SwiftUI, UIKit, React Native and Firebase,
-                            with a strong focus on architecture, performance and user experience.
-                        </p>
-
-                        <div className="flex flex-wrap gap-3 mb-6">
-                            <a
-                                href="/resume.pdf"
-                                target="_blank"
-                                rel="noopener noreferrer"
-                                className="inline-flex items-center justify-center rounded-full bg-white text-slate-900 text-sm font-medium px-5 py-2.5 shadow-md hover:bg-slate-100 transition-colors"
-                            >
-                                Resume
-                            </a>
-                            <a
-                                href="https://github.com/ManeetSri"
-                                target="_blank"
-                                rel="noreferrer"
-                                className="inline-flex items-center justify-center rounded-full bg-white text-slate-900 text-sm font-medium px-5 py-2.5 shadow-md hover:bg-slate-100 transition-colors"
-                            >
-                                View GitHub
-                            </a>
-                            <a
-                                href="#contact"
-                                className="inline-flex items-center justify-center rounded-full border border-violet-300/60 text-violet-50 text-sm px-5 py-2.5 bg-white/5 hover:bg-white/10 transition-colors"
-                            >
-                                Contact Me
-                            </a>
-                        </div>
-
-                        <div className="flex flex-wrap gap-2">
-                            {['Swift · SwiftUI · UIKit', 'Ride-hailing & Logistics', 'E-commerce & Platforms'].map((tag) => (
-                                <span key={tag} className="pill">
-                                    {tag}
-                                </span>
-                            ))}
-                        </div>
-                    </motion.div>
-
-                    {/* Right Card */}
-                    <motion.div
-                        initial={{ opacity: 0, x: 30 }}
-                        animate={{ opacity: 1, x: 0 }}
-                        transition={{ duration: 0.8, delay: 0.2, ease: "easeOut" }}
-                        className="flex justify-center md:justify-end"
-                    >
-                        <div className="glass-card rounded-3xl p-6 w-full max-w-md transform transition-all hover:scale-[1.02]">
-                            <p className="text-[11px] font-semibold tracking-[0.25em] uppercase text-slate-300 mb-4">
-                                Snapshot
-                            </p>
-                            <div className="space-y-4 text-sm text-slate-100">
-                                <div className="flex justify-between gap-4">
-                                    <span className="text-slate-300">Current Role</span>
-                                    <span className="font-semibold text-right text-white">
-                                        Assistant Manager – IT<br />Mahindra Logistics
-                                    </span>
-                                </div>
-                                <div className="flex justify-between">
-                                    <span className="text-slate-300">Experience</span>
-                                    <span className="font-semibold text-white">3+ years</span>
-                                </div>
-                                <div className="flex justify-between gap-4">
-                                    <span className="text-slate-300">Focus</span>
-                                    <span className="font-semibold text-right text-white">
-                                        iOS Apps · Architecture<br />Mobility & Logistics
-                                    </span>
-                                </div>
-                            </div>
-                            <p className="mt-5 pt-4 border-t border-violet-300/40 text-[11px] text-slate-300">
-                                Previously at Singsys, JamTech & Synclovis — delivering multi-domain mobile apps and mentoring junior engineers.
-                            </p>
-                        </div>
-                    </motion.div>
-
-                </div>
-            </div>
-        </section>
-    );
-};
+        ) : (
+            <motion.p {...rise(ready, 0.4)} className="mt-7 flex items-center gap-2 font-mono text-sm text-muted">
+                <ArrowDown size={16} aria-hidden="true" className="animate-bounce" /> Scroll to unlock
+            </motion.p>
+        )}
+    </section>
+);
 
 export default Hero;
