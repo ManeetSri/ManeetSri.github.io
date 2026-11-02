@@ -26,15 +26,17 @@
 
 ## 🚀 About The Project
 
-This is my personal portfolio website, designed to showcase my skills, experience, and projects as a Mobile Application Engineer. Built with **React** and **Tailwind CSS**, it features a modern, responsive design with a focus on cleanliness and performance.
+This is my personal portfolio website, built like an iPhone app being compiled and run. Built with **React**, **Tailwind CSS** and **Framer Motion**, it tells the story of my work as you scroll.
 
 ### ✨ Key Features
 
--   **🎨 Modern UI/UX**: Clean, dark-themed responsive design with glassmorphism effects.
--   **📱 Fully Responsive**: Optimized for all devices from mobile to desktop.
--   **⚡ Fast Performance**: Built with Vite for lightning-fast HMR and build times.
--   **📝 Contact Form**: Fully functional contact form integrated with **Netlify Forms**.
--   **✍️ Blog Integration**: Displays my latest Medium articles dynamically.
+-   **🔨 Xcode-style loader**: Compiles my career, then morphs into the phone's Dynamic Island.
+-   **📱 Scroll-driven phone**: One pinned phone unlocks, shows my version history and opens each app.
+-   **🌍 Live demo**: A working web recreation of my CountryPicker Swift Package.
+-   **📈 Instruments-style skills**: Each skill is plotted against the roles where I used it.
+-   **♿ Reduced motion support**: Every scene falls back to a complete static layout.
+-   **📝 Contact Form**: A Messages-style form integrated with **Netlify Forms**.
+-   **✍️ Blog Integration**: Displays my latest Medium articles as a git log.
 
 ## 🛠️ Built With
 
