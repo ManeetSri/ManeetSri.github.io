@@ -1,10 +1,11 @@
 import { useState } from 'react';
 import { motion } from 'framer-motion';
 import { ArrowUp, FileText, Github, Linkedin, Mail } from 'lucide-react';
+import { submitNetlifyForm } from '../utils/netlifyForm';
 
 const BUBBLES = [
     'Hi, thanks for scrolling all the way to the end.',
-    'I\'m open to roles and collaborations around mobility, logistics, ecommerce and user-centric mobile products.',
+    'I\'m open to freelance projects, roles and collaborations around iOS, Android and user-centric mobile products.',
     'Happy to talk architecture, performance and product trade-offs. What are you building?',
 ];
 
@@ -19,10 +20,6 @@ const EMPTY_FORM = { name: '', email: '', message: '' };
 
 const fieldClass = 'w-full rounded-2xl border border-line bg-ink px-4 py-3 text-base text-paper placeholder:text-muted/80 focus:border-amber focus:outline-none';
 
-const encode = (data) => Object.keys(data)
-    .map((key) => `${encodeURIComponent(key)}=${encodeURIComponent(data[key])}`)
-    .join('&');
-
 const Contact = () => {
     const [formData, setFormData] = useState(EMPTY_FORM);
     const [status, setStatus] = useState('');
@@ -36,15 +33,8 @@ const Contact = () => {
         event.preventDefault();
         setStatus('sending');
 
-        fetch('/', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-            body: encode({ 'form-name': 'contact', 'bot-field': event.target.elements['bot-field'].value, ...formData }),
-        })
-            .then((response) => {
-                if (!response.ok) {
-                    throw new Error(`Form submission failed with status ${response.status}`);
-                }
+        submitNetlifyForm('contact', { 'bot-field': event.target.elements['bot-field'].value, ...formData })
+            .then(() => {
                 setStatus('success');
                 setSent((messages) => [...messages, formData.message]);
                 setFormData(EMPTY_FORM);
@@ -56,7 +46,7 @@ const Contact = () => {
     };
 
     return (
-        <section id="contact" className="relative bg-ink px-5 pb-28 pt-24 sm:px-10 lg:px-[5vw]">
+        <section id="contact" className="relative bg-ink px-5 pb-28 pt-16 sm:px-10 lg:px-[5vw] lg:pt-24">
             <h2 className="mb-12 font-display text-[clamp(2.4rem,6vw,5.5rem)] font-semibold leading-none tracking-tight">
                 Ready to <span className="swift-gradient-text">ship</span> something?
             </h2>

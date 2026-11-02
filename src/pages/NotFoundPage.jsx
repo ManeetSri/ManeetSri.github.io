@@ -1,9 +1,14 @@
 import { ArrowLeft } from 'lucide-react';
 import { Link } from 'react-router-dom';
-import { useDocumentTitle } from '../hooks/useDocumentTitle';
+import { usePageMeta } from '../hooks/usePageMeta';
 
 const NotFoundPage = () => {
-    useDocumentTitle('Page not found – Maneet Srivastav');
+    usePageMeta({
+        title: 'Page not found | Maneet Srivastav',
+        description: 'This page does not exist.',
+        path: '/',
+        noindex: true,
+    });
 
     return (
         <main className="flex min-h-svh items-center justify-center px-5 pb-20 text-center">

@@ -1,18 +1,11 @@
-const SESSION_KEY = 'maneet-build-played';
+// Lives in memory, so a refresh plays the loader again but moving between pages doesn't
+let played = false;
 
 export const shouldPlayLoader = (hash) => {
-    if (hash || window.matchMedia('(prefers-reduced-motion: reduce)').matches) return false;
-    try {
-        return !sessionStorage.getItem(SESSION_KEY);
-    } catch {
-        return true;
-    }
+    if (played || hash) return false;
+    return !window.matchMedia('(prefers-reduced-motion: reduce)').matches;
 };
 
 export const markPlayed = () => {
-    try {
-        sessionStorage.setItem(SESSION_KEY, '1');
-    } catch {
-        // Without storage the build simply plays again on the next visit
-    }
+    played = true;
 };

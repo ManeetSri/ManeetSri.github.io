@@ -4,19 +4,25 @@ import { MotionConfig, useReducedMotion } from 'framer-motion';
 import ScrollToTop from './components/ScrollToTop';
 import ScrollProgress from './components/ScrollProgress';
 import TabBar from './components/TabBar';
+import FeedbackSheet from './components/FeedbackSheet';
 import BuildLoader from './components/BuildLoader';
 import { shouldPlayLoader } from './components/loaderSession';
 import Stage from './sections/Stage';
 import StaticStory from './sections/StaticStory';
 import Instruments from './sections/Instruments';
+import Services from './sections/Services';
 import Notes from './sections/Notes';
 import Contact from './sections/Contact';
 import BlogsPage from './pages/BlogsPage';
 import NotFoundPage from './pages/NotFoundPage';
-import { useDocumentTitle } from './hooks/useDocumentTitle';
+import { usePageMeta } from './hooks/usePageMeta';
 
 const Home = () => {
-  useDocumentTitle('Maneet Srivastav – iOS & Mobile Application Engineer');
+  usePageMeta({
+    title: 'Freelance iOS & Android App Developer | Maneet Srivastav',
+    description: 'Freelance mobile app developer building iOS and Android apps with Swift, SwiftUI and React Native. 4+ years shipping ride-hailing, retail and education apps.',
+    path: '/',
+  });
 
   const { hash } = useLocation();
   const reduceMotion = useReducedMotion();
@@ -29,6 +35,7 @@ const Home = () => {
       <main>
         {reduceMotion ? <StaticStory /> : <Stage ready={ready} />}
         <Instruments />
+        <Services />
         <Notes />
         <Contact />
       </main>
@@ -49,6 +56,7 @@ function App() {
           <Route path="*" element={<NotFoundPage />} />
         </Routes>
         <TabBar />
+        <FeedbackSheet />
       </Router>
     </MotionConfig>
   );

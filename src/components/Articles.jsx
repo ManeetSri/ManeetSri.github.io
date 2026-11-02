@@ -134,7 +134,8 @@ const Articles = ({ limit }) => {
                     {posts.length > 0 && <span className="whitespace-nowrap text-xs">{posts.length} commits</span>}
                 </p>
                 {loading && <p className="px-4 py-6 font-mono text-sm text-muted sm:px-5">Fetching origin…</p>}
-                <ul>
+                {/* On the home page, phones get a shorter list and "View the full log" covers the rest */}
+                <ul className={limit ? 'max-lg:[&>li:nth-child(n+4)]:hidden' : undefined}>
                     {log.map((post, index) => (
                         <Commit key={post.guid} post={post} index={index} isHead={post === posts[0]} />
                     ))}

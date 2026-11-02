@@ -1,6 +1,6 @@
-import { useState } from 'react';
-import { motion, useMotionValueEvent, useScroll } from 'framer-motion';
+import { motion } from 'framer-motion';
 import { career } from '../../data/career';
+import { useActiveVersion } from '../../hooks/useActiveVersion';
 
 const Row = ({ entry, state }) => (
     <motion.div
@@ -24,18 +24,9 @@ const Row = ({ entry, state }) => (
     </motion.div>
 );
 
-// The phone's view of the Journey section: an App Store version history for "Maneet".
-// The highlighted row is the latest release note to reach the middle of the page, worked out
-// from the scroll position so it stays right after a jump from the tab bar.
+// The phone's view of the Journey section: an App Store version history for "Maneet"
 const VersionScreen = () => {
-    const [activeIndex, setActiveIndex] = useState(0);
-    const { scrollY } = useScroll();
-
-    useMotionValueEvent(scrollY, 'change', () => {
-        const notes = [...document.querySelectorAll('#journey ol > li')];
-        const reached = notes.filter((note) => note.getBoundingClientRect().top <= window.innerHeight * 0.475);
-        setActiveIndex(Math.max(0, reached.length - 1));
-    });
+    const activeIndex = useActiveVersion();
 
     return (
         <div aria-hidden="true" className="absolute inset-0 bg-[#111216] px-4 pt-14">

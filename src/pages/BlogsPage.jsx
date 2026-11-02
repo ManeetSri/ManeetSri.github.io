@@ -2,10 +2,14 @@ import { ArrowLeft, ExternalLink } from 'lucide-react';
 import { Link } from 'react-router-dom';
 import Articles from '../components/Articles';
 import { MEDIUM_PROFILE_URL } from '../hooks/useMediumPosts';
-import { useDocumentTitle } from '../hooks/useDocumentTitle';
+import { usePageMeta } from '../hooks/usePageMeta';
 
 const BlogsPage = () => {
-    useDocumentTitle('Articles – Maneet Srivastav');
+    usePageMeta({
+        title: 'iOS & Mobile App Development Articles | Maneet Srivastav',
+        description: 'Articles on iOS and mobile app development: SwiftUI, Core Data, MVVM architecture, debugging and developer tools, from a working mobile engineer.',
+        path: '/blogs',
+    });
 
     return (
         <main className="min-h-svh px-5 pb-28 pt-16 sm:px-10 lg:px-[5vw]">

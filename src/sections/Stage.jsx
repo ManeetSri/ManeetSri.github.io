@@ -120,7 +120,7 @@ const Stage = ({ ready }) => {
             <div className="lg:grid lg:grid-cols-[minmax(0,1fr)_minmax(380px,38vw)]">
                 <div className="min-w-0">
                     <Hero ref={heroRef} ready={ready} showPhone={!isDesktop} />
-                    <Journey />
+                    <Journey showStrip={!isDesktop} />
                     <Work ref={workRef} p={workP} active={active} onJump={jumpToScene} showPhone={!isDesktop} />
                 </div>
                 {isDesktop && (

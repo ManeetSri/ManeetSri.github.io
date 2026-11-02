@@ -23,10 +23,10 @@ const TabBar = () => {
         if (pathname !== '/') return undefined;
         const observer = new IntersectionObserver((entries) => {
             entries.forEach((entry) => {
-                if (entry.isIntersecting) setVisible(entry.target.id);
+                if (entry.isIntersecting) setVisible(entry.target.dataset.tab ?? entry.target.id);
             });
         }, { rootMargin: '-50% 0px -50% 0px' });
-        TABS.forEach(({ id }) => {
+        [...TABS.map(({ id }) => id), 'services'].forEach((id) => {
             const section = document.getElementById(id);
             if (section) observer.observe(section);
         });
@@ -54,7 +54,7 @@ const TabBar = () => {
                     onClick={(event) => goTo(event, id)}
                     aria-label={name}
                     aria-current={current === id ? 'location' : undefined}
-                    className={`relative flex h-11 min-w-10 items-center justify-center gap-1.5 rounded-full px-1.5 text-sm transition-colors min-[375px]:min-w-11 min-[375px]:px-2.5 lg:px-3.5 ${current === id ? 'text-ink' : 'text-muted hover:text-paper'}`}
+                    className={`relative flex h-11 min-w-10 items-center justify-center gap-1.5 rounded-full px-1.5 text-sm transition-colors min-[390px]:min-w-11 min-[390px]:px-2.5 lg:px-3.5 ${current === id ? 'text-ink' : 'text-muted hover:text-paper'}`}
                 >
                     {current === id && (
                         <motion.span
@@ -64,7 +64,7 @@ const TabBar = () => {
                         />
                     )}
                     <Icon size={18} className="relative shrink-0" aria-hidden="true" />
-                    <span className="relative hidden font-medium lg:inline">{name}</span>
+                    <span className={`relative text-xs font-medium lg:inline lg:text-sm ${current === id ? 'hidden min-[375px]:inline' : 'hidden'}`}>{name}</span>
                 </a>
             ))}
             <a
@@ -72,7 +72,7 @@ const TabBar = () => {
                 target="_blank"
                 rel="noopener noreferrer"
                 aria-label="Resume (PDF)"
-                className="swift-gradient ml-0.5 flex h-11 min-w-10 items-center justify-center gap-1.5 rounded-full px-1.5 text-sm font-semibold text-ink min-[375px]:min-w-11 min-[375px]:px-2.5 lg:px-3.5"
+                className="swift-gradient ml-0.5 flex h-11 min-w-10 items-center justify-center gap-1.5 rounded-full px-1.5 text-sm font-semibold text-ink min-[390px]:min-w-11 min-[390px]:px-2.5 lg:px-3.5"
             >
                 <FileText size={18} className="shrink-0" aria-hidden="true" />
                 <span className="hidden lg:inline">Resume</span>

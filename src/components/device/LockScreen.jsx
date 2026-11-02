@@ -1,9 +1,11 @@
 import { useEffect, useState } from 'react';
 import { motion } from 'framer-motion';
-import { GitBranch, Star, Truck } from 'lucide-react';
+import { GitBranch, Truck } from 'lucide-react';
+import AppIcon from './AppIcon';
+import { projects } from '../../data/projects';
 
 const NOTIFICATIONS = [
-    { id: 'rating', icon: Star, color: '#30D158', app: 'Alyte', title: '4.7 ★ from 854 ratings', body: 'App Store India, Nov 2026' },
+    { id: 'rating', project: projects.find((project) => project.id === 'alyte'), app: 'Alyte', title: '4.7 ★ from 854 ratings', body: 'App Store India, Nov 2026' },
     { id: 'role', icon: Truck, color: '#F05138', app: 'Now', title: 'At Mahindra Logistics', body: 'Building enterprise mobility apps' },
     { id: 'oss', icon: GitBranch, color: '#FDB03A', app: 'Open source', title: 'CountryPicker_SwiftUI', body: 'A SwiftUI Swift Package' },
 ];
@@ -26,7 +28,7 @@ const LockScreen = ({ ready = true }) => {
             </p>
 
             <div className="mt-auto mb-12 w-full space-y-2">
-                {NOTIFICATIONS.map(({ id, icon: Icon, color, app, title, body }, index) => (
+                {NOTIFICATIONS.map(({ id, project, icon: Icon, color, app, title, body }, index) => (
                     <motion.div
                         key={id}
                         initial={{ opacity: 0, y: 24, scale: 0.96 }}
@@ -34,9 +36,13 @@ const LockScreen = ({ ready = true }) => {
                         transition={{ type: 'spring', stiffness: 220, damping: 22, delay: 0.25 + index * 0.18 }}
                         className="flex items-center gap-2.5 rounded-[20px] bg-white/12 p-2.5"
                     >
-                        <span className="flex h-9 w-9 shrink-0 items-center justify-center rounded-[9px]" style={{ background: color }}>
-                            <Icon size={18} className="text-black" />
-                        </span>
+                        {project ? (
+                            <span className="shrink-0"><AppIcon project={project} size={36} /></span>
+                        ) : (
+                            <span className="flex h-9 w-9 shrink-0 items-center justify-center rounded-[9px]" style={{ background: color }}>
+                                <Icon size={18} className="text-black" />
+                            </span>
+                        )}
                         <span className="min-w-0">
                             <span className="block text-[11px] text-white/65">{app}</span>
                             <span className="block truncate text-[13px] font-semibold">{title}</span>

@@ -20,9 +20,9 @@ const rolesById = Object.fromEntries(career.map((role) => [role.id, role]));
 const years = Array.from({ length: NOW[0] - 2022 }, (_, index) => 2023 + index);
 
 const Track = ({ track, index, onInspect }) => (
-    <li className="grid gap-1.5 border-t border-line py-2.5 lg:grid-cols-[190px_minmax(0,1fr)] lg:items-center lg:gap-4">
-        <span className="text-sm font-medium">{track.name}</span>
-        <span className="relative block h-7 rounded bg-white/[0.04]">
+    <li className="grid grid-cols-[92px_minmax(0,1fr)] items-center gap-2 border-t border-line py-1.5 sm:grid-cols-[150px_minmax(0,1fr)] lg:grid-cols-[190px_minmax(0,1fr)] lg:gap-4 lg:py-2.5">
+        <span className="text-[13px] font-medium leading-tight sm:text-sm">{track.name}</span>
+        <span className="relative block h-9 rounded bg-white/[0.04] lg:h-7">
             {track.roles.map((id) => {
                 const role = rolesById[id];
                 const description = `${track.name}: ${role.shortName}, ${role.period}`;
@@ -51,16 +51,22 @@ const Instruments = () => {
     const [inspected, setInspected] = useState('');
 
     return (
-        <section id="skills" className="relative bg-ink px-5 py-24 sm:px-10 lg:px-[5vw]">
+        <section id="skills" className="relative bg-ink px-5 py-16 sm:px-10 lg:px-[5vw] lg:py-24">
             <p className="mb-3 font-mono text-sm text-swift">Instruments</p>
             <h2 className="font-display text-[clamp(2.4rem,5vw,4.5rem)] font-semibold leading-none tracking-tight">No percentages. Just a trace of where each skill ran.</h2>
-            <p className="mt-5 max-w-2xl text-lg leading-relaxed text-muted">Each track is plotted against my real career timeline, from what each role's description names. Hover or tap a trace to see where it comes from.</p>
+            <p className="mt-5 max-w-2xl text-lg leading-relaxed text-muted">Each track is plotted against my real career timeline, from what each role's description names.</p>
 
-            <div className="mt-12 rounded-2xl border border-line bg-surface p-4 sm:p-6">
+            <div className="mt-8 rounded-2xl border border-line bg-surface p-4 sm:p-6 lg:mt-12">
                 <p aria-live="polite" className="mb-4 min-h-5 font-mono text-sm text-amber">{inspected || 'Hover or tap a trace'}</p>
 
-                <div className="grid gap-4 lg:grid-cols-[190px_minmax(0,1fr)]">
-                    <span className="hidden lg:block" />
+                <p aria-hidden="true" className="mb-3 flex flex-wrap gap-x-3 font-mono text-xs leading-relaxed text-muted sm:hidden">
+                    {career.map((role) => (
+                        <span key={role.id} className="whitespace-nowrap"><span className="text-amber">{role.shortName[0]}</span> {role.shortName}</span>
+                    ))}
+                </p>
+
+                <div className="grid grid-cols-[92px_minmax(0,1fr)] gap-2 sm:grid-cols-[150px_minmax(0,1fr)] lg:grid-cols-[190px_minmax(0,1fr)] lg:gap-4">
+                    <span />
                     <div className="relative h-7">
                         {career.map((role) => (
                             <span key={role.id} style={place(role)} className="absolute inset-y-0 truncate border-l border-paper/30 pl-1 font-mono text-xs text-muted">
@@ -77,8 +83,8 @@ const Instruments = () => {
                     ))}
                 </ul>
 
-                <div className="grid gap-4 border-t border-line pt-2 lg:grid-cols-[190px_minmax(0,1fr)]">
-                    <span className="hidden lg:block" />
+                <div className="grid grid-cols-[92px_minmax(0,1fr)] gap-2 border-t border-line pt-2 sm:grid-cols-[150px_minmax(0,1fr)] lg:grid-cols-[190px_minmax(0,1fr)] lg:gap-4">
+                    <span />
                     <div aria-hidden="true" className="relative h-5 font-mono text-xs text-muted">
                         {years.map((year) => (
                             <span key={year} className="absolute" style={{ left: `${((year * 12 + 1 - TIMELINE_START) / TIMELINE_LENGTH) * 100}%` }}>{year}</span>
