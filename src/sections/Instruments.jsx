@@ -34,6 +34,9 @@ const Track = ({ track, index, onInspect }) => (
                         onMouseEnter={() => onInspect(description)}
                         onFocus={() => onInspect(description)}
                         onClick={() => onInspect(description)}
+                        data-event="skill_inspect"
+                        data-event-skill={track.name}
+                        data-event-role={id}
                         initial={{ scaleX: 0 }}
                         whileInView={{ scaleX: 1 }}
                         viewport={{ once: true, margin: '-8% 0px' }}

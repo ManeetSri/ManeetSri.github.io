@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState } from 'react';
 import { animate, motion, useMotionValue, useMotionValueEvent, useReducedMotion, useTransform } from 'framer-motion';
 import { Car, Check, MapPin, RotateCcw } from 'lucide-react';
+import { track } from '../../analytics';
 
 const MAP_WIDTH = 360;
 const MAP_HEIGHT = 400;
@@ -44,6 +45,7 @@ const RideDemo = () => {
     const progress = useMotionValue(0);
     const driveRef = useRef(null);
     const timerRef = useRef(null);
+    const scrubbedRef = useRef(false);
 
     const destination = DESTINATIONS.find((item) => item.id === destinationId);
     const hasArrived = percent >= 100;
@@ -62,7 +64,12 @@ const RideDemo = () => {
 
     useEffect(() => stopDriving, []);
 
+    useEffect(() => {
+        if (hasArrived && destinationId) track('ride_complete', { destination: destinationId });
+    }, [hasArrived, destinationId]);
+
     const startRide = (id) => {
+        track('ride_request', { destination: id });
         stopDriving();
         setDestinationId(id);
         setPhase('finding');
@@ -75,6 +82,10 @@ const RideDemo = () => {
     };
 
     const scrub = (event) => {
+        if (!scrubbedRef.current) {
+            scrubbedRef.current = true;
+            track('ride_scrub', { destination: destinationId });
+        }
         stopDriving();
         setPhase('driving');
         progress.set(Number(event.target.value) / 100);
@@ -180,6 +191,7 @@ const RideDemo = () => {
                     <button
                         type="button"
                         onClick={reset}
+                        data-event="ride_reset"
                         disabled={!destination}
                         className="flex h-11 shrink-0 items-center gap-1.5 rounded-full bg-white/8 px-3.5 text-sm font-medium transition-colors hover:bg-white/15 disabled:opacity-40"
                     >

@@ -20,8 +20,8 @@ const list = (items, render) => `<ul>${items.map((item) => `<li>${render(item)}<
 // The site's content as plain HTML, for crawlers that don't run JavaScript.
 // React replaces it on load, so people and crawlers get the same information.
 const renderContent = () => `<div id="seo-content">
-    <h1>Maneet Srivastav: freelance iOS &amp; Android app developer</h1>
-    <p>Mobile app developer shipping production iOS and Android apps with Swift, SwiftUI, UIKit and React Native. Open to freelance app development and project work.</p>
+    <h1>Maneet Srivastav: iOS &amp; Android app developer</h1>
+    <p>Mobile app developer shipping production iOS and Android apps with Swift, SwiftUI, UIKit and React Native. Open to mobile app development and project work.</p>
     <p><a href="/resume.pdf">Resume (PDF)</a> · <a href="mailto:srivastavmaneet@gmail.com">Email</a> · ${PROFILES.map((url) => `<a href="${url}">${new URL(url).hostname.replace('www.', '')}</a>`).join(' · ')}</p>
     <h2>Mobile app development services</h2>
     ${list(services, (service) => `<strong>${escapeHtml(service.title)}</strong>: ${escapeHtml(service.body)}`)}
@@ -56,7 +56,7 @@ const structuredData = () => JSON.stringify({
         {
             '@type': 'ProfessionalService',
             '@id': `${SITE_URL}#service`,
-            name: 'Maneet Srivastav – Freelance Mobile App Development',
+            name: 'Maneet Srivastav – Mobile App Development',
             url: SITE_URL,
             image: `${SITE_URL}assets/og-image.png`,
             founder: { '@id': `${SITE_URL}#person` },

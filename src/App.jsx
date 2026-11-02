@@ -5,6 +5,7 @@ import ScrollToTop from './components/ScrollToTop';
 import ScrollProgress from './components/ScrollProgress';
 import TabBar from './components/TabBar';
 import FeedbackSheet from './components/FeedbackSheet';
+import AnalyticsTracker from './components/AnalyticsTracker';
 import BuildLoader from './components/BuildLoader';
 import { shouldPlayLoader } from './components/loaderSession';
 import Stage from './sections/Stage';
@@ -48,6 +49,7 @@ function App() {
     <MotionConfig reducedMotion="user">
       <Router>
         <ScrollToTop />
+        <AnalyticsTracker />
         <ScrollProgress />
         <Routes>
           <Route path="/" element={<Home />} />

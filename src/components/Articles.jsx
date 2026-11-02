@@ -20,6 +20,9 @@ const FeaturedPost = ({ post }) => (
         href={post.link}
         target="_blank"
         rel="noopener noreferrer"
+        data-event="article_open"
+        data-event-title={post.title}
+        data-event-placement="featured"
         initial={{ opacity: 0, y: 24 }}
         whileInView={{ opacity: 1, y: 0 }}
         viewport={{ once: true, margin: '-8% 0px' }}
@@ -63,6 +66,8 @@ const Commit = ({ post, index, isHead }) => {
             <button
                 type="button"
                 onClick={() => setOpen(!open)}
+                data-event={open ? undefined : 'article_expand'}
+                data-event-title={post.title}
                 aria-expanded={open}
                 className="flex w-full items-start gap-3 px-4 py-4 text-left transition-colors hover:bg-raised sm:px-5"
             >
@@ -94,6 +99,9 @@ const Commit = ({ post, index, isHead }) => {
                                 href={post.link}
                                 target="_blank"
                                 rel="noopener noreferrer"
+                                data-event="article_open"
+                                data-event-title={post.title}
+                                data-event-placement="log"
                                 className="inline-flex items-center gap-1.5 text-sm font-medium text-amber hover:underline"
                             >
                                 Read on Medium <ExternalLink size={14} aria-hidden="true" />

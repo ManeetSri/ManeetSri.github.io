@@ -3,6 +3,7 @@ import { motion, useMotionValueEvent, useReducedMotion } from 'framer-motion';
 import { Check, Search } from 'lucide-react';
 import { Scene } from './shared';
 import { countries, flagFor } from '../data/countries';
+import { track } from '../analytics';
 
 const ACCENT = '#FF7A59';
 const DEMO_QUERY = '+91';
@@ -51,6 +52,7 @@ const CountryPickerScene = ({ p }) => {
 
     const select = (country) => {
         setSelected(country.iso);
+        track('country_select', { iso: country.iso });
         navigator.vibrate?.(10);
     };
 
@@ -95,6 +97,7 @@ const CountryPickerScene = ({ p }) => {
                             // Clear the scroll demo's text, so the visitor starts with an empty box
                             if (touched.current) return;
                             touched.current = true;
+                            track('country_demo_start');
                             setQuery('');
                             setDebounced('');
                         }}

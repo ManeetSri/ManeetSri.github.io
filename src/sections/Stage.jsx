@@ -9,6 +9,7 @@ import VersionScreen from '../components/device/VersionScreen';
 import WorkScreens from '../components/device/WorkScreens';
 import { preloadScenes } from '../components/device/scenes';
 import { useIsDesktop } from '../hooks/useIsDesktop';
+import { track } from '../analytics';
 import { CLOSE, LAUNCH, activeIndexAt, segments } from '../data/workTimeline';
 
 // Takes the steps out of mouse-wheel scrolling, without lagging noticeably behind it
@@ -77,6 +78,10 @@ const Stage = ({ ready }) => {
     useMotionValueEvent(workP, 'change', (value) => {
         setActive(activeIndexAt(Math.min(value, 0.9999)));
     });
+
+    useEffect(() => {
+        if (active >= 0) track('app_view', { app: segments[active].project.id });
+    }, [active]);
 
     // Wait for the loader, then fetch the scenes while nothing else is happening
     useEffect(() => {

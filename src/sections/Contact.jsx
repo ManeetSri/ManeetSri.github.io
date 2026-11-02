@@ -3,10 +3,11 @@ import { motion } from 'framer-motion';
 import { ArrowUp, FileText, Github, Linkedin, Mail } from 'lucide-react';
 import { submitNetlifyForm } from '../utils/netlifyForm';
 import { onContactPrefill } from '../utils/contactPrefill';
+import { isAnalyticsOn, setAnalyticsOn, track } from '../analytics';
 
 const BUBBLES = [
     'Hi, thanks for scrolling all the way to the end.',
-    'I\'m open to freelance projects, roles and collaborations around iOS, Android and user-centric mobile products.',
+    'I\'m open to projects, roles and collaborations around iOS, Android and user-centric mobile products.',
     'Happy to talk architecture, performance and product trade-offs. What are you building?',
 ];
 
@@ -25,11 +26,14 @@ const Contact = () => {
     const [formData, setFormData] = useState(EMPTY_FORM);
     const [status, setStatus] = useState('');
     const [sent, setSent] = useState([]);
+    const [analyticsOn, setAnalyticsState] = useState(isAnalyticsOn);
     const nameRef = useRef(null);
+    const startedRef = useRef(false);
 
     // A message started by the app builder, unless the visitor has already written their own
     useEffect(() => onContactPrefill((message) => {
         setFormData((current) => (current.message.trim() ? current : { ...current, message }));
+        track('contact_prefilled');
         nameRef.current?.focus({ preventScroll: true });
     }), []);
 
@@ -44,12 +48,14 @@ const Contact = () => {
         submitNetlifyForm('contact', { 'bot-field': event.target.elements['bot-field'].value, ...formData })
             .then(() => {
                 setStatus('success');
+                track('generate_lead', { form: 'contact' });
                 setSent((messages) => [...messages, formData.message]);
                 setFormData(EMPTY_FORM);
             })
             .catch((error) => {
                 console.error('Error:', error);
                 setStatus('error');
+                track('form_error', { form: 'contact' });
             });
     };
 
@@ -94,7 +100,18 @@ const Contact = () => {
                     )}
                 </div>
 
-                <form onSubmit={handleSubmit} name="contact" data-netlify="true" data-netlify-honeypot="bot-field" className="mt-6 space-y-3">
+                <form
+                    onSubmit={handleSubmit}
+                    onFocus={() => {
+                        if (startedRef.current) return;
+                        startedRef.current = true;
+                        track('form_start', { form: 'contact' });
+                    }}
+                    name="contact"
+                    data-netlify="true"
+                    data-netlify-honeypot="bot-field"
+                    className="mt-6 space-y-3"
+                >
                     <input type="hidden" name="form-name" value="contact" />
                     {/* Honeypot: hidden from people, filled in by bots */}
                     <input type="text" name="bot-field" className="hidden" tabIndex={-1} autoComplete="off" aria-hidden="true" />
@@ -150,6 +167,9 @@ const Contact = () => {
                             href={href}
                             target={href.startsWith('mailto') ? undefined : '_blank'}
                             rel="noopener noreferrer"
+                            data-event="profile_click"
+                            data-event-profile={label === 'srivastavmaneet@gmail.com' ? 'email' : label.toLowerCase()}
+                            data-event-source="contact"
                             className="inline-flex h-11 items-center gap-2 rounded-full border border-line bg-white/5 px-4 text-sm font-medium transition-colors hover:bg-white/10"
                         >
                             <Icon size={16} aria-hidden="true" /> {label}
@@ -160,6 +180,19 @@ const Contact = () => {
 
             <footer className="mt-20 border-t border-line pt-6 text-center font-mono text-sm text-muted">
                 <p><span className="text-[#30D158]">Build succeeded</span> · © {new Date().getFullYear()} · Designed & built by Maneet Srivastav</p>
+                <p className="mt-3 text-xs">
+                    {analyticsOn ? 'This site uses Google Analytics to understand visits, with no advertising.' : 'Analytics is off in this browser.'}{' '}
+                    <button
+                        type="button"
+                        onClick={() => {
+                            setAnalyticsOn(!analyticsOn);
+                            setAnalyticsState(!analyticsOn);
+                        }}
+                        className="inline-flex min-h-6 items-center underline underline-offset-2 hover:text-paper"
+                    >
+                        {analyticsOn ? 'Turn it off' : 'Turn it on'}
+                    </button>
+                </p>
             </footer>
         </section>
     );

@@ -3,6 +3,7 @@ import { AnimatePresence, motion, useDragControls } from 'framer-motion';
 import { ArrowRight, Check, FileText, Github, Linkedin, Mail, MessageSquareHeart, Newspaper, Star, X } from 'lucide-react';
 import { useLocation, useNavigate } from 'react-router-dom';
 import { submitNetlifyForm } from '../utils/netlifyForm';
+import { track } from '../analytics';
 
 const PROMPTED_KEY = 'maneet-feedback-prompted';
 const PROMPT_AFTER_MS = 45000;
@@ -59,9 +60,11 @@ const FeedbackForm = ({ onConnect }) => {
                 page: window.location.pathname,
             });
             setStatus('success');
+            track('feedback_submit', { rating, has_message: message.trim().length > 0, has_email: email.trim().length > 0 });
         } catch (error) {
             console.error('Error:', error);
             setStatus('error');
+            track('form_error', { form: 'feedback' });
         }
     };
 
@@ -155,6 +158,8 @@ const ConnectPanel = ({ onStartProject }) => (
         <button
             type="button"
             onClick={onStartProject}
+            data-event="cta_click"
+            data-event-cta="start_project"
             className="swift-gradient mb-4 flex h-12 w-full items-center justify-center gap-2 rounded-full font-semibold text-ink"
         >
             Start a project <ArrowRight size={18} aria-hidden="true" />
@@ -166,6 +171,9 @@ const ConnectPanel = ({ onStartProject }) => (
                         href={href}
                         target={href.startsWith('mailto') ? undefined : '_blank'}
                         rel="noopener noreferrer"
+                        data-event={label === 'Resume' ? 'resume_open' : 'profile_click'}
+                        data-event-profile={label === 'Resume' ? undefined : label.toLowerCase()}
+                        data-event-source="feedback_sheet"
                         className="flex min-h-13 items-center gap-3 px-4 py-2.5 transition-colors hover:bg-raised"
                     >
                         <Icon size={20} className="shrink-0 text-amber" aria-hidden="true" />
@@ -269,6 +277,8 @@ const Sheet = ({ initialTab, onClose, onStartProject }) => {
                             key={id}
                             type="button"
                             onClick={() => setTab(id)}
+                            data-event="feedback_tab"
+                            data-event-tab={id}
                             aria-pressed={tab === id}
                             className={`relative h-10 flex-1 rounded-full text-sm font-medium transition-colors ${tab === id ? 'text-ink' : 'text-muted hover:text-paper'}`}
                         >
@@ -305,6 +315,7 @@ const FeedbackSheet = () => {
         const prompt = () => {
             if (wasPrompted()) return;
             markPrompted();
+            track('nudge_shown');
             setPrompting(true);
         };
         const timer = setTimeout(prompt, PROMPT_AFTER_MS);
@@ -325,7 +336,8 @@ const FeedbackSheet = () => {
         return () => clearTimeout(timer);
     }, [prompting]);
 
-    const openSheet = () => {
+    const openSheet = (source) => {
+        track('feedback_open', { source });
         setPrompting(false);
         setOpen(true);
     };
@@ -344,7 +356,7 @@ const FeedbackSheet = () => {
         <>
             <button
                 type="button"
-                onClick={openSheet}
+                onClick={() => openSheet('button')}
                 aria-label="Send feedback or connect"
                 className="phone-ui fixed right-3 top-3 z-40 flex h-11 w-11 items-center justify-center gap-2 rounded-full border border-line bg-surface/80 text-paper shadow-xl shadow-black/40 backdrop-blur-xl transition-colors hover:bg-raised lg:bottom-3 lg:right-5 lg:top-auto lg:w-auto lg:px-4"
             >
@@ -361,7 +373,7 @@ const FeedbackSheet = () => {
                         transition={{ type: 'spring', stiffness: 360, damping: 28 }}
                         className="phone-ui fixed inset-x-3 top-3 z-[60] flex items-center gap-1 rounded-[22px] border border-line bg-raised/95 p-2 shadow-2xl shadow-black/60 backdrop-blur-xl lg:bottom-16 lg:left-auto lg:right-5 lg:top-auto lg:w-[360px]"
                     >
-                        <button type="button" onClick={openSheet} className="flex min-w-0 flex-1 items-center gap-3 rounded-2xl p-1 text-left">
+                        <button type="button" onClick={() => openSheet('nudge')} className="flex min-w-0 flex-1 items-center gap-3 rounded-2xl p-1 text-left">
                             <span className="swift-gradient flex h-10 w-10 shrink-0 items-center justify-center rounded-xl text-sm font-bold text-ink">MS</span>
                             <span className="min-w-0">
                                 <span className="block text-sm font-semibold">How's the build so far?</span>
@@ -371,6 +383,7 @@ const FeedbackSheet = () => {
                         <button
                             type="button"
                             onClick={() => setPrompting(false)}
+                            data-event="nudge_dismiss"
                             aria-label="Dismiss"
                             className="flex h-11 w-11 shrink-0 items-center justify-center rounded-full text-muted hover:text-paper"
                         >

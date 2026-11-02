@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState } from 'react';
 import { AnimatePresence, motion, useInView, useReducedMotion } from 'framer-motion';
 import { useIsDesktop } from '../../hooks/useIsDesktop';
+import { track } from '../../analytics';
 
 const STEP_MS = 2800;
 
@@ -106,6 +107,7 @@ const ProjectFlow = () => {
                             type="button"
                             whileTap={{ scale: 0.95 }}
                             onClick={() => {
+                                track('flow_step_select', { step: step.id });
                                 setUserTookOver(true);
                                 setActiveId(step.id);
                             }}

@@ -53,6 +53,8 @@ const TabBar = () => {
                     href={`/#${id}`}
                     onClick={(event) => goTo(event, id)}
                     aria-label={name}
+                    data-event="tab_click"
+                    data-event-tab={id}
                     aria-current={current === id ? 'location' : undefined}
                     className={`relative flex h-11 min-w-10 items-center justify-center gap-1.5 rounded-full px-1.5 text-sm transition-colors min-[390px]:min-w-11 min-[390px]:px-2.5 lg:px-3.5 ${current === id ? 'text-ink' : 'text-muted hover:text-paper'}`}
                 >
@@ -72,6 +74,8 @@ const TabBar = () => {
                 target="_blank"
                 rel="noopener noreferrer"
                 aria-label="Resume (PDF)"
+                data-event="resume_open"
+                data-event-source="tab_bar"
                 className="swift-gradient ml-0.5 flex h-11 min-w-10 items-center justify-center gap-1.5 rounded-full px-1.5 text-sm font-semibold text-ink min-[390px]:min-w-11 min-[390px]:px-2.5 lg:px-3.5"
             >
                 <FileText size={18} className="shrink-0" aria-hidden="true" />

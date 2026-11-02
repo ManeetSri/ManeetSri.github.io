@@ -34,7 +34,7 @@ const IntroLayer = ({ p, isActive, onSkip }) => {
             <p className="font-mono text-sm text-swift lg:mb-3">The work</p>
             <h2 className="font-display text-[clamp(1.9rem,5vw,4.5rem)] font-semibold leading-[1.02] tracking-tight">Eight apps. Keep scrolling to open them.</h2>
             <p className="mt-2 max-w-xl text-sm text-muted lg:mt-5 lg:text-lg">Ride-hailing, wellbeing, retail, jobs, faith, school and an open-source package.</p>
-            <a href="#skills" onClick={onSkip} className="mt-6 hidden w-fit font-mono text-sm text-muted underline underline-offset-4 hover:text-paper lg:block">Skip apps</a>
+            <a href="#skills" onClick={onSkip} data-event="skip_apps" className="mt-6 hidden w-fit font-mono text-sm text-muted underline underline-offset-4 hover:text-paper lg:block">Skip apps</a>
         </motion.div>
     );
 };
@@ -63,6 +63,7 @@ const Work = ({ ref, p, active, onJump, showPhone }) => (
                     </div>
                     <a
                         href="#skills"
+                        data-event="skip_apps"
                         onClick={(event) => {
                             event.preventDefault();
                             document.getElementById('skills')?.scrollIntoView();

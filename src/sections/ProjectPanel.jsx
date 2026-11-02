@@ -1,6 +1,7 @@
 import { useState } from 'react';
 import { Check, Copy, ExternalLink, Github, Globe } from 'lucide-react';
 import AppIcon from '../components/device/AppIcon';
+import { track } from '../analytics';
 
 const linkClass = 'inline-flex h-10 items-center gap-1.5 rounded-full border border-line bg-white/5 px-3.5 text-sm font-medium transition-colors hover:bg-white/10';
 
@@ -10,6 +11,7 @@ const CopySnippet = ({ snippet }) => {
     const copy = async () => {
         try {
             await navigator.clipboard.writeText(snippet);
+            track('snippet_copy');
             setCopied(true);
             setTimeout(() => setCopied(false), 1800);
         } catch {
@@ -54,12 +56,12 @@ const ProjectPanel = ({ project }) => {
 
             <div className="mt-3 flex flex-wrap items-center gap-2 lg:mt-5">
                 {project.link && (
-                    <a href={project.link} target="_blank" rel="noopener noreferrer" className={linkClass}>
+                    <a href={project.link} target="_blank" rel="noopener noreferrer" data-event="app_link_click" data-event-app={project.id} data-event-destination={isGithub ? 'github' : 'app_store'} className={linkClass}>
                         {isGithub ? <><Github size={15} aria-hidden="true" /> GitHub</> : <><ExternalLink size={15} aria-hidden="true" /> App Store</>}
                     </a>
                 )}
                 {project.website && (
-                    <a href={project.website} target="_blank" rel="noopener noreferrer" className={linkClass}>
+                    <a href={project.website} target="_blank" rel="noopener noreferrer" data-event="app_link_click" data-event-app={project.id} data-event-destination="website" className={linkClass}>
                         <Globe size={15} aria-hidden="true" /> Website
                     </a>
                 )}

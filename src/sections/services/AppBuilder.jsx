@@ -5,6 +5,7 @@ import AppIcon from '../../components/device/AppIcon';
 import { features, platforms, services } from '../../data/services';
 import { projects } from '../../data/projects';
 import { prefillContact } from '../../utils/contactPrefill';
+import { track } from '../../analytics';
 
 const SERVICE_ICONS = { ios: Smartphone, 'cross-platform': Layers, projects: Wrench, mobility: Route, commerce: ShoppingBag, release: Rocket };
 const FEATURE_ICONS = { maps: Map, payments: CreditCard, realtime: Radio, purchases: Repeat, push: Bell, firebase: Cloud, data: Database, video: Video };
@@ -25,15 +26,18 @@ const AppBuilder = () => {
     const proof = projects.filter((project) => proofIds.includes(project.id));
 
     const toggle = (id) => {
+        track('builder_feature', { feature: id, on: !selected.includes(id) });
         setSelected((current) => (current.includes(id) ? current.filter((item) => item !== id) : [...current, id]));
     };
 
     const applyService = (service) => {
+        track('builder_preset', { service: service.id });
         setPlatform(service.platform);
         setSelected(service.features);
     };
 
     const talkAboutIt = () => {
+        track('builder_cta', { platform, feature_count: chosen.length, features: chosen.map((feature) => feature.id).join(',') });
         const list = chosen.map((feature) => feature.label.toLowerCase()).join(', ');
         prefillContact(`Hi Maneet, I'm thinking about an app for ${platformInfo.label}${list ? ` with ${list}` : ''}. Here's the idea: `);
     };
@@ -77,7 +81,10 @@ const AppBuilder = () => {
                             <button
                                 key={id}
                                 type="button"
-                                onClick={() => setPlatform(id)}
+                                onClick={() => {
+                                    track('builder_platform', { platform: id });
+                                    setPlatform(id);
+                                }}
                                 aria-pressed={platform === id}
                                 className={`relative h-10 flex-1 rounded-full text-sm font-medium transition-colors ${platform === id ? 'text-ink' : 'text-muted hover:text-paper'}`}
                             >

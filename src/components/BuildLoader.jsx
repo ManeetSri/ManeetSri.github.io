@@ -2,6 +2,7 @@ import { useEffect, useRef, useState } from 'react';
 import { motion, useSpring, useTransform } from 'framer-motion';
 import { Check } from 'lucide-react';
 import { markPlayed } from './loaderSession';
+import { track } from '../analytics';
 
 const STEPS = [
     { label: 'Compiling Synclovis.swift', note: '2022', ms: 320 },
@@ -86,9 +87,13 @@ const BuildLoader = ({ onReady, onDone }) => {
             setPhase('landed');
             callbacks.current.onReady();
         }, LANDED_AT));
-        timers.push(setTimeout(() => callbacks.current.onDone(), DONE_AT));
+        timers.push(setTimeout(() => {
+            track('loader_complete', { skipped: false });
+            callbacks.current.onDone();
+        }, DONE_AT));
 
         const skip = () => {
+            track('loader_complete', { skipped: true });
             callbacks.current.onReady();
             callbacks.current.onDone();
         };

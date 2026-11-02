@@ -1,6 +1,8 @@
+import { useEffect } from 'react';
 import { ArrowLeft } from 'lucide-react';
 import { Link } from 'react-router-dom';
 import { usePageMeta } from '../hooks/usePageMeta';
+import { track } from '../analytics';
 
 const NotFoundPage = () => {
     usePageMeta({
@@ -9,6 +11,10 @@ const NotFoundPage = () => {
         path: '/',
         noindex: true,
     });
+
+    useEffect(() => {
+        track('page_not_found', { path: window.location.pathname });
+    }, []);
 
     return (
         <main className="flex min-h-svh items-center justify-center px-5 pb-20 text-center">

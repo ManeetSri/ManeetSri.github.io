@@ -6,6 +6,7 @@ import ProjectFlow from './services/ProjectFlow';
 import RideDemo from './services/RideDemo';
 import { faqs } from '../data/services';
 import { useIsDesktop } from '../hooks/useIsDesktop';
+import { track } from '../analytics';
 
 const MODULES = [
     { id: 'builder', tab: 'Your app', icon: SlidersHorizontal, title: 'Sketch your app', intro: 'Choose what it needs, and see what it would be built with and where I\'ve done it before.', Component: AppBuilder },
@@ -25,7 +26,13 @@ const Faq = () => (
         <h3 className="mb-4 font-display text-3xl font-semibold tracking-tight">Common questions</h3>
         <div className="overflow-hidden rounded-2xl border border-line bg-surface">
             {faqs.map((faq) => (
-                <details key={faq.question} className="group border-b border-line last:border-b-0">
+                <details
+                    key={faq.question}
+                    onToggle={(event) => {
+                        if (event.currentTarget.open) track('faq_open', { question: faq.question });
+                    }}
+                    className="group border-b border-line last:border-b-0"
+                >
                     <summary className="flex min-h-14 cursor-pointer list-none items-center justify-between gap-3 px-4 py-3 font-medium transition-colors hover:bg-raised sm:px-5 [&::-webkit-details-marker]:hidden">
                         {faq.question}
                         <ChevronDown size={18} aria-hidden="true" className="shrink-0 text-muted transition-transform group-open:rotate-180" />
@@ -78,6 +85,8 @@ const Services = () => {
                                 type="button"
                                 onClick={() => setTab(id)}
                                 aria-pressed={tab === id}
+                                data-event="demo_tab"
+                                data-event-demo={id}
                                 className={`relative flex h-11 min-w-0 flex-1 items-center justify-center gap-1.5 rounded-full text-[13px] font-medium transition-colors ${tab === id ? 'text-ink' : 'text-muted'}`}
                             >
                                 {tab === id && (
