@@ -1,6 +1,7 @@
 import { useEffect, useState } from 'react';
 import { AnimatePresence, motion } from 'framer-motion';
 import { Cookie } from 'lucide-react';
+import { Link } from 'react-router-dom';
 import { applyConsent, track } from '../analytics';
 import { getConsent, needsChoice, onOpenCookieSettings } from '../analytics/consent';
 import { isLoaderPlaying, onLoaderFinished } from './loaderSession';
@@ -85,7 +86,8 @@ const CookieBanner = () => {
                             <Cookie size={19} aria-hidden="true" />
                         </span>
                         <p className="text-sm leading-snug text-paper/90">
-                            Can I use cookies to understand visits and measure ads? It's your choice, and the site works the same either way.
+                            Can I use cookies to understand visits and measure ads? It's your choice, and the site works the same either way.{' '}
+                            <Link to="/privacy" className="underline underline-offset-2 hover:text-amber">Privacy Policy</Link>
                         </p>
                     </div>
 

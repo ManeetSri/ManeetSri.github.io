@@ -1,8 +1,8 @@
 import { useEffect, useRef, useState } from 'react';
+import { Link, useLocation, useNavigate } from 'react-router-dom';
 import { motion } from 'framer-motion';
 import { ArrowUp, FileText, Github, Linkedin, Mail } from 'lucide-react';
 import { submitNetlifyForm } from '../utils/netlifyForm';
-import { onContactPrefill } from '../utils/contactPrefill';
 import { track } from '../analytics';
 import { openCookieSettings } from '../analytics/consent';
 
@@ -24,18 +24,23 @@ const EMPTY_FORM = { name: '', email: '', message: '' };
 const fieldClass = 'w-full rounded-2xl border border-line bg-ink px-4 py-3 text-base text-paper placeholder:text-muted/80 focus:border-amber focus:outline-none';
 
 const Contact = () => {
-    const [formData, setFormData] = useState(EMPTY_FORM);
+    const location = useLocation();
+    const navigate = useNavigate();
+    const prefill = location.state?.prefill;
+
+    // The game can start the message before arriving here
+    const [formData, setFormData] = useState(() => ({ ...EMPTY_FORM, message: prefill ?? '' }));
     const [status, setStatus] = useState('');
     const [sent, setSent] = useState([]);
     const nameRef = useRef(null);
     const startedRef = useRef(false);
 
-    // A message started by the app builder, unless the visitor has already written their own
-    useEffect(() => onContactPrefill((message) => {
-        setFormData((current) => (current.message.trim() ? current : { ...current, message }));
+    useEffect(() => {
+        if (!prefill) return;
         track('contact_prefilled');
         nameRef.current?.focus({ preventScroll: true });
-    }), []);
+        navigate(`${location.pathname}${location.hash}`, { replace: true, state: null });
+    }, [prefill, navigate, location.pathname, location.hash]);
 
     const handleChange = (event) => {
         setFormData({ ...formData, [event.target.name]: event.target.value });
@@ -180,7 +185,7 @@ const Contact = () => {
 
             <footer className="mt-20 border-t border-line pt-6 text-center font-mono text-sm text-muted">
                 <p><span className="text-[#30D158]">Build succeeded</span> · © {new Date().getFullYear()} · Designed & built by Maneet Srivastav</p>
-                <p className="mt-3 text-xs">
+                <p className="mt-3 flex items-center justify-center gap-4 text-xs">
                     <button
                         type="button"
                         onClick={openCookieSettings}
@@ -188,6 +193,7 @@ const Contact = () => {
                     >
                         Cookie settings
                     </button>
+                    <Link to="/privacy" className="inline-flex min-h-6 items-center underline underline-offset-2 hover:text-paper">Privacy Policy</Link>
                 </p>
             </footer>
         </section>

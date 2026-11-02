@@ -1,7 +1,7 @@
 import { useEffect, useRef, useState } from 'react';
 import { animate, motion, useMotionValue, useMotionValueEvent, useReducedMotion, useTransform } from 'framer-motion';
 import { Car, Check, MapPin, RotateCcw } from 'lucide-react';
-import { track } from '../../analytics';
+import { track } from '../analytics';
 
 const MAP_WIDTH = 360;
 const MAP_HEIGHT = 400;
@@ -37,7 +37,7 @@ const measure = (route) => {
 };
 const POSITIONS = Object.fromEntries(DESTINATIONS.map(({ id, route }) => [id, measure(route)]));
 
-const RideDemo = () => {
+const RideDemo = ({ onArrive }) => {
     const reduceMotion = useReducedMotion();
     const [destinationId, setDestinationId] = useState(null);
     const [phase, setPhase] = useState('idle');
@@ -65,7 +65,12 @@ const RideDemo = () => {
     useEffect(() => stopDriving, []);
 
     useEffect(() => {
-        if (hasArrived && destinationId) track('ride_complete', { destination: destinationId });
+        if (hasArrived && destinationId) {
+            track('ride_complete', { destination: destinationId });
+            onArrive?.();
+        }
+        // Only arriving should trigger this, not a new callback from the parent
+        // eslint-disable-next-line react-hooks/exhaustive-deps
     }, [hasArrived, destinationId]);
 
     const startRide = (id) => {

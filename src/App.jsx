@@ -1,4 +1,4 @@
-import { useState } from 'react';
+import { Suspense, lazy, useState } from 'react';
 import { BrowserRouter as Router, Routes, Route, Navigate, useLocation } from 'react-router-dom';
 import { MotionConfig, useReducedMotion } from 'framer-motion';
 import ScrollToTop from './components/ScrollToTop';
@@ -17,7 +17,24 @@ import Notes from './sections/Notes';
 import Contact from './sections/Contact';
 import BlogsPage from './pages/BlogsPage';
 import NotFoundPage from './pages/NotFoundPage';
+import PrivacyPage from './pages/PrivacyPage';
 import { usePageMeta } from './hooks/usePageMeta';
+
+const BuildPage = lazy(() => import('./pages/BuildPage'));
+
+// The game page is its own focused space, without the portfolio's navigation
+const PortfolioChrome = () => {
+  const { pathname } = useLocation();
+  if (pathname === '/build') return null;
+
+  return (
+    <>
+      <ScrollProgress />
+      <TabBar />
+      <FeedbackSheet />
+    </>
+  );
+};
 
 const Home = () => {
   usePageMeta({
@@ -51,15 +68,15 @@ function App() {
       <Router>
         <ScrollToTop />
         <AnalyticsTracker />
-        <ScrollProgress />
         <Routes>
           <Route path="/" element={<Home />} />
           <Route path="/projects" element={<Navigate to="/#work" replace />} />
           <Route path="/blogs" element={<BlogsPage />} />
+          <Route path="/privacy" element={<PrivacyPage />} />
+          <Route path="/build" element={<Suspense fallback={<div className="min-h-svh bg-ink" />}><BuildPage /></Suspense>} />
           <Route path="*" element={<NotFoundPage />} />
         </Routes>
-        <TabBar />
-        <FeedbackSheet />
+        <PortfolioChrome />
         <CookieBanner />
       </Router>
     </MotionConfig>

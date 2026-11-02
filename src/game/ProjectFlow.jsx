@@ -1,8 +1,8 @@
 import { useEffect, useRef, useState } from 'react';
 import { AnimatePresence, motion, useInView, useReducedMotion } from 'framer-motion';
 import { ArrowRight, Check, CircleHelp, Code2, Compass, Hammer, Lightbulb, Plug, RefreshCcw, Rocket, Undo2 } from 'lucide-react';
-import { useIsDesktop } from '../../hooks/useIsDesktop';
-import { track } from '../../analytics';
+import { useIsDesktop } from '../hooks/useIsDesktop';
+import { track } from '../analytics';
 
 const STEP_MS = 2800;
 
@@ -72,7 +72,7 @@ const labelPosition = (edge, layout) => {
     return { x: (a.x + b.x) / 2, y: a.y - 8 };
 };
 
-const ProjectFlow = () => {
+const ProjectFlow = ({ manual = false, onDecision }) => {
     const isDesktop = useIsDesktop();
     const reduceMotion = useReducedMotion();
     const layout = LAYOUTS[isDesktop ? 'wide' : 'tall'];
@@ -83,7 +83,7 @@ const ProjectFlow = () => {
     const [activeId, setActiveId] = useState('idea');
     const [litEdgeId, setLitEdgeId] = useState(null);
     const [minorVersion, setMinorVersion] = useState(0);
-    const [userTookOver, setUserTookOver] = useState(false);
+    const [userTookOver, setUserTookOver] = useState(manual);
 
     const active = stepById(activeId);
     const activeIndex = STEPS.indexOf(active);
@@ -117,6 +117,7 @@ const ProjectFlow = () => {
 
     const decide = (choice, id, edgeId) => {
         track('flow_decision', { choice });
+        onDecision?.(choice);
         if (choice === 'next_version') setMinorVersion((version) => version + 1);
         goTo(id, edgeId);
     };

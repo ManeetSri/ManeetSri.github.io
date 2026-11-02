@@ -22,7 +22,7 @@ const list = (items, render) => `<ul>${items.map((item) => `<li>${render(item)}<
 const renderContent = () => `<div id="seo-content">
     <h1>Maneet Srivastav: iOS &amp; Android app developer</h1>
     <p>Mobile app developer shipping production iOS and Android apps with Swift, SwiftUI, UIKit and React Native. Open to mobile app development and project work.</p>
-    <p><a href="/resume.pdf">Resume (PDF)</a> · <a href="mailto:srivastavmaneet@gmail.com">Email</a> · ${PROFILES.map((url) => `<a href="${url}">${new URL(url).hostname.replace('www.', '')}</a>`).join(' · ')}</p>
+    <p><a href="/build">Ship your app: a mobile app building game</a> · <a href="/privacy">Privacy Policy</a> · <a href="/resume.pdf">Resume (PDF)</a> · <a href="mailto:srivastavmaneet@gmail.com">Email</a> · ${PROFILES.map((url) => `<a href="${url}">${new URL(url).hostname.replace('www.', '')}</a>`).join(' · ')}</p>
     <h2>Mobile app development services</h2>
     ${list(services, (service) => `<strong>${escapeHtml(service.title)}</strong>: ${escapeHtml(service.body)}`)}
     <h2>Apps I've worked on</h2>

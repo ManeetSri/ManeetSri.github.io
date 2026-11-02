@@ -1,30 +1,63 @@
-import { useState } from 'react';
 import { motion } from 'framer-motion';
-import { ChevronDown, GitFork, Map, SlidersHorizontal } from 'lucide-react';
-import AppBuilder from './services/AppBuilder';
-import ProjectFlow from './services/ProjectFlow';
-import RideDemo from './services/RideDemo';
-import { faqs } from '../data/services';
-import { useIsDesktop } from '../hooks/useIsDesktop';
+import { ArrowRight, ChevronDown, Sparkles } from 'lucide-react';
+import { Link } from 'react-router-dom';
+import { faqs, services } from '../data/services';
+import { SERVICE_ICONS } from '../game/icons';
 import { track } from '../analytics';
 
-const MODULES = [
-    { id: 'builder', tab: 'Your app', icon: SlidersHorizontal, title: 'Sketch your app', intro: 'Pick what it needs and see how it comes together.', Component: AppBuilder },
-    { id: 'flow', tab: 'The path', icon: GitFork, title: 'From idea to App Store', intro: 'Follow an app through every stage. At "Ready?", you decide what happens.', Component: ProjectFlow },
-    { id: 'ride', tab: 'Take a ride', icon: Map, title: 'Take a ride', intro: 'The kind of real-time map I build. Tap a destination and watch it go, or drag through the trip.', Component: RideDemo },
-];
+// The game lives on its own page. This invites people in, and each mission starts it there.
+const Services = () => (
+    <section id="services" data-tab="skills" className="relative bg-ink px-5 py-16 sm:px-10 lg:px-[5vw] lg:py-24">
+        <div className="relative overflow-hidden rounded-[2rem] border border-line bg-[radial-gradient(80%_120%_at_0%_0%,rgba(240,81,56,0.2),transparent_65%)] bg-surface p-5 sm:p-8 lg:p-10">
+            <div className="grid items-center gap-8 lg:grid-cols-[minmax(0,5fr)_minmax(0,6fr)]">
+                <div>
+                    <p className="mb-3 flex items-center gap-2 font-mono text-sm text-amber">
+                        <Sparkles size={15} aria-hidden="true" /> Play · 5 levels
+                    </p>
+                    <h2 className="font-display text-[clamp(2.2rem,4.6vw,4rem)] font-semibold leading-none tracking-tight">Let's see what your app could be.</h2>
+                    <p className="mt-4 max-w-xl text-lg leading-relaxed text-muted">
+                        Got an idea? Pick a mission, power up your app, take a test ride and get it to the App Store.
+                    </p>
+                    <Link
+                        to="/build"
+                        data-event="game_entry"
+                        data-event-source="home_button"
+                        className="swift-gradient mt-6 inline-flex h-12 items-center justify-center gap-2 rounded-full px-7 font-semibold text-ink transition-transform hover:scale-[1.03]"
+                    >
+                        Ship your app <ArrowRight size={18} aria-hidden="true" />
+                    </Link>
+                </div>
 
-const ModuleHeading = ({ title, intro }) => (
-    <div className="mb-5">
-        <h3 className="font-display text-3xl font-semibold tracking-tight">{title}</h3>
-        <p className="mt-1.5 max-w-2xl leading-relaxed text-muted">{intro}</p>
-    </div>
-);
+                <ul className="grid grid-cols-2 gap-2 sm:grid-cols-3">
+                    {services.map((service, index) => {
+                        const Icon = SERVICE_ICONS[service.id];
+                        return (
+                            <motion.li
+                                key={service.id}
+                                initial={{ opacity: 0, scale: 0.9 }}
+                                whileInView={{ opacity: 1, scale: 1 }}
+                                viewport={{ once: true }}
+                                transition={{ type: 'spring', stiffness: 300, damping: 22, delay: index * 0.05 }}
+                            >
+                                <Link
+                                    to={`/build?mission=${service.id}`}
+                                    aria-label={`Start the game with ${service.title}`}
+                                    data-event="game_entry"
+                                    data-event-source={service.id}
+                                    className="flex h-full min-h-[108px] flex-col justify-between gap-3 rounded-2xl border border-line bg-ink/50 p-3.5 transition-colors hover:border-amber/60 hover:bg-raised"
+                                >
+                                    <Icon size={22} aria-hidden="true" className="text-amber" />
+                                    <span className="text-sm font-semibold leading-snug">{service.title}</span>
+                                </Link>
+                            </motion.li>
+                        );
+                    })}
+                </ul>
+            </div>
+        </div>
 
-const Faq = () => (
-    <div>
-        <h3 className="mb-4 font-display text-3xl font-semibold tracking-tight">Common questions</h3>
-        <div className="overflow-hidden rounded-2xl border border-line bg-surface">
+        <h3 className="mb-4 mt-12 font-display text-3xl font-semibold tracking-tight">Common questions</h3>
+        <div className="max-w-3xl overflow-hidden rounded-2xl border border-line bg-surface">
             {faqs.map((faq) => (
                 <details
                     key={faq.question}
@@ -41,77 +74,7 @@ const Faq = () => (
                 </details>
             ))}
         </div>
-    </div>
+    </section>
 );
-
-// Desktop shows everything. Phones get one module at a time, so the page doesn't grow by three screens.
-const Services = () => {
-    const isDesktop = useIsDesktop();
-    const [tab, setTab] = useState(MODULES[0].id);
-    const current = MODULES.find((module) => module.id === tab);
-
-    return (
-        <section id="services" data-tab="skills" className="relative bg-ink px-5 py-16 sm:px-10 lg:px-[5vw] lg:py-24">
-            <p className="mb-3 font-mono text-sm text-swift">Got an idea?</p>
-            <h2 className="font-display text-[clamp(2.4rem,5vw,4.5rem)] font-semibold leading-none tracking-tight">Let's see what your app could be.</h2>
-            <p className="mt-5 max-w-2xl text-lg leading-relaxed text-muted">
-                Sketch it, follow the path it takes to the App Store, or take one of my maps for a ride.
-            </p>
-
-            {isDesktop ? (
-                <div className="mt-14 space-y-16">
-                    <div>
-                        <ModuleHeading title={MODULES[0].title} intro={MODULES[0].intro} />
-                        <AppBuilder />
-                    </div>
-                    <div>
-                        <ModuleHeading title={MODULES[1].title} intro={MODULES[1].intro} />
-                        <ProjectFlow />
-                    </div>
-                    <div className="grid items-start gap-10 lg:grid-cols-[minmax(0,7fr)_minmax(0,5fr)]">
-                        <div>
-                            <ModuleHeading title={MODULES[2].title} intro={MODULES[2].intro} />
-                            <RideDemo />
-                        </div>
-                        <Faq />
-                    </div>
-                </div>
-            ) : (
-                <>
-                    <div role="group" aria-label="Choose a demo" className="mt-8 flex rounded-full border border-line bg-surface p-1">
-                        {MODULES.map(({ id, tab: label, icon: Icon }) => (
-                            <button
-                                key={id}
-                                type="button"
-                                onClick={() => setTab(id)}
-                                aria-pressed={tab === id}
-                                data-event="demo_tab"
-                                data-event-demo={id}
-                                className={`relative flex h-11 min-w-0 flex-1 items-center justify-center gap-1.5 rounded-full text-[13px] font-medium transition-colors ${tab === id ? 'text-ink' : 'text-muted'}`}
-                            >
-                                {tab === id && (
-                                    <motion.span
-                                        layoutId="services-tab"
-                                        transition={{ type: 'spring', stiffness: 420, damping: 36 }}
-                                        className="absolute inset-0 rounded-full bg-paper"
-                                    />
-                                )}
-                                <Icon size={15} aria-hidden="true" className="relative shrink-0" />
-                                <span className="relative truncate">{label}</span>
-                            </button>
-                        ))}
-                    </div>
-
-                    <motion.div key={current.id} initial={{ opacity: 0, y: 12 }} animate={{ opacity: 1, y: 0 }} transition={{ duration: 0.25 }} className="mt-6">
-                        <ModuleHeading title={current.title} intro={current.intro} />
-                        <current.Component />
-                    </motion.div>
-
-                    <div className="mt-12"><Faq /></div>
-                </>
-            )}
-        </section>
-    );
-};
 
 export default Services;
