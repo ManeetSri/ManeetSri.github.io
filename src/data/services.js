@@ -3,6 +3,7 @@
 export const services = [
     {
         id: 'ios',
+        short: 'iOS app',
         title: 'iOS App Development',
         body: 'Native iPhone apps in Swift, SwiftUI and UIKit, built to last and ready for the App Store.',
         platform: 'ios',
@@ -10,6 +11,7 @@ export const services = [
     },
     {
         id: 'cross-platform',
+        short: 'iOS + Android',
         title: 'iOS & Android Apps with React Native',
         body: 'One React Native codebase for both platforms, when you need to reach iPhone and Android users together.',
         platform: 'both',
@@ -17,6 +19,7 @@ export const services = [
     },
     {
         id: 'projects',
+        short: 'Full project',
         title: 'End-to-End Project Development',
         body: 'From first idea to shipped product: architecture, build, integrations and release.',
         platform: 'ios',
@@ -24,6 +27,7 @@ export const services = [
     },
     {
         id: 'mobility',
+        short: 'Ride-hailing',
         title: 'Ride-Hailing & Logistics Apps',
         body: 'User and driver apps with maps, routing, payments and real-time updates.',
         platform: 'ios',
@@ -31,6 +35,7 @@ export const services = [
     },
     {
         id: 'commerce',
+        short: 'E-commerce',
         title: 'E-commerce & Subscription Apps',
         body: 'Product catalogs, secure checkout, order tracking, loyalty, in-app purchases and subscriptions.',
         platform: 'ios',
@@ -38,6 +43,7 @@ export const services = [
     },
     {
         id: 'release',
+        short: 'App Store launch',
         title: 'App Store Release & Support',
         body: 'Submissions that follow App Store policies, plus fixes and improvements after launch.',
         platform: 'ios',

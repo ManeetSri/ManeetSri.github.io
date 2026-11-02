@@ -9,8 +9,8 @@ import { useIsDesktop } from '../hooks/useIsDesktop';
 import { track } from '../analytics';
 
 const MODULES = [
-    { id: 'builder', tab: 'Your app', icon: SlidersHorizontal, title: 'Sketch your app', intro: 'Choose what it needs, and see what it would be built with and where I\'ve done it before.', Component: AppBuilder },
-    { id: 'flow', tab: 'The path', icon: GitFork, title: 'From idea to App Store', intro: 'How an app gets made, loops included. Tap any step.', Component: ProjectFlow },
+    { id: 'builder', tab: 'Your app', icon: SlidersHorizontal, title: 'Sketch your app', intro: 'Pick what it needs and see how it comes together.', Component: AppBuilder },
+    { id: 'flow', tab: 'The path', icon: GitFork, title: 'From idea to App Store', intro: 'Follow an app through every stage. At "Ready?", you decide what happens.', Component: ProjectFlow },
     { id: 'ride', tab: 'Take a ride', icon: Map, title: 'Take a ride', intro: 'The kind of real-time map I build. Tap a destination and watch it go, or drag through the trip.', Component: RideDemo },
 ];
 

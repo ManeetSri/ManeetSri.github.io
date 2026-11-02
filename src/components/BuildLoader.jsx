@@ -1,7 +1,7 @@
 import { useEffect, useRef, useState } from 'react';
 import { motion, useSpring, useTransform } from 'framer-motion';
 import { Check } from 'lucide-react';
-import { markPlayed } from './loaderSession';
+import { loaderFinished, loaderStarted } from './loaderSession';
 import { track } from '../analytics';
 
 const STEPS = [
@@ -64,7 +64,7 @@ const BuildLoader = ({ onReady, onDone }) => {
 
     // Timers rather than animation callbacks, so a page opened in a background tab can't get stuck here
     useEffect(() => {
-        markPlayed();
+        loaderStarted();
         document.documentElement.style.overflow = 'hidden';
 
         let elapsed = 0;
@@ -105,6 +105,7 @@ const BuildLoader = ({ onReady, onDone }) => {
             window.removeEventListener('keydown', skip);
             window.removeEventListener('pointerdown', skip);
             document.documentElement.style.overflow = '';
+            loaderFinished();
         };
     }, [percent]);
 

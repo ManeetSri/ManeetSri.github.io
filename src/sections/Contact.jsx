@@ -3,7 +3,8 @@ import { motion } from 'framer-motion';
 import { ArrowUp, FileText, Github, Linkedin, Mail } from 'lucide-react';
 import { submitNetlifyForm } from '../utils/netlifyForm';
 import { onContactPrefill } from '../utils/contactPrefill';
-import { isAnalyticsOn, setAnalyticsOn, track } from '../analytics';
+import { track } from '../analytics';
+import { openCookieSettings } from '../analytics/consent';
 
 const BUBBLES = [
     'Hi, thanks for scrolling all the way to the end.',
@@ -26,7 +27,6 @@ const Contact = () => {
     const [formData, setFormData] = useState(EMPTY_FORM);
     const [status, setStatus] = useState('');
     const [sent, setSent] = useState([]);
-    const [analyticsOn, setAnalyticsState] = useState(isAnalyticsOn);
     const nameRef = useRef(null);
     const startedRef = useRef(false);
 
@@ -181,16 +181,12 @@ const Contact = () => {
             <footer className="mt-20 border-t border-line pt-6 text-center font-mono text-sm text-muted">
                 <p><span className="text-[#30D158]">Build succeeded</span> · © {new Date().getFullYear()} · Designed & built by Maneet Srivastav</p>
                 <p className="mt-3 text-xs">
-                    {analyticsOn ? 'This site uses Google Analytics to understand visits, with no advertising.' : 'Analytics is off in this browser.'}{' '}
                     <button
                         type="button"
-                        onClick={() => {
-                            setAnalyticsOn(!analyticsOn);
-                            setAnalyticsState(!analyticsOn);
-                        }}
+                        onClick={openCookieSettings}
                         className="inline-flex min-h-6 items-center underline underline-offset-2 hover:text-paper"
                     >
-                        {analyticsOn ? 'Turn it off' : 'Turn it on'}
+                        Cookie settings
                     </button>
                 </p>
             </footer>

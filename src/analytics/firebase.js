@@ -13,22 +13,24 @@ const firebaseConfig = {
     measurementId: 'G-BM8QH45DQG',
 };
 
-export const createClient = async () => {
+const toConsentSettings = ({ analytics, ads }) => ({
+    analytics_storage: analytics ? 'granted' : 'denied',
+    ad_storage: ads ? 'granted' : 'denied',
+    ad_user_data: ads ? 'granted' : 'denied',
+    ad_personalization: ads ? 'granted' : 'denied',
+});
+
+export const createClient = async (consent) => {
     if (!(await isSupported())) return null;
 
     const app = initializeApp(firebaseConfig);
 
-    // Measurement only: no advertising storage, personalization or Google Signals
-    setConsent({
-        analytics_storage: 'granted',
-        ad_storage: 'denied',
-        ad_user_data: 'denied',
-        ad_personalization: 'denied',
-    });
+    // Signals and ad personalization are allowed here, and the visitor's consent decides if they run
+    setConsent(toConsentSettings(consent));
     const analytics = initializeAnalytics(app, {
         config: {
-            allow_google_signals: false,
-            allow_ad_personalization_signals: false,
+            allow_google_signals: true,
+            allow_ad_personalization_signals: true,
         },
     });
 
@@ -38,6 +40,7 @@ export const createClient = async () => {
     return {
         log: (name, params) => logEvent(analytics, name, params),
         setUserProperties: (properties) => setUserProperties(analytics, properties),
+        setConsent: (choice) => setConsent(toConsentSettings(choice)),
         setEnabled: (enabled) => {
             setAnalyticsCollectionEnabled(analytics, enabled);
             performance.dataCollectionEnabled = enabled;

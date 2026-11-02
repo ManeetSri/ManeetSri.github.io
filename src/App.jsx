@@ -6,6 +6,7 @@ import ScrollProgress from './components/ScrollProgress';
 import TabBar from './components/TabBar';
 import FeedbackSheet from './components/FeedbackSheet';
 import AnalyticsTracker from './components/AnalyticsTracker';
+import CookieBanner from './components/CookieBanner';
 import BuildLoader from './components/BuildLoader';
 import { shouldPlayLoader } from './components/loaderSession';
 import Stage from './sections/Stage';
@@ -20,8 +21,8 @@ import { usePageMeta } from './hooks/usePageMeta';
 
 const Home = () => {
   usePageMeta({
-    title: 'Freelance iOS & Android App Developer | Maneet Srivastav',
-    description: 'Freelance mobile app developer building iOS and Android apps with Swift, SwiftUI and React Native. 4+ years shipping ride-hailing, retail and education apps.',
+    title: 'iOS & Android App Developer | Maneet Srivastav',
+    description: 'Mobile app developer building iOS and Android apps with Swift, SwiftUI and React Native. 4+ years shipping ride-hailing, retail and education apps.',
     path: '/',
   });
 
@@ -59,6 +60,7 @@ function App() {
         </Routes>
         <TabBar />
         <FeedbackSheet />
+        <CookieBanner />
       </Router>
     </MotionConfig>
   );
