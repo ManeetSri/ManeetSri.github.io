@@ -1,0 +1,225 @@
+## Why it matters
+
+Sooner or later you'll read Swift code containing `withUnsafeBufferPointer` or `UnsafeMutablePointer`: in heavily optimised solutions, in competitive programming templates, in code that talks to C libraries, and inside the standard library itself. This deep-dive lesson teaches you to **recognise and read** that code and to understand exactly what makes it unsafe. It doesn't ask you to write it: safe Swift is fast enough for everything in this course.
+
+## What a pointer is
+
+A **pointer** is a memory address together with the type of value expected there. You've been using a safe kind all along: a class reference is an address that ARC manages for you, so the object stays alive while you hold it.
+
+Swift's **unsafe pointers** are raw addresses with the safety removed:
+
+- **No lifetime management.** Holding a pointer doesn't keep anything alive. If the memory is freed, the pointer still holds the old address.
+- **No bounds checks in optimised builds.** Nothing stops you reading past the end of the memory you were given.
+- **No automatic clean-up.** Memory you allocate through a pointer must be freed by you.
+
+"Unsafe" doesn't mean "forbidden". It means *Swift stops checking, and correctness is now your job*.
+
+## The family of pointer types
+
+The names are built from three words, so you can read any of them:
+
+| Word | Meaning |
+| --- | --- |
+| `Mutable` | you can write through it, not only read |
+| `Buffer` | it knows how many elements it covers, and works like a collection |
+| `Raw` | it points at untyped bytes rather than values of one type |
+
+| Type | Use |
+| --- | --- |
+| `UnsafePointer<T>` | read a `T` (or several in a row) at an address |
+| `UnsafeMutablePointer<T>` | read and write `T` values |
+| `UnsafeBufferPointer<T>` | read-only view of `count` values in a row |
+| `UnsafeMutableBufferPointer<T>` | read-write view of `count` values |
+| `UnsafeRawPointer` | read untyped bytes |
+
+## Reading an array through a buffer pointer
+
+An array's elements sit side by side in one buffer (see [Stack vs heap](/dsa/learn/swift-stack-heap)). `withUnsafeBufferPointer` hands that memory to a closure as an `UnsafeBufferPointer`:
+
+```swift run
+let numbers = [3, 1, 4, 1, 5]
+
+let total = numbers.withUnsafeBufferPointer { buffer -> Int in
+    var sum = 0
+    for i in 0..<buffer.count {
+        sum += buffer[i]
+    }
+    return sum
+}
+print(total)
+```
+
+```output
+14
+```
+
+Notice the shape:
+
+- The pointer only exists **inside the closure**. Swift guarantees the array's memory stays put until the closure returns.
+- Whatever the closure returns becomes the result of `withUnsafeBufferPointer`, here the sum.
+- A buffer pointer is a collection, so `buffer.count`, `buffer[i]`, `for value in buffer` and even `buffer.reduce(0, +)` all work.
+
+Code like this exists because, in an optimised build, `buffer[i]` skips the bounds check that `numbers[i]` performs. In a hot loop that can make a measurable difference. Usually it doesn't, which is why you measure before reaching for it.
+
+## Writing in place
+
+The mutable version lets you change the elements, again only inside the closure:
+
+```swift run
+var values = [1, 2, 3]
+values.withUnsafeMutableBufferPointer { buffer in
+    for i in buffer.indices {
+        buffer[i] *= 10
+    }
+}
+print(values)
+```
+
+```output
+[10, 20, 30]
+```
+
+`values` must be a `var`, and the method works on it like a mutating method: the changes are written straight into the array's buffer.
+
+## A single pointer: pointee and arithmetic
+
+A buffer pointer's `baseAddress` is an `UnsafePointer` to its first element. A plain pointer doesn't know how many elements follow it. You read the value it points at with `pointee`, and move it with `+`:
+
+```swift run
+let numbers = [3, 1, 4, 1, 5]
+
+numbers.withUnsafeBufferPointer { buffer in
+    if let base = buffer.baseAddress {
+        print(base.pointee)
+        print((base + 2).pointee)
+        print(base[4])
+    }
+}
+```
+
+```output
+3
+4
+5
+```
+
+`base + 2` doesn't add 2 bytes. It moves forward two *elements*, which for `Int` is 2 × 8 = 16 bytes: pointer arithmetic steps by the type's stride, from [MemoryLayout: size, stride and alignment](/dsa/learn/swift-memory-layout). `base[4]` is shorthand for `(base + 4).pointee`. `baseAddress` is optional because an empty buffer may have no address at all.
+
+## Managing memory yourself
+
+You can also ask for raw memory directly. Then you're responsible for every step that ARC normally does for you:
+
+```swift run
+let pointer = UnsafeMutablePointer<Int>.allocate(capacity: 3)   // 1. get memory
+pointer.initialize(repeating: 0, count: 3)                       // 2. put values in it
+pointer[1] = 7
+print(pointer[0], pointer[1], pointer[2])
+pointer.deinitialize(count: 3)                                   // 3. destroy the values
+pointer.deallocate()                                             // 4. give the memory back
+```
+
+```output
+0 7 0
+```
+
+Forget step 4 and the memory leaks. Do step 4 twice and the program may crash. Use the pointer after step 4 and you read memory that may now belong to something else.
+
+## What makes it unsafe
+
+Each of these compiles. None reliably crashes. That's the danger.
+
+**Reading past the end.** In a debug build, the buffer's subscript checks the index. In an optimised build it doesn't, so this reads whatever bytes happen to follow the array:
+
+```swift
+numbers.withUnsafeBufferPointer { buffer in
+    print(buffer[10])    // only 5 elements: undefined behaviour in a release build
+}
+```
+
+**Letting the pointer escape.** The pointer is only valid inside the closure. Returning it compiles, but afterwards the array is free to move or be freed, and the pointer is left dangling:
+
+```swift
+let escaped = numbers.withUnsafeBufferPointer { $0 }   // never do this
+print(escaped[0])                                      // may print anything
+```
+
+**Undefined behaviour** is the technical name for what happens in these cases: the language makes no promise at all. The program might print a wrong number, crash, or work perfectly until a different input or a new compiler version. Safe Swift is designed so that mistakes crash immediately with a clear message, as you saw with "Index out of range". Unsafe code gives up that guarantee.
+
+<Callout kind="tip" title="A safer alternative is arriving">
+Swift 6.2 added `Span`, a view of contiguous memory that's checked and can't escape the value it views. As it spreads, it replaces many uses of buffer pointers. Treat buffer pointers as something to recognise and, rarely, to use after measuring.
+</Callout>
+
+<Callout kind="gotcha" title="Swift gotcha: passing an array as a pointer">
+When you call a C function that wants a pointer, you can pass `&array` and Swift creates a pointer to the elements for you. That pointer is only valid **for the duration of the call**. Storing it anywhere and using it later is the same dangling-pointer bug as letting it escape a closure.
+</Callout>
+
+```cards
+- id: unsafe-meaning
+  front: "What does 'unsafe' mean in `UnsafePointer`?"
+  back: "Swift stops checking: no lifetime management, no bounds checks in optimised builds, no automatic clean-up. Correctness becomes your job."
+- id: pointer-names
+  front: "What do `Mutable`, `Buffer` and `Raw` mean in a pointer type's name?"
+  back: "Mutable: you can write through it. Buffer: it knows its count and is a collection. Raw: it points at untyped bytes."
+- id: pointer-scope
+  front: "How long is the pointer from `withUnsafeBufferPointer` valid?"
+  back: "Only inside the closure. Returning or storing it leaves a dangling pointer."
+- id: undefined-behaviour
+  front: "What is undefined behaviour?"
+  back: "A situation where the language makes no promise at all: the program may crash, print garbage, or seem to work. Reading past a buffer's end in a release build is one."
+```
+
+```quiz
+- id: q1
+  type: output
+  prompt: "What does this print?"
+  code: |
+    let values = [2, 4, 6, 8]
+    let result = values.withUnsafeBufferPointer { buffer -> Int in
+        var product = 1
+        for value in buffer where value > 3 {
+            product *= value
+        }
+        return product
+    }
+    print(result)
+  answer: "192"
+  explain: "A buffer pointer is a collection, so `for value in buffer` works. The values over 3 are 4, 6 and 8, and 4 × 6 × 8 = 192."
+- id: q2
+  type: match
+  prompt: "Match each pointer type to what it's for."
+  pairs:
+    - ["UnsafeBufferPointer<Int>", "Read-only view of several Ints, with a count"]
+    - ["UnsafeMutablePointer<Int>", "Read and write Ints at an address, with no count"]
+    - ["UnsafeRawPointer", "Read untyped bytes"]
+  explain: "`Buffer` means it knows its count, `Mutable` means you can write, and `Raw` means untyped bytes."
+- id: q3
+  type: truefalse
+  prompt: "In an optimised (release) build, reading `buffer[10]` from a 5-element `UnsafeBufferPointer` always crashes with \"Index out of range\"."
+  answer: false
+  explain: "Buffer pointers skip bounds checks in optimised builds. Reading past the end is undefined behaviour: it might return garbage, crash or seem fine."
+- id: q4
+  type: bug
+  prompt: "Which line contains the dangerous mistake?"
+  code: |
+    func firstElementPointer(of numbers: [Int]) -> UnsafePointer<Int>? {
+        return numbers.withUnsafeBufferPointer { buffer in
+            buffer.baseAddress
+        }
+    }
+    let pointer = firstElementPointer(of: [7, 8, 9])
+    print(pointer?.pointee ?? 0)
+  answer: 3
+  explain: "Line 3 returns the buffer's address out of the closure, so the pointer escapes. It's only valid inside the closure; using it afterwards on line 7 is undefined behaviour."
+- id: q5
+  type: output
+  prompt: "What does this print?"
+  code: |
+    let numbers = [10, 20, 30, 40]
+    numbers.withUnsafeBufferPointer { buffer in
+        if let base = buffer.baseAddress {
+            print((base + 1).pointee + base[3])
+        }
+    }
+  answer: "60"
+  explain: "`base + 1` moves forward one element, to 20, and `base[3]` is the fourth element, 40. Pointer arithmetic counts elements, not bytes: 20 + 40 = 60."
+```

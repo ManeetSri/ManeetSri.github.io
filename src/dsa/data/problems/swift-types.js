@@ -1,2 +1,43 @@
 // Problems for the swift-types module. Fields are described in ../problems.js.
-export default [];
+export default [
+    {
+        id: 'rectangle-geometry',
+        title: 'Rectangle geometry',
+        difficulty: 'warmup',
+        patterns: ['basics'],
+        lessons: ['swift-structs'],
+        swiftTest: 'RectangleGeometryTests',
+        lists: ['swift'],
+        minutes: 15,
+    },
+    {
+        id: 'plane-point',
+        title: 'Point on a plane',
+        difficulty: 'easy',
+        patterns: ['basics', 'math'],
+        lessons: ['swift-mutating', 'swift-structs'],
+        swiftTest: 'PlanePointTests',
+        lists: ['swift'],
+        minutes: 15,
+    },
+    {
+        id: 'shape-areas',
+        title: 'Shape areas',
+        difficulty: 'easy',
+        patterns: ['basics', 'math'],
+        lessons: ['swift-enums'],
+        swiftTest: 'ShapeAreasTests',
+        lists: ['swift'],
+        minutes: 20,
+    },
+    {
+        id: 'arithmetic-tree',
+        title: 'Evaluate an arithmetic tree',
+        difficulty: 'medium',
+        patterns: ['recursion'],
+        lessons: ['swift-indirect-enums'],
+        swiftTest: 'ArithmeticTreeTests',
+        lists: ['swift'],
+        minutes: 30,
+    },
+];

@@ -1,2 +1,43 @@
 // Problems for the swift-first-steps module. Fields are described in ../problems.js.
-export default [];
+export default [
+    {
+        id: 'profile-line',
+        title: 'A profile line',
+        difficulty: 'warmup',
+        patterns: ['basics', 'strings'],
+        lessons: ['swift-print-interpolation'],
+        swiftTest: 'ProfileLineTests',
+        lists: ['swift'],
+        minutes: 10,
+    },
+    {
+        id: 'greeting-card',
+        title: 'A greeting card',
+        difficulty: 'easy',
+        patterns: ['basics', 'strings'],
+        lessons: ['swift-print-interpolation'],
+        swiftTest: 'GreetingCardTests',
+        lists: ['swift'],
+        minutes: 15,
+    },
+    {
+        id: 'pizza-party',
+        title: 'Pizza party maths',
+        difficulty: 'easy',
+        patterns: ['basics'],
+        lessons: ['swift-type-inference'],
+        swiftTest: 'PizzaPartyTests',
+        lists: ['swift'],
+        minutes: 15,
+    },
+    {
+        id: 'name-badge',
+        title: 'A boxed name badge',
+        difficulty: 'medium',
+        patterns: ['basics', 'strings'],
+        lessons: ['swift-print-interpolation', 'swift-let-var'],
+        swiftTest: 'NameBadgeTests',
+        lists: ['swift'],
+        minutes: 20,
+    },
+];

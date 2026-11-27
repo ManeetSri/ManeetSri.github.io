@@ -1,0 +1,300 @@
+## Why it matters
+
+ARC frees an object when its reference count reaches zero. But what if two objects hold strong references to *each other*? Neither count can ever reach zero, so neither object is ever freed. This is a **retain cycle**, the most common memory leak in Swift apps. It also appears naturally in data structures: a doubly linked list's `next` and `previous` pointers, a tree's `children` and `parent`, a graph whose nodes point at their neighbours. You need to recognise the shape before you can fix it in the next lesson.
+
+## Two objects holding each other
+
+Here are two nodes, each with a strong `next` reference, pointing at each other:
+
+```swift run
+final class Node {
+    let name: String
+    var next: Node?
+
+    init(_ name: String) {
+        self.name = name
+        print("\(name) created")
+    }
+
+    deinit {
+        print("\(name) freed")
+    }
+}
+
+do {
+    let a = Node("A")
+    let b = Node("B")
+    a.next = b
+    b.next = a
+    print("leaving the scope")
+}
+print("scope ended")
+```
+
+```output
+A created
+B created
+leaving the scope
+scope ended
+```
+
+Neither "freed" line ever prints. Both nodes are still in memory, and nothing in the program can reach them any more.
+
+## Why ARC can't free them
+
+Count the strong references to each node, before and after the scope ends:
+
+```text title="Inside the scope"
+  a ──▶ [A] ──next──▶ [B] ◀── b
+         ▲              │
+         └─────next─────┘
+
+  A is held by: a, B.next     → count 2
+  B is held by: b, A.next     → count 2
+```
+
+```text title="After the scope ends"
+        [A] ──next──▶ [B]
+         ▲              │
+         └─────next─────┘
+
+  A is held by: B.next        → count 1
+  B is held by: A.next        → count 1
+```
+
+When `a` and `b` go away, each count drops by one, but only to one. A can't be freed until B lets go of it, and B can't be freed until A lets go. ARC only counts references; it doesn't notice that the remaining ones form a closed loop with no way in from outside.
+
+<Callout kind="analogy" title="Two people holding a door for each other">
+Each says "after you" and waits for the other to go first. Nobody ever walks through. Each object waits for the other to be freed first, so both wait forever.
+</Callout>
+
+## Leaks are silent
+
+A leak doesn't crash your program or print an error. The memory is never given back. One leaked pair is harmless, but code that leaks on every loop iteration, or every time a user opens a screen, keeps growing.
+
+This program counts how many nodes are alive with a `static` property (M09) that `init` increases and `deinit` decreases:
+
+```swift run
+final class Node {
+    static var alive = 0
+    var next: Node?
+
+    init() { Node.alive += 1 }
+    deinit { Node.alive -= 1 }
+}
+
+for _ in 1...3 {
+    let a = Node()
+    let b = Node()
+    a.next = b
+    b.next = a
+}
+print("nodes alive after the cycles: \(Node.alive)")
+
+for _ in 1...3 {
+    let a = Node()
+    let b = Node()
+    a.next = b
+}
+print("nodes alive after the chains: \(Node.alive)")
+```
+
+```output
+nodes alive after the cycles: 6
+nodes alive after the chains: 6
+```
+
+The first loop leaks all six nodes, two per iteration. The second loop builds one-way chains, `a` pointing at `b` but not back, and every one of those nodes is freed at the end of its iteration, so the count stays at six.
+
+## Where cycles hide in data structures
+
+Any time two objects need to reach *each other*, a cycle is waiting to happen:
+
+| Structure | The two directions |
+| --- | --- |
+| Doubly linked list | `next` and `previous` |
+| Tree with parent pointers | `children` and `parent` |
+| Graph of node objects | each node's `neighbours` |
+| iOS screen and its helper | the screen owns the helper; the helper's `delegate` points back |
+
+The tree case looks innocent. A parent holds its children, and each child remembers its parent so it can walk upwards:
+
+```swift run
+final class TreeNode {
+    let name: String
+    var children: [TreeNode] = []
+    var parent: TreeNode?
+
+    init(_ name: String) { self.name = name }
+    deinit { print("\(name) freed") }
+}
+
+do {
+    let root = TreeNode("root")
+    let child = TreeNode("child")
+    root.children.append(child)
+    child.parent = root
+    print("tree built")
+}
+print("scope ended")
+```
+
+```output
+tree built
+scope ended
+```
+
+`root` holds `child` through its array, and `child` holds `root` through `parent`. That's a cycle, so neither is freed.
+
+A cycle can even have only one object. In a circular list where a single node's `next` points at itself, the node holds itself alive.
+
+## Cycles through closures
+
+Closures are reference types, and a closure keeps a strong reference to every object it captures (M06). So an object that stores a closure which uses `self` forms a cycle: the object holds the closure, and the closure holds the object.
+
+```swift run
+final class Counter {
+    var count = 0
+    var onTap: (() -> Void)?
+
+    init() { print("Counter created") }
+    deinit { print("Counter freed") }
+
+    func setUp() {
+        onTap = { self.count += 1 }
+    }
+}
+
+do {
+    let counter = Counter()
+    counter.setUp()
+    counter.onTap?()
+    print(counter.count)
+}
+print("done")
+```
+
+```output
+Counter created
+1
+done
+```
+
+"Counter freed" never appears. This pattern is everywhere in iOS code: a screen stores a completion handler or a timer callback that mentions `self`. It's the reason Swift makes you write `self.` explicitly inside escaping closures: to make you notice the capture.
+
+## Breaking a cycle by hand
+
+A cycle disappears as soon as any one of its links is removed. You could set a link to `nil` yourself before the objects go out of scope:
+
+```swift run
+final class Node {
+    static var alive = 0
+    var next: Node?
+
+    init() { Node.alive += 1 }
+    deinit { Node.alive -= 1 }
+}
+
+do {
+    let a = Node()
+    let b = Node()
+    a.next = b
+    b.next = a
+    b.next = nil    // break the loop before leaving
+}
+print("nodes alive: \(Node.alive)")
+```
+
+```output
+nodes alive: 0
+```
+
+This works, but it's fragile. You have to remember to do it on every path out of the code, and forgetting once brings the leak back. The real fix is to make one direction of the relationship not count at all, which is what `weak` and `unowned` do in the next lesson.
+
+<Callout kind="tip" title="Finding leaks">
+Printing from `deinit` is a quick check: if it never prints, something still holds the object. In Xcode, the **Debug Memory Graph** button (three connected circles in the debug bar) draws every live object and the references between them, and the **Leaks** instrument in Instruments flags cycles while your app runs.
+</Callout>
+
+<Callout kind="gotcha" title="Swift gotcha: every link must be strong">
+A cycle only leaks if *every* reference around the loop is strong. One `weak` or `unowned` link anywhere in the loop is enough to break it. That's why the fix is to change one direction, not both.
+</Callout>
+
+The problem below asks you to link an owner and a pet in both directions without leaking them. It needs `weak` from the next lesson, so try it after reading that one.
+
+```cards
+- id: retain-cycle-definition
+  front: "What is a retain cycle?"
+  back: "Objects that hold strong references to each other in a loop. Their counts never reach zero, so ARC never frees them: a memory leak."
+- id: cycle-in-structures
+  front: "Which data structures naturally risk retain cycles?"
+  back: "Any where objects point both ways: doubly linked lists (`next`/`previous`), trees with parent pointers, and graphs of node objects."
+- id: closure-cycle
+  front: "How can a closure cause a retain cycle?"
+  back: "An object stores a closure that captures `self` strongly. The object holds the closure and the closure holds the object."
+- id: leak-detection
+  front: "How can you check whether an object leaks?"
+  back: "Print from its `deinit`; if it never prints, something still holds it. Xcode's memory graph and the Leaks instrument show cycles visually."
+```
+
+```quiz
+- id: q1
+  type: output
+  prompt: "What does this print?"
+  code: |
+    final class Room {
+        let name: String
+        var door: Room?
+        init(_ name: String) { self.name = name }
+        deinit { print("\(name) freed") }
+    }
+
+    do {
+        let hall = Room("Hall")
+        let study = Room("Study")
+        hall.door = study
+        study.door = hall
+    }
+    print("finished")
+  answer: "finished"
+  explain: "Each room holds the other strongly, so after the scope both counts are still one. Neither `deinit` runs, and only \"finished\" is printed."
+- id: q2
+  type: multi
+  prompt: "Which of these create a retain cycle, assuming every property is an ordinary strong reference?"
+  options:
+    - "A tree node holds its `children`, and each child holds its `parent`"
+    - "A linked list where each node holds only its `next` node"
+    - "An object stores a closure that uses `self`"
+    - "A single node whose `next` points at itself"
+  answer: [0, 2, 3]
+  explain: "A cycle needs a closed loop of strong references. Parent and child point both ways, the object and its closure hold each other, and a self-pointing node holds itself. A one-way list has no loop."
+- id: q3
+  type: bug
+  prompt: "This code leaks both objects. Which line creates the cycle?"
+  code: |
+    final class Owner { var pet: Pet? }
+    final class Pet { var owner: Owner? }
+
+    func adopt() {
+        let owner = Owner()
+        let pet = Pet()
+        owner.pet = pet
+        pet.owner = owner
+    }
+  answer: 8
+  explain: "Line 7 alone is a one-way link, which is fine. Line 8 adds the strong link back from the pet to the owner, closing the loop. The next lesson makes that back-reference `weak`."
+- id: q4
+  type: truefalse
+  prompt: "A retain cycle makes your program crash as soon as the objects become unreachable."
+  answer: false
+  explain: "Leaks are silent. The memory is never given back, which is why you need `deinit` prints, the memory graph or Instruments to spot them."
+- id: q5
+  type: mcq
+  prompt: "Why can't ARC free two objects that only reference each other?"
+  options:
+    - "ARC only runs when the app is idle"
+    - "Each object's count stays at one because of the other's reference, and ARC only frees at zero"
+    - "Objects in a cycle are moved to the stack"
+    - "ARC frees them, but `deinit` is skipped"
+  answer: 1
+  explain: "ARC only counts. Each object still has one strong reference, from the other, so neither count can reach zero. ARC doesn't search for unreachable loops."
+```

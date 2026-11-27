@@ -70,7 +70,7 @@ const rawModules = [
 
     // Part I: Swift from zero ───────────────────────────────────────────────────────────────
     {
-        id: 'swift-first-steps', code: 'M01', part: 1, title: 'First steps in Swift', level: 'beginner', tracks: ['core'], requires: ['orientation'],
+        id: 'swift-first-steps', code: 'M01', part: 1, title: 'First steps in Swift', level: 'beginner', tracks: ['core'], requires: ['orientation'], status: 'ready',
         summary: 'What a program is, where Swift runs, printing, comments, constants and variables.',
         lessons: [
             ['swift-what-is-a-program', 'What a program is'],
@@ -83,7 +83,7 @@ const rawModules = [
         ],
     },
     {
-        id: 'swift-types-operators', code: 'M02', part: 1, title: 'Basic types and operators', level: 'beginner', tracks: ['core'], requires: ['swift-first-steps'],
+        id: 'swift-types-operators', code: 'M02', part: 1, title: 'Basic types and operators', level: 'beginner', tracks: ['core'], requires: ['swift-first-steps'], status: 'ready',
         summary: 'Numbers, booleans, characters, conversions, every operator, overflow, ranges and tuples.',
         lessons: [
             ['swift-integers', 'Integers: Int, UInt and sized integers'],
@@ -98,7 +98,7 @@ const rawModules = [
         ],
     },
     {
-        id: 'swift-control-flow', code: 'M03', part: 1, title: 'Control flow', level: 'beginner', tracks: ['core'], requires: ['swift-types-operators'],
+        id: 'swift-control-flow', code: 'M03', part: 1, title: 'Control flow', level: 'beginner', tracks: ['core'], requires: ['swift-types-operators'], status: 'ready',
         summary: 'Decisions, loops, switch pattern matching, guard and tracing loops by hand.',
         lessons: [
             ['swift-if-else', 'if, else if and else'],
@@ -112,7 +112,7 @@ const rawModules = [
         ],
     },
     {
-        id: 'swift-optionals', code: 'M04', part: 1, title: 'Optionals', level: 'beginner', tracks: ['core'], requires: ['swift-control-flow'],
+        id: 'swift-optionals', code: 'M04', part: 1, title: 'Optionals', level: 'beginner', tracks: ['core'], requires: ['swift-control-flow'], status: 'ready',
         summary: 'Values that might be missing, and every safe way to unwrap them.',
         lessons: [
             ['swift-why-nil', 'Why nil exists'],
@@ -125,7 +125,7 @@ const rawModules = [
         ],
     },
     {
-        id: 'swift-functions', code: 'M05', part: 1, title: 'Functions', level: 'beginner', tracks: ['core'], requires: ['swift-optionals'],
+        id: 'swift-functions', code: 'M05', part: 1, title: 'Functions', level: 'beginner', tracks: ['core'], requires: ['swift-optionals'], status: 'ready',
         summary: 'Parameters, labels, defaults, inout for in-place algorithms, nested helpers and a first look at recursion.',
         lessons: [
             ['swift-defining-functions', 'Defining and calling functions'],
@@ -139,7 +139,7 @@ const rawModules = [
         ],
     },
     {
-        id: 'swift-closures', code: 'M06', part: 1, title: 'Closures and higher-order functions', level: 'beginner', tracks: ['core'], requires: ['swift-functions'],
+        id: 'swift-closures', code: 'M06', part: 1, title: 'Closures and higher-order functions', level: 'beginner', tracks: ['core'], requires: ['swift-functions'], status: 'ready',
         summary: 'Closure syntax, capturing, and the map/filter/reduce toolkit, plus when a plain loop is better.',
         lessons: [
             ['swift-closure-syntax', 'Closure syntax and trailing closures', { minutes: 25 }],
@@ -153,7 +153,7 @@ const rawModules = [
         ],
     },
     {
-        id: 'swift-collections', code: 'M07', part: 1, title: 'Swift collections', level: 'beginner', tracks: ['core'], requires: ['swift-closures'],
+        id: 'swift-collections', code: 'M07', part: 1, title: 'Swift collections', level: 'beginner', tracks: ['core'], requires: ['swift-closures'], status: 'ready',
         summary: 'Arrays, sets and dictionaries in depth, value semantics, and what Swift leaves for us to build.',
         lessons: [
             ['swift-array-basics', 'Creating and accessing arrays', { minutes: 25 }],
@@ -168,7 +168,7 @@ const rawModules = [
         ],
     },
     {
-        id: 'swift-strings', code: 'M08', part: 1, title: 'Strings in depth', level: 'intermediate', tracks: ['core'], requires: ['swift-collections'],
+        id: 'swift-strings', code: 'M08', part: 1, title: 'Strings in depth', level: 'intermediate', tracks: ['core'], requires: ['swift-collections'], status: 'ready',
         summary: 'Why Swift strings are different, and the fast patterns every string problem needs.',
         lessons: [
             ['swift-unicode', 'Unicode and grapheme clusters'],
@@ -183,7 +183,7 @@ const rawModules = [
         ],
     },
     {
-        id: 'swift-types', code: 'M09', part: 1, title: 'Structs, classes and enums', level: 'intermediate', tracks: ['core'], requires: ['swift-strings'],
+        id: 'swift-types', code: 'M09', part: 1, title: 'Structs, classes and enums', level: 'intermediate', tracks: ['core'], requires: ['swift-strings'], status: 'ready',
         summary: 'Building your own types, value vs reference semantics, copy-on-write and recursive enums.',
         lessons: [
             ['swift-structs', 'Structs, properties and methods', { minutes: 25 }],
@@ -199,7 +199,7 @@ const rawModules = [
         ],
     },
     {
-        id: 'swift-generics', code: 'M10', part: 1, title: 'Protocols, extensions and generics', level: 'intermediate', tracks: ['core'], requires: ['swift-types'],
+        id: 'swift-generics', code: 'M10', part: 1, title: 'Protocols, extensions and generics', level: 'intermediate', tracks: ['core'], requires: ['swift-types'], status: 'ready',
         summary: 'The tools that let your data structures work with any type and feel built in.',
         lessons: [
             ['swift-protocols', 'Protocols and conformance'],
@@ -216,7 +216,7 @@ const rawModules = [
         ],
     },
     {
-        id: 'swift-memory', code: 'M11', part: 1, title: 'Memory, ARC and references', level: 'intermediate', tracks: ['core'], requires: ['swift-generics'],
+        id: 'swift-memory', code: 'M11', part: 1, title: 'Memory, ARC and references', level: 'intermediate', tracks: ['core'], requires: ['swift-generics'], status: 'ready',
         summary: 'Where values live, how ARC works, retain cycles, weak references and writing your own copy-on-write.',
         lessons: [
             ['swift-stack-heap', 'Stack vs heap'],
@@ -229,7 +229,7 @@ const rawModules = [
         ],
     },
     {
-        id: 'swift-tooling', code: 'M12', part: 1, title: 'Tooling for DSA', level: 'intermediate', tracks: ['core'], requires: ['swift-memory'],
+        id: 'swift-tooling', code: 'M12', part: 1, title: 'Tooling for DSA', level: 'intermediate', tracks: ['core'], requires: ['swift-memory'], status: 'ready',
         summary: 'Errors, testing, release builds, timing code, debugging and reading input.',
         lessons: [
             ['swift-errors', 'throws, try and Result'],

@@ -1,2 +1,43 @@
 // Problems for the swift-memory module. Fields are described in ../problems.js.
-export default [];
+export default [
+    {
+        id: 'break-the-cycle',
+        title: 'Break the cycle',
+        difficulty: 'easy',
+        patterns: ['basics', 'design'],
+        lessons: ['swift-retain-cycles', 'swift-weak-unowned'],
+        swiftTest: 'PetAdoptionTests',
+        lists: ['swift'],
+        minutes: 15,
+    },
+    {
+        id: 'weak-parent-tree',
+        title: 'Climbing a tree with weak parents',
+        difficulty: 'easy',
+        patterns: ['traversal'],
+        lessons: ['swift-weak-unowned'],
+        swiftTest: 'WeakParentTreeTests',
+        lists: ['swift'],
+        minutes: 20,
+    },
+    {
+        id: 'struct-layout-calculator',
+        title: 'Struct layout calculator',
+        difficulty: 'easy',
+        patterns: ['simulation', 'math'],
+        lessons: ['swift-memory-layout'],
+        swiftTest: 'StructLayoutCalculatorTests',
+        lists: ['swift'],
+        minutes: 20,
+    },
+    {
+        id: 'copy-on-write-stack',
+        title: 'A copy-on-write stack',
+        difficulty: 'medium',
+        patterns: ['design'],
+        lessons: ['swift-implementing-cow'],
+        swiftTest: 'CopyOnWriteStackTests',
+        lists: ['swift'],
+        minutes: 30,
+    },
+];
