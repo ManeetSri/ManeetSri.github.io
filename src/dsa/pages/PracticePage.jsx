@@ -80,7 +80,7 @@ const PracticePage = () => {
     return (
         <div className="mx-auto max-w-5xl">
             <PageHeader eyebrow={`${solved} of ${problems.length} solved`} title="Practice">
-                Every problem has hints, several approaches and tests you run in the companion Swift package. More arrive with each part.
+                Every problem has hints, several approaches, an editor that saves your code, and tests you run in the companion Swift package.
             </PageHeader>
 
             {listProgress.length > 0 && (
