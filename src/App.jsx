@@ -20,13 +20,15 @@ import BlogsPage from './pages/BlogsPage';
 import NotFoundPage from './pages/NotFoundPage';
 import PrivacyPage from './pages/PrivacyPage';
 import { usePageMeta } from './hooks/usePageMeta';
+import { isPrivatePath } from './utils/privatePaths';
 
 const BuildPage = lazy(() => import('./pages/BuildPage'));
+const DsaApp = lazy(() => import('./dsa/DsaApp'));
 
-// The game page is its own focused space, without the portfolio's navigation
+// The game page and the private learning console are their own focused spaces, without the portfolio's navigation
 const PortfolioChrome = () => {
   const { pathname } = useLocation();
-  if (pathname === '/build') return null;
+  if (pathname === '/build' || isPrivatePath(pathname)) return null;
 
   return (
     <>
@@ -35,6 +37,12 @@ const PortfolioChrome = () => {
       <FeedbackSheet />
     </>
   );
+};
+
+// The learning console never runs analytics, so it has nothing to ask consent for
+const SiteCookieBanner = () => {
+  const { pathname } = useLocation();
+  return isPrivatePath(pathname) ? null : <CookieBanner />;
 };
 
 const Home = () => {
@@ -76,11 +84,12 @@ function App() {
           <Route path="/blogs" element={<BlogsPage />} />
           <Route path="/privacy" element={<PrivacyPage />} />
           <Route path="/build" element={<Suspense fallback={<div className="min-h-svh bg-ink" />}><BuildPage /></Suspense>} />
+          <Route path="/dsa/*" element={<Suspense fallback={<div className="min-h-svh bg-ink" />}><DsaApp /></Suspense>} />
           <Route path="*" element={<NotFoundPage />} />
         </Routes>
         </ErrorBoundary>
         <PortfolioChrome />
-        <CookieBanner />
+        <SiteCookieBanner />
       </Router>
     </MotionConfig>
   );
