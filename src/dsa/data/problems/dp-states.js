@@ -1,0 +1,43 @@
+// Problems for the dp-states module. Fields are described in ../problems.js.
+export default [
+    {
+        id: 'stock-trades-with-cooldown',
+        title: 'Stock trades with a cooldown',
+        difficulty: 'medium',
+        patterns: ['dp'],
+        lessons: ['dpsm-state-diagrams', 'dpsm-cooldown-fee'],
+        swiftTest: 'StockTradesWithCooldownTests',
+        lists: ['core75'],
+        minutes: 30,
+    },
+    {
+        id: 'stock-trades-with-limit',
+        title: 'Stock trades with a limit',
+        difficulty: 'hard',
+        patterns: ['dp'],
+        lessons: ['dpsm-stocks-3-4'],
+        swiftTest: 'StockTradesWithLimitTests',
+        lists: ['patterns150'],
+        minutes: 40,
+    },
+    {
+        id: 'paint-the-houses',
+        title: 'Paint the houses',
+        difficulty: 'medium',
+        patterns: ['dp'],
+        lessons: ['dpsm-paint-flip'],
+        swiftTest: 'HousePaintingCostTests',
+        lists: ['patterns150'],
+        minutes: 30,
+    },
+    {
+        id: 'switch-row-flips',
+        title: 'Fewest flips to sort a switch row',
+        difficulty: 'medium',
+        patterns: ['dp', 'strings'],
+        lessons: ['dpsm-paint-flip'],
+        swiftTest: 'SwitchRowFlipsTests',
+        lists: ['patterns150'],
+        minutes: 20,
+    },
+];

@@ -777,7 +777,7 @@ const rawModules = [
 
     // Part VII: Algorithm design paradigms ──────────────────────────────────────────────────
     {
-        id: 'backtracking', code: 'M48', part: 7, title: 'Backtracking', level: 'intermediate', tracks: ['core'], requires: ['advanced-graphs'],
+        id: 'backtracking', code: 'M48', part: 7, title: 'Backtracking', level: 'intermediate', tracks: ['core'], requires: ['advanced-graphs'], status: 'ready',
         summary: 'Exploring decision trees with choose, explore, unchoose, and pruning them.',
         lessons: [
             ['bk-template', 'The decision tree and the backtracking template', { minutes: 30 }],
@@ -794,7 +794,7 @@ const rawModules = [
         ],
     },
     {
-        id: 'divide-conquer', code: 'M49', part: 7, title: 'Divide and conquer', level: 'intermediate', tracks: ['core'], requires: ['backtracking'],
+        id: 'divide-conquer', code: 'M49', part: 7, title: 'Divide and conquer', level: 'intermediate', tracks: ['core'], requires: ['backtracking'], status: 'ready',
         summary: 'Split, solve, combine: the paradigm behind merge sort and much more.',
         lessons: [
             ['dc-paradigm', 'Divide, conquer, combine'],
@@ -808,7 +808,7 @@ const rawModules = [
         ],
     },
     {
-        id: 'greedy', code: 'M50', part: 7, title: 'Greedy algorithms', level: 'intermediate', tracks: ['core'], requires: ['divide-conquer'],
+        id: 'greedy', code: 'M50', part: 7, title: 'Greedy algorithms', level: 'intermediate', tracks: ['core'], requires: ['divide-conquer'], status: 'ready',
         summary: 'When the locally best choice is globally best, how to prove it, and when it fails.',
         lessons: [
             ['greedy-idea', 'The greedy choice property', { minutes: 25 }],
@@ -824,7 +824,7 @@ const rawModules = [
         ],
     },
     {
-        id: 'dp-foundations', code: 'M51', part: 7, title: 'DP 1: Foundations', level: 'intermediate', tracks: ['core'], requires: ['greedy'],
+        id: 'dp-foundations', code: 'M51', part: 7, title: 'DP 1: Foundations', level: 'intermediate', tracks: ['core'], requires: ['greedy'], status: 'ready',
         summary: 'From recursion to memoisation to tabulation, and the recipe for every DP problem.',
         lessons: [
             ['dp-what-is-dp', 'Overlapping subproblems and optimal substructure', { minutes: 25 }],
@@ -839,7 +839,7 @@ const rawModules = [
         ],
     },
     {
-        id: 'dp-grids', code: 'M52', part: 7, title: 'DP 2: Grids and paths', level: 'intermediate', tracks: ['core'], requires: ['dp-foundations'],
+        id: 'dp-grids', code: 'M52', part: 7, title: 'DP 2: Grids and paths', level: 'intermediate', tracks: ['core'], requires: ['dp-foundations'], status: 'ready',
         summary: 'Counting and optimising paths through grids.',
         lessons: [
             ['dpg-unique-paths', 'Unique paths I and II'],
@@ -851,7 +851,7 @@ const rawModules = [
         ],
     },
     {
-        id: 'dp-knapsack', code: 'M53', part: 7, title: 'DP 3: Knapsack family', level: 'advanced', tracks: ['core'], requires: ['dp-grids'],
+        id: 'dp-knapsack', code: 'M53', part: 7, title: 'DP 3: Knapsack family', level: 'advanced', tracks: ['core'], requires: ['dp-grids'], status: 'ready',
         summary: '0/1, unbounded and bounded knapsack, and the many problems that are secretly knapsack.',
         lessons: [
             ['dpk-01', '0/1 knapsack, from 2D to 1D', { minutes: 35 }],
@@ -865,7 +865,7 @@ const rawModules = [
         ],
     },
     {
-        id: 'dp-strings', code: 'M54', part: 7, title: 'DP 4: Strings', level: 'advanced', tracks: ['core'], requires: ['dp-knapsack'],
+        id: 'dp-strings', code: 'M54', part: 7, title: 'DP 4: Strings', level: 'advanced', tracks: ['core'], requires: ['dp-knapsack'], status: 'ready',
         summary: 'LCS, edit distance, palindromes and pattern matching with DP.',
         lessons: [
             ['dps-lcs', 'Longest common subsequence, and printing it', { minutes: 35 }],
@@ -880,7 +880,7 @@ const rawModules = [
         ],
     },
     {
-        id: 'dp-lis', code: 'M55', part: 7, title: 'DP 5: Subsequences and LIS', level: 'advanced', tracks: ['core'], requires: ['dp-strings'],
+        id: 'dp-lis', code: 'M55', part: 7, title: 'DP 5: Subsequences and LIS', level: 'advanced', tracks: ['core'], requires: ['dp-strings'], status: 'ready',
         summary: 'Longest increasing subsequence in O(n²) and O(n log n), and its family.',
         lessons: [
             ['lis-quadratic', 'LIS in O(n²)'],
@@ -892,7 +892,7 @@ const rawModules = [
         ],
     },
     {
-        id: 'dp-intervals', code: 'M56', part: 7, title: 'DP 6: Intervals and partitions', level: 'expert', tracks: ['interview'], requires: ['dp-lis'],
+        id: 'dp-intervals', code: 'M56', part: 7, title: 'DP 6: Intervals and partitions', level: 'expert', tracks: ['interview'], requires: ['dp-lis'], status: 'ready',
         summary: 'DP over ranges: matrix chains, balloons, cuts and games.',
         lessons: [
             ['dpi-matrix-chain', 'Matrix chain multiplication', { minutes: 35 }],
@@ -906,7 +906,7 @@ const rawModules = [
         ],
     },
     {
-        id: 'dp-states', code: 'M57', part: 7, title: 'DP 7: State machines', level: 'advanced', tracks: ['core'], requires: ['dp-intervals'],
+        id: 'dp-states', code: 'M57', part: 7, title: 'DP 7: State machines', level: 'advanced', tracks: ['core'], requires: ['dp-intervals'], status: 'ready',
         summary: 'Turning state diagrams into DP transitions, with the stock problems as the guide.',
         lessons: [
             ['dpsm-stocks-1-2', 'Best time to buy and sell stock I and II'],
@@ -917,7 +917,7 @@ const rawModules = [
         ],
     },
     {
-        id: 'dp-advanced', code: 'M58', part: 7, title: 'DP 8: Advanced DP', level: 'expert', tracks: ['cp'], requires: ['dp-states'],
+        id: 'dp-advanced', code: 'M58', part: 7, title: 'DP 8: Advanced DP', level: 'expert', tracks: ['cp'], requires: ['dp-states'], status: 'ready',
         summary: 'DP on trees, bitmasks, digits and probabilities, plus the classic optimisations.',
         lessons: [
             ['dpa-trees', 'DP on trees', { minutes: 35, tracks: ['cp', 'interview'] }],
@@ -932,7 +932,7 @@ const rawModules = [
         ],
     },
     {
-        id: 'patterns', code: 'M59', part: 7, title: 'Pattern master map', level: 'advanced', tracks: ['core'], requires: ['dp-advanced'],
+        id: 'patterns', code: 'M59', part: 7, title: 'Pattern master map', level: 'advanced', tracks: ['core'], requires: ['dp-advanced'], status: 'ready',
         summary: 'Recognising which pattern a problem needs, with a Swift template for each.',
         lessons: [
             ['pat-recognition', 'Reading the pattern from constraints and wording', { minutes: 30 }],

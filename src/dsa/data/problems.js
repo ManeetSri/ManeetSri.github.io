@@ -50,6 +50,18 @@ import shortestPaths from './problems/shortest-paths.js';
 import unionFind from './problems/union-find.js';
 import mst from './problems/mst.js';
 import advancedGraphs from './problems/advanced-graphs.js';
+import backtracking from './problems/backtracking.js';
+import divideConquer from './problems/divide-conquer.js';
+import greedy from './problems/greedy.js';
+import dpFoundations from './problems/dp-foundations.js';
+import dpGrids from './problems/dp-grids.js';
+import dpKnapsack from './problems/dp-knapsack.js';
+import dpStrings from './problems/dp-strings.js';
+import dpLis from './problems/dp-lis.js';
+import dpIntervals from './problems/dp-intervals.js';
+import dpStates from './problems/dp-states.js';
+import dpAdvanced from './problems/dp-advanced.js';
+import patterns from './problems/patterns.js';
 
 export const DIFFICULTIES = {
     warmup: { label: 'Warm-up', xp: 15 },
@@ -151,6 +163,18 @@ export const problems = [
     ...unionFind,
     ...mst,
     ...advancedGraphs,
+    ...backtracking,
+    ...divideConquer,
+    ...greedy,
+    ...dpFoundations,
+    ...dpGrids,
+    ...dpKnapsack,
+    ...dpStrings,
+    ...dpLis,
+    ...dpIntervals,
+    ...dpStates,
+    ...dpAdvanced,
+    ...patterns,
 ];
 
 export const problemById = Object.fromEntries(problems.map((problem) => [problem.id, problem]));
