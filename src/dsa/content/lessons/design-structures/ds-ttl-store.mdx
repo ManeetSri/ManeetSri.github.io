@@ -1,0 +1,258 @@
+## Why it matters
+
+Plenty of data is only good for a while. A login session lasts 30 minutes; a cached API response is fresh for 60 seconds; a one-time code dies after 5 minutes. Each entry carries a **time to live** (TTL), and after it, the entry must behave as if it was never there. Redis, the most popular in-memory store, has `EXPIRE` built in; HTTP responses carry `Cache-Control: max-age`; and `NSCache`, notably, has no expiry at all, so iOS apps often add their own. The interview question "design a key-value store with expiry" has a neat answer built from two ideas: check on read, and clean up in deadline order with a heap.
+
+## Requirements
+
+- `set(value, for: key, ttl:)`: store a value that lives for `ttl` time units. Setting a key again replaces the value **and restarts its clock**.
+- `value(for: key)`: the value if it's still live, else `nil`.
+- `removeValue(for: key)` and `count`: how many entries are live right now.
+- **The boundary:** an entry set at time t with TTL d is live at times before t + d and gone from t + d on. Pin this down out loud; off-by-one errors live here.
+
+## Time is an input
+
+The tempting implementation reads the real clock inside every method. Don't. A test of a 30-minute TTL would have to wait 30 minutes, and tests that read the clock pass or fail depending on how fast the machine is. Instead, **pass the time in**: every method takes `now`, or the store is given a clock to call, such as a closure `() -> Int`. Tests then move time forward by changing a number, and every run is identical.
+
+```swift run
+let setAt = 100, ttl = 30
+for now in [129, 130] {
+    print(now, now < setAt + ttl ? "live" : "expired")
+}
+```
+
+```output
+129 live
+130 expired
+```
+
+In an app, the clock you pass in should be a monotonic one (time since the device started), not the wall clock, which jumps when the user changes time zone or the system corrects itself. A TTL measured on a clock that can go backwards might never expire.
+
+## Design 1: lazy expiry
+
+Store each value with the time it **expires**, `now + ttl`, rather than when it was set: then every check is one comparison. On every read, compare: an expired entry is treated as missing, and since you're there, delete it. This is **lazy expiry**: nothing happens until someone looks.
+
+```swift run
+struct LazyTTLStore {
+    private var entries: [String: (value: String, expiresAt: Int)] = [:]
+
+    var stored: Int { entries.count }
+
+    mutating func set(_ value: String, for key: String, ttl: Int, now: Int) {
+        entries[key] = (value, now + ttl)              // live while now < expiresAt
+    }
+
+    mutating func value(for key: String, now: Int) -> String? {
+        guard let entry = entries[key] else { return nil }
+        if entry.expiresAt <= now {
+            entries[key] = nil                         // found dead on read: clean it up now
+            return nil
+        }
+        return entry.value
+    }
+}
+
+var sessions = LazyTTLStore()
+sessions.set("token-a", for: "ana", ttl: 30, now: 0)
+sessions.set("token-m", for: "maneet", ttl: 60, now: 10)
+print(sessions.value(for: "ana", now: 29) ?? "expired")
+print(sessions.value(for: "ana", now: 30) ?? "expired")
+print(sessions.value(for: "maneet", now: 69) ?? "expired")
+for guest in 0..<1_000 {
+    sessions.set("token-g", for: "guest\(guest)", ttl: 5, now: 100)
+}
+print("stored, though every one has expired by time 200:", sessions.stored)
+```
+
+```output
+token-a
+expired
+token-m
+stored, though every one has expired by time 200: 1001
+```
+
+Reads are correct and O(1). But look at the last line: a thousand guest sessions that nobody will ever read again sit in memory forever, along with Maneet's expired token. And there's no way to answer "how many entries are live?" without checking every one: O(n).
+
+## Design 2: add a heap of deadlines
+
+To clean up without waiting for reads, you need the entry that expires **soonest**, again and again. That's a min-heap, ordered by expiry time. On every `set`, push `(expiresAt, key)`. To clean up at time `now`, pop deadlines from the top while they're at or before `now`, deleting their entries. You stop at the first deadline still in the future, so the work is proportional to what actually expired.
+
+One complication: overwriting a key pushes a **new** deadline but can't cheaply remove the old one from the middle of the heap. The old one is **stale**, and when it's eventually popped it must not delete the newer entry. The fix is a check: delete only if the entry's `expiresAt` still equals the deadline's. This is **lazy deletion**, the same trick as skipping outdated entries in [Dijkstra's algorithm](/dsa/learn/sp-dijkstra).
+
+```swift run
+// The heap from "Build a generic Heap<T>", compacted, with peek
+struct Heap<Element> {
+    private var items: [Element] = []
+    private let areInIncreasingOrder: (Element, Element) -> Bool
+
+    init(areInIncreasingOrder: @escaping (Element, Element) -> Bool) {
+        self.areInIncreasingOrder = areInIncreasingOrder
+    }
+
+    func peek() -> Element? { items.first }
+
+    mutating func insert(_ element: Element) {
+        items.append(element)
+        var child = items.count - 1
+        while child > 0 && areInIncreasingOrder(items[child], items[(child - 1) / 2]) {
+            items.swapAt(child, (child - 1) / 2)
+            child = (child - 1) / 2
+        }
+    }
+
+    mutating func pop() -> Element? {
+        guard !items.isEmpty else { return nil }
+        items.swapAt(0, items.count - 1)
+        let top = items.removeLast()
+        var parent = 0
+        while true {
+            let left = 2 * parent + 1
+            let right = left + 1
+            var first = parent
+            if left < items.count && areInIncreasingOrder(items[left], items[first]) { first = left }
+            if right < items.count && areInIncreasingOrder(items[right], items[first]) { first = right }
+            if first == parent { return top }
+            items.swapAt(parent, first)
+            parent = first
+        }
+    }
+}
+
+struct TTLStore {
+    private var entries: [String: (value: String, expiresAt: Int)] = [:]
+    private var deadlines = Heap<(expiresAt: Int, key: String)>(areInIncreasingOrder: { $0.expiresAt < $1.expiresAt })
+
+    mutating func set(_ value: String, for key: String, ttl: Int, now: Int) {
+        entries[key] = (value, now + ttl)
+        deadlines.insert((now + ttl, key))             // any earlier deadline for key is now stale
+    }
+
+    mutating func value(for key: String, now: Int) -> String? {
+        guard let entry = entries[key], entry.expiresAt > now else { return nil }
+        return entry.value
+    }
+
+    /// Eager cleanup: throw out everything whose deadline has passed, earliest first.
+    mutating func count(now: Int) -> Int {
+        while let next = deadlines.peek(), next.expiresAt <= now {
+            _ = deadlines.pop()
+            if let entry = entries[next.key], entry.expiresAt == next.expiresAt {
+                entries[next.key] = nil
+                print("  expired \(next.key)")
+            } else {
+                print("  skipped a stale deadline for \(next.key)")
+            }
+        }
+        return entries.count
+    }
+}
+
+var cache = TTLStore()
+cache.set("v1", for: "feed", ttl: 10, now: 0)          // expires at 10
+cache.set("v1", for: "profile", ttl: 30, now: 0)       // expires at 30
+cache.set("v2", for: "feed", ttl: 10, now: 5)          // refreshed: expires at 15 instead
+print("count at 12:", cache.count(now: 12))
+print("count at 15:", cache.count(now: 15))
+print("feed at 15:", cache.value(for: "feed", now: 15) ?? "gone")
+print("count at 40:", cache.count(now: 40))
+```
+
+```output
+  skipped a stale deadline for feed
+count at 12: 2
+  expired feed
+count at 15: 1
+feed at 15: gone
+  expired profile
+count at 40: 0
+```
+
+At time 12, the first deadline (10, feed) has passed, but "feed" was refreshed and now expires at 15: the deadline is stale and is skipped, so the refreshed entry survives. At 15 its real deadline comes up and it goes. Each deadline is pushed once and popped once, so cleanup costs amortised O(log n) per `set`, and `count` no longer scans anything.
+
+### When to clean up
+
+The heap tells you **what** to delete; you still choose **when**:
+
+- **On reads of the count**, as above, which is enough for correctness.
+- **On every `set`** too, so memory stays bounded even if nobody ever asks for the count. The cost is still amortised O(log n).
+- **On a timer**, in the background, as real servers do. Redis combines lazy expiry with a periodic sweep of a random sample of keys.
+
+Stale deadlines also take memory. If a few keys are refreshed constantly, the heap fills with stale entries; once they outnumber the live entries, rebuild the heap from the dictionary in O(n), a cost that the overwrites which caused it have already paid for.
+
+## Other designs
+
+| Design | `set` | `value` | `count` | Notes |
+| --- | --- | --- | --- | --- |
+| Lazy expiry only | O(1) | O(1) | O(n) | expired, unread entries stay forever |
+| Lazy + heap of deadlines | O(log n) | O(1) | amortised O(log n) | stale deadlines need the equality check |
+| Lazy + ordered set of (expiresAt, key) | O(log n) | O(1) | amortised O(log n) | an overwrite removes the old deadline, so nothing goes stale |
+| Timing wheel: a ring of per-second buckets | O(1) | O(1) | O(1) amortised per second that passes | the hit counter's ring, for huge numbers of timers |
+
+An ordered set, such as DSAKit's `SortedSet` of `(expiresAt, key)` pairs, can delete the old deadline on overwrite because it supports removing any element in O(log n), which a heap can't. A heap is simpler and usually fast enough.
+
+<Callout kind="gotcha" title="Common mistakes">
+- **Off by one at the deadline.** Decide whether an entry set at t with TTL d is live at exactly t + d, say it, and test it.
+- **Letting a stale deadline delete a refreshed entry.** Always compare the deadline with the entry's current expiry before deleting.
+- **Reading the real clock inside the store.** Tests become slow and flaky. Pass time in.
+- **Counting by filtering.** `entries.values.filter { … }.count` is O(n) per call, which hides inside an innocent-looking one-liner.
+</Callout>
+
+## Practice
+
+**Expiring key-value store** asks for `set`, `value`, `removeValue` and `count`, generic over key and value types. One test keeps about 25,000 entries live and asks for the count after each of 200,000 sets, so counting by scanning runs out of time.
+
+```cards
+- id: ttl-expires-at
+  front: "Why store an entry's expiry time rather than when it was set?"
+  back: "Every check becomes one comparison, `expiresAt > now`, and the heap of deadlines can be ordered by the same number."
+- id: ttl-lazy
+  front: "What is lazy expiry, and what are its two weaknesses?"
+  back: "Checking an entry's expiry only when it's read. Expired entries that are never read stay in memory, and counting live entries means checking all of them."
+- id: ttl-heap
+  front: "How does a min-heap of deadlines clean up expired entries efficiently?"
+  back: "Pop deadlines while the top one is at or before now, deleting their entries; stop at the first future deadline. Each deadline is pushed and popped once: amortised O(log n)."
+- id: ttl-stale
+  front: "How do you stop a stale deadline from deleting a refreshed entry?"
+  back: "When popping a deadline, delete the entry only if its current expiry equals the deadline's time; otherwise skip it."
+```
+
+```quiz
+- id: q1
+  type: output
+  prompt: "An entry was set at time 100 with a TTL of 30. What does this print?"
+  code: |
+    let setAt = 100, ttl = 30
+    for now in [129, 130] {
+        print(now, now < setAt + ttl ? "live" : "expired")
+    }
+  answer: "129 live\n130 expired"
+  explain: "The entry expires at 100 + 30 = 130. It's live at times before 130, and gone from 130 on."
+- id: q2
+  type: trace
+  prompt: "A key is set at time 2 with TTL 5, then set again at time 4 with TTL 2. At what time does it first stop being readable?"
+  answer: "6"
+  explain: "The second set replaces the value and restarts the clock: it now expires at 4 + 2 = 6. The first deadline, 7, is stale and will be skipped when popped."
+- id: q3
+  type: mcq
+  prompt: "When a deadline is popped from the heap, why check that the entry's `expiresAt` equals the deadline's?"
+  options:
+    - "To keep the heap balanced"
+    - "So a deadline left over from before an overwrite doesn't delete the newer entry"
+    - "Because Swift heaps can return the wrong element"
+    - "To avoid an integer overflow"
+  answer: 1
+  explain: "Overwriting a key pushes a new deadline but leaves the old one in the heap. Without the check, the old deadline would delete the refreshed entry early."
+- id: q4
+  type: bigo
+  prompt: "With lazy expiry only, what does counting the live entries cost?"
+  answer: "O(n)"
+  explain: "Nothing records which entries have expired, so every entry must be checked against the current time."
+- id: q5
+  type: truefalse
+  prompt: "With lazy expiry alone, an expired entry that's never read again stays in memory."
+  answer: true
+  explain: "Lazy expiry deletes an entry only when a read finds it expired. Unread entries are never examined, which is why the heap of deadlines (or a background sweep) is added."
+- id: q6
+  type: recall
+  prompt: "Why should a TTL store take the current time as an input instead of reading the clock itself?"
+  model: "So tests can move time forward instantly and get the same result every run: a 30-minute TTL is tested by changing a number, not by waiting. It also keeps the store's logic separate from where time comes from, so an app can pass a monotonic clock that never jumps backwards."
+```

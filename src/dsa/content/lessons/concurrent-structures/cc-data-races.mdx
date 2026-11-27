@@ -1,0 +1,246 @@
+## Why it matters
+
+Your phone has several processor cores, and iOS apps use them: images decode, JSON parses and search results sort away from the main thread so the interface stays smooth. The moment two pieces of code run at the same time and touch the same data structure, it can be silently corrupted, in ways that tests rarely catch and users report as "random" crashes. This module is about data structures that stay correct under concurrency, and algorithms that use several cores. This first lesson is about the problem itself: what goes wrong, why you can't see it by running the code, and the three shapes of a fix.
+
+## Running code at the same time
+
+This is the course's first look at Swift concurrency, so here are the pieces you need, one at a time:
+
+- A **task** is a unit of work that can run at the same time as other tasks. Swift runs tasks on a small pool of threads, roughly one per core, so several tasks really do run simultaneously.
+- An **`async`** function is one that can **suspend**: pause, give its thread back for other work, and continue later. You call it with **`await`**, which marks the places where your code might pause.
+- A **task group** runs several **child tasks** and waits for all of them. `withTaskGroup(of:)` creates the group, `group.addTask { … }` starts a child, and `for await result in group` receives the children's results **in the order they finish**, not the order they were added.
+- In a single-file script like this course's `run` blocks, you can write `await` at the top level.
+
+Here's a sum of squares split across four child tasks:
+
+```swift run
+func sumOfSquares(_ numbers: ClosedRange<Int>) -> Int {
+    numbers.reduce(0) { $0 + $1 * $1 }
+}
+
+let total = await withTaskGroup(of: Int.self) { group in
+    for start in stride(from: 1, through: 1_000, by: 250) {
+        group.addTask {
+            sumOfSquares(start...(start + 249))
+        }
+    }
+    var sum = 0
+    for await part in group {
+        sum += part
+    }
+    return sum
+}
+print(total)
+print(sumOfSquares(1...1_000))
+```
+
+```output
+333833500
+333833500
+```
+
+What to notice:
+
+- `of: Int.self` says what each child returns. Each child sums one quarter of the range, 1 to 250, 251 to 500, and so on.
+- The four quarters can finish in any order, and the order changes from run to run. The output is still the same every time, because addition doesn't care about order. That's a theme of this module: concurrent code must produce answers that don't depend on timing.
+- **Nothing is shared.** Each child works on its own numbers and hands back a value. The only variable that changes, `sum`, belongs to the parent, which receives results one at a time. That's what makes this code safe.
+
+## What a data race is
+
+A **data race** happens when two threads access the same memory at the same time, at least one of them writes, and nothing coordinates them. The classic victim is `count += 1`. It looks like one step, but the processor does three: **load** the value, **add** one, **store** the result. Two tasks can interleave those steps:
+
+```text
+count is 41
+Task A: load 41
+Task B: load 41          (A hasn't stored yet, so B sees the old value)
+Task A: store 42
+Task B: store 42         (B overwrites A's work: one increment is lost)
+count is 42, but two increments ran, so it should be 43
+```
+
+That's a **lost update**, and it's the mildest outcome. An `Array` or `Dictionary` is far worse: if one task appends and triggers a resize while another reads, the reader can follow a pointer into memory that has already been freed. Swift treats a data race as **undefined behaviour**: the program no longer has any guaranteed meaning. It might give a slightly wrong number, crash, or appear to work.
+
+## Why running it tells you nothing
+
+Here's a racy counter: a hundred tasks each add 1 a thousand times to the same class instance.
+
+```swift
+final class Tally {
+    var total = 0
+}
+
+func countInParallel() async -> Int {
+    let tally = Tally()
+    await withTaskGroup(of: Void.self) { group in
+        for _ in 0..<100 {
+            group.addTask {
+                for _ in 0..<1_000 {
+                    tally.total += 1        // 100 tasks read and write the same Int: a data race
+                }
+            }
+        }
+    }
+    return tally.total                       // anything up to 100,000, and different each run
+}
+```
+
+This lesson doesn't run it, because its output isn't predictable. On one run it might print 100,000; on the next, 61,407. A different Mac, a release build or an extra `print` changes the timing and the result. A race can pass a thousand test runs and then fail on a user's phone. Don't trust "it worked when I ran it" for concurrent code.
+
+You can catch races in two reliable ways.
+
+**At compile time, with Swift 6 language mode.** Compiled in Swift 6 mode, that code is rejected:
+
+```text title="What Swift 6 language mode reports"
+error: passing closure as a 'sending' parameter risks causing data races between code in the
+current isolation context and concurrent execution of the closure
+note: closure captures 'tally' which is accessible to code in the current isolation context
+```
+
+In plain words: every child task captures the same mutable `tally`, so they could all touch it at once. The companion package and the `run` blocks use **Swift 5 language mode**, which compiles this code without a word. [Sendable](/dsa/learn/cc-sendable) explains the two modes and how to switch.
+
+**At run time, with Thread Sanitizer.** Build with `swift build --sanitize=thread` (or `swift test --sanitize=thread`), or tick **Thread Sanitizer** in the Diagnostics tab of your Xcode scheme. The program runs more slowly, but watches every memory access and reports races it actually sees, with both threads' stack traces:
+
+```text title="What Thread Sanitizer prints"
+WARNING: ThreadSanitizer: Swift access race (pid=51358)
+...
+WARNING: ThreadSanitizer: data race (pid=51358)
+```
+
+It only finds races on code paths your run executes, so it's a complement to the compiler, not a replacement.
+
+## The idea of a lock-free counter
+
+The processor itself offers a fix for single values: **atomic** instructions, which do a whole read-modify-write as one indivisible step. An atomic "add one" can't be interleaved, so no update is lost.
+
+For updates more complex than adding, there's **compare-and-swap**: "if the value is still `old`, replace it with `new`, and tell me whether that worked". You read the value, compute the new one, and try to swap it in. If another thread changed it in the meantime, the swap fails and you try again:
+
+```text
+repeat
+    old = load(counter)
+    new = old + 1                       (or any function of old)
+until compareAndSwap(counter, expected: old, desired: new) succeeds
+```
+
+This is called **lock-free**: no thread ever waits for another to finish; a thread that loses the race retries with the fresh value. You'll write it in Swift with `Atomic` in [Mutex and atomics in Swift 6](/dsa/learn/cc-mutex-atomics). Atomics protect one machine-sized value at a time, though. A dictionary needs something bigger.
+
+## Three safe shapes
+
+Every fix in this module takes one of three shapes:
+
+1. **Don't share.** Give each task its own data and have it return a result; the parent combines the results. The sum of squares above is this shape, and so are the parallel algorithms in [Parallel merge sort and BFS with TaskGroup](/dsa/learn/cc-parallel-algorithms). Prefer it whenever it fits.
+2. **Protect the state with an actor.** An actor lets only one task at a time run code that touches its state. Callers `await` their turn.
+3. **Protect it with a lock or an atomic.** A `Mutex` makes tasks take turns for a short, synchronous moment; an `Atomic` makes single-value updates indivisible.
+
+Here's the tally from before, with the counter moved into an actor. The `await` on `tally.add(1)` is where a task may wait for its turn:
+
+```swift run
+actor Tally {
+    private(set) var total = 0
+
+    func add(_ amount: Int) {
+        total += amount
+    }
+}
+
+let tally = Tally()
+await withTaskGroup(of: Void.self) { group in
+    for _ in 0..<100 {
+        group.addTask {
+            for _ in 0..<1_000 {
+                await tally.add(1)
+            }
+        }
+    }
+}
+print(await tally.total)
+```
+
+```output
+100000
+```
+
+It prints 100,000 on every run, on every machine. The next lesson is about actors in depth. Notice, though, that for **this** job shape 1 would be better still: each task could count its own thousand and return it, with no waiting at all. An actor is for state that genuinely has to be shared, such as a cache.
+
+<Callout kind="gotcha" title="Swift gotchas with data races">
+- **Swift 5 language mode won't warn you.** Both a class instance and a captured `var` mutated from several child tasks compile silently there. Swift 6 mode rejects them.
+- **Value types help, but only for copies.** An array captured by several tasks is a separate copy in each one (copy-on-write), so the tasks can't see each other's changes. That's safe, but it also means a task can't report results by modifying a captured array. Return values instead.
+- **A print statement can hide a race.** Printing slows a task down and changes the timing, so a race that shows up without the print can vanish with it.
+</Callout>
+
+## Practice
+
+**Word counts in parallel** asks you to count words across many documents, one child task per document, without sharing a dictionary between tasks: shape 1, with a merge at the end.
+
+```cards
+- id: race-definition
+  front: "What is a data race?"
+  back: "Two threads access the same memory at the same time, at least one of them writes, and nothing coordinates them. In Swift it's undefined behaviour."
+- id: race-lost-update
+  front: "Why can `count += 1` lose updates when two tasks run it at once?"
+  back: "It's three steps: load, add, store. Both tasks can load the same old value, and the second store overwrites the first."
+- id: race-detection
+  front: "How can you catch data races, given that running the code proves nothing?"
+  back: "At compile time with Swift 6 language mode, and at run time with Thread Sanitizer (`--sanitize=thread`, or the Xcode scheme's Diagnostics tab)."
+- id: race-three-shapes
+  front: "What are the three shapes of a fix for shared mutable state?"
+  back: "Don't share (each task returns a result and the parent combines them), protect the state with an actor, or protect it with a Mutex or an Atomic."
+```
+
+```quiz
+- id: q1
+  type: order
+  prompt: "Put this lost update in order. `count` starts at 7, and tasks A and B each run `count += 1`."
+  lines:
+    - "A loads 7"
+    - "B loads 7"
+    - "A stores 8"
+    - "B stores 8, and count ends at 8 instead of 9"
+  explain: "Both tasks read the old value before either wrote. The second store overwrites the first, so one increment vanishes."
+- id: q2
+  type: output
+  prompt: "Child tasks can finish in any order. What does this print?"
+  code: |
+    let words = ["actor", "task", "await", "group"]
+    let total = await withTaskGroup(of: Int.self) { group in
+        for word in words {
+            group.addTask { word.count }
+        }
+        var sum = 0
+        for await count in group {
+            sum += count
+        }
+        return sum
+    }
+    print(total)
+  answer: "19"
+  explain: "Each child returns the length of one word: 5, 4, 5 and 5. The results arrive in an unpredictable order, but the sum is 19 whatever the order. Nothing is shared between the children."
+- id: q3
+  type: truefalse
+  prompt: "If a concurrent program gives the right answer in 1,000 test runs, it has no data races."
+  answer: false
+  explain: "Races depend on timing. They can stay hidden on one machine or in one build mode and appear on another. Use Swift 6 language mode and Thread Sanitizer instead of trusting test runs."
+- id: q4
+  type: mcq
+  prompt: "Which change makes the racy `Tally` class example correct?"
+  options:
+    - "Mark `Tally` as `final`"
+    - "Make `total` a `let`"
+    - "Turn `Tally` into an actor and call `await tally.add(1)`"
+    - "Run the loop in a release build"
+  answer: 2
+  explain: "An actor lets one task at a time run its code, so each increment completes before the next starts. `final` changes nothing about concurrency, a `let` couldn't be incremented, and build mode only changes the timing."
+- id: q5
+  type: multi
+  prompt: "Which of these are data races? Choose all that apply."
+  options:
+    - "Two child tasks append to the same class instance's array at once"
+    - "Two child tasks each sort their own copy of an array"
+    - "One task writes a shared class's property while another reads it, with no lock or actor"
+    - "Each child task returns a dictionary, and the parent merges them in a `for await` loop"
+  answer: [0, 2]
+  explain: "A race needs shared memory, simultaneous access and at least one write. Separate copies share nothing, and the parent merging results one at a time is a single task doing the writing."
+- id: q6
+  type: recall
+  prompt: "In your own words, what does a compare-and-swap loop do, and why is it called lock-free?"
+  model: "It reads the current value, computes the new value, and asks the processor to store it only if the value is still the one it read. If another thread changed it in between, the swap fails and it tries again with the fresh value. No thread ever waits for another to release a lock; a thread that loses the race retries."
+```

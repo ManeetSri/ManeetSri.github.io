@@ -185,11 +185,14 @@ const MockPage = () => {
                             const values = Object.values(mock.scores ?? {});
                             const average = values.length ? values.reduce((sum, value) => sum + value, 0) / values.length : 0;
                             return (
-                                <li key={mock.at} className="flex flex-wrap items-center gap-3 px-4 py-3 text-sm">
-                                    <span className="font-mono text-xs text-muted">{formatDate(mock.at)}</span>
-                                    <Link to={`/dsa/practice/${mock.problemId}`} className="flex-1 hover:text-amber">{problemById[mock.problemId]?.title ?? mock.problemId}</Link>
-                                    <span className="font-mono text-xs text-muted">{formatDuration(mock.seconds)}</span>
-                                    <Chip tone={average >= 3 ? 'green' : average >= 2 ? 'amber' : 'red'}>{average.toFixed(1)} / 4</Chip>
+                                <li key={mock.at} className="px-4 py-3 text-sm">
+                                    <div className="flex flex-wrap items-center gap-3">
+                                        <span className="font-mono text-xs text-muted">{formatDate(mock.at)}</span>
+                                        <Link to={`/dsa/practice/${mock.problemId}`} className="flex-1 hover:text-amber">{problemById[mock.problemId]?.title ?? mock.problemId}</Link>
+                                        <span className="font-mono text-xs text-muted">{formatDuration(mock.seconds)}</span>
+                                        <Chip tone={average >= 3 ? 'green' : average >= 2 ? 'amber' : 'red'}>{average.toFixed(1)} / 4</Chip>
+                                    </div>
+                                    {mock.notes && <p className="mt-1.5 text-muted"><span className="font-medium text-paper">Practise next:</span> {mock.notes}</p>}
                                 </li>
                             );
                         })}

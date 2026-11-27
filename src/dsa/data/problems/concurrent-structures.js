@@ -1,0 +1,43 @@
+// Problems for the concurrent-structures module. Fields are described in ../problems.js.
+export default [
+    {
+        id: 'sharded-word-tally',
+        title: 'Word counts in parallel',
+        difficulty: 'medium',
+        patterns: ['hashing'],
+        lessons: ['cc-data-races'],
+        swiftTest: 'ShardedWordTallyTests',
+        lists: ['patterns150', 'swift'],
+        minutes: 25,
+    },
+    {
+        id: 'coalescing-memo-cache',
+        title: 'A coalescing memo cache',
+        difficulty: 'medium',
+        patterns: ['design', 'hashing'],
+        lessons: ['cc-actors', 'cc-sendable'],
+        swiftTest: 'CoalescingMemoCacheTests',
+        lists: ['patterns150', 'swift'],
+        minutes: 30,
+    },
+    {
+        id: 'taskgroup-merge-sort',
+        title: 'Parallel merge sort',
+        difficulty: 'medium',
+        patterns: ['sorting'],
+        lessons: ['cc-parallel-algorithms'],
+        swiftTest: 'TaskGroupMergeSortTests',
+        lists: ['patterns150', 'swift'],
+        minutes: 30,
+    },
+    {
+        id: 'frontier-parallel-bfs',
+        title: 'Parallel BFS, level by level',
+        difficulty: 'medium',
+        patterns: ['bfs'],
+        lessons: ['cc-parallel-algorithms'],
+        swiftTest: 'FrontierParallelBFSTests',
+        lists: ['patterns150', 'swift'],
+        minutes: 35,
+    },
+];

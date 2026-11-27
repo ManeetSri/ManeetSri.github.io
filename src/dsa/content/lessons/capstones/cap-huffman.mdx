@@ -1,0 +1,506 @@
+## Why it matters
+
+[Huffman coding](/dsa/learn/greedy-huffman) showed how merging the two rarest symbols gives the shortest prefix-free code. Turning that into a tool that compresses real files means solving everything the lesson could skip: packing bits into bytes, writing a header so the decoder can rebuild the tree, making the encoder and decoder break ties identically, and rejecting damaged files instead of crashing. In this project you build `huff`, a command-line tool with `compress`, `decompress` and `stats` commands, using Apple's **Swift Argument Parser**. Command-line tools are how iOS developers automate builds, asset pipelines and code generation, and a binary file format is good practice for the day you parse one inside an app.
+
+## What you'll build
+
+```bash
+swift run huff compress notes.txt              # writes notes.txt.huff
+swift run huff decompress notes.txt.huff -o copy.txt
+swift run huff stats notes.txt                 # frequencies, code lengths, expected size
+cmp notes.txt copy.txt && echo identical
+```
+
+- `HuffmanCore`, a library: frequencies, a deterministic tree, code tables, a bit writer and reader, and the file format.
+- `huff`, an executable built with Swift Argument Parser.
+- Tests that round-trip empty files, one-symbol files, all 256 byte values and a megabyte of seeded random data, and that check damaged files are rejected.
+
+Budget about two hours.
+
+## Before you start
+
+- The algorithm: [Huffman coding](/dsa/learn/greedy-huffman), [Build a generic Heap\<T\>](/dsa/learn/heap-build) and [The greedy choice property](/dsa/learn/greedy-idea).
+- Bits and bytes: [The bitwise operators and masking shifts](/dsa/learn/bits-operators), [Checking, setting, clearing and toggling bits](/dsa/learn/bits-single-bits) and [Array(s) and \[UInt8\] for fast access](/dsa/learn/swift-string-to-array).
+- Errors: [throws, try and Result](/dsa/learn/swift-errors).
+- Measuring: [Debug vs release builds](/dsa/learn/swift-release-builds) and [Benchmarking properly](/dsa/learn/fs-benchmarking).
+- Optionally, your own DSAKit from [Publish DSAKit, your own tested package](/dsa/learn/cap-dsakit), for its `Heap`.
+
+## The architecture
+
+```text
+ compress:    bytes ─▶ count 256 frequencies ─▶ build tree ─▶ code table ─▶ BitWriter ─▶ header + payload
+ decompress:  file ─▶ check magic ─▶ read header ─▶ build the SAME tree ─▶ walk bits ─▶ bytes
+```
+
+The file format, every integer big-endian:
+
+```text
+ offset  size      field
+ 0       4         magic "HUF1": identifies the format and its version
+ 4       4         original length in bytes (UInt32)
+ 8       2         number of distinct byte values, s (UInt16, since 256 doesn't fit in a byte)
+ 10      5 × s     for each byte value: the byte (1), then its count (UInt32)
+ 10 + 5s ...       the payload: codes packed most significant bit first, last byte zero-padded
+```
+
+- **Bytes, not Characters.** The tool compresses any file, so it works on `[UInt8]`. A text's characters are byte patterns like any other here.
+- **The header stores frequencies, and the decoder rebuilds the tree from them.** That only works if both sides build the identical tree, so the tie-breaking rule is part of the file format: change it, and old files decode to garbage.
+- **The length tells the decoder when to stop**, so padding bits in the last byte are never mistaken for symbols, and a file with one distinct byte needs no payload at all.
+
+```text title="Huff/"
+Package.swift
+Sources/
+  HuffmanCore/
+    HuffmanTree.swift       deterministic construction, code table
+    Bits.swift              BitWriter, BitReader
+    Huffman.swift           compress(_:), decompress(_:), the header
+  huff/
+    Huff.swift              the @main command and its subcommands
+Tests/HuffmanCoreTests/
+```
+
+## Milestones
+
+### 1. A deterministic tree
+
+Count the 256 byte values, then build the tree. A heap works, as in [Huffman coding](/dsa/learn/greedy-huffman). So does a neat alternative used in the key code: sort the leaves once, then merge with **two queues**, one of leaves and one of new inner nodes. Inner nodes are created in increasing order of weight, so their queue stays sorted for free, and the two lightest trees are always at the fronts of the two queues: O(s log s) for the sort, then O(s).
+
+- **Acceptance:** "abracadabra" encodes in 23 bits; the code lengths satisfy the Kraft equality (the sum of 2^−length over all symbols is exactly 1 when there are at least two symbols); the same input always gives the same codes.
+- **Exercises:** the greedy algorithm, and determinism as a requirement.
+
+### 2. Bit packing
+
+A `BitWriter` collects bits into a byte, most significant first, and appends it when 8 have arrived; `finish()` pads the last byte with zeros. A reader extracts bit `i` as `bytes[i / 8] >> (7 - i % 8) & 1`.
+
+- **Acceptance:** writing then reading every bit sequence of length 0 to 20 (over a million sequences) gives back the same bits.
+- **Exercises:** shifts and masks.
+
+### 3. The file format
+
+Write the header, then the payload. The decoder checks the magic, reads the header, checks that the counts add up to the length, rebuilds the tree, and walks it bit by bit until it has produced `length` bytes.
+
+- **Acceptance:** round trips for empty input, one repeated byte, all 256 byte values, and 1 MB of seeded random bytes; every truncated version of a file is rejected with an error, never a crash.
+- **Exercises:** serialisation, and treating input files as untrusted.
+
+### 4. The command-line tool
+
+Add Swift Argument Parser and write `compress`, `decompress` and `stats` subcommands with `--output` options and helpful `--help` text. Errors print a message and exit with a failure status.
+
+- **Acceptance:** `huff compress` followed by `huff decompress` reproduces files exactly (check with `cmp`); `huff decompress` on a non-Huffman file prints a clear error.
+- **Exercises:** keeping the core separate from its interface. The same `HuffmanCore` could sit behind a macOS app's "Compress" button.
+
+### 5. Measure it
+
+Build with `swift build -c release`, then compress a text file, a Swift source file, a PNG and a ZIP. Compare the sizes with `gzip`, and time large files to get megabytes per second.
+
+- **Acceptance:** a table of results, with a one-line explanation per row: why text shrinks by around 40%, why the PNG barely changes, why tiny files grow.
+- **Exercises:** the limits of a method. Huffman uses whole bits per byte and ignores repetition, which is exactly what gzip's LZ77 stage exploits.
+
+## Key code: build, pack, write, read
+
+The whole core in one file: the two-queue tree, the code table, the bit writer, big-endian integers, and the header. The decoder runs the same tree construction on the frequencies it reads.
+
+```swift run
+/// A Huffman tree in arrays. Leaves have a symbol; inner nodes have two children.
+struct HuffmanTree {
+    var weight: [Int] = []
+    var symbol: [UInt8?] = []
+    var left: [Int] = []
+    var right: [Int] = []
+    var root = -1
+
+    /// The decoder runs this too, on the frequencies in the header, so every tie must break the
+    /// same way: leaves in (count, byte) order, and a leaf before an inner node of equal weight.
+    init(frequencies: [(byte: UInt8, count: Int)]) {
+        let sorted = frequencies.sorted { ($0.count, $0.byte) < ($1.count, $1.byte) }
+        for (byte, count) in sorted {
+            weight.append(count); symbol.append(byte); left.append(-1); right.append(-1)
+        }
+        // Two queues: the sorted leaves, and inner nodes, which are made in order of weight anyway
+        var nextLeaf = 0
+        var inner: [Int] = []
+        var nextInner = 0
+        func takeLightest() -> Int {
+            if nextLeaf < sorted.count && (nextInner == inner.count || weight[nextLeaf] <= weight[inner[nextInner]]) {
+                nextLeaf += 1
+                return nextLeaf - 1
+            }
+            nextInner += 1
+            return inner[nextInner - 1]
+        }
+        for _ in 0..<max(sorted.count - 1, 0) {
+            let a = takeLightest(), b = takeLightest()
+            weight.append(weight[a] + weight[b]); symbol.append(nil); left.append(a); right.append(b)
+            inner.append(weight.count - 1)
+        }
+        root = weight.count - 1
+    }
+
+    /// The code for each byte value: left adds a 0, right a 1. A lone symbol gets an empty code.
+    func codes() -> [[UInt8]?] {
+        var table = [[UInt8]?](repeating: nil, count: 256)
+        guard root >= 0 else { return table }
+        var stack: [(node: Int, code: [UInt8])] = [(root, [])]
+        while let (node, code) = stack.popLast() {
+            if let byte = symbol[node] {
+                table[Int(byte)] = code
+            } else {
+                stack.append((right[node], code + [1]))
+                stack.append((left[node], code + [0]))
+            }
+        }
+        return table
+    }
+}
+
+/// Packs bits into bytes, first bit in the highest position
+struct BitWriter {
+    private(set) var bytes: [UInt8] = []
+    private var current: UInt8 = 0
+    private var used = 0
+
+    mutating func write(_ bit: UInt8) {
+        current = current << 1 | bit
+        used += 1
+        if used == 8 {
+            bytes.append(current)
+            (current, used) = (0, 0)
+        }
+    }
+
+    mutating func finish() -> [UInt8] {
+        if used > 0 {
+            bytes.append(current << (8 - used))               // pad the last byte with zeros
+            (current, used) = (0, 0)
+        }
+        return bytes
+    }
+}
+
+func appendBigEndian<T: FixedWidthInteger>(_ value: T, to bytes: inout [UInt8]) {
+    for shift in stride(from: T.bitWidth - 8, through: 0, by: -8) {
+        bytes.append(UInt8(truncatingIfNeeded: value >> shift))
+    }
+}
+
+func readBigEndian<T: FixedWidthInteger>(_ type: T.Type, _ bytes: [UInt8], at offset: inout Int) -> T {
+    var value: T = 0
+    for _ in 0..<(T.bitWidth / 8) {
+        value = value << 8 | T(bytes[offset])
+        offset += 1
+    }
+    return value
+}
+
+func frequencies(of input: [UInt8]) -> [(byte: UInt8, count: Int)] {
+    var counts = [Int](repeating: 0, count: 256)
+    for byte in input { counts[Int(byte)] += 1 }
+    return (0..<256).filter { counts[$0] > 0 }.map { (byte: UInt8($0), count: counts[$0]) }
+}
+
+/// File layout: "HUF1", length (UInt32), symbol count (UInt16), (byte, count as UInt32) per symbol, bits
+func compress(_ input: [UInt8]) -> [UInt8] {
+    let frequencies = frequencies(of: input)
+
+    var output = Array("HUF1".utf8)
+    appendBigEndian(UInt32(input.count), to: &output)
+    appendBigEndian(UInt16(frequencies.count), to: &output)
+    for (byte, count) in frequencies {
+        output.append(byte)
+        appendBigEndian(UInt32(count), to: &output)
+    }
+    let table = HuffmanTree(frequencies: frequencies).codes()
+    var writer = BitWriter()
+    for byte in input {
+        for bit in table[Int(byte)]! { writer.write(bit) }
+    }
+    return output + writer.finish()
+}
+
+func decompress(_ file: [UInt8]) -> [UInt8]? {
+    guard file.count >= 10, Array(file[0..<4]) == Array("HUF1".utf8) else { return nil }
+    var offset = 4
+    let length = Int(readBigEndian(UInt32.self, file, at: &offset))
+    let symbolCount = Int(readBigEndian(UInt16.self, file, at: &offset))
+    guard file.count >= offset + 5 * symbolCount else { return nil }
+    var frequencies: [(byte: UInt8, count: Int)] = []
+    for _ in 0..<symbolCount {
+        let byte = file[offset]
+        offset += 1
+        frequencies.append((byte, Int(readBigEndian(UInt32.self, file, at: &offset))))
+    }
+    guard frequencies.reduce(0, { $0 + $1.count }) == length else { return nil }   // a damaged header
+    let tree = HuffmanTree(frequencies: frequencies)          // the same tree the encoder built
+    var output: [UInt8] = []
+    output.reserveCapacity(length)
+    if let only = tree.root >= 0 ? tree.symbol[tree.root] : nil {
+        return [UInt8](repeating: only, count: length)        // one symbol: the length says it all
+    }
+    var node = tree.root
+    var bitIndex = offset * 8
+    while output.count < length {
+        guard bitIndex / 8 < file.count else { return nil }   // truncated file
+        let bit = file[bitIndex / 8] >> (7 - bitIndex % 8) & 1
+        bitIndex += 1
+        node = bit == 0 ? tree.left[node] : tree.right[node]
+        if let byte = tree.symbol[node] {
+            output.append(byte)
+            node = tree.root
+        }
+    }
+    return output
+}
+
+func binary(_ byte: UInt8) -> String {
+    let digits = String(byte, radix: 2)
+    return String(repeating: "0", count: 8 - digits.count) + digits
+}
+
+let word = Array("abracadabra".utf8)
+let codes = HuffmanTree(frequencies: frequencies(of: word)).codes()
+print(frequencies(of: word).map { "\(Character(UnicodeScalar($0.byte)))=\(codes[Int($0.byte)]!.map(String.init).joined())" }.joined(separator: " "))
+let packed = compress(word)
+let header = 10 + 5 * frequencies(of: word).count
+print("\(word.count) bytes -> \(packed.count): header \(header), payload", packed[header...].map(binary).joined(separator: " "))
+print("round trip:", decompress(packed) == word, "| truncated file:", decompress(Array(packed.dropLast())) == nil ? "rejected" : "accepted")
+
+let text = Array(String(repeating: "she sells sea shells by the sea shore. ", count: 20).utf8)
+let file = compress(text)
+print("\(text.count) bytes -> \(file.count) bytes (\(file.count * 100 / text.count)%), round trip:", decompress(file) == text)
+
+for sample in ["", "aaaaaaaa", "ab"] {
+    let bytes = Array(sample.utf8)
+    let file = compress(bytes)
+    print("\"\(sample)\": \(file.count) bytes, round trip:", decompress(file) == bytes)
+}
+```
+
+```output
+a=0 b=110 c=100 d=101 r=111
+11 bytes -> 38: header 35, payload 01101110 10001010 11011100
+round trip: true | truncated file: rejected
+780 bytes -> 378 bytes (48%), round trip: true
+"": 10 bytes, round trip: true
+"aaaaaaaa": 15 bytes, round trip: true
+"ab": 21 bytes, round trip: true
+```
+
+What to notice:
+
+- **The codes match the greedy lesson's heap version**: `a=0`, `b=110`, `c=100`, `d=101`, `r=111`, and the same 23 payload bits. The two-queue method made the same choices because both prefer, among equal weights, the tree that was waiting longest.
+- **Compression has overhead.** "abracadabra" grew from 11 bytes to 38: the 35-byte header dwarfs the 3-byte payload. The 780-byte text shrank to 48% of its size. Real formats store less in the header, which is what canonical codes (a stretch goal) are for.
+- **The edge cases are boring, on purpose.** An empty file is a 10-byte header. A file of one repeated byte has a tree that's a single leaf with an empty code, so the payload is empty and the length says everything. Code that crashes on these is the most common Huffman bug.
+- **Damage is detected, not trusted.** The truncated file was rejected because the payload ran out before `length` bytes were produced. The decoder also checks the magic and that the counts add up to the length, so it never builds a tree from nonsense.
+
+## The command-line layer
+
+In the package, the key code's free functions become static methods of a caseless `public enum Huffman`, so the tool calls `Huffman.compress(_:)` and `Huffman.decompress(_:)`.
+
+```swift title="Package.swift"
+// swift-tools-version: 6.0
+import PackageDescription
+
+let package = Package(
+    name: "Huff",
+    platforms: [.macOS(.v14)],
+    dependencies: [
+        .package(url: "https://github.com/apple/swift-argument-parser", from: "1.5.0"),
+    ],
+    targets: [
+        .target(name: "HuffmanCore"),
+        .executableTarget(name: "huff", dependencies: [
+            "HuffmanCore",
+            .product(name: "ArgumentParser", package: "swift-argument-parser"),
+        ]),
+        .testTarget(name: "HuffmanCoreTests", dependencies: ["HuffmanCore"]),
+    ]
+)
+```
+
+```swift title="Sources/huff/Huff.swift"
+import ArgumentParser
+import Foundation
+import HuffmanCore
+
+@main
+struct Huff: ParsableCommand {
+    static let configuration = CommandConfiguration(
+        abstract: "Compress and decompress files with Huffman coding.",
+        subcommands: [Compress.self, Decompress.self, Stats.self]
+    )
+}
+
+struct HuffError: Error, CustomStringConvertible {
+    let description: String
+}
+
+struct Compress: ParsableCommand {
+    static let configuration = CommandConfiguration(abstract: "Compress a file.")
+
+    @Argument(help: "The file to compress.")
+    var input: String
+
+    @Option(name: .shortAndLong, help: "Where to write the result (default: <input>.huff).")
+    var output: String?
+
+    func run() throws {
+        let bytes = [UInt8](try Data(contentsOf: URL(fileURLWithPath: input)))
+        let packed = Huffman.compress(bytes)
+        try Data(packed).write(to: URL(fileURLWithPath: output ?? input + ".huff"))
+        print("\(bytes.count) -> \(packed.count) bytes")
+    }
+}
+
+struct Decompress: ParsableCommand {
+    static let configuration = CommandConfiguration(abstract: "Restore a .huff file.")
+
+    @Argument(help: "The .huff file to decompress.")
+    var input: String
+
+    @Option(name: .shortAndLong, help: "Where to write the result.")
+    var output: String
+
+    func run() throws {
+        let file = [UInt8](try Data(contentsOf: URL(fileURLWithPath: input)))
+        guard let bytes = Huffman.decompress(file) else {
+            throw HuffError(description: "\(input) isn't a valid .huff file, or it's damaged.")
+        }
+        try Data(bytes).write(to: URL(fileURLWithPath: output))
+    }
+}
+```
+
+`Stats` follows the same shape: read the file, print each byte value's count and code length, and the payload size the codes predict. Three details:
+
+- **The file can't be called `main.swift`.** A file with that name runs its top-level code as the program, and `@main` would then be a second entry point. Name it after the command.
+- **Property wrappers declare the interface.** `@Argument` is positional, `@Option` takes a value (`-o copy.txt` or `--output copy.txt`), and `@Flag` is a Boolean switch. The library generates `--help` from them, and reports a missing argument before `run()` is called.
+- **Thrown errors become clean exits.** An error thrown from `run()` is printed as "Error: …" and the process exits with a non-zero status, which scripts and CI can check.
+
+## Tests to write
+
+```swift title="Tests/HuffmanCoreTests/HuffmanTests.swift"
+import Testing
+@testable import HuffmanCore
+
+@Suite struct HuffmanTests {
+    @Test("Round trips", arguments: ["", "a", "aaaaaaaa", "ab", "abracadabra", String(repeating: "xyz ", count: 500)])
+    func roundTrip(text: String) {
+        let bytes = Array(text.utf8)
+        #expect(Huffman.decompress(Huffman.compress(bytes)) == bytes)
+    }
+
+    @Test("Every byte value, and seeded random data")
+    func binaryData() {
+        var random = SeededGenerator(seed: 6)
+        let everyByte = (0...255).map { UInt8($0) }
+        let noise = (0..<1_000_000).map { _ in UInt8.random(in: 0...255, using: &random) }
+        for bytes in [everyByte, Array(everyByte.reversed()), noise] {
+            #expect(Huffman.decompress(Huffman.compress(bytes)) == bytes)
+        }
+    }
+
+    @Test("Every truncated file is rejected")
+    func truncation() {
+        let file = Huffman.compress(Array("she sells sea shells".utf8))
+        for length in 0..<file.count {
+            #expect(Huffman.decompress(Array(file.prefix(length))) == nil)
+        }
+    }
+
+    @Test("Code lengths satisfy the Kraft equality")
+    func kraft() {
+        let tree = HuffmanTree(frequencies: Huffman.frequencies(of: Array("abracadabra alakazam".utf8)))
+        let lengths = tree.codes().compactMap { $0?.count }
+        #expect(lengths.reduce(0.0) { $0 + 1 / Double(1 << $1) } == 1.0)
+    }
+}
+```
+
+The Kraft check is a sharp test of the tree: in a full binary tree, where every inner node has two children, the leaves' 2^−depth always add up to exactly 1. A tree with a missing child, or codes taken from the wrong nodes, fails it. Add a **fuzz test** too: feed the decoder a few thousand seeded random byte arrays, some starting with "HUF1", and check it never crashes.
+
+## Stretch goals
+
+- **Canonical codes.** Store only each symbol's code length, then assign codes in order of (length, byte value): the decoder can rebuild them from the lengths alone. The header shrinks to at most 256 bytes, the tie-breaking rule stops being part of the format, and you can drop the frequency counts. DEFLATE, inside ZIP and PNG, does exactly this.
+- **Table-driven decoding.** Decoding bit by bit is slow. With canonical codes, look up the next 8 or 12 bits in a table that gives the symbol and its length in one step, and measure the speed-up.
+- **Streaming.** Process files larger than memory: count frequencies in a first pass over chunks, then encode chunk by chunk with a `FileHandle`.
+- **Length limits.** Pathological frequencies (like the Fibonacci numbers) make codes very long. Cap code lengths at 15 bits, as DEFLATE does, and measure how little the compression suffers.
+
+## Done when
+
+- `huff compress` and `huff decompress` round-trip any file exactly, checked with `cmp`.
+- Empty files, one-symbol files and all 256 byte values work, and truncated or foreign files give a clear error.
+- The tree construction is deterministic, and you can explain why the format depends on it.
+- You've measured text, source code and already-compressed files, and can explain each result.
+
+```cards
+- id: cap-huff-same-tree
+  front: "Why must a Huffman decoder break ties exactly as the encoder does?"
+  back: "The file stores frequencies, and the decoder rebuilds the tree from them. Any difference in tie-breaking gives a different tree, so the bits decode to garbage."
+- id: cap-huff-length
+  front: "What does storing the original length in the header buy you?"
+  back: "The decoder knows when to stop, so padding bits in the last byte are never decoded, and a one-symbol file needs no payload at all."
+- id: cap-huff-two-queues
+  front: "How can Huffman's tree be built without a heap?"
+  back: "Sort the leaves, then merge from two queues: leaves, and inner nodes in the order they're made. Inner nodes are created in increasing weight, so the two lightest trees are always at the queue fronts."
+- id: cap-huff-bit-read
+  front: "How do you read bit i of a byte array packed most significant bit first?"
+  back: "`bytes[i / 8] >> (7 - i % 8) & 1`: the byte holding it, shifted so the bit lands in the lowest position."
+```
+
+```quiz
+- id: q1
+  type: output
+  prompt: "This packs the bits 1, 0, 1, 1 into a byte, most significant first, then pads. What does it print?"
+  code: |
+    var current: UInt8 = 0
+    var used = 0
+    for bit: UInt8 in [1, 0, 1, 1] {
+        current = current << 1 | bit
+        used += 1
+    }
+    current <<= UInt8(8 - used)
+    print(current, String(current, radix: 2))
+  answer: "176 10110000"
+  explain: "After four bits, current is 0b1011 (11). Shifting left by the 4 unused positions puts them at the top: 0b10110000, which is 128 + 32 + 16 = 176."
+- id: q2
+  type: mcq
+  prompt: "The header stores the original length. Without it, what would go wrong when decoding?"
+  options:
+    - "Nothing: the padding is always zeros, which decode to nothing"
+    - "The decoder couldn't tell padding bits from real codes, so it could output extra symbols at the end"
+    - "The tree couldn't be rebuilt"
+    - "The magic number check would fail"
+  answer: 1
+  explain: "Zero bits are valid code bits: in the abracadabra tree, a single 0 is the code for a. Up to 7 padding zeros could decode as extra a's. The length tells the decoder exactly when to stop."
+- id: q3
+  type: truefalse
+  prompt: "Compressing an already compressed file, such as a PNG, with Huffman coding usually shrinks it a lot more."
+  answer: false
+  explain: "Compressed data looks close to random: every byte value is about equally common, so Huffman gives each about 8 bits, and the header makes the file slightly bigger."
+- id: q4
+  type: blank
+  prompt: "Complete the big-endian writer, which appends the most significant byte first."
+  code: |
+    func appendBigEndian<T: FixedWidthInteger>(_ value: T, to bytes: inout [UInt8]) {
+        for shift in stride(from: T.bitWidth - 8, through: 0, by: ___) {
+            bytes.append(UInt8(truncatingIfNeeded: value ___ shift))
+        }
+    }
+  answers: ["-8", ">>"]
+  explain: "Shifts go 24, 16, 8, 0 for a UInt32, stepping by -8. Shifting right brings each byte down to the lowest 8 bits, and truncatingIfNeeded keeps only those."
+- id: q5
+  type: multi
+  prompt: "Which checks should the decoder make before trusting a file? Choose all that apply."
+  options:
+    - "The first four bytes are the magic \"HUF1\""
+    - "The file is long enough for the header it claims"
+    - "The symbol counts add up to the stored length"
+    - "The file name ends in .huff"
+    - "The payload doesn't run out before length bytes are produced"
+  answer: [0, 1, 2, 4]
+  explain: "Each of those protects against reading past the end or building a tree from nonsense. The file name says nothing about the contents."
+- id: q6
+  type: recall
+  prompt: "Explain why the two-queue construction always finds the two lightest trees at the fronts of the queues."
+  model: "The leaf queue is sorted at the start. Every new inner node weighs the sum of the two lightest trees available, and those sums never decrease from one merge to the next, so inner nodes join their queue in increasing order of weight. With both queues sorted, the lightest tree is at one of the two fronts, and so is the second lightest after it's removed."
+```

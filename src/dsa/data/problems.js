@@ -70,6 +70,13 @@ import advancedStructures from './problems/advanced-structures.js';
 import geometry from './problems/geometry.js';
 import numberTheory from './problems/number-theory.js';
 import randomised from './problems/randomised.js';
+import fastSwift from './problems/fast-swift.js';
+import swiftLibrary from './problems/swift-library.js';
+import concurrentStructures from './problems/concurrent-structures.js';
+import interviewPlaybook from './problems/interview-playbook.js';
+import designStructures from './problems/design-structures.js';
+import mockPractice from './problems/mock-practice.js';
+import capstones from './problems/capstones.js';
 
 export const DIFFICULTIES = {
     warmup: { label: 'Warm-up', xp: 15 },
@@ -191,6 +198,13 @@ export const problems = [
     ...geometry,
     ...numberTheory,
     ...randomised,
+    ...fastSwift,
+    ...swiftLibrary,
+    ...concurrentStructures,
+    ...interviewPlaybook,
+    ...designStructures,
+    ...mockPractice,
+    ...capstones,
 ];
 
 export const problemById = Object.fromEntries(problems.map((problem) => [problem.id, problem]));

@@ -1,0 +1,33 @@
+// Problems for the swift-library module. Fields are described in ../problems.js.
+export default [
+    {
+        id: 'stable-partition-helper',
+        title: 'Stable partition',
+        difficulty: 'medium',
+        patterns: ['sorting', 'basics'],
+        lessons: ['lib-stdlib-algorithms', 'lib-swift-algorithms'],
+        swiftTest: 'StablePartitionHelperTests',
+        lists: ['patterns150', 'swift'],
+        minutes: 25,
+    },
+    {
+        id: 'windows-chunks-pairs',
+        title: 'Windows, chunks and adjacent pairs',
+        difficulty: 'medium',
+        patterns: ['basics'],
+        lessons: ['lib-swift-algorithms'],
+        swiftTest: 'SliceWindowHelpersTests',
+        lists: ['patterns150', 'swift'],
+        minutes: 30,
+    },
+    {
+        id: 'cp-range-sum-template',
+        title: 'Range sums through the template',
+        difficulty: 'medium',
+        patterns: ['design', 'prefix-sum'],
+        lessons: ['lib-cp-template'],
+        swiftTest: 'TemplateQueryRunnerTests',
+        lists: ['patterns150', 'swift'],
+        minutes: 30,
+    },
+];

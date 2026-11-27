@@ -1,0 +1,489 @@
+## Why it matters
+
+Copy-on-write makes copying an array cheap, until a write finds its storage shared. Then that one write copies every element first. Put such a write inside a loop and an O(n) algorithm quietly becomes O(n²), with nothing in the code that looks like a copy. This happens constantly in real apps: building adjacency lists in a dictionary, updating structs inside an array, a property observer on a view model's array. This lesson catalogues the patterns that cause hidden copies and the one-line fixes for each, and it proves every claim by **counting** copies rather than timing them.
+
+You know the mechanism from [Copy-on-write explained](/dsa/learn/swift-copy-on-write-intro) and [Writing your own copy-on-write](/dsa/learn/swift-implementing-cow), and you've seen it as Trap 4 in [Swift's hidden costs](/dsa/learn/bigo-swift-hidden-costs). Here the question is practical: which everyday lines make a second reference, so that the next write has to copy?
+
+## A copy counter you can trust
+
+Timing a copy is noisy and depends on the build. Counting is exact. `Tracked` below is a tiny copy-on-write value built with the recipe from M11, plus one line that counts every time it has to copy its buffer:
+
+```swift run
+var copies = 0
+
+final class Buffer {
+    var items: [Int]
+    init(_ items: [Int]) { self.items = items }
+}
+
+// A copy-on-write value that counts every time it has to copy its buffer
+struct Tracked {
+    private var buffer = Buffer([0, 0, 0, 0])
+
+    subscript(index: Int) -> Int {
+        get { buffer.items[index] }
+        set {
+            if !isKnownUniquelyReferenced(&buffer) {
+                copies += 1
+                buffer = Buffer(buffer.items)
+            }
+            buffer.items[index] = newValue
+        }
+    }
+}
+
+var a = Tracked()
+a[0] = 1
+var b = a
+b[1] = 2
+b[2] = 3
+print("copies:", copies)
+print(a[1], b[1])
+```
+
+```output
+copies: 1
+0 2
+```
+
+One copy, on `b`'s first write, exactly as M11 described. `Array`, `Dictionary`, `Set` and `String` make the same uniqueness check before every write, so **any line that makes a `Tracked` copy makes an array copy too**. Each example below declares `Tracked` again so that it runs on its own; only the code after it is new. Every count shown is the same in debug and release builds.
+
+## Trap 1: taking an element out to change it
+
+You have an array of values that each own a buffer: rows of a grid, players with score lists, nodes with neighbour arrays. The natural-looking way to change one is to take it out, change it and put it back:
+
+```swift run
+var copies = 0
+
+final class Buffer {
+    var items: [Int]
+    init(_ items: [Int]) { self.items = items }
+}
+
+struct Tracked {
+    private var buffer = Buffer([0, 0, 0, 0])
+
+    subscript(index: Int) -> Int {
+        get { buffer.items[index] }
+        set {
+            if !isKnownUniquelyReferenced(&buffer) {
+                copies += 1
+                buffer = Buffer(buffer.items)
+            }
+            buffer.items[index] = newValue
+        }
+    }
+}
+
+var rows = (0..<3).map { _ in Tracked() }       // three rows, three separate buffers
+
+copies = 0
+for r in 0..<3 {
+    var row = rows[r]        // a second reference to the row's buffer
+    row[0] = 1               // shared, so this copies the whole row
+    rows[r] = row
+}
+print("take out, change, put back:", copies)
+
+copies = 0
+for r in 0..<3 {
+    rows[r][1] = 1           // changes the row where it lives
+}
+print("change in place:", copies)
+```
+
+```output
+take out, change, put back: 3
+change in place: 0
+```
+
+`var row = rows[r]` gives the row's buffer a second owner, the local variable, so the write copies it. `rows[r][1] = 1` is different: an array's subscript can hand out its element **in place** for the length of a change, so the row's buffer still has one owner when the write happens. You'll see how that works, and how to give your own types the same ability, in the next lesson.
+
+The same trap with real types:
+
+```swift
+// Copies player.scores on every call: O(number of scores)
+var player = players[i]
+player.scores.append(points)
+players[i] = player
+
+// In place: O(1) amortised
+players[i].scores.append(points)
+```
+
+If you genuinely need several lines of work on one element, put them in a `mutating` method on the element's type and call `players[i].recordWin(points)`, or pass `&players[i]` to a function with an `inout` parameter. Both work on the element where it lives.
+
+## Trap 2: dictionaries of arrays
+
+This one hides in graph code. Building an adjacency list in a dictionary, the read-change-write version copies the whole neighbour list for every edge:
+
+```swift
+// O(degree) per edge: every append copies the list first
+var neighbours = graph[from] ?? []
+neighbours.append(to)
+graph[from] = neighbours
+
+// O(1) amortised per edge
+graph[from, default: []].append(to)
+```
+
+A node with 10,000 edges costs about 50 million element copies the slow way. Counting it with `Tracked`:
+
+```swift run
+var copies = 0
+
+final class Buffer {
+    var items: [Int]
+    init(_ items: [Int]) { self.items = items }
+}
+
+struct Tracked {
+    private var buffer = Buffer([0, 0, 0, 0])
+
+    subscript(index: Int) -> Int {
+        get { buffer.items[index] }
+        set {
+            if !isKnownUniquelyReferenced(&buffer) {
+                copies += 1
+                buffer = Buffer(buffer.items)
+            }
+            buffer.items[index] = newValue
+        }
+    }
+}
+
+var groups: [String: Tracked] = ["a": Tracked()]
+
+copies = 0
+for i in 0..<4 {
+    var group = groups["a"] ?? Tracked()
+    group[i] = 1
+    groups["a"] = group
+}
+print("read, change, write back:", copies)
+
+copies = 0
+for i in 0..<4 {
+    groups["a", default: Tracked()][i] = 2
+}
+print("default subscript:", copies)
+
+copies = 0
+for i in 0..<4 {
+    groups["a"]?[i] = 3
+}
+print("optional chaining:", copies)
+
+copies = 0
+var taken = groups.removeValue(forKey: "a") ?? Tracked()
+taken[0] = 4
+groups["a"] = taken
+print("remove, change, put back:", copies)
+```
+
+```output
+read, change, write back: 4
+default subscript: 0
+optional chaining: 0
+remove, change, put back: 0
+```
+
+The `default:` subscript and optional chaining (`groups["a"]?[i] = 3`) both change the value inside the dictionary's own storage. The last pattern is worth remembering for longer edits: `removeValue(forKey:)` hands you the value and drops the dictionary's reference, so your local variable is the only owner and changes it freely before you put it back.
+
+For graphs whose nodes are numbered `0..<n`, an `[[Int]]` with `graph[from].append(to)` avoids hashing as well, as in [Adjacency matrix, list and edge list](/dsa/learn/graph-representations).
+
+## Trap 3: a local copy of a property
+
+Inside a method, copying a property into a local variable to work on it is the same trap with different clothes:
+
+```swift run
+var copies = 0
+
+final class Buffer {
+    var items: [Int]
+    init(_ items: [Int]) { self.items = items }
+}
+
+struct Tracked {
+    private var buffer = Buffer([0, 0, 0, 0])
+
+    subscript(index: Int) -> Int {
+        get { buffer.items[index] }
+        set {
+            if !isKnownUniquelyReferenced(&buffer) {
+                copies += 1
+                buffer = Buffer(buffer.items)
+            }
+            buffer.items[index] = newValue
+        }
+    }
+}
+
+final class Board {
+    var cells = Tracked()
+
+    func markSlowly(_ index: Int) {
+        var cells = self.cells      // a second reference
+        cells[index] = 1            // copies the whole buffer
+        self.cells = cells
+    }
+
+    func mark(_ index: Int) {
+        cells[index] = 1            // changes the stored property in place
+    }
+}
+
+let board = Board()
+copies = 0
+for i in 0..<4 {
+    board.markSlowly(i)
+}
+print("local copy, then write back:", copies)
+
+copies = 0
+for i in 0..<4 {
+    board.mark(i)
+}
+print("write to the property:", copies)
+```
+
+```output
+local copy, then write back: 4
+write to the property: 0
+```
+
+People write `var cells = self.cells` to shorten names, or to "work on a copy and commit at the end". The first reason isn't worth an O(n) copy per call. For the second, a real snapshot, the copy is the point and you should pay for it knowingly.
+
+A related case: a `for` loop holds on to the collection it's iterating. `for item in items { items.append(item) }` copies `items` once on the first append, because the loop still reads the original. Once is usually fine; inside another loop it isn't.
+
+## Trap 4: closures that keep a value alive
+
+A closure that captures a variable shares the **variable** itself ([Capturing values](/dsa/learn/swift-capturing)), so it doesn't add an owner to the buffer. A capture list, or a captured `let` constant, stores the **value**, and that does:
+
+```swift run
+var copies = 0
+
+final class Buffer {
+    var items: [Int]
+    init(_ items: [Int]) { self.items = items }
+}
+
+struct Tracked {
+    private var buffer = Buffer([0, 0, 0, 0])
+
+    subscript(index: Int) -> Int {
+        get { buffer.items[index] }
+        set {
+            if !isKnownUniquelyReferenced(&buffer) {
+                copies += 1
+                buffer = Buffer(buffer.items)
+            }
+            buffer.items[index] = newValue
+        }
+    }
+}
+
+var history = Tracked()
+let readLatest = { history[0] }               // captures the variable
+copies = 0
+history[0] = 1
+print("after a plain capture:", copies, readLatest())
+
+let frozen = { [history] in history[0] }      // captures the value right now
+copies = 0
+history[0] = 2
+history[1] = 2
+print("after a capture list:", copies, frozen(), readLatest())
+```
+
+```output
+after a plain capture: 0 1
+after a capture list: 1 1 2
+```
+
+The capture list froze a snapshot, so the next write copied once to keep that snapshot intact. That's exactly right for an undo closure. It's a leak of performance when a long-lived closure, such as a completion handler or a cached sort comparator, captured a big array it didn't need to freeze: every later write to the original pays one copy, and the closure keeps the old buffer alive in memory.
+
+## Trap 5: returning a changed copy instead of using inout
+
+A function that takes a value and returns a changed version reads nicely, and `score = settingFirst(score, to: 1)` looks harmless. But while the function runs, the caller's `score` still owns the buffer, so the change inside always copies:
+
+```swift run
+var copies = 0
+
+final class Buffer {
+    var items: [Int]
+    init(_ items: [Int]) { self.items = items }
+}
+
+struct Tracked {
+    private var buffer = Buffer([0, 0, 0, 0])
+
+    subscript(index: Int) -> Int {
+        get { buffer.items[index] }
+        set {
+            if !isKnownUniquelyReferenced(&buffer) {
+                copies += 1
+                buffer = Buffer(buffer.items)
+            }
+            buffer.items[index] = newValue
+        }
+    }
+}
+
+func settingFirst(_ value: Tracked, to number: Int) -> Tracked {
+    var result = value       // shares the caller's buffer
+    result[0] = number       // so this copies
+    return result
+}
+
+func setFirst(_ value: inout Tracked, to number: Int) {
+    value[0] = number        // the caller's own variable, changed in place
+}
+
+var score = Tracked()
+copies = 0
+for round in 1...4 {
+    score = settingFirst(score, to: round)
+}
+print("return a changed copy:", copies)
+
+copies = 0
+for round in 1...4 {
+    setFirst(&score, to: round)
+}
+print("inout:", copies)
+```
+
+```output
+return a changed copy: 4
+inout: 0
+```
+
+This is why in-place algorithms in this course take `inout` parameters ([`inout`, `swap` and `swapAt`](/dsa/learn/swift-inout-swap)): `quickSort(&numbers)` never copies the array, while a version that takes the array and returns a changed one has to duplicate it on every call. Returning a new value is still the right design when the result is genuinely new, such as `sorted()` producing a second array while you keep the first.
+
+## Trap 6: property observers that read oldValue
+
+A stored property with a `didSet` observer can be changed in place, as long as the observer doesn't mention `oldValue`. If it does, Swift must keep the old value alive during every change, and keeping it alive means a second owner:
+
+```swift
+var cells = Tracked() {
+    didSet { redrawCount += 1 }                          // 0 copies for 4 writes
+}
+
+var cells = Tracked() {
+    didSet { if oldValue[0] != cells[0] { redraw() } }   // 4 copies for 4 writes
+}
+```
+
+Counted with `Tracked`, four writes made no copies with the first observer and four with the second. In an iOS view model, an array property whose observer compares against `oldValue` copies the whole array on every single change. If you need to know what changed, record it in the mutating method that makes the change instead.
+
+## Finding copies in your own code
+
+1. **Read the line as a reference count.** Before a write, ask: does anything else own this buffer right now? A local copy, a capture, a dictionary or array element that was read out, an `oldValue`?
+2. **Prefer in-place forms:** `array[i].mutate()`, `dict[key, default: …].mutate()`, `dict[key]?.mutate()`, `inout` parameters and `mutating` methods.
+3. **Count, don't guess.** For your own copy-on-write types, a counter like `Tracked`'s makes a test fail the moment a change starts copying. The practice problem in the next lesson works exactly like this.
+4. **Look at allocations.** A copy is a heap allocation the size of the buffer. In the Instruments lesson at the end of this module, you'll see accidental copies show up as thousands of short-lived allocations of the same large size.
+
+<Callout kind="gotcha" title="Swift gotchas: copies you didn't write">
+- **`Array(repeating: row, count: n)` shares one buffer between all n rows.** That's fine: the first write to each row copies it (except the last row, which by then owns the buffer alone), which is the same work as creating the rows separately. It only surprises you if you were counting copies.
+- **A copy that happens once is fine.** These traps matter inside loops, where one copy per pass turns O(n) work into O(n²).
+- **The optimiser can't save you here.** Every count in this lesson is the same in debug and release builds, because the second owner really exists while the write happens.
+</Callout>
+
+## Practice
+
+**List every folder's path** produces tens of megabytes of text from a deep folder tree. The obvious approaches rebuild every path from scratch, or copy and prepend strings over and over; aim to keep one path buffer you extend and trim, and to build the output once.
+
+```cards
+- id: take-out-put-back
+  front: "Why does `var row = grid[r]; row[c] = 1; grid[r] = row` copy, while `grid[r][c] = 1` doesn't?"
+  back: "The local `row` is a second owner of the row's buffer, so the write must copy it. `grid[r][c] = 1` changes the element in place, where the buffer has one owner."
+- id: dictionary-default
+  front: "How do you append to an array stored in a dictionary without copying it?"
+  back: "`dict[key, default: []].append(x)`, or `dict[key]?.append(x)` when the key exists. Reading it out, appending and writing back copies the whole array every time."
+- id: inout-vs-return
+  front: "Why does `value = changed(value)` copy, while `change(&value)` doesn't?"
+  back: "During the call, the caller's variable still owns the buffer, so changing the parameter's copy must duplicate it. `inout` changes the caller's variable itself."
+- id: oldvalue-copies
+  front: "Which property observer makes every change to an array property copy it?"
+  back: "A `didSet` (or `willSet`) that reads `oldValue`: Swift has to keep the old array alive during the change, which means a second owner."
+```
+
+```quiz
+- id: q1
+  type: bug
+  prompt: "This builds an adjacency list correctly but takes O(E²) time in the worst case. Which line causes it?"
+  code: |
+    func buildGraph(_ edges: [(Int, Int)]) -> [Int: [Int]] {
+        var graph: [Int: [Int]] = [:]
+        for (from, to) in edges {
+            var list = graph[from] ?? []
+            list.append(to)
+            graph[from] = list
+        }
+        return graph
+    }
+  answer: 4
+  explain: "`var list = graph[from] ?? []` gives the list a second owner, so `append` copies all of it. With every edge leaving one node, that's 0 + 1 + 2 + … copies. `graph[from, default: []].append(to)` appends in place."
+- id: q2
+  type: output
+  prompt: "`Box` is a copy-on-write type that prints `copy` whenever a write has to duplicate its storage. What does this print?"
+  code: |
+    final class Storage {
+        var value = 0
+    }
+
+    struct Box {
+        private var storage = Storage()
+        var value: Int {
+            get { storage.value }
+            set {
+                if !isKnownUniquelyReferenced(&storage) {
+                    print("copy")
+                    let fresh = Storage()
+                    fresh.value = storage.value
+                    storage = fresh
+                }
+                storage.value = newValue
+            }
+        }
+    }
+
+    var boxes = [Box(), Box()]
+    boxes[0].value = 1
+    var second = boxes[1]
+    second.value = 2
+    boxes[1] = second
+    boxes[1].value = 3
+    print(boxes[0].value, boxes[1].value, second.value)
+  answer: |
+    copy
+    copy
+    1 3 2
+  explain: "`boxes[0].value = 1` changes the element in place. `var second = boxes[1]` adds a second owner, so `second.value = 2` copies. Then `boxes[1] = second` makes the array element and `second` share storage again, and `second` is still alive, so `boxes[1].value = 3` copies too. A leftover local keeps sharing until it goes away."
+- id: q3
+  type: multi
+  prompt: "Which of these change `scores` (an `[Int]` stored in a dictionary under `name`) without copying it?"
+  options:
+    - "`table[name, default: []].append(10)`"
+    - "`table[name]?.append(10)`"
+    - "`var s = table[name]!; s.append(10); table[name] = s`"
+    - "`var s = table.removeValue(forKey: name) ?? []; s.append(10); table[name] = s`"
+  answer: [0, 1, 3]
+  explain: "The `default:` subscript and optional chaining change the array inside the dictionary. Removing the value first leaves your local variable as the only owner. Reading it out with `!` leaves the dictionary as a second owner, so the append copies."
+- id: q4
+  type: truefalse
+  prompt: "A closure that captures an array variable without a capture list makes the array's next write copy its buffer."
+  answer: false
+  explain: "A plain capture shares the variable itself, not a second copy of its value, so the buffer still has one owner. A capture list like `[items]` stores the value, and that does make the next write copy."
+- id: q5
+  type: mcq
+  prompt: "A recursive merge sort is written as `func sorted(_ a: [Int]) -> [Int]`, and an in-place quicksort as `func sort(_ a: inout [Int], _ low: Int, _ high: Int)`. Why can the quicksort avoid copying the array entirely?"
+  options:
+    - "Because quicksort is O(n log n)"
+    - "Because `inout` changes the caller's array itself, so its buffer keeps one owner"
+    - "Because arrays are never copied in recursive functions"
+    - "Because the optimiser removes copies in release builds"
+  answer: 1
+  explain: "With `inout`, every level of recursion works on the same array and its buffer is never shared, so swaps happen in place. A function that takes an array and returns a changed one must copy whenever the caller still holds the original."
+```

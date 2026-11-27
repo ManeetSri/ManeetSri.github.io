@@ -1,0 +1,307 @@
+## Why it matters
+
+Sorting a big array or searching a big graph on one core leaves the rest of the processor idle. Swift's task groups make it straightforward to spread that work over every core, and to do it without a single lock, because the safest parallel algorithms share nothing while they work. This lesson parallelises two algorithms you know well, merge sort and BFS, and then looks honestly at when parallel code is slower than the plain version, which is more often than people expect.
+
+## The shape of a parallel algorithm
+
+Both algorithms in this lesson follow the "don't share" shape from [Why shared mutable state breaks](/dsa/learn/cc-data-races):
+
+1. **Split** the work into independent pieces.
+2. **Give each child task its own data.** Copying a slice into an `Array` gives the child a value of its own; copy-on-write means read-only sharing costs nothing.
+3. **Return results instead of writing them.** No child writes to anything another task can see.
+4. **Combine in the parent**, which receives results one at a time from `for await`.
+
+Because results arrive in **completion order**, which changes from run to run, each child returns its piece's index along with its result, and the parent puts the results back in their places. That one habit makes the output independent of timing.
+
+## Parallel merge sort
+
+The plan has two phases. First, cut the array into a few chunks and sort each chunk in its own child task. Then merge the sorted runs in pairs, round after round, with the merges of each round running in parallel, until one run is left. It's the bottom-up merge sort from [Merge sort, top-down and bottom-up](/dsa/learn/sort-merge), starting from big sorted chunks instead of single elements.
+
+```swift run
+/// A tiny seeded generator, so the "random" data is the same on every run
+struct SeededGenerator: RandomNumberGenerator {
+    var state: UInt64
+    mutating func next() -> UInt64 {
+        state = state &* 6_364_136_223_846_793_005 &+ 1_442_695_040_888_963_407
+        return state ^ (state >> 29)
+    }
+}
+
+func merge(_ first: [Int], _ second: [Int]) -> [Int] {
+    var result: [Int] = []
+    result.reserveCapacity(first.count + second.count)
+    var i = 0
+    var j = 0
+    while i < first.count && j < second.count {
+        if second[j] < first[i] {
+            result.append(second[j])
+            j += 1
+        } else {
+            result.append(first[i])
+            i += 1
+        }
+    }
+    result.append(contentsOf: first[i...])
+    result.append(contentsOf: second[j...])
+    return result
+}
+
+/// Sorts `chunkCount` chunks in parallel, then merges sorted runs in pairs, each round in parallel
+func parallelSorted(_ items: [Int], chunkCount: Int) async -> [Int] {
+    let size = max(1, (items.count + chunkCount - 1) / chunkCount)     // ceiling division
+    let starts = Array(stride(from: 0, to: items.count, by: size))
+
+    var runs = await withTaskGroup(of: (index: Int, run: [Int]).self) { group in
+        for (index, start) in starts.enumerated() {
+            let chunk = Array(items[start..<min(start + size, items.count)])   // the child's own copy
+            group.addTask { (index, chunk.sorted()) }
+        }
+        var sortedChunks = Array(repeating: [Int](), count: starts.count)
+        for await result in group {
+            sortedChunks[result.index] = result.run       // results arrive in any order
+        }
+        return sortedChunks
+    }
+
+    while runs.count > 1 {
+        let current = runs
+        runs = await withTaskGroup(of: (index: Int, run: [Int]).self) { group in
+            for pair in stride(from: 0, to: current.count, by: 2) {
+                let first = current[pair]
+                let second = pair + 1 < current.count ? current[pair + 1] : []
+                group.addTask { (pair / 2, merge(first, second)) }
+            }
+            var merged = Array(repeating: [Int](), count: (current.count + 1) / 2)
+            for await result in group {
+                merged[result.index] = result.run
+            }
+            return merged
+        }
+    }
+    return runs.first ?? []
+}
+
+var generator = SeededGenerator(state: 2_024)
+let data = (0..<50_000).map { _ in Int.random(in: 0..<1_000_000, using: &generator) }
+let sorted = await parallelSorted(data, chunkCount: 8)
+print(sorted == data.sorted(), sorted.count)
+print(await parallelSorted([5, 3, 9, 1, 7, 2], chunkCount: 4))
+print(await parallelSorted([], chunkCount: 4))
+```
+
+```output
+true 50000
+[1, 2, 3, 5, 7, 9]
+[]
+```
+
+What to notice:
+
+- **Each child gets a copy.** `Array(items[start..<…])` copies one chunk for one child, and `first` and `second` are copies of two runs. No child can see another's data, so there's nothing to race on.
+- **Results carry their index.** `sortedChunks[result.index] = result.run` puts each run back where it belongs, whatever order the children finish in. For sorting integers the order of the runs doesn't actually matter, but the habit does: in a stable sort of records, or in BFS, it decides the answer.
+- **The merge rounds halve the number of runs**: 8 runs, then 4, 2 and 1, so there are log₂ 8 = 3 rounds.
+- **The printed output is a check, not a timing.** `sorted == data.sorted()` compares the parallel result with the standard library's. That's how you should test parallel code: against a simple sequential version, never by printing which thread did what.
+
+### The recursive version
+
+The other classic shape splits recursively: if the array is small, sort it directly; otherwise sort the two halves in parallel and merge them. `async let` starts a child task without a group, which suits exactly two pieces:
+
+```swift
+async let left = sortedInParallel(firstHalf, threshold: threshold)     // starts a child task
+async let right = sortedInParallel(secondHalf, threshold: threshold)   // and another
+return merge(await left, await right)                                  // waits for both
+```
+
+The **threshold** matters. Creating and scheduling a task costs far more than comparing two integers, so splitting down to single elements would spend almost all its time on tasks. Below a few thousand elements, `sorted()` on one core is faster than any split. Writing this version with a task group and a threshold is this lesson's first practice problem.
+
+## Level-synchronous BFS
+
+BFS looks sequential, a queue processed one node at a time, but it has a parallel structure hiding in it. Every node in the current **frontier**, the nodes discovered in the last round, is at the same distance from the start. So the order in which you expand them doesn't matter, and you can expand them all at once:
+
+1. Split the frontier into chunks, one child task per chunk.
+2. Each child looks at its nodes' neighbours and returns the ones that were **undiscovered when the level began**. Children only read the distances; they never write.
+3. The parent goes through the returned lists in chunk order. The first time it meets an undiscovered node, it records the distance and adds the node to the next frontier. A node reached from two chunks is only added once.
+4. Repeat with the next frontier until it's empty.
+
+Here it is on a grid, as in [BFS and unweighted shortest paths](/dsa/learn/gt-bfs), with a chunk size of 2 so that even this small frontier is split:
+
+```swift run
+struct Cell: Hashable, Sendable {
+    let row: Int
+    let column: Int
+}
+
+let rows = [
+    "S..#....",
+    ".#.#.##.",
+    ".#...#..",
+    "...#...#",
+    "##.#.#..",
+    "...#...G",
+]
+let grid = rows.map { Array($0) }
+
+func neighbours(of cell: Cell) -> [Cell] {
+    [(0, 1), (1, 0), (0, -1), (-1, 0)].compactMap { step in
+        let next = Cell(row: cell.row + step.0, column: cell.column + step.1)
+        guard next.row >= 0, next.row < grid.count, next.column >= 0, next.column < grid[0].count,
+              grid[next.row][next.column] != "#" else { return nil }
+        return next
+    }
+}
+
+/// One level's work: each chunk of the frontier, in its own child task, reports the neighbours
+/// that were undiscovered when the level began. Children only read `distance`.
+func discover(_ frontier: [Cell], distance: [[Int]], chunkSize: Int) async -> [[Cell]] {
+    let starts = Array(stride(from: 0, to: frontier.count, by: chunkSize))
+    return await withTaskGroup(of: (index: Int, found: [Cell]).self) { group in
+        for (index, start) in starts.enumerated() {
+            let chunk = frontier[start..<min(start + chunkSize, frontier.count)]
+            group.addTask {
+                let found = chunk.flatMap(neighbours).filter { distance[$0.row][$0.column] == -1 }
+                return (index, found)
+            }
+        }
+        var byChunk = Array(repeating: [Cell](), count: starts.count)
+        for await result in group {
+            byChunk[result.index] = result.found
+        }
+        return byChunk
+    }
+}
+
+func parallelDistances(from start: Cell, chunkSize: Int) async -> [[Int]] {
+    var distance = grid.map { $0.map { _ in -1 } }
+    distance[start.row][start.column] = 0
+    var frontier = [start]
+    var level = 0
+    while !frontier.isEmpty {
+        let found = await discover(frontier, distance: distance, chunkSize: chunkSize)
+        var next: [Cell] = []
+        for cell in found.joined() where distance[cell.row][cell.column] == -1 {
+            distance[cell.row][cell.column] = level + 1      // only the parent writes
+            next.append(cell)
+        }
+        frontier = next
+        level += 1
+    }
+    return distance
+}
+
+let distance = await parallelDistances(from: Cell(row: 0, column: 0), chunkSize: 2)
+for row in distance {
+    print(row.map { $0 < 0 ? " #" : ($0 < 10 ? " \($0)" : "\($0)") }.joined(separator: " "))
+}
+print("goal:", distance[5][7])
+```
+
+```output
+ 0  1  2  #  8  9 10 11
+ 1  #  3  #  7  #  # 12
+ 2  #  4  5  6  # 10 11
+ 3  4  5  #  7  8  9  #
+ #  #  6  #  8  # 10 11
+ 9  8  7  #  9 10 11 12
+goal: 12
+```
+
+Walls print as `#`. What to notice:
+
+- **The distances are exactly what sequential BFS gives**, on every run, because each level is finished completely before the next begins, and the parent alone assigns distances.
+- **Duplicates are handled by the parent.** Two chunks can both report the same cell, for example a cell with two neighbours in the frontier. The `where distance[…] == -1` check in the parent's loop keeps the first and skips the rest.
+- **Why the work is in a separate function.** The children capture `distance` to read it. By the time `discover` returns, they've finished and let go of it, so the parent's writes find the array uniquely referenced and change it in place. If the parent wrote while a child still held the array, copy-on-write would copy the whole grid on every level: correct, but slow. [Avoiding accidental copies](/dsa/learn/fs-avoiding-copies) has more on this kind of hidden copy.
+
+## When parallelism doesn't pay
+
+Parallel code is easy to get right in this shape, and easy to make slower than the original. Before reaching for a task group, run through these:
+
+- **Task overhead.** Each child task has to be created, scheduled and collected. If its work is a few hundred comparisons, the overhead dominates. Give each task thousands of elements' worth of work, and aim for a number of tasks that's a small multiple of the number of cores, not one per element.
+- **The sequential part limits everything.** If a tenth of the work can't be split, no number of cores makes the whole job more than ten times faster. This is **Amdahl's law**. Merge sort's last merge walks all n elements on one core. BFS's parent loop, which deduplicates and assigns distances, runs on one core every level.
+- **Synchronising per level costs per level.** Level-synchronous BFS runs one task group per level. A wide, shallow graph (a social network, where everyone is a few hops apart) has big frontiers and few levels: good. A long, thin graph (a path) has one node per level, so it's all overhead and no parallelism.
+- **Copies and memory bandwidth.** Copying chunks and runs costs O(n) per round. Several cores reading memory at once can saturate the memory bus, so doubling cores rarely doubles speed for simple loops like merging.
+- **Debug builds lie.** Unoptimised code is so slow that almost anything looks like a speed-up. Measure release builds, several times, as [Benchmarking properly](/dsa/learn/fs-benchmarking) explains.
+
+So: write the sequential version first, measure it, parallelise only the part that measurement says is slow, and keep the sequential version around to test the parallel one against.
+
+<Callout kind="gotcha" title="Swift gotchas with parallel algorithms">
+- **Never block inside a task.** Swift runs tasks on a pool with about one thread per core. A task that waits on a semaphore or sleeps holds a thread the others need, and enough of them can freeze the whole pool. Use `await` to wait.
+- **Don't let children write to a shared array**, even to "their own" slots. Two tasks writing different elements of the same Swift array still race on the array's storage. Return results and let the parent store them.
+- **Results arrive in completion order.** Tag them with an index whenever order matters.
+- **Never print timings or thread ids in tests.** They change from run to run. Test that the parallel answer equals the sequential one.
+</Callout>
+
+## Practice
+
+**Parallel merge sort** asks for the recursive version with a task group and a threshold, tested against `sorted()`. **Parallel BFS, level by level** asks for this lesson's frontier-chunking BFS on a directed graph given as adjacency lists, tested against ordinary BFS, including on a long path where parallelism can't help.
+
+```cards
+- id: parallel-shape
+  front: "What's the safe shape for a parallel algorithm with a task group?"
+  back: "Split into independent pieces, give each child its own copy of its data, have children return results (tagged with an index) instead of writing shared state, and combine in the parent."
+- id: parallel-threshold
+  front: "Why does a parallel merge sort need a threshold?"
+  back: "Creating and scheduling a task costs far more than comparing elements. Below a few thousand elements, sorting directly on one core is faster than splitting further."
+- id: parallel-bfs-levels
+  front: "Why can BFS expand a whole frontier in parallel?"
+  back: "Every frontier node is at the same distance, so the order doesn't matter. Children gather undiscovered neighbours; the parent deduplicates and assigns the next distance."
+- id: parallel-amdahl
+  front: "What does Amdahl's law say about parallel speed-ups?"
+  back: "The part that can't be split limits the whole: if a tenth of the work is sequential, no number of cores makes it more than ten times faster."
+```
+
+```quiz
+- id: q1
+  type: output
+  prompt: "What does this print?"
+  code: |
+    let words = ["delta", "alpha", "echo", "bravo", "charlie"]
+    let pieces = await withTaskGroup(of: (index: Int, piece: [String]).self) { group in
+        for (index, start) in stride(from: 0, to: words.count, by: 2).enumerated() {
+            let chunk = Array(words[start..<min(start + 2, words.count)])
+            group.addTask { (index, chunk.sorted()) }
+        }
+        var all = Array(repeating: [String](), count: 3)
+        for await result in group {
+            all[result.index] = result.piece
+        }
+        return all
+    }
+    print(pieces)
+  answer: "[[\"alpha\", \"delta\"], [\"bravo\", \"echo\"], [\"charlie\"]]"
+  explain: "The chunks are [delta, alpha], [echo, bravo] and [charlie]. Each is sorted in its own child task, and the index puts each result back in its chunk's place, so the output is the same whatever order the children finish in."
+- id: q2
+  type: truefalse
+  prompt: "Splitting a merge sort all the way down to one element per child task gives the fastest parallel sort."
+  answer: false
+  explain: "Every task has overhead far larger than a comparison. Below a threshold of a few thousand elements, sorting directly is faster, so good parallel sorts stop splitting there."
+- id: q3
+  type: mcq
+  prompt: "In level-synchronous BFS, two chunks both report node 9 as an undiscovered neighbour. What happens?"
+  options:
+    - "Node 9 gets two different distances, one from each chunk"
+    - "The parent assigns node 9's distance the first time it sees it and skips the second report"
+    - "It's a data race, so the result is undefined"
+    - "The children must coordinate with a lock to avoid it"
+  answer: 1
+  explain: "Children only read the distances as they were when the level began, so duplicates are possible but harmless. The parent processes the reports one at a time and keeps only the first."
+- id: q4
+  type: multi
+  prompt: "Which of these make level-synchronous parallel BFS slower than ordinary BFS? Choose all that apply."
+  options:
+    - "A graph that's one long path, with one node per level"
+    - "A huge, shallow graph with frontiers of millions of nodes"
+    - "A chunk size of 1 on a graph with big frontiers"
+    - "Running a debug build to measure it"
+  answer: [0, 2]
+  explain: "A path has nothing to parallelise and pays a task group per level, and chunks of one node pay task overhead per node. Big frontiers are where it shines. A debug build doesn't make it slower relative to sequential BFS; it makes measurements meaningless."
+- id: q5
+  type: bigo
+  prompt: "There are n sorted runs. Merging them in pairs, round after round, until one remains: how many rounds are there?"
+  answer: "O(log n)"
+  options: ["O(1)", "O(log n)", "O(n)", "O(n log n)"]
+  explain: "Each round halves the number of runs, so n runs need about log₂ n rounds: 8 runs take 3 rounds, and 1,024 runs take 10."
+- id: q6
+  type: recall
+  prompt: "A teammate parallelises a loop by having each child task write its answer into `results[i]` of a shared `var results` array. Explain the problem and the fix."
+  model: "Several tasks writing to the same Swift array is a data race, even at different indexes, because they all touch the array's shared storage and copy-on-write bookkeeping. Swift 6 mode rejects it. The fix is to have each child return its index and answer, and let the parent, receiving results one at a time in a for await loop, store them in the array."
+```

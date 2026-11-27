@@ -1,0 +1,119 @@
+Build a key-value store whose entries expire, like a cache of login sessions or API responses. Every entry is stored with a time to live (TTL), and the current time is passed in to every call, so the store never reads a real clock.
+
+`ExpiringKeyValueStore.Store<Key: Hashable, Value>`, with `init()`, `set(_:for:ttl:now:)`, `value(for:now:) -> Value?`, `removeValue(for:now:) -> Value?` and `count(now:) -> Int`
+
+- `now` never decreases from one call to the next.
+- `set(value, for: key, ttl: d, now: t)` stores the value, replacing any earlier one for that key and restarting its clock. It's **live** at times before `t + d`, and gone from `t + d` on. `ttl` is at least 1.
+- `value(for:now:)` returns the live value, or `nil` if the key was never set, was removed or has expired.
+- `removeValue(for:now:)` removes the key's entry and returns its value if it was still live, otherwise `nil`.
+- `count(now:)` returns how many entries are live at `now`. It must not scan every entry: aim for amortised O(log n) per operation.
+
+## Examples
+
+| Calls on a new `Store<String, String>` | Result |
+| --- | --- |
+| `set("token-1", for: "maneet", ttl: 10, now: 0)` | |
+| `value(for: "maneet", now: 9)` | `"token-1"` |
+| `value(for: "maneet", now: 10)` | `nil`: expired at 0 + 10 |
+| `count(now: 10)` | `0` |
+| new store: `set("a", for: "k", ttl: 5, now: 0)`, `set("b", for: "k", ttl: 5, now: 3)`, `value(for: "k", now: 7)` | `"b"`: the second set restarted the clock |
+| new store: `set("a", for: "k", ttl: 100, now: 0)`, `set("b", for: "k", ttl: 1, now: 1)`, `count(now: 2)` | `0`: the newer, shorter TTL wins |
+
+## Constraints
+
+- Up to 200,000 calls; `0 ≤ now ≤ 2,000,000,000`; `1 ≤ ttl ≤ 1,000,000`.
+- One test keeps about 25,000 entries live and calls `count(now:)` after every one of 200,000 `set`s.
+- `Store` is a struct: a copy is an independent store.
+
+<Hints>
+<Hint>
+Store each entry with the time it expires: `[Key: (value: Value, expiresAt: Int)]`. Checking `expiresAt > now` on every read gives you lazy expiry: an expired entry is treated as missing (and can be deleted) when someone looks at it.
+</Hint>
+<Hint>
+Lazy expiry alone can't count live entries without looking at all of them. Add a min-heap of `(expiresAt, key)` deadlines, pushed on every `set`. When counting, pop every deadline at or before `now` and delete its entry: the earliest deadline is always on top, so you stop at the first one still in the future. DSAKit's `Heap` works: `import DSAKit`.
+</Hint>
+<Hint>
+Overwriting or removing a key leaves its old deadline in the heap. When that **stale** deadline is popped, it mustn't delete the newer entry. Delete only if the entry's `expiresAt` equals the deadline's; otherwise skip it.
+</Hint>
+</Hints>
+
+## Solutions
+
+<Approach title="Lazy expiry only" time="O(1) per read, O(n) per count" space="O(n)">
+
+The dictionary of entries with expiry times answers `value(for:now:)` and `removeValue(for:now:)` perfectly well. But `count(now:)` has to filter every entry, and expired entries that nobody reads again stay in memory forever.
+
+```swift
+public mutating func count(now: Int) -> Int {
+    entries.values.filter { $0.expiresAt > now }.count
+}
+```
+
+</Approach>
+
+<Approach title="Lazy expiry plus a heap of deadlines" time="amortised O(log n) per operation" space="O(n + stale deadlines)">
+
+Each deadline is pushed once and popped at most once, so the purge loop costs O(log n) per `set` over the store's life. When overwrites leave more stale deadlines than live entries, rebuilding the heap from the entries (O(n) with heapify) keeps memory in check, and its cost is paid for by the overwrites that caused it.
+
+```swift
+import DSAKit
+
+public enum ExpiringKeyValueStore {
+    public struct Store<Key: Hashable, Value> {
+        private var entries: [Key: (value: Value, expiresAt: Int)] = [:]
+        private var deadlines = Heap<(expiresAt: Int, key: Key)>(areInIncreasingOrder: { $0.expiresAt < $1.expiresAt })
+
+        public init() {}
+
+        public mutating func set(_ value: Value, for key: Key, ttl: Int, now: Int) {
+            precondition(ttl > 0, "A time to live must be at least 1")
+            purge(now: now)
+            entries[key] = (value, now + ttl)
+            deadlines.insert((now + ttl, key))
+            compactIfMostlyStale()
+        }
+
+        public mutating func value(for key: Key, now: Int) -> Value? {
+            guard let entry = entries[key] else { return nil }
+            guard entry.expiresAt > now else {
+                entries[key] = nil                     // lazy expiry: found dead on read
+                return nil
+            }
+            return entry.value
+        }
+
+        @discardableResult
+        public mutating func removeValue(for key: Key, now: Int) -> Value? {
+            guard let entry = entries.removeValue(forKey: key) else { return nil }
+            return entry.expiresAt > now ? entry.value : nil
+        }
+
+        public mutating func count(now: Int) -> Int {
+            purge(now: now)
+            return entries.count
+        }
+
+        /// Pops every deadline that has passed. Only a deadline that still matches its entry removes it.
+        private mutating func purge(now: Int) {
+            while let next = deadlines.peek(), next.expiresAt <= now {
+                deadlines.pop()
+                if let entry = entries[next.key], entry.expiresAt == next.expiresAt {
+                    entries[next.key] = nil
+                }
+            }
+        }
+
+        /// Overwrites leave stale deadlines behind. Once they outnumber the live entries, rebuild the
+        /// heap from the entries: O(n) work that pays for the n operations that made the waste.
+        private mutating func compactIfMostlyStale() {
+            guard deadlines.count > 64 && deadlines.count > 2 * entries.count else { return }
+            deadlines = Heap(entries.map { (expiresAt: $0.value.expiresAt, key: $0.key) },
+                             areInIncreasingOrder: { $0.expiresAt < $1.expiresAt })
+        }
+    }
+}
+```
+
+Two deadlines for the same key can share a time (set with TTL 5 at time 0, then TTL 4 at time 1). That's harmless: the first one popped removes the entry, and the second finds nothing to remove.
+
+</Approach>

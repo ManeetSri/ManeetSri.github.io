@@ -1,0 +1,145 @@
+An app's networking layer must never send more than `limit` requests to the same endpoint in any `window` milliseconds, or the server starts refusing them. Build the limiter it asks before each request. Each endpoint has its own window, and only requests that were allowed count. Also report how long a caller should wait before trying again.
+
+`EndpointRateLimiter.Limiter`, with `init(limit: Int, window: Int)`, `allow(_ endpoint: String, at time: Int) -> Bool` and `retryAfter(_ endpoint: String, at time: Int) -> Int`
+
+A request at `time` counts the allowed requests to the same endpoint at times `s` with `time - window < s ≤ time`. If there are fewer than `limit`, `allow` returns `true` and records it. `retryAfter` records nothing: it returns 0 if a request would be allowed now, or else how many milliseconds until one would be. Times are passed in, in milliseconds, and never decrease from one call to the next.
+
+## Examples
+
+With `limit: 2` and `window: 1000`:
+
+| Call | Returns | Why |
+| --- | --- | --- |
+| `allow("/feed", at: 0)` | `true` | nothing in the window yet |
+| `allow("/feed", at: 400)` | `true` | one in the window |
+| `allow("/feed", at: 999)` | `false` | 0 and 400 are both in the window |
+| `retryAfter("/feed", at: 999)` | `1` | the request at 0 leaves at 1000 |
+| `allow("/feed", at: 1000)` | `true` | the request at 0 has just left |
+| `allow("/search", at: 1000)` | `true` | a different endpoint |
+| `allow("/feed", at: 1300)` | `false` | 400 and 1000 are in the window |
+| `retryAfter("/feed", at: 1300)` | `100` | the request at 400 leaves at 1400 |
+| `allow("/feed", at: 1400)` | `true` | |
+
+The rejected request at 999 wasn't recorded, which is why the one at 1000 succeeds.
+
+## Constraints
+
+- `1 ≤ limit ≤ 1,000` and `1 ≤ window ≤ 10⁹`
+- `0 ≤ time ≤ 10¹²`, never decreasing, and several calls can share a time.
+- Up to 200,000 calls and 1,000 different endpoints. The tests make 200,000 calls, so an approach that rescans every past request is too slow.
+
+<Hints>
+<Hint>
+Each endpoint needs the times of its allowed requests, oldest first. Times only move forward, so a request that has left the window can never come back into it.
+</Hint>
+<Hint>
+A queue per endpoint works: before answering, drop times from the front while they're `≤ time - window`, then compare the count with `limit`. Use a head index rather than `removeFirst()`. And the front of the queue is the request that has to leave before the next one is allowed.
+</Hint>
+<Hint>
+You never store more than `limit` times per endpoint, because a request is only recorded when there are fewer than `limit`. So a fixed ring buffer of `limit` slots is enough: the request is allowed if the buffer isn't full, or if its oldest slot has left the window, in which case the new time overwrites it.
+</Hint>
+</Hints>
+
+## Solutions
+
+<Approach title="A queue of times per endpoint" time="O(1) amortised per call" space="O(limit) per endpoint">
+
+Keep a dictionary from endpoint to a queue of allowed times. Expired times are dropped from the front, so each time is added once and dropped once. The head index stops the array from shifting, and the occasional compaction stops it from growing for ever.
+
+```swift
+public enum EndpointRateLimiter {
+    public final class Limiter {
+        private struct Window {
+            var times: [Int] = []
+            var head = 0
+            var count: Int { times.count - head }
+
+            mutating func dropExpired(at time: Int, window: Int) {
+                while head < times.count && times[head] <= time - window { head += 1 }
+                if head > 64 && head * 2 > times.count {       // compact now and then
+                    times.removeFirst(head)
+                    head = 0
+                }
+            }
+        }
+
+        public let limit: Int
+        public let window: Int
+        private var windows: [String: Window] = [:]
+
+        public init(limit: Int, window: Int) {
+            self.limit = limit
+            self.window = window
+        }
+
+        public func allow(_ endpoint: String, at time: Int) -> Bool {
+            windows[endpoint, default: Window()].dropExpired(at: time, window: window)
+            guard windows[endpoint]!.count < limit else { return false }
+            windows[endpoint]!.times.append(time)
+            return true
+        }
+
+        public func retryAfter(_ endpoint: String, at time: Int) -> Int {
+            guard var entry = windows[endpoint] else { return 0 }
+            entry.dropExpired(at: time, window: window)
+            return entry.count < limit ? 0 : entry.times[entry.head] + window - time
+        }
+    }
+}
+```
+
+`retryAfter` works on a copy, so it really does record nothing. Mutating `windows[endpoint, default: Window()]` directly changes the stored value in place, without copying it out and back.
+
+</Approach>
+
+<Approach title="A ring buffer of the last limit requests" time="O(1) per call" space="O(limit) per endpoint">
+
+Only the last `limit` allowed requests can ever matter. Store exactly those in a fixed ring, with `start` pointing at the oldest. When the ring is full, the oldest is the one that has to leave the window before anything else gets through.
+
+```swift
+public enum EndpointRateLimiter {
+    public final class Limiter {
+        private struct Recent {
+            var times: [Int] = []   // grows to `limit`, then wraps around
+            var start = 0           // index of the oldest time, once full
+
+            mutating func admit(_ time: Int, limit: Int, window: Int) -> Bool {
+                if times.count < limit {
+                    times.append(time)
+                    return true
+                }
+                guard times[start] <= time - window else { return false }
+                times[start] = time
+                start = (start + 1) % limit
+                return true
+            }
+
+            func wait(at time: Int, limit: Int, window: Int) -> Int {
+                guard times.count == limit else { return 0 }
+                return max(0, times[start] + window - time)
+            }
+        }
+
+        public let limit: Int
+        public let window: Int
+        private var recent: [String: Recent] = [:]
+
+        public init(limit: Int, window: Int) {
+            self.limit = limit
+            self.window = window
+        }
+
+        public func allow(_ endpoint: String, at time: Int) -> Bool {
+            recent[endpoint, default: Recent()].admit(time, limit: limit, window: window)
+        }
+
+        public func retryAfter(_ endpoint: String, at time: Int) -> Int {
+            recent[endpoint]?.wait(at: time, limit: limit, window: window) ?? 0
+        }
+    }
+}
+```
+
+This is the sliding-window log in its tightest form. In an interview, mention the alternative a server would use: a **token bucket**, which stores just a token count and a timestamp per endpoint, and allows short bursts while enforcing an average rate.
+
+</Approach>

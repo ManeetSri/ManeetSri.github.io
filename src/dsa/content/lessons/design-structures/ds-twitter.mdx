@@ -1,0 +1,281 @@
+## Why it matters
+
+Every social app has a home feed: the newest posts from the people you follow, merged into one list. So do plenty of apps that aren't "social": a GitHub dashboard, a Strava activity list, a team's notification centre. "Design Twitter" is a classic interview question because it uses three structures you already know, a dictionary, a graph and a heap, and asks you to choose between real trade-offs: do the work when someone posts, or when someone reads? This lesson designs the core in memory, then looks at what changes at real scale.
+
+## Requirements
+
+Start by pinning down a small, testable core. A good set of clarifying questions:
+
+- **Operations?** Post, follow, unfollow, and read the feed: the 10 newest posts from the user and everyone they follow.
+- **"Newest" by what?** By the order of posting. Two posts in the same second still need an order.
+- **Does a user see their own posts?** Yes, always, without following themselves.
+- **After an unfollow, do that person's old posts vanish from the feed?** Yes: the feed reflects who you follow **now**.
+- **Sizes?** Thousands of users, hundreds of thousands of posts, some users following hundreds of others.
+- **Paging?** Usually yes: "load more" at the bottom of the list. Hold that thought for later.
+
+## The API
+
+```swift
+struct MiniTwitter {
+    mutating func post(_ tweetID: Int, by user: Int)
+    mutating func follow(_ followee: Int, by follower: Int)
+    mutating func unfollow(_ followee: Int, by follower: Int)
+    func feed(for user: Int, limit: Int = 10) -> [Int]
+}
+```
+
+A struct, because everything inside will be dictionaries and arrays, so copies are independent for free. Users and tweets are plain `Int` ids; a real app would use its own types.
+
+## The data model
+
+**The follow graph.** "Who does this user follow?" is a directed graph: an edge from follower to followee. Feeds need each user's outgoing edges, and follow and unfollow need O(1) insert and remove without duplicates. So: an adjacency list of sets, `[Int: Set<Int>]`, as in [Adjacency matrix, list and edge list](/dsa/learn/graph-representations).
+
+**Posts.** Each user's posts in their own array, oldest first. A feed only ever needs the newest posts of a few people, and per-user arrays give exactly that.
+
+**Order.** Give every post a timestamp from **one global counter** that goes up by one per post, rather than the real clock. Two posts can't share a counter value, so there are never ties; tests don't depend on the time of day; and each user's array is automatically sorted, newest at the end.
+
+## Building the feed
+
+A feed is "the 10 newest posts across several sorted arrays". Here are the candidates, for a user who follows f people, with P posts in the whole network and T posts by the user and their followees:
+
+| Approach | Cost per feed | Problem |
+| --- | --- | --- |
+| Scan all posts from the newest, keeping visible ones | up to O(P) | a user who follows quiet people walks the whole network |
+| Gather every post of every author, sort, take 10 | O(T log T) | sorts thousands of posts to show 10 |
+| Take the last 10 of each author, sort those, take 10 | O(10f log(10f)) | simple and decent; still sorts 10f items |
+| **k-way merge with a heap** | O(f log f + 10 log f) | — |
+
+The last row is [Merge k sorted lists](/dsa/learn/heap-k-way-merge), run backwards. Put each author's **newest** post into a heap ordered newest first. Pop the top: it's the newest post of all. Push that author's next older post. Stop after 10 pops. The heap never holds more than one entry per author, so each step costs O(log f), and the feed never touches posts it won't show.
+
+```swift run
+// The heap from "Build a generic Heap<T>", compacted
+struct Heap<Element> {
+    private var items: [Element] = []
+    private let areInIncreasingOrder: (Element, Element) -> Bool
+
+    init(areInIncreasingOrder: @escaping (Element, Element) -> Bool) {
+        self.areInIncreasingOrder = areInIncreasingOrder
+    }
+
+    mutating func insert(_ element: Element) {
+        items.append(element)
+        var child = items.count - 1
+        while child > 0 && areInIncreasingOrder(items[child], items[(child - 1) / 2]) {
+            items.swapAt(child, (child - 1) / 2)
+            child = (child - 1) / 2
+        }
+    }
+
+    mutating func pop() -> Element? {
+        guard !items.isEmpty else { return nil }
+        items.swapAt(0, items.count - 1)
+        let top = items.removeLast()
+        var parent = 0
+        while true {
+            let left = 2 * parent + 1
+            let right = left + 1
+            var first = parent
+            if left < items.count && areInIncreasingOrder(items[left], items[first]) { first = left }
+            if right < items.count && areInIncreasingOrder(items[right], items[first]) { first = right }
+            if first == parent { return top }
+            items.swapAt(parent, first)
+            parent = first
+        }
+    }
+}
+
+struct MiniTwitter {
+    private var following: [Int: Set<Int>] = [:]               // follower -> people they follow
+    private var tweets: [Int: [(time: Int, id: Int)]] = [:]     // author -> tweets, oldest first
+    private var clock = 0                                       // one counter orders every tweet
+
+    mutating func post(_ tweetID: Int, by user: Int) {
+        tweets[user, default: []].append((clock, tweetID))
+        clock += 1
+    }
+
+    mutating func follow(_ followee: Int, by follower: Int) {
+        guard follower != followee else { return }
+        following[follower, default: []].insert(followee)
+    }
+
+    mutating func unfollow(_ followee: Int, by follower: Int) {
+        following[follower]?.remove(followee)
+    }
+
+    func feed(for user: Int, limit: Int = 10) -> [Int] {
+        // Newest on top: each entry is an author's newest tweet not yet taken
+        var newest = Heap<(time: Int, author: Int, index: Int)>(areInIncreasingOrder: { $0.time > $1.time })
+        for author in (following[user] ?? []).union([user]) {
+            if let list = tweets[author], let last = list.last {
+                newest.insert((last.time, author, list.count - 1))
+            }
+        }
+        var result: [Int] = []
+        var pops = 0
+        while result.count < limit, let top = newest.pop() {
+            pops += 1
+            let list = tweets[top.author]!
+            result.append(list[top.index].id)
+            if top.index > 0 {                                 // that author's next older tweet
+                newest.insert((list[top.index - 1].time, top.author, top.index - 1))
+            }
+        }
+        print("  (\(pops) pops)")
+        return result
+    }
+}
+
+let maneet = 1, ana = 2, sam = 3
+var app = MiniTwitter()
+app.post(10, by: maneet)
+app.post(20, by: ana)
+app.post(21, by: ana)
+app.post(30, by: sam)
+app.post(11, by: maneet)
+app.post(31, by: sam)
+
+app.follow(ana, by: maneet)
+print(app.feed(for: maneet))
+app.follow(sam, by: maneet)
+print(app.feed(for: maneet))
+print(app.feed(for: maneet, limit: 3))
+app.unfollow(ana, by: maneet)
+print(app.feed(for: maneet))
+print(app.feed(for: sam))
+```
+
+```output
+  (4 pops)
+[11, 21, 20, 10]
+  (6 pops)
+[31, 11, 30, 21, 20, 10]
+  (3 pops)
+[31, 11, 30]
+  (4 pops)
+[31, 11, 30, 10]
+  (2 pops)
+[31, 30]
+```
+
+What to notice:
+
+- **The heap is a max-heap by time**, so its comparison is `$0.time > $1.time`. Merging sorted lists into newest-first order is the mirror image of the oldest-first merge from Part V.
+- **Each entry remembers where it came from**: the author and the index in their array, so the next older post is one subtraction away.
+- **With `limit: 3`, only three pops happen.** The work depends on the limit and the number of authors, not on how many posts exist.
+- **Unfollowing Ana hides her old posts at once**, because the feed is computed from the current follow set every time.
+- `(following[user] ?? []).union([user])` adds the user themself without changing the stored set. Iterating a `Set` visits authors in an unpredictable order, but that doesn't matter: the heap sorts it out.
+
+## Putting numbers on it
+
+Interviewers like a quick estimate, because it shows the design was chosen for the sizes in the requirements rather than by habit. Say there are 1,000 users who each follow 200 others, and 200,000 posts in total.
+
+| Operation | Cost in this design | With these numbers |
+| --- | --- | --- |
+| `post` | append to one array, one counter increment | a handful of steps |
+| `follow`, `unfollow` | one set insert or remove | a handful of steps |
+| `feed` | build a heap of up to 201 authors, then 10 pops and pushes of about log₂ 201 ≈ 8 steps each | roughly 200 + 160 steps |
+| a global scan, for comparison | walk back through posts until 10 visible ones turn up | anything up to 200,000 steps |
+
+Building the heap is the biggest part of a feed. Inserting 201 entries one by one costs O(f log f); building it in one go with bottom-up heapify, as in [O(n) heapify](/dsa/learn/heap-heapify), costs O(f). DSAKit's `Heap(_:areInIncreasingOrder:)` does exactly that, and the practice problem's solution uses it.
+
+Memory is one array entry per post, one set entry per follow, and nothing per feed: feeds are computed, not stored. Keep that last point in mind for the next section.
+
+## Pull or push?
+
+The design above is the **pull** model, also called fan-out on read: the feed is assembled when someone reads it. The opposite is the **push** model, fan-out on write: when someone posts, copy the post id into a stored feed for **each of their followers**, so reading only returns the front of your own list.
+
+| | Pull (merge on read) | Push (copy on write) |
+| --- | --- | --- |
+| Post | O(1) | O(followers): one copy per follower |
+| Read the feed | O(f log f + limit × log f) | O(limit) |
+| Unfollow | instant | old copies must be removed from your stored feed |
+| Memory | each post stored once | each post stored once per follower |
+| Hurts when | users follow very many people | someone with millions of followers posts |
+
+Reads usually outnumber posts by a lot, which favours push. But one post by a celebrity with 50 million followers would mean 50 million writes. Real systems are **hybrid**: they push posts from ordinary accounts into followers' stored feeds, and pull posts from the few huge accounts at read time, merging the two, with exactly the heap merge above. Mentioning this trade-off, even briefly, is what interviewers listen for.
+
+## Paging with a cursor
+
+An app shows the first page of 10, and loads more when you scroll to the bottom. The tempting API is an offset, "give me posts 10 to 19". But if three new posts arrive while you're reading, everything shifts down by three, and the next page repeats three posts you've already seen.
+
+A **cursor** fixes it: "give me 10 posts older than post 4182", the last one on screen. New posts at the top can't move what's older than a fixed post. In this design, a cursor turns into a time, and for each author a binary search finds where their posts older than that time end; the heap merge starts from there. That's the hard part of this lesson's practice problem.
+
+<Callout kind="tip" title="Testing it">
+The model for a feed is short and obviously right: keep every post in one global list, and for a feed, walk it backwards keeping posts by visible authors. Run both designs on thousands of random posts, follows, unfollows and feeds, and compare. Then add one test the model would fail on time: a user who follows two quiet people while 200,000 posts arrive from everyone else.
+</Callout>
+
+<Callout kind="gotcha" title="Common mistakes">
+- **Ordering by real time.** Two posts in the same millisecond have no defined order, and tests become flaky. Use a counter.
+- **A min-heap by accident.** The newest-first merge needs the largest time on top. Check the direction of the comparison.
+- **Forgetting the user's own posts,** or adding the user to their own stored follow set, so that unfollowing yourself removes your posts.
+- **Pushing every post of every author into the heap.** That's the "gather and sort" design wearing a heap's clothes: O(T log T). Push one entry per author, and the next one only when it's popped.
+</Callout>
+
+## Practice
+
+**Mini social feed** is this design plus cursor paging: `feed(for:limit:olderThan:)` returns the page of posts older than a given post. One test pages through 100,000 posts from 500 followees, and another checks that a firehose of posts from strangers doesn't slow down a quiet user's feed.
+
+```cards
+- id: feed-data-model
+  front: "What data model supports post, follow, unfollow and a newest-first feed?"
+  back: "The follow graph as `[Int: Set<Int>]`, each user's posts in their own array (sorted because of a global counter), and the feed built from those arrays."
+- id: feed-heap-merge
+  front: "How does a heap build the 10 newest posts from f authors' sorted lists?"
+  back: "Push each author's newest post into a max-heap by time. Pop the top, then push that author's next older post. Stop after 10 pops: O(f log f + 10 log f)."
+- id: pull-vs-push
+  front: "Compare pull (fan-out on read) with push (fan-out on write) for feeds."
+  back: "Pull stores each post once and merges at read time. Push copies each post into every follower's feed, making reads O(limit) but posts by accounts with millions of followers very expensive. Real systems mix the two."
+- id: cursor-paging
+  front: "Why page a feed with a cursor instead of an offset?"
+  back: "New posts shift every offset, so the next page repeats posts already seen. \"Older than post X\" stays fixed however many new posts arrive."
+```
+
+```quiz
+- id: q1
+  type: trace
+  prompt: "A user's own posts have times 1 and 5. They follow one person whose posts have times 2, 3 and 7. Which times does a feed with limit 3 return, in order?"
+  answer: "7, 5, 3"
+  explain: "The heap starts with each author's newest: 5 and 7. Pop 7 and push that author's next, 3. Pop 5 and push the user's next, 1. Pop 3. That's three posts: 7, 5, 3."
+- id: q2
+  type: bigo
+  prompt: "The feed gathers every post by the user and their followees, T posts in all, sorts them and keeps 10. What's the cost per feed?"
+  options: ["O(10)", "O(f log f)", "O(T)", "O(T log T)"]
+  answer: "O(T log T)"
+  explain: "Sorting T posts is O(T log T), even though only 10 are shown. The heap merge avoids this by never looking at posts beyond the 10th."
+- id: q3
+  type: mcq
+  prompt: "Why stamp posts with a global counter instead of the current date and time?"
+  options:
+    - "Dates can't be compared in Swift"
+    - "A counter gives every post a distinct, increasing number, so order is never ambiguous and tests are repeatable"
+    - "A counter uses less memory than a dictionary"
+    - "Dates make the heap slower"
+  answer: 1
+  explain: "Two posts can share a time, leaving their order undefined, and real clocks make tests depend on when they run. A counter has neither problem, and it keeps each user's array sorted automatically."
+- id: q4
+  type: match
+  prompt: "Match each feed design with what it makes expensive."
+  pairs:
+    - ["Pull: merge at read time", "Reading for users who follow very many people"]
+    - ["Push: copy into followers' feeds", "Posting by accounts with millions of followers"]
+    - ["Scan every post from the newest", "Feeds for users who follow a few quiet accounts"]
+  explain: "Each design moves work somewhere. Pull pays per followee at read time, push pays per follower at post time, and a global scan pays for every post in the network that isn't visible."
+- id: q5
+  type: truefalse
+  prompt: "In the heap merge, the heap can end up holding several posts by the same author at once."
+  answer: false
+  explain: "Each author has exactly one entry until it's popped, and only then is that author's next post pushed. So the heap never holds more than one entry per author: at most f + 1."
+- id: q6
+  type: output
+  prompt: "What does this print?"
+  code: |
+    var following: [Int: Set<Int>] = [:]
+    following[1, default: []].insert(2)
+    following[1, default: []].insert(2)
+    following[1, default: []].insert(3)
+    let authors = (following[1] ?? []).union([1])
+    print(authors.count, authors.contains(1))
+  answer: "3 true"
+  explain: "Following 2 twice stores it once, because it's a set. The union adds the user (1) for this feed without changing the stored set: 2, 3 and 1."
+```

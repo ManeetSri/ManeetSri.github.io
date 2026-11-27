@@ -1059,7 +1059,7 @@ const rawModules = [
 
     // Part IX: Swift mastery for DSA ────────────────────────────────────────────────────────
     {
-        id: 'fast-swift', code: 'M68', part: 9, title: 'Writing fast Swift', level: 'advanced', tracks: ['ios'], requires: ['randomised'],
+        id: 'fast-swift', code: 'M68', part: 9, title: 'Writing fast Swift', level: 'advanced', tracks: ['ios'], requires: ['randomised'], status: 'ready',
         summary: 'Build settings, avoiding copies, memory layout, dispatch and measuring properly.',
         lessons: [
             ['fs-build-settings', 'Debug, release and -Ounchecked'],
@@ -1073,7 +1073,7 @@ const rawModules = [
         ],
     },
     {
-        id: 'swift-library', code: 'M69', part: 9, title: 'Standard library and packages', level: 'intermediate', tracks: ['core'], requires: ['fast-swift'],
+        id: 'swift-library', code: 'M69', part: 9, title: 'Standard library and packages', level: 'intermediate', tracks: ['core'], requires: ['fast-swift'], status: 'ready',
         summary: 'Algorithms Swift already gives you, swift-algorithms, swift-collections and a CP template.',
         lessons: [
             ['lib-stdlib-algorithms', 'Standard library algorithms', { minutes: 25 }],
@@ -1084,7 +1084,7 @@ const rawModules = [
         ],
     },
     {
-        id: 'concurrent-structures', code: 'M70', part: 9, title: 'Concurrency-aware data structures', level: 'advanced', tracks: ['ios'], requires: ['swift-library'],
+        id: 'concurrent-structures', code: 'M70', part: 9, title: 'Concurrency-aware data structures', level: 'advanced', tracks: ['ios'], requires: ['swift-library'], status: 'ready',
         summary: 'Data races, actors, Sendable and parallel algorithms.',
         lessons: [
             ['cc-data-races', 'Why shared mutable state breaks'],
@@ -1097,7 +1097,7 @@ const rawModules = [
 
     // Part X: Interviews, design & capstones ────────────────────────────────────────────────
     {
-        id: 'interview-playbook', code: 'M71', part: 10, title: 'Interview playbook', level: 'intermediate', tracks: ['interview'], requires: ['concurrent-structures'],
+        id: 'interview-playbook', code: 'M71', part: 10, title: 'Interview playbook', level: 'intermediate', tracks: ['interview'], requires: ['concurrent-structures'], status: 'ready',
         summary: 'How to run a 45-minute interview, communicate, test, and avoid Swift gotchas.',
         lessons: [
             ['int-structure', 'The 45-minute structure', { minutes: 15 }],
@@ -1111,7 +1111,7 @@ const rawModules = [
         ],
     },
     {
-        id: 'design-structures', code: 'M72', part: 10, title: 'Designing data structures', level: 'advanced', tracks: ['interview'], requires: ['interview-playbook'],
+        id: 'design-structures', code: 'M72', part: 10, title: 'Designing data structures', level: 'advanced', tracks: ['interview'], requires: ['interview-playbook'], status: 'ready',
         summary: 'The "design a…" questions: iterators, caches, counters, feeds and stores.',
         lessons: [
             ['ds-iterators', 'Iterators: peeking, flatten nested and zigzag', { minutes: 30 }],
@@ -1127,7 +1127,7 @@ const rawModules = [
         ],
     },
     {
-        id: 'mock-practice', code: 'M73', part: 10, title: 'Mock interviews and mixed practice', level: 'advanced', tracks: ['interview'], requires: ['design-structures'],
+        id: 'mock-practice', code: 'M73', part: 10, title: 'Mock interviews and mixed practice', level: 'advanced', tracks: ['interview'], requires: ['design-structures'], status: 'ready',
         summary: 'Timed sets, random problems and honest self-scoring.',
         lessons: [
             ['mock-timed-sets', 'Timed problem sets', { minutes: 60 }],
@@ -1137,7 +1137,7 @@ const rawModules = [
         ],
     },
     {
-        id: 'capstones', code: 'M74', part: 10, title: 'Capstone projects', level: 'advanced', tracks: ['ios'], requires: ['mock-practice'],
+        id: 'capstones', code: 'M74', part: 10, title: 'Capstone projects', level: 'advanced', tracks: ['ios'], requires: ['mock-practice'], status: 'ready',
         summary: 'Ten Swift and SwiftUI projects that put the structures and algorithms to real use.',
         lessons: [
             ['cap-dsakit', 'Publish DSAKit, your own tested package', { minutes: 120, tracks: ['core', 'ios'] }],

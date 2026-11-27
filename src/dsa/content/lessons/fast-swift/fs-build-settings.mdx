@@ -1,0 +1,238 @@
+## Why it matters
+
+Part IX is about making correct Swift fast, and every measurement in it depends on how the code was built. [Debug vs release builds](/dsa/learn/swift-release-builds) showed you the two everyday settings and the speed gap between them. This lesson goes one level deeper: exactly which safety checks each setting keeps, what the "unchecked" setting really removes, and how to build, test and profile each way in SwiftPM and Xcode without surprises.
+
+## Four settings, four sets of checks
+
+The Swift compiler has four optimisation levels. You've met two of them:
+
+| Setting | Aims for | Typical use |
+| --- | --- | --- |
+| `-Onone` | fast compiling, easy debugging | Debug builds, `swift test`, Xcode's Run |
+| `-O` | fast code | Release builds, Profile, Archive, judges |
+| `-Osize` | small code, nearly as fast | apps where download size matters |
+| `-Ounchecked` | fast code with safety checks removed | almost never |
+
+The difference that matters most is what each one still checks while your program runs:
+
+| Check | `-Onone` | `-O` and `-Osize` | `-Ounchecked` |
+| --- | --- | --- | --- |
+| `assert`, `assertionFailure` | stops | removed | removed |
+| `precondition`, `preconditionFailure` | stops | stops | removed |
+| integer overflow (`+`, `-`, `*`) | stops | stops | not checked |
+| array index out of range | stops | stops | not checked |
+| force-unwrapping `nil` | stops | stops | not checked |
+| `fatalError` | stops | stops | stops |
+
+Two details are easy to miss. In `-O` builds the checks are all still there, but they usually stop the program without printing the message, to keep the code small: you'll see a bare "trace trap" instead of "Index out of range". And in `-Ounchecked` builds a removed `precondition` isn't only skipped: the optimiser is allowed to *assume* its condition is true and build the rest of the code on that assumption.
+
+## -Ounchecked: the checks really are gone
+
+Here's a three-line program that reads a position from the command line, built three ways and asked for index 5 of a three-element array:
+
+```swift title="peek.swift"
+let numbers = [10, 20, 30]
+let position = Int(CommandLine.arguments[1])!
+print(numbers[position])
+```
+
+```text title="What happened on one Mac"
+$ swiftc -Onone peek.swift -o peek && ./peek 5
+Swift/ContiguousArrayBuffer.swift:695: Fatal error: Index out of range
+
+$ swiftc -O peek.swift -o peek && ./peek 5
+zsh: trace trap  ./peek 5
+
+$ swiftc -Ounchecked peek.swift -o peek && ./peek 5
+6709975948
+```
+
+The unchecked build didn't crash. It read whatever eight bytes happened to sit after the array and printed them as a number. That's **undefined behaviour**, the term from [Unsafe pointers](/dsa/learn/swift-unsafe-pointers): the language makes no promise at all about what happens. A wrong answer is the mild outcome. Writing out of bounds can corrupt other data, and out-of-bounds reads and writes are how many security exploits start.
+
+Why does the setting exist? Each check costs a compare and a branch. In a tight loop over millions of elements, that can add up to a few percent. Usually it's less, because `-O` already deletes checks it can prove will never fail: in `for i in numbers.indices { total += numbers[i] }`, the optimiser knows every `i` is valid and drops the bounds check by itself.
+
+So treat `-Ounchecked` as an experiment, never a default:
+
+1. **Don't ship it.** One bug that a check would have caught becomes silent data corruption on a user's phone.
+2. **If you want wrapping arithmetic, say so.** Overflow in `-Ounchecked` doesn't "wrap around"; it's undefined. The `&+`, `&-` and `&*` operators wrap in every build, on purpose:
+
+```swift run
+// FNV-1a, a simple hash that relies on multiplication wrapping around
+var hash: UInt64 = 14_695_981_039_346_656_037
+for byte in "swift".utf8 {
+    hash = (hash ^ UInt64(byte)) &* 1_099_511_628_211
+}
+print(hash)
+print(Int8.max &+ 1)
+```
+
+```output
+11823696842872234712
+-128
+```
+
+3. **If one loop really needs no checks, remove them locally**, inside that loop only, with a buffer pointer. You'll meet that later in this module, in "ContiguousArray, reserveCapacity and buffer pointers", and you only do it after measuring.
+
+## assert or precondition: decide what survives release
+
+The table gives you a rule for your own checks. A `precondition` stays in the version users run, so it should be **cheap**: a comparison, a count. An `assert` disappears from release builds, so it can afford to be **expensive**: a check that walks a whole array is fine in debug and free in release.
+
+```swift run
+var validations = 0
+
+func isSorted(_ items: [Int]) -> Bool {
+    validations += 1
+    return zip(items, items.dropFirst()).allSatisfy { $0 <= $1 }
+}
+
+func binarySearch(_ items: [Int], for target: Int) -> Int? {
+    assert(isSorted(items), "binarySearch needs sorted input")   // O(n), debug builds only
+    var low = 0
+    var high = items.count - 1
+    while low <= high {
+        let mid = low + (high - low) / 2
+        if items[mid] == target { return mid }
+        if items[mid] < target { low = mid + 1 } else { high = mid - 1 }
+    }
+    return nil
+}
+
+let primes = [2, 3, 5, 7, 11, 13]
+print(binarySearch(primes, for: 7) ?? -1)
+print(binarySearch(primes, for: 4) ?? -1)
+print("validations:", validations)
+```
+
+```output
+3
+-1
+validations: 2
+```
+
+This ran unoptimised, so the O(n) check ran on both calls and would catch an unsorted input while you test. In a release build, `validations` would print 0: the check, and the call to `isSorted`, vanish, and the search is O(log n) again. As a `precondition`, the same check would make every search O(n) in the shipped app.
+
+The flip side: never put work your program needs inside an `assert`. If `isSorted` also sorted the array, release builds would skip the sorting.
+
+## SwiftPM: building and testing in release
+
+You know `-c release`. Here's what it changes, read from `swift build -v` on Swift 6:
+
+| | `swift build` (debug) | `swift build -c release` |
+| --- | --- | --- |
+| optimisation | `-Onone` | `-O` |
+| compiles each module as a whole | no | yes (`-whole-module-optimization`) |
+| defines `DEBUG` | yes | no |
+| testing enabled (`-enable-testing`) | yes | no |
+| debug information (`-g`) | yes | yes |
+
+Defining `DEBUG` means you can write code that only exists in debug builds:
+
+```swift
+#if DEBUG
+print("visited \(visitedCount) cells")      // gone from release builds entirely
+#endif
+```
+
+Whole-module optimisation gets its own section later in this module, in "final, dispatch and generic specialisation". Debug information stays in release builds so that profilers can show function names, which you'll rely on in the module's last lesson, on Instruments.
+
+Tests can run optimised too:
+
+```bash
+swift test -c release --filter FolderPathListingTests
+swift build -c release -Xswiftc -Ounchecked        # an experiment, never a habit
+```
+
+`-Xswiftc` passes the next flag straight to the compiler.
+
+### Why @testable import complicates release tests
+
+`@testable import MyLibrary` lets a test reach `internal` declarations. That only works if the library was compiled with testing enabled, which keeps internal names visible from outside the module and so blocks some optimisations. Debug builds always enable it. For `swift test -c release`, SwiftPM enables it for you by default, so `@testable` still compiles, but you're testing a slightly less optimised build than the one you ship. Pass `--disable-testable-imports` to test the real release build, and any `@testable import` then fails to compile.
+
+Xcode is stricter: its Release configuration has **Enable Testability** set to No, so testing the Release configuration with `@testable` fails until you switch that setting on.
+
+The companion package's problem tests sidestep the issue: they use a plain `import Solutions` (or `import Exercises`) against `public` APIs (see [Access control](/dsa/learn/swift-access-control)), so they test exactly what each problem promises and never need testability.
+
+Why run tests in release at all? Large-input tests run 10–100 times faster, and a few bugs only appear once the optimiser is involved: work hidden in an `assert`, or undefined behaviour in unsafe code that happened to work unoptimised.
+
+## Xcode: configurations and schemes
+
+An Xcode project has two **build configurations**, Debug and Release, and each configuration is a full set of build settings. A **scheme** decides which configuration each action uses:
+
+| Scheme action | Default configuration |
+| --- | --- |
+| Run (Command-R) | Debug |
+| Test (Command-U) | Debug |
+| Profile (Command-I) | Release |
+| Archive | Release |
+
+Change them under **Product › Scheme › Edit Scheme…**: pick an action on the left, then Build Configuration. Running in Release for a quick feel of real speed is fine; just switch back before debugging.
+
+In **Build Settings**, four settings mirror the SwiftPM table: **Optimization Level** (No Optimization, Optimize for Speed, Optimize for Size), **Compilation Mode** (Incremental for Debug, Whole Module for Release), **Active Compilation Conditions** (`DEBUG` in Debug) and **Enable Testability**. `-Ounchecked` isn't on the Optimization Level menu at all. You'd have to type it into **Other Swift Flags** by hand, which says a lot about how rarely it's wanted.
+
+<Callout kind="gotcha" title="Swift gotchas: build settings">
+- **A green debug test run doesn't prove the release build works.** An `assert` with a side effect, or unsafe code with undefined behaviour, can behave differently once optimised. Run the important tests with `-c release` now and then.
+- **`-Ounchecked` doesn't make overflow wrap.** It makes it undefined. Use `&+`, `&-` and `&*` when wrapping is what you mean.
+- **`-O` crash reports are terse.** A release build may stop with only "trace trap". Reproduce it in a debug build, or in the debugger, to see the message and the line.
+</Callout>
+
+```cards
+- id: unchecked-removes
+  front: "What does `-Ounchecked` remove that `-O` keeps?"
+  back: "Overflow checks, array bounds checks, force-unwrap checks and `precondition`. The optimiser may even assume a precondition holds. `fatalError` still stops the program."
+- id: assert-vs-precondition-cost
+  front: "Which belongs in `assert` and which in `precondition`?"
+  back: "Expensive checks of your own logic go in `assert`, which release builds remove. Cheap promises that must hold in the shipped app go in `precondition`."
+- id: wrapping-operators
+  front: "How do you get arithmetic that wraps around instead of trapping?"
+  back: "Use `&+`, `&-` and `&*`. They wrap in every build. Overflow under `-Ounchecked` is undefined, not wrapping."
+- id: release-flags
+  front: "What does `swift build -c release` change besides `-O`?"
+  back: "Whole-module optimisation is on, `DEBUG` isn't defined, and testing isn't enabled. Debug information stays, so profilers can show function names."
+```
+
+```quiz
+- id: q1
+  type: match
+  prompt: "Match each check to the lowest optimisation level that removes it."
+  pairs:
+    - ["`assert`", "`-O`"]
+    - ["`precondition`", "`-Ounchecked`"]
+    - ["`fatalError`", "never removed"]
+  explain: "`assert` is a debug-only check, gone from `-O` and `-Osize`. `precondition` survives `-O` and is removed only by `-Ounchecked`. `fatalError` always stops the program."
+- id: q2
+  type: output
+  prompt: "What does this print?"
+  code: |
+    let small: UInt8 = 250
+    print(small &+ 10)
+    print(UInt8.max &* 2)
+  answer: |
+    4
+    254
+  explain: "Wrapping operators keep only the low 8 bits. 250 + 10 = 260, and 260 − 256 = 4. 255 × 2 = 510, and 510 − 256 = 254. These results are the same in every build."
+- id: q3
+  type: mcq
+  prompt: "A release build of your app crashes with only \"trace trap\". What's the best next step?"
+  options:
+    - "Rebuild with `-Ounchecked` so it stops crashing"
+    - "Reproduce it in a debug build or the debugger to see the message and line"
+    - "Wrap the code in `#if DEBUG`"
+    - "Replace every `precondition` with `assert`"
+  answer: 1
+  explain: "Release builds trap tersely to keep code small. A debug build stops with the full message and points at the line. `-Ounchecked` would hide the bug and turn it into undefined behaviour."
+- id: q4
+  type: truefalse
+  prompt: "Under `-Ounchecked`, `Int.max + 1` is guaranteed to give `Int.min`."
+  answer: false
+  explain: "With the check removed, overflow is undefined behaviour: the optimiser may assume it never happens. Only `Int.max &+ 1` is guaranteed to give `Int.min`."
+- id: q5
+  type: multi
+  prompt: "Which are true of `swift build -c release` with Swift 6?"
+  options:
+    - "It compiles with `-O`"
+    - "It defines `DEBUG`"
+    - "It uses whole-module optimisation"
+    - "It keeps debug information for profilers"
+  answer: [0, 2, 3]
+  explain: "Release builds use `-O` and whole-module optimisation and still include debug information. `DEBUG` is only defined in debug builds, so `#if DEBUG` code disappears."
+```

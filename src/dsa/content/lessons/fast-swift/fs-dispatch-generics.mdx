@@ -1,0 +1,235 @@
+## Why it matters
+
+Every method call is either decided when the program is **compiled** or looked up while it **runs**. The lookup itself is cheap. What it costs is everything the optimiser can no longer do: it can't copy the method's body into your loop, can't specialise it for your types, and can't simplify across the call. This lesson explains which Swift features cause run-time lookups, what `final`, `private` and whole-module optimisation do about them, and why a generic function usually beats the same function written with `any`. It ties together [Classes, inheritance and final](/dsa/learn/swift-classes), [Generic functions and constraints](/dsa/learn/swift-generic-functions) and [some vs any](/dsa/learn/swift-some-any), this time from the performance side.
+
+## Static and dynamic dispatch
+
+**Dispatch** means choosing which function body a call runs.
+
+- **Static dispatch:** the compiler knows exactly which body runs, so it can call it directly or, better, **inline** it: paste the body into the caller. Calls on structs and enums, free functions, and `final` class methods are static.
+- **Dynamic dispatch:** the body depends on the value at run time, so the program looks it up first. A class method that a subclass might override is looked up in the class's table of methods (its *vtable*). A protocol requirement called through `any`, or from generic code that hasn't been specialised, is looked up in a table of the type's conformance (its *witness table*). In iOS code, `@objc dynamic` members use Objective-C's message sending, the slowest kind.
+
+Dynamic dispatch is what makes overriding work:
+
+```swift run
+class Shape {
+    func describe() -> String { "a shape" }
+}
+
+final class Circle: Shape {
+    override func describe() -> String { "a circle" }
+}
+
+let shapes: [Shape] = [Shape(), Circle()]
+for shape in shapes {
+    print(shape.describe())      // which describe()? decided at run time
+}
+```
+
+```output
+a shape
+a circle
+```
+
+The compiler can't know which `describe()` runs, because the array's static type is just `Shape`. The lookup is a few instructions. The lost inlining matters more: a three-line method called through a table stays a real call in your hot loop, and the optimiser can't see through it to remove a retain, a bounds check or a repeated computation.
+
+## final and private: promising there are no overrides
+
+If the compiler can prove a method is never overridden, it can dispatch statically. You can tell it so:
+
+- **`final class Node`** or **`final func`**: no subclass can override. Every class in this course's data structures has been `final` for this reason, along with clarity.
+- **`private` and `fileprivate`** members can only be overridden in the same file, which the compiler sees entirely, so it can check for itself that no override exists.
+- **Whole-module optimisation** extends that to `internal` members. When the compiler sees the whole module at once, it can check every subclass and treat any method nobody overrides as final. That includes `public` members too, since outside modules can't override anything that isn't `open`.
+
+So in an optimised build, most class methods in a module end up statically dispatched. `final` is still worth writing: it documents intent, it works in debug builds, and it stops a future subclass from silently undoing the optimisation.
+
+## Whole-module optimisation
+
+Without it, the compiler optimises each file on its own. A generic function in `Heap.swift` called from `Solver.swift` can't be specialised for your element type, because while compiling `Solver.swift` the compiler can't see `Heap.swift`'s body. **Whole-module optimisation** (WMO) compiles all of a module's files as one unit, so every body is visible everywhere in the module.
+
+You saw in [Debug, release and -Ounchecked](/dsa/learn/fs-build-settings) that `swift build -c release` passes `-whole-module-optimization`, and that Xcode's Release configuration sets Compilation Mode to Whole Module. Debug builds don't, so that changing one file only recompiles that file. That's one more reason debug timings are misleading.
+
+## Generics: specialised or not
+
+A generic function such as `func largest<T: Comparable>(_ items: [T]) -> T` can run in two ways:
+
+- **Unspecialised:** one compiled version handles every `T`. It receives `T`'s witness table and calls through it for `<`, and calls through another table even to copy or destroy a `T`. Correct for any type, and slow in a loop.
+- **Specialised:** the optimiser sees `largest` called with `[Int]` and compiles a separate copy just for `Int`, where `<` is a single processor instruction. That copy is as fast as code you'd write by hand for `Int`.
+
+Specialisation needs two things: an optimised build, and the generic function's body visible where it's called. Within a module, WMO provides the visibility. Across modules, it needs `@inlinable`, below.
+
+## Generic constraints vs any
+
+The same function can take its shapes in two ways, and they compile very differently:
+
+```swift run
+protocol Shape {
+    func area() -> Double
+}
+
+struct Square: Shape {
+    var side: Double
+    func area() -> Double { side * side }
+}
+
+struct Box: Shape {
+    var width, height, depth, density: Double
+    func area() -> Double { width * height }
+}
+
+// One concrete type per call: stored at full speed, can be specialised
+func totalArea(_ shapes: [some Shape]) -> Double {
+    shapes.reduce(0) { $0 + $1.area() }
+}
+
+// Any mix of types: each element in a box, every area() looked up at run time
+func totalArea(mixed shapes: [any Shape]) -> Double {
+    shapes.reduce(0) { $0 + $1.area() }
+}
+
+print(totalArea([Square(side: 1), Square(side: 2), Square(side: 3)]))
+print(totalArea(mixed: [Square(side: 2), Box(width: 2, height: 5, depth: 1, density: 1)]))
+
+print(MemoryLayout<Square>.size, MemoryLayout<Box>.size)
+print(MemoryLayout<any Shape>.size)
+```
+
+```output
+14.0
+14.0
+8 32
+40
+```
+
+`[some Shape]` is a generic parameter written short: every element has the same concrete type, so a `[Square]` stores 8-byte squares side by side, and the optimiser can specialise the function for `Square` and inline `area()`.
+
+`[any Shape]` stores every element in an **existential container**: 40 bytes, made of three words of space for the value, a pointer to the type's information and a pointer to its witness table. A `Square` fits in the three words. A `Box`, at 32 bytes, doesn't, so it's **boxed**: stored in a separate heap allocation, with the container pointing at it. And every `area()` call goes through the witness table. A 1,000-element `[any Shape]` of boxes means 1,000 allocations and 1,000 lookups that a `[Square]` never needs.
+
+How to choose:
+
+1. **Use generics or `some` by default**, in hot code especially.
+2. **Use `any` when you really need mixing**: a list of different view models, a plugin registry. It's the right tool there.
+3. **For a closed set of cases in a hot loop, consider an enum.** `enum Piece { case square(Double), rectangle(Double, Double) }` stores each value inline (17 bytes here) and dispatches with a `switch`, statically. The trade-off is that adding a new kind means editing the enum.
+
+## A dispatch gotcha: methods only in an extension
+
+Only methods **declared in the protocol** are looked up dynamically. A method that exists only in a protocol extension is dispatched statically, by the type the compiler sees:
+
+```swift run
+protocol Greeter {
+    func greet() -> String              // a requirement: looked up at run time
+}
+
+extension Greeter {
+    func greet() -> String { "hello" }
+    func farewell() -> String { "goodbye" }   // not a requirement: chosen at compile time
+}
+
+struct French: Greeter {
+    func greet() -> String { "bonjour" }
+    func farewell() -> String { "au revoir" }
+}
+
+let direct = French()
+let boxed: any Greeter = French()
+print(direct.greet(), direct.farewell())
+print(boxed.greet(), boxed.farewell())
+```
+
+```output
+bonjour au revoir
+bonjour goodbye
+```
+
+Through `any Greeter`, the compiler only knows the extension's `farewell()`, so that's what runs, even though the value is `French`. If types are meant to customise a method, declare it in the protocol.
+
+## @inlinable: specialising across modules
+
+When your code calls a generic function from **another module**, such as DSAKit, swift-collections or the standard library, the optimiser normally sees only the function's declaration, not its body. It can't inline the call or specialise it, so the generic code runs unspecialised, going through witness tables for every comparison and copy.
+
+Marking a public function `@inlinable` publishes its body as part of the module's interface. Client modules can then inline and specialise it as if it were their own code. The standard library marks most of `Array`, `Dictionary` and the algorithms on them this way, which is why `[Int].sort()` in your module runs at full speed. Recent compilers also optimise across modules on their own in some cases when a package is built from source, but `@inlinable` is the explicit way a library author makes sure.
+
+It has a price. An `@inlinable` body becomes part of the library's public promise: it can only use `public` declarations (or ones marked `@usableFromInline`), and clients built against an old version keep running the old body until they're recompiled. Use it for small, hot, generic functions in libraries that others build on, and nowhere else.
+
+<Callout kind="gotcha" title="Swift gotchas: dispatch and generics">
+- **`[any P]` hides in plain sight.** Swift still accepts the older spelling `let items: [P]`, which means `[any P]`. Turning on the upcoming feature `ExistentialAny` makes the compiler insist on writing `any`, so the cost is always visible.
+- **Protocol extension methods aren't overridable.** Only requirements declared in the protocol are dispatched dynamically.
+- **Debug builds dispatch and specialise much less.** Don't judge generics or `final` from a debug timing.
+</Callout>
+
+```cards
+- id: static-vs-dynamic
+  front: "What's the difference between static and dynamic dispatch, and why does it matter for speed?"
+  back: "Static: the compiler knows which body runs, so it can inline it. Dynamic: the body is looked up at run time (vtable, witness table or message send), which blocks inlining and the optimisations that follow."
+- id: final-private-wmo
+  front: "Which three things let the compiler treat a class method as final?"
+  back: "Marking it (or its class) `final`; making it `private` or `fileprivate`; and whole-module optimisation, which sees every subclass in the module."
+- id: existential-container
+  front: "What does storing a value in `any Shape` cost?"
+  back: "A 40-byte existential container per value, a heap allocation (boxing) if the value is larger than 24 bytes, and a witness-table lookup for every requirement called."
+- id: inlinable
+  front: "What does `@inlinable` do?"
+  back: "It publishes a public function's body so other modules can inline and specialise it. The body then becomes part of the library's public promise."
+```
+
+```quiz
+- id: q1
+  type: output
+  prompt: "What does this print?"
+  code: |
+    protocol Animal {
+        func sound() -> String
+    }
+
+    extension Animal {
+        func sound() -> String { "..." }
+        func describe() -> String { "an animal that says " + sound() }
+    }
+
+    struct Dog: Animal {
+        func sound() -> String { "woof" }
+        func describe() -> String { "a dog" }
+    }
+
+    let pet: any Animal = Dog()
+    print(pet.describe())
+    print(Dog().describe())
+  answer: |
+    an animal that says woof
+    a dog
+  explain: "`describe()` isn't a protocol requirement, so through `any Animal` the extension's version runs. Inside it, `sound()` is a requirement, looked up dynamically, so it finds `Dog`'s \"woof\". Called on a `Dog` directly, the compiler picks `Dog`'s own `describe()`."
+- id: q2
+  type: multi
+  prompt: "Which calls can the compiler dispatch statically, without whole-module optimisation?"
+  options:
+    - "A method on a struct"
+    - "A method of a `final class`"
+    - "A non-final class method called on a variable whose type is that class"
+    - "A protocol requirement called on an `any` value"
+  answer: [0, 1]
+  explain: "Structs can't be subclassed and `final` rules out overrides, so both are known at compile time. A non-final method might be overridden by a subclass, and an `any` value could hold any conforming type, so both need a run-time lookup."
+- id: q3
+  type: mcq
+  prompt: "A `struct Particle` is 48 bytes. What happens when you store 10,000 of them in an `[any Simulated]`?"
+  options:
+    - "Each is stored inline in a 48-byte slot"
+    - "Each is stored in a 40-byte container, which points to a separate heap allocation holding the particle"
+    - "The array becomes a linked list"
+    - "Swift refuses to compile it"
+  answer: 1
+  explain: "An existential container has three words (24 bytes) of inline space. A 48-byte value doesn't fit, so it's boxed in its own heap allocation: 10,000 allocations that a `[Particle]` wouldn't make."
+- id: q4
+  type: truefalse
+  prompt: "Without `@inlinable` (or cross-module optimisation), a generic function from another module can't be specialised for your types."
+  answer: true
+  explain: "Specialising needs the function's body, and normally a client only sees the declaration. `@inlinable` puts the body in the module's interface so clients can specialise and inline it."
+- id: q5
+  type: match
+  prompt: "Match each feature to the kind of dispatch it uses."
+  pairs:
+    - ["`final func` on a class", "static"]
+    - ["Overridable class method", "vtable lookup"]
+    - ["Requirement called on `any P`", "witness table lookup"]
+    - ["`@objc dynamic` member", "Objective-C message send"]
+  explain: "`final` rules out overrides, so the body is known. Overridable methods go through the class's vtable, protocol requirements on existentials through the witness table, and `@objc dynamic` through the Objective-C runtime."
+```

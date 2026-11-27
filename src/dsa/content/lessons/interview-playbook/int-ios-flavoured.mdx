@@ -1,0 +1,398 @@
+## Why it matters
+
+Interviews for iOS roles often wrap a classic DSA problem in an app setting: "design the image cache for a photo grid", "the search field shouldn't hit the server on every keystroke", "animate only the rows that changed". The core is a structure or algorithm you already know. The iOS setting adds follow-up questions about memory, threads and UIKit that a generic candidate can't answer, which is exactly why they're asked. This lesson walks through the five that come up most, each with a compact Swift sketch.
+
+## What makes a question iOS-flavoured
+
+Each one is a familiar app problem on top of a classic core:
+
+| App problem | DSA core | Learned in |
+| --- | --- | --- |
+| Image cache with a memory limit | Hash map plus doubly linked list (LRU) | [LRU cache](/dsa/learn/ll-lru-cache) |
+| Search-as-you-type, scroll handlers | Simulating events over timestamps | [Stream problems](/dsa/learn/queue-streams) |
+| Not flooding an API | Sliding window over a queue, token bucket | [Fixed-size windows](/dsa/learn/sw-fixed) |
+| Animating table or collection view changes | Longest common subsequence | [Longest common subsequence](/dsa/learn/dps-lcs) |
+| Questions about the view hierarchy | Trees, parent pointers, DFS and LCA | [Trees in real code](/dsa/learn/tree-real-world) |
+
+The structure of the interview doesn't change: clarify, approach, code, test ([The 45-minute structure](/dsa/learn/int-structure)). What changes is the clarifying questions, which now include app concerns, and the follow-ups at the end.
+
+## 1. An image cache with a byte budget
+
+> Design an in-memory cache for decoded thumbnails in a photo grid. It must stay under a memory limit.
+
+**Clarify.** What's the key? (The image URL.) What's the limit measured in? (Bytes, because a full-screen image is a hundred times bigger than a thumbnail; an entry count would be meaningless.) How do you measure an image? (Its decoded size, width × height × 4 bytes, not the compressed file size.) What counts as a use? What if a single image is bigger than the whole budget? Should it free memory on a memory warning?
+
+**Approach.** It's the LRU cache from M25 with one change. There, adding an entry to a full cache evicted exactly one entry. Here, inserting an image evicts least recently used images **while** the total is over budget, which might be none or several. The O(1) structure is the same: a dictionary from URL to node, and a doubly linked list of nodes in order of use, with a running byte total. Here's the eviction rule as a simple model, which is how you'd explain it before writing the real thing:
+
+```swift run
+// A model of the eviction rule, most recently used first. O(n) per call: fine to explain, too slow to ship.
+struct ImageCacheModel {
+    let budget: Int
+    private(set) var entries: [(url: String, bytes: Int)] = []
+    private(set) var total = 0
+
+    init(budget: Int) {
+        self.budget = budget
+    }
+
+    mutating func use(_ url: String) -> Bool {
+        guard let index = entries.firstIndex(where: { $0.url == url }) else { return false }
+        entries.insert(entries.remove(at: index), at: 0)
+        return true
+    }
+
+    mutating func insert(_ url: String, bytes: Int) -> [String] {
+        if let index = entries.firstIndex(where: { $0.url == url }) {
+            total -= entries.remove(at: index).bytes
+        }
+        entries.insert((url, bytes), at: 0)
+        total += bytes
+        var evicted: [String] = []
+        while total > budget, let oldest = entries.popLast() {   // evict until it fits
+            total -= oldest.bytes
+            evicted.append(oldest.url)
+        }
+        return evicted
+    }
+}
+
+var cache = ImageCacheModel(budget: 100)
+_ = cache.insert("a.jpg", bytes: 50)
+_ = cache.insert("b.jpg", bytes: 30)
+_ = cache.use("a.jpg")
+print(cache.insert("c.jpg", bytes: 40))
+print(cache.entries.map { $0.url }, cache.total)
+print(cache.insert("d.jpg", bytes: 70))
+print(cache.entries.map { $0.url }, cache.total)
+```
+
+```output
+["b.jpg"]
+["c.jpg", "a.jpg"] 90
+["a.jpg", "c.jpg"]
+["d.jpg"] 70
+```
+
+Using `a.jpg` saved it from the first eviction; the 70-byte `d.jpg` needed two. Notice one hole in this model: an image bigger than the whole budget would evict everything, including itself. That's the clarifying question from earlier, and the practice problem below makes you handle it.
+
+**Follow-ups to expect:**
+
+- **Why not `NSCache`?** It's thread-safe and empties itself under memory pressure, which is great. But it doesn't promise *which* entries it evicts, so you can't rely on LRU order, and it can evict at times you don't control. A custom cache gives predictable behaviour; many apps put one in front of `NSCache` or a disk cache.
+- **Threads.** Images are decoded off the main thread, so two threads can touch the cache at once. Wrap it in an actor, as in [Actors as thread-safe caches](/dsa/learn/cc-actors).
+- **Memory warnings.** Listen for `UIApplication.didReceiveMemoryWarningNotification` and trim to, say, half the budget.
+- **A disk tier.** Memory is fast and small; disk is slower and bigger. A miss in memory checks disk before the network.
+- **Why LRU?** A grid shows recently seen images again soon, so recency predicts reuse well. [Cache policies: LRU, LFU and FIFO](/dsa/learn/rand-cache-policies) compares the alternatives, and M72 comes back to cache design.
+
+## 2. Debounce and throttle
+
+> The search field shouldn't send a request on every keystroke. And the "like" button shouldn't fire twenty times if tapped twenty times.
+
+These are two different tools:
+
+- **Debounce** waits for quiet. Each event restarts a timer, and only when `delay` milliseconds pass with no new event does the action run, using the **last** event. Right for search-as-you-type.
+- **Throttle** acts on the **first** event straight away, then ignores events until `interval` milliseconds have passed. Right for scroll handlers and buttons.
+
+Interviewers want them as code without real timers, so the clock becomes data: each event comes with its timestamp. That makes the logic deterministic and testable, which is a point worth saying out loud.
+
+```swift run
+// Debounce: fire `delay` ms after the last event of each burst
+func debounce(_ times: [Int], delay: Int) -> [Int] {
+    var fires: [Int] = []
+    for (index, time) in times.enumerated() {
+        let isLast = index == times.count - 1
+        if isLast || times[index + 1] - time >= delay {   // the next event is too late to cancel
+            fires.append(time + delay)
+        }
+    }
+    return fires
+}
+
+// Throttle: act on an event, then ignore events for `interval` ms
+func throttle(_ times: [Int], interval: Int) -> [Int] {
+    var accepted: [Int] = []
+    for time in times {
+        if let last = accepted.last, time - last < interval { continue }
+        accepted.append(time)
+    }
+    return accepted
+}
+
+let events = [0, 100, 150, 400, 1000, 1050, 1100, 1700]
+print(debounce(events, delay: 300))
+print(throttle(events, interval: 300))
+```
+
+```output
+[700, 1400, 2000]
+[0, 400, 1000, 1700]
+```
+
+The same eight events give three debounced actions, each 300 ms after a burst ends, and four throttled ones, each at least 300 ms apart. Clarify the boundary: if the next event arrives at *exactly* the fire time, does it cancel? Here it doesn't (`>=`). Either is fine if you say which.
+
+In an app you'd use Combine's `debounce(for:scheduler:)` and `throttle(for:scheduler:latest:)`, or an async loop that sleeps. In the interview, the version above is what shows you understand them. The practice problem turns debounce into a stateful class, with a clock that advances and duplicate queries skipped.
+
+## 3. Rate limiting
+
+> The app must not send more than 10 requests per second to the server, or the server starts rejecting them.
+
+Three classic designs, each a trade-off you can narrate:
+
+| Design | How | Trade-off |
+| --- | --- | --- |
+| Fixed window counter | Count requests per whole second; reset at each new second | O(1) memory, but allows 20 in a moment that straddles a boundary |
+| Sliding window log | A queue of recent request times; drop those older than the window | Exact, but stores up to `limit` times per client |
+| Token bucket | Tokens refill at a steady rate up to a cap; each request spends one | O(1) memory, allows short bursts, enforces the average rate |
+
+The sliding window log is a queue with a head index, the pattern from [A queue with a head index](/dsa/learn/queue-head-index), and it's the practice problem below. The token bucket is the one servers usually use. With timestamps passed in, it's a few lines of integer arithmetic:
+
+```swift run
+struct TokenBucket {
+    let capacity: Int          // the biggest burst allowed
+    let refillEvery: Int       // milliseconds to earn one token back
+    private var tokens: Int
+    private var lastRefill: Int
+
+    init(capacity: Int, refillEvery: Int, now: Int) {
+        self.capacity = capacity
+        self.refillEvery = refillEvery
+        tokens = capacity
+        lastRefill = now
+    }
+
+    mutating func allow(at time: Int) -> Bool {
+        let earned = (time - lastRefill) / refillEvery
+        if earned > 0 {
+            tokens = min(capacity, tokens + earned)
+            lastRefill += earned * refillEvery     // keep the part of a token not yet earned
+        }
+        guard tokens > 0 else { return false }
+        tokens -= 1
+        return true
+    }
+}
+
+var bucket = TokenBucket(capacity: 3, refillEvery: 1000, now: 0)
+let requests = [0, 10, 20, 30, 1000, 1500, 2600, 2700, 5000]
+print(requests.map { bucket.allow(at: $0) })
+```
+
+```output
+[true, true, true, false, true, false, true, false, true]
+```
+
+A burst of three goes through at once, the fourth is refused, and then requests succeed at about one per second. After a long pause the bucket refills, but only up to its capacity of three. Advancing `lastRefill` by whole tokens, not to `time`, keeps the partly earned token, so the rate stays exact.
+
+## 4. Diffing lists for table and collection view updates
+
+> A feed refreshes. Animate only the rows that changed, instead of calling `reloadData()`.
+
+`performBatchUpdates` wants the rows to delete, as indexes into the **old** list, and the rows to insert, as indexes into the **new** list. The fewest changes keep the most rows in place, and rows that stay must appear in both lists in the same order. So the rows to keep are a **longest common subsequence** of the two lists, and everything else is a deletion or an insertion. That's the practice problem, and it's [Longest common subsequence, and printing it](/dsa/learn/dps-lcs) applied to ids.
+
+Swift's standard library has a diff built in, which is worth knowing for the follow-up "how would you do this in production?":
+
+```swift run
+let old = ["Inbox", "Drafts", "Sent", "Spam"]
+let new = ["Inbox", "Starred", "Sent", "Archive"]
+for change in new.difference(from: old) {
+    switch change {
+    case let .remove(offset, element, _):
+        print("delete old row \(offset): \(element)")
+    case let .insert(offset, element, _):
+        print("insert new row \(offset): \(element)")
+    }
+}
+```
+
+```output
+delete old row 3: Spam
+delete old row 1: Drafts
+insert new row 1: Starred
+insert new row 3: Archive
+```
+
+It keeps `Inbox` and `Sent`, the longest common subsequence, and lists removals from the highest offset down, so deleting them in order never shifts an index you haven't used yet. It uses Myers' algorithm, a faster way to find a shortest edit script; you'll build a diff tool with it in M74.
+
+**Follow-ups to expect:** Diffable data sources (`UICollectionViewDiffableDataSource`) do all of this for you, which is why they need every item to have a unique, `Hashable` identifier: duplicates would make "which row moved?" ambiguous. A row that moved is a deletion plus an insertion in a plain diff; `difference(from:).inferringMoves()` pairs those up so the row can slide instead of fading.
+
+## 5. View hierarchy questions
+
+> Each view has subviews and a superview. Print the hierarchy indented. Find the nearest view that contains two given views.
+
+The view hierarchy is a tree ([Trees in real code: files and view hierarchies](/dsa/learn/tree-real-world)). `subviews` are the children, and `superview` is a parent pointer, `weak` so a child doesn't keep its parent alive ([weak and unowned references](/dsa/learn/swift-weak-unowned)). Typical questions:
+
+- **Flatten it**, like UIKit's private `recursiveDescription`: a preorder DFS with depth.
+- **Nearest common superview**, which UIKit needs for `convert(_:to:)`: lowest common ancestor with parent pointers.
+- **Is A inside B?** Walk up from A looking for B, which is `isDescendant(of:)`.
+- **Find every view matching a test**, such as every `UIButton`: any traversal.
+
+Both main questions fit in a sketch:
+
+```swift run
+final class View {
+    let name: String
+    private(set) var subviews: [View] = []
+    private(set) weak var superview: View?     // weak: the parent owns the child, not the reverse
+
+    init(_ name: String) {
+        self.name = name
+    }
+
+    func addSubview(_ view: View) {
+        view.superview = self
+        subviews.append(view)
+    }
+}
+
+// Flatten: preorder with an explicit stack, indenting by depth
+func flatten(_ root: View) -> [String] {
+    var lines: [String] = []
+    var stack = [(view: root, depth: 0)]
+    while let (view, depth) = stack.popLast() {
+        lines.append(String(repeating: "  ", count: depth) + view.name)
+        for child in view.subviews.reversed() {   // reversed, so the first subview comes out first
+            stack.append((child, depth + 1))
+        }
+    }
+    return lines
+}
+
+// Nearest common superview: level the depths, then climb together
+func depth(of view: View) -> Int {
+    var depth = 0
+    var current = view
+    while let parent = current.superview {
+        depth += 1
+        current = parent
+    }
+    return depth
+}
+
+func commonSuperview(_ a: View, _ b: View) -> View? {
+    var x: View? = a
+    var y: View? = b
+    var depthX = depth(of: a)
+    var depthY = depth(of: b)
+    while depthX > depthY { x = x?.superview; depthX -= 1 }
+    while depthY > depthX { y = y?.superview; depthY -= 1 }
+    while let p = x, let q = y, p !== q {        // !== compares identity, not contents
+        x = p.superview
+        y = q.superview
+    }
+    return x                                     // nil if they're in different windows
+}
+
+let window = View("window")
+let header = View("header"), list = View("list")
+let title = View("title"), avatar = View("avatar")
+let cell0 = View("cell0"), cell1 = View("cell1")
+let label0 = View("label0"), label1 = View("label1")
+window.addSubview(header)
+window.addSubview(list)
+header.addSubview(title)
+header.addSubview(avatar)
+list.addSubview(cell0)
+list.addSubview(cell1)
+cell0.addSubview(label0)
+cell1.addSubview(label1)
+
+print(flatten(window).joined(separator: "\n"))
+print(commonSuperview(label0, label1)?.name ?? "none")
+print(commonSuperview(title, label1)?.name ?? "none")
+print(commonSuperview(cell0, label0)?.name ?? "none")
+print(commonSuperview(label0, View("alert"))?.name ?? "none")
+```
+
+```output
+window
+  header
+    title
+    avatar
+  list
+    cell0
+      label0
+    cell1
+      label1
+list
+window
+cell0
+none
+```
+
+Two views at the same depth reach their common superview after the same number of steps, so once they're level, climbing in lockstep makes them meet there. It's O(depth) time and O(1) extra space, the parent-pointer version of [Lowest common ancestor](/dsa/learn/bt-lca). Comparing with `!==` matters: two different views could have the same name, and only identity says they're the same object ([Identity with ===](/dsa/learn/swift-identity)). Both functions are iterative, so a deeply nested hierarchy can't overflow the stack.
+
+<Callout kind="gotcha" title="iOS-flavoured traps">
+- **Measuring images by file size.** A JPEG of a few hundred kilobytes can decode to over 10 MB. Memory limits are about decoded bytes.
+- **Real timers in the design.** `Timer` and `DispatchQueue.asyncAfter` make the logic untestable. Pass time in, then wire it to a real clock at the edge.
+- **Strong superview pointers.** A child that holds its parent strongly creates a retain cycle with the parent's `subviews`.
+- **Forgetting the main thread.** Caches and limiters are used from many threads; UIKit updates happen on the main one. Mention both.
+</Callout>
+
+## Practice
+
+Five problems build the real versions of these sketches: a limiter with a sliding window per endpoint and a "retry after" answer; a debouncer driven by a simulated clock; the byte-budget cache with O(1) operations; the table diff with the fewest changes; and the nearest common superview with the path between two views. They're medium problems, and each is a realistic 35–45 minute interview question, so try at least one under a timer.
+
+```cards
+- id: ios-cache-core
+  front: "What's the structure behind an image cache with a byte budget?"
+  back: "An LRU cache, a dictionary from URL to node plus a doubly linked list in order of use, that evicts from the old end while the total bytes exceed the budget."
+- id: ios-debounce-throttle
+  front: "What's the difference between debounce and throttle?"
+  back: "Debounce waits for a quiet period and acts on the last event (search fields). Throttle acts on the first event, then ignores events for an interval (buttons, scrolling)."
+- id: ios-diff-lcs
+  front: "How do you compute the fewest table view changes between two lists of ids?"
+  back: "Keep a longest common subsequence. Every other old row is a deletion (old index) and every other new row an insertion (new index)."
+- id: ios-time-as-data
+  front: "Why pass timestamps in when designing debouncers and rate limiters?"
+  back: "It makes the logic deterministic and testable without real timers. The real clock is wired in at the edge."
+```
+
+```quiz
+- id: q1
+  type: match
+  prompt: "Match each app problem to the DSA idea at its core."
+  pairs:
+    - ["Thumbnail cache under a memory limit", "LRU: dictionary plus doubly linked list"]
+    - ["Animating only the rows that changed", "Longest common subsequence"]
+    - ["Nearest view containing two views", "Lowest common ancestor"]
+    - ["At most 10 requests per second", "Sliding window over timestamps"]
+  explain: "The iOS setting changes the clarifying questions and follow-ups, but each core is a structure or algorithm from earlier parts of the course."
+- id: q2
+  type: output
+  prompt: "What does this print?"
+  code: |
+    func throttle(_ times: [Int], interval: Int) -> [Int] {
+        var accepted: [Int] = []
+        for time in times {
+            if let last = accepted.last, time - last < interval { continue }
+            accepted.append(time)
+        }
+        return accepted
+    }
+    print(throttle([0, 50, 120, 130, 260], interval: 100))
+  answer: "[0, 120, 260]"
+  explain: "0 is accepted. 50 is too soon. 120 is 120 ms after 0, so it's accepted. 130 is 10 ms after 120, too soon. 260 is 140 ms after 120, accepted."
+- id: q3
+  type: trace
+  prompt: "With the lesson's `debounce`, events at `[0, 200, 250, 600]` and a delay of 300, at what times do actions fire? Separate them with commas."
+  answer: "550, 900"
+  explain: "0 and 200 are each followed within 300 ms, so they're cancelled. 250 is followed by 600, 350 ms later, so it fires at 550. 600 is the last event, so it fires at 900."
+- id: q4
+  type: truefalse
+  prompt: "`NSCache` guarantees it evicts the least recently used entry first."
+  answer: false
+  explain: "`NSCache` is thread-safe and frees memory under pressure, but it doesn't promise an eviction order. If you need strict LRU behaviour, you build it."
+- id: q5
+  type: mcq
+  prompt: "In the token bucket, why does `allow(at:)` advance `lastRefill` by `earned * refillEvery` instead of setting it to `time`?"
+  options:
+    - "To avoid integer overflow"
+    - "To keep the part of a token that's been earned but not completed, so the average rate stays exact"
+    - "Because `time` can go backwards"
+    - "So the bucket never refills"
+  answer: 1
+  explain: "If 1,600 ms have passed with tokens every 1,000 ms, one token is earned and 600 ms count towards the next. Setting `lastRefill` to `time` would throw those 600 ms away."
+- id: q6
+  type: recall
+  prompt: "An interviewer asks how your image cache should behave when the app gets a memory warning. What do you say?"
+  model: "Listen for the memory warning notification and trim the cache: evict least recently used images until the total is under a lower limit, say half the budget, or empty it entirely. Images can be decoded again from disk or the network, so it's safe to drop them. If the cache is shared across threads, the trim has to go through the same synchronisation, such as an actor."
+```
