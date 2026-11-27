@@ -1,0 +1,303 @@
+## Why it matters
+
+Half the cleverness in a hashing solution is choosing the **key**. Should `"Maneet"` and `"maneet"` count as the same user? Is the road from Leeds to York the same road as York to Leeds? Is a grid cell a pair of numbers or a struct? In [Hashable and hash(into:)](/dsa/learn/swift-hashable) you learned the mechanics. This lesson is about designing keys that mean what you want, and about the contract between `==` and `hash(into:)` that keeps a hash table honest.
+
+## Decide what "the same" means
+
+When Swift synthesises `Hashable` for a struct, two values are equal when **every** stored property is equal. That's right for plain data like a grid cell. It's wrong whenever your idea of "the same" is looser than "identical in every field".
+
+The cleanest fix is often to **normalise at the door**: store the key in a standard form in `init`, so the synthesised conformance does the right thing.
+
+### Case-insensitive keys
+
+Usernames are a classic. People type `Maneet`, `MANEET` and `maneet` and expect the same account:
+
+```swift run
+struct Username: Hashable {
+    let value: String
+
+    init(_ raw: String) {
+        value = raw.lowercased()      // normalise once, here
+    }
+}
+
+var lastLogin: [Username: String] = [:]
+lastLogin[Username("Maneet")] = "Monday"
+lastLogin[Username("MANEET")] = "Friday"
+
+print(lastLogin.count)
+print(lastLogin[Username("maneet")] ?? "never")
+```
+
+```output
+1
+Friday
+```
+
+The second assignment replaced the first, because both names became `"maneet"` before Swift ever compared or hashed them. There's no custom `==` or `hash(into:)` to get wrong.
+
+### Unordered pairs
+
+A road joins two towns, and it's the same road whichever end you name first. Normalise by always storing the towns in sorted order:
+
+```swift run
+struct Road: Hashable {
+    let from: String
+    let to: String
+
+    init(_ a: String, _ b: String) {
+        from = min(a, b)
+        to = max(a, b)
+    }
+}
+
+let roads: Set<Road> = [
+    Road("Leeds", "York"),
+    Road("York", "Leeds"),
+    Road("Leeds", "Hull"),
+]
+print(roads.count)
+print(roads.contains(Road("Hull", "Leeds")))
+```
+
+```output
+2
+true
+```
+
+The same trick handles undirected graph edges, which you'll store in sets throughout the graph modules.
+
+## The contract between == and hash
+
+When you do write `==` and `hash(into:)` yourself, they must agree:
+
+> **If `a == b`, then `a` and `b` must produce the same hash value.**
+
+The reverse isn't required: different values may share a hash. That's a collision, and the table handles it by calling `==`.
+
+### Breaking it: hashing more than == compares
+
+Suppose a library considers two books the same if they share an ISBN, but someone hashes the title too:
+
+```swift
+struct Book: Hashable {
+    let isbn: String
+    let title: String
+
+    static func == (lhs: Book, rhs: Book) -> Bool {
+        lhs.isbn == rhs.isbn
+    }
+
+    func hash(into hasher: inout Hasher) {
+        hasher.combine(isbn)
+        hasher.combine(title)          // wrong: == ignores the title
+    }
+}
+
+let shelf: Set<Book> = [
+    Book(isbn: "978-1", title: "Swift Basics"),
+    Book(isbn: "978-1", title: "Swift Basics (2nd printing)"),
+]
+print(shelf.count)
+```
+
+These two books are equal, so the set should hold one. But they hash differently, so the set usually looks in the wrong bucket, never compares them, and keeps both: it usually prints `2`. "Usually", because now and then the two hashes happen to pick the same bucket and it prints `1`. A bug that appears at random is the worst kind. The fix is to hash exactly what `==` compares: `isbn` alone.
+
+### The safe direction: hashing less
+
+Hashing **fewer** properties than `==` compares is legal, because equal values still hash equally. It only causes more collisions. Take it to the extreme, with every value hashing the same, and count how often the set has to call `==`:
+
+```swift run
+var comparisons = 0
+
+struct Plate: Hashable {
+    let number: Int
+
+    static func == (lhs: Plate, rhs: Plate) -> Bool {
+        comparisons += 1
+        return lhs.number == rhs.number
+    }
+
+    func hash(into hasher: inout Hasher) {
+        hasher.combine(number)
+    }
+}
+
+struct LazyPlate: Hashable {
+    let number: Int
+
+    static func == (lhs: LazyPlate, rhs: LazyPlate) -> Bool {
+        comparisons += 1
+        return lhs.number == rhs.number
+    }
+
+    func hash(into hasher: inout Hasher) {
+        hasher.combine(0)             // every plate gets the same hash
+    }
+}
+
+var good = Set<Plate>()
+good.reserveCapacity(1_000)
+for number in 0..<1_000 {
+    good.insert(Plate(number: number))
+}
+print("good hash, under 5,000 comparisons:", comparisons < 5_000)
+
+comparisons = 0
+var lazy = Set<LazyPlate>()
+lazy.reserveCapacity(1_000)
+for number in 0..<1_000 {
+    lazy.insert(LazyPlate(number: number))
+}
+print("constant hash:", comparisons, "comparisons")
+```
+
+```output
+good hash, under 5,000 comparisons: true
+constant hash: 499500 comparisons
+```
+
+With a real hash, a thousand inserts need a few hundred comparisons (the exact number changes each run, because of the random seed). With a constant hash, each new plate is compared with every plate already there: 0 + 1 + … + 999 = 499,500. The set still works, but every operation is O(n), so building it is O(n²). Correct but slow.
+
+### == must be a real equivalence
+
+Hash tables also assume `==` behaves like equality: every value equals itself, `a == b` means `b == a`, and if `a == b` and `b == c` then `a == c`. "Within 0.01 of each other" fails the last rule: 1.000 is close to 1.006, which is close to 1.012, but 1.000 isn't close to 1.012. No hash function can make "close enough" work as a key. Round values to a fixed precision first, as the pitfalls lesson shows.
+
+## Combining several properties
+
+When a key has several identifying properties, call `combine` once for each, in a fixed order. That's exactly what the synthesised version does:
+
+```swift
+func hash(into hasher: inout Hasher) {
+    hasher.combine(row)
+    hasher.combine(column)
+}
+```
+
+Resist mixing them yourself with something like `hasher.combine(row ^ column)`. XOR throws information away: `(1, 2)` and `(2, 1)` give the same value, and so does every cell on the diagonal, `(3, 3)` and `(7, 7)` both giving 0. `Hasher` is designed to mix inputs without losing anything.
+
+Also, never implement the old `hashValue` property yourself: it's deprecated in favour of `hash(into:)`.
+
+## Classes as keys: identity
+
+Classes don't get synthesised `Hashable`, and often the meaning you want is **identity**: this particular object, not "an object with the same fields". For graph nodes, two different nodes can carry the same label. Use `===`, from [Identity with ===](/dsa/learn/swift-identity), for equality, and hash the object's identity with `ObjectIdentifier`:
+
+```swift run
+final class Node: Hashable {
+    let label: String
+
+    init(_ label: String) {
+        self.label = label
+    }
+
+    static func == (lhs: Node, rhs: Node) -> Bool {
+        lhs === rhs
+    }
+
+    func hash(into hasher: inout Hasher) {
+        hasher.combine(ObjectIdentifier(self))
+    }
+}
+
+let first = Node("A")
+let second = Node("A")
+var visited: Set<Node> = [first]
+
+print(visited.contains(first))
+print(visited.contains(second))
+visited.insert(second)
+print(visited.count)
+```
+
+```output
+true
+false
+2
+```
+
+`ObjectIdentifier(self)` wraps the object's unique identity in a `Hashable` value. Two nodes with the same label are still two nodes.
+
+<Callout kind="gotcha" title="Swift gotcha: tuples still can't be keys">
+`[(Int, Int): Int]` doesn't compile, because tuples can't conform to `Hashable`. A two-property struct costs nothing at run time. For a quick key, an array works too, since `[Int]` is `Hashable`: `[[1, 2]: "a"]`. It's slower than a struct, because each array is a separate allocation, but handy for variable-length keys.
+</Callout>
+
+## Practice
+
+**Group words by shifting** needs a key that's the same for every word in a group: decide what stays the same when every letter shifts. **Most points on one line** needs a slope key that's exact, which rules out `Double`; the pitfalls lesson explains why.
+
+```cards
+- id: normalise-at-door
+  front: "What's the simplest way to make `\"Maneet\"` and `\"maneet\"` the same key?"
+  back: "Normalise in `init`: store `raw.lowercased()`. The synthesised `==` and `hash(into:)` then do the right thing, with nothing custom to get wrong."
+- id: hash-contract
+  front: "State the contract between `==` and `hash(into:)`."
+  back: "Equal values must produce equal hash values. Unequal values may share a hash (a collision)."
+- id: hash-more-than-equal
+  front: "What goes wrong if `hash(into:)` uses a property that `==` ignores?"
+  back: "Equal values can hash to different buckets, so sets keep duplicates and lookups miss, and only some of the time."
+- id: identity-key
+  front: "How do you make a class hash by identity?"
+  back: "Compare with `===` in `==`, and call `hasher.combine(ObjectIdentifier(self))` in `hash(into:)`."
+```
+
+```quiz
+- id: q1
+  type: output
+  prompt: "What does this print?"
+  code: |
+    struct Pair: Hashable {
+        let low: Int
+        let high: Int
+        init(_ a: Int, _ b: Int) {
+            low = min(a, b)
+            high = max(a, b)
+        }
+    }
+    let pairs: Set<Pair> = [Pair(3, 1), Pair(1, 3), Pair(2, 2), Pair(3, 2)]
+    print(pairs.count)
+  answer: "3"
+  explain: "`Pair(3, 1)` and `Pair(1, 3)` are both stored as (1, 3), so they're one element. (2, 2) and (2, 3) are different, giving 3."
+- id: q2
+  type: bug
+  prompt: "Two `Score` values should be equal when their `player` matches. Which line breaks the hashing contract?"
+  code: |
+    struct Score: Hashable {
+        let player: String
+        let points: Int
+
+        static func == (lhs: Score, rhs: Score) -> Bool {
+            lhs.player == rhs.player
+        }
+
+        func hash(into hasher: inout Hasher) {
+            hasher.combine(player)
+            hasher.combine(points)
+        }
+    }
+  answer: 11
+  explain: "`==` ignores `points`, so two equal scores with different points would hash differently. Hash only `player`."
+- id: q3
+  type: truefalse
+  prompt: "A `hash(into:)` that combines nothing but a constant is legal, but makes every set operation O(n)."
+  answer: true
+  explain: "Equal values still hash equally, so the contract holds. But every element collides, so each lookup compares against all of them."
+- id: q4
+  type: mcq
+  prompt: "Why is `hasher.combine(row ^ column)` a poor way to hash a grid cell?"
+  options:
+    - "XOR is slow"
+    - "It doesn't compile"
+    - "Different cells such as (1, 2) and (2, 1) give the same value, causing extra collisions"
+    - "It breaks the rule that equal values have equal hashes"
+  answer: 2
+  explain: "It's still correct, since equal cells give equal XORs, but it throws information away and makes many cells collide. Combine each property separately."
+- id: q5
+  type: bigo
+  prompt: "Every key in a `Set` has the same hash value. What's the total time to insert n distinct keys?"
+  answer: "O(n²)"
+  explain: "Each insert compares the new key with every key already there: 0 + 1 + … + (n − 1), about n²/2 comparisons."
+- id: q6
+  type: recall
+  prompt: "Why can't \"within 0.01 of each other\" be the equality for a hash key?"
+  model: "Hash tables need `==` to be an equivalence: reflexive, symmetric and transitive. Closeness isn't transitive (1.000 is close to 1.006, which is close to 1.012, but 1.000 isn't close to 1.012), so there's no consistent way to give close values equal hashes. Round to a fixed precision first, then use exact equality."
+```

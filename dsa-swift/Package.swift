@@ -21,6 +21,8 @@ let package = Package(
         .target(name: "Solutions", dependencies: ["DSAKit"]),
         // One set of tests, compiled against Exercises by default or Solutions with -DSOLUTIONS
         .testTarget(name: "DSATests", dependencies: ["DSAKit", "Exercises", "Solutions"]),
+        // DSAKit's own reference implementations, tested directly
+        .testTarget(name: "DSAKitTests", dependencies: ["DSAKit"]),
     ],
     // Swift 6 compiler, Swift 5 language mode: modern Swift without strict-concurrency errors
     // getting in the way before concurrency is taught in Part IX

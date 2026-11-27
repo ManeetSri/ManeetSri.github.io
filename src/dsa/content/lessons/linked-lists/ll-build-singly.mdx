@@ -1,0 +1,657 @@
+## Why it matters
+
+Loose nodes are fine for a quick experiment, but real code wants a **type** that looks after them: one that knows where the list starts and ends, how long it is, and keeps all of that correct through every insert and remove. Building that type is the best way to really understand linked lists, and every bug you meet along the way (a stale tail, a lost node, a wrong count) is a bug you'll recognise in interview problems later. It's also how Swift's own collections are made: a friendly public interface wrapped around careful internal bookkeeping.
+
+## The plan
+
+You'll build `LinkedList<Element>`, a generic singly linked list, with these operations and costs:
+
+| Operation | What it does | Cost |
+| --- | --- | --- |
+| `prepend(_:)` | add at the front | O(1) |
+| `append(_:)` | add at the end | O(1) |
+| `insert(_:at:)` | add at a position | O(i) |
+| `removeFirst()` | remove from the front | O(1) |
+| `remove(at:)` | remove at a position | O(i) |
+| `value(at:)`, `firstIndex(of:)` | search | O(n) |
+| `count`, `isEmpty`, `first`, `last` | ask about the list | O(1) |
+
+Two design choices up front.
+
+**The list is a class.** That's the simplest version that's correct: one list object owns the nodes, and every variable that refers to it sees the same list. You'll see near the end why a plain struct here would be subtly broken, and in [Copy-on-write and persistent lists](/dsa/learn/ll-persistent) how to make a proper value type.
+
+**Bad positions return `false` or `nil`.** `insert(_:at:)` returns whether it worked, and `remove(at:)` returns an optional. Swift's `Array` takes the other approach and crashes on a bad index; you'll compare the two at the end.
+
+## Step 1: a node inside the list
+
+The node type goes **inside** the list, as a nested class. Nested inside a generic type, it can use the list's `Element` for its value, and its full name, `LinkedList<Int>.Node`, can't clash with anyone else's `Node`:
+
+```swift
+final class LinkedList<Element> {
+    final class Node {
+        var value: Element
+        var next: Node?
+
+        init(_ value: Element, next: Node? = nil) {
+            self.value = value
+            self.next = next
+        }
+    }
+
+    private var head: Node?
+    private var tail: Node?
+    private(set) var count = 0
+}
+```
+
+The list keeps three things:
+
+- `head`: the first node, or `nil` when the list is empty.
+- `tail`: the **last** node. You'll see in a moment why it's worth storing.
+- `count`: updated by every insert and remove, so asking for it is O(1) instead of a walk.
+
+`head` and `tail` are `private`: code outside the list can't reach the nodes and break the bookkeeping. `count` is `private(set)`, readable by anyone but changed only by the list itself ([Access control](/dsa/learn/swift-access-control)).
+
+The simple questions read straight off those properties:
+
+```swift
+var isEmpty: Bool { head == nil }
+var first: Element? { head?.value }
+var last: Element? { tail?.value }
+```
+
+## Step 2: prepend
+
+Adding at the front means making a node that points at the old head, then calling it the new head. In an empty list, that new node is also the last node, so the tail must point at it too:
+
+```swift
+func prepend(_ value: Element) {
+    head = Node(value, next: head)
+    if tail == nil {
+        tail = head
+    }
+    count += 1
+}
+```
+
+That's O(1) however long the list is. Notice that the methods aren't `mutating`. The list is a class, so methods change its properties directly, and `let list = LinkedList<Int>()` can still be changed, just as a `let` reference could in M09.
+
+## Step 3: append, and why the tail matters
+
+Without a tail, appending means walking from the head to the last node every time: O(n) per append, and O(n²) to build a list of n elements. With a tail, you jump straight to the end:
+
+```swift
+func append(_ value: Element) {
+    let node = Node(value)
+    if let tail {
+        tail.next = node       // the old last node points at the new one
+    } else {
+        head = node            // empty list: the new node is the head too
+    }
+    tail = node
+    count += 1
+}
+```
+
+The tail is a second strong reference to the last node. That isn't a retain cycle (M11): the last node points at nothing, so no loop forms.
+
+Here's the list so far, with a `description` so it prints nicely:
+
+```swift run
+final class LinkedList<Element> {
+    final class Node {
+        var value: Element
+        var next: Node?
+
+        init(_ value: Element, next: Node? = nil) {
+            self.value = value
+            self.next = next
+        }
+    }
+
+    private var head: Node?
+    private var tail: Node?
+    private(set) var count = 0
+
+    var isEmpty: Bool { head == nil }
+    var first: Element? { head?.value }
+    var last: Element? { tail?.value }
+
+    func prepend(_ value: Element) {
+        head = Node(value, next: head)
+        if tail == nil {
+            tail = head
+        }
+        count += 1
+    }
+
+    func append(_ value: Element) {
+        let node = Node(value)
+        if let tail {
+            tail.next = node
+        } else {
+            head = node
+        }
+        tail = node
+        count += 1
+    }
+}
+
+extension LinkedList: CustomStringConvertible {
+    var description: String {
+        var parts: [String] = []
+        var current = head
+        while let node = current {
+            parts.append("\(node.value)")
+            current = node.next
+        }
+        parts.append("nil")
+        return parts.joined(separator: " -> ")
+    }
+}
+
+let list = LinkedList<Int>()
+print(list, list.isEmpty)
+list.append(2)
+list.append(3)
+list.prepend(1)
+print(list)
+print("count:", list.count, "first:", list.first ?? 0, "last:", list.last ?? 0)
+
+let words = LinkedList<String>()
+words.prepend("world")
+words.prepend("hello")
+print(words)
+```
+
+```output
+nil true
+1 -> 2 -> 3 -> nil
+count: 3 first: 1 last: 3
+hello -> world -> nil
+```
+
+The extension can read `head` even though it's `private`: Swift lets extensions of a type in the same file see its `private` members.
+
+## Step 4: walking to a position
+
+Inserting and removing in the middle both need "the node at position i". A private helper does the walking. It assumes the caller has already checked that `index` is valid, which is why the force unwraps are safe:
+
+```swift
+/// The node at `index`, which must be in 0..<count.
+private func node(at index: Int) -> Node {
+    var node = head!
+    for _ in 0..<index {
+        node = node.next!
+    }
+    return node
+}
+```
+
+## Step 5: insert at a position
+
+Valid positions run from `0` (the front) to `count` (just after the last element). The two ends already have methods, so only the middle needs new code. To insert at position `i`, find the node **before** it, at `i - 1`, and link the new node in after it:
+
+```swift
+@discardableResult
+func insert(_ value: Element, at index: Int) -> Bool {
+    guard index >= 0 && index <= count else { return false }
+    if index == 0 {
+        prepend(value)
+    } else if index == count {
+        append(value)
+    } else {
+        let before = node(at: index - 1)
+        before.next = Node(value, next: before.next)
+        count += 1
+    }
+    return true
+}
+```
+
+`@discardableResult` lets callers ignore the `Bool` without a warning. Inserting in the middle can never change the tail, because a middle node always has a node after it.
+
+## Step 6: removing
+
+Removing the first node moves the head along. If that empties the list, the tail must be cleared as well, or it would keep pointing at a node that's no longer in the list:
+
+```swift
+@discardableResult
+func removeFirst() -> Element? {
+    guard let first = head else { return nil }
+    head = first.next
+    if head == nil {
+        tail = nil
+    }
+    count -= 1
+    return first.value
+}
+```
+
+Removing at position `i` finds the node before it and points that past the removed node. If the removed node was the tail, the node before it becomes the new tail:
+
+```swift
+@discardableResult
+func remove(at index: Int) -> Element? {
+    guard index >= 0 && index < count else { return nil }
+    if index == 0 {
+        return removeFirst()
+    }
+    let before = node(at: index - 1)
+    let removed = before.next!
+    before.next = removed.next
+    if removed === tail {
+        tail = before
+    }
+    count -= 1
+    return removed.value
+}
+```
+
+`removed === tail` asks whether they're the same node, not whether their values match. Two nodes can hold equal values.
+
+## Step 7: searching
+
+`value(at:)` reuses the helper. `firstIndex(of:)` needs to compare elements with `==`, which not every type supports, so it goes in an extension that only applies when `Element` is `Equatable` ([Extensions and protocol extensions](/dsa/learn/swift-extensions)):
+
+```swift
+func value(at index: Int) -> Element? {
+    guard index >= 0 && index < count else { return nil }
+    return node(at: index).value
+}
+
+extension LinkedList where Element: Equatable {
+    func firstIndex(of value: Element) -> Int? {
+        var index = 0
+        var current = head
+        while let node = current {
+            if node.value == value {
+                return index
+            }
+            index += 1
+            current = node.next
+        }
+        return nil
+    }
+}
+```
+
+## The whole list
+
+Here's everything together, with a test drive that hits the awkward cases on purpose: removing the last element, emptying the list, then appending again.
+
+```swift run
+final class LinkedList<Element> {
+    final class Node {
+        var value: Element
+        var next: Node?
+
+        init(_ value: Element, next: Node? = nil) {
+            self.value = value
+            self.next = next
+        }
+    }
+
+    private var head: Node?
+    private var tail: Node?
+    private(set) var count = 0
+
+    var isEmpty: Bool { head == nil }
+    var first: Element? { head?.value }
+    var last: Element? { tail?.value }
+
+    func prepend(_ value: Element) {
+        head = Node(value, next: head)
+        if tail == nil {
+            tail = head
+        }
+        count += 1
+    }
+
+    func append(_ value: Element) {
+        let node = Node(value)
+        if let tail {
+            tail.next = node
+        } else {
+            head = node
+        }
+        tail = node
+        count += 1
+    }
+
+    private func node(at index: Int) -> Node {
+        var node = head!
+        for _ in 0..<index {
+            node = node.next!
+        }
+        return node
+    }
+
+    @discardableResult
+    func insert(_ value: Element, at index: Int) -> Bool {
+        guard index >= 0 && index <= count else { return false }
+        if index == 0 {
+            prepend(value)
+        } else if index == count {
+            append(value)
+        } else {
+            let before = node(at: index - 1)
+            before.next = Node(value, next: before.next)
+            count += 1
+        }
+        return true
+    }
+
+    @discardableResult
+    func removeFirst() -> Element? {
+        guard let first = head else { return nil }
+        head = first.next
+        if head == nil {
+            tail = nil
+        }
+        count -= 1
+        return first.value
+    }
+
+    @discardableResult
+    func remove(at index: Int) -> Element? {
+        guard index >= 0 && index < count else { return nil }
+        if index == 0 {
+            return removeFirst()
+        }
+        let before = node(at: index - 1)
+        let removed = before.next!
+        before.next = removed.next
+        if removed === tail {
+            tail = before
+        }
+        count -= 1
+        return removed.value
+    }
+
+    func value(at index: Int) -> Element? {
+        guard index >= 0 && index < count else { return nil }
+        return node(at: index).value
+    }
+}
+
+extension LinkedList where Element: Equatable {
+    func firstIndex(of value: Element) -> Int? {
+        var index = 0
+        var current = head
+        while let node = current {
+            if node.value == value {
+                return index
+            }
+            index += 1
+            current = node.next
+        }
+        return nil
+    }
+}
+
+extension LinkedList: CustomStringConvertible {
+    var description: String {
+        var parts: [String] = []
+        var current = head
+        while let node = current {
+            parts.append("\(node.value)")
+            current = node.next
+        }
+        parts.append("nil")
+        return parts.joined(separator: " -> ")
+    }
+}
+
+let list = LinkedList<Int>()
+for value in [10, 20, 30] {
+    list.append(value)
+}
+list.insert(15, at: 1)
+list.insert(40, at: 4)
+print(list)
+print(list.insert(99, at: 9), list.firstIndex(of: 30) ?? -1, list.value(at: 2) ?? -1)
+
+print(list.remove(at: 4) ?? -1, "removed; last is now", list.last ?? -1)
+list.append(35)
+print(list)
+
+while let value = list.removeFirst() {
+    print("took", value, "count", list.count)
+}
+print(list, list.last == nil)
+list.append(1)
+print(list, "first", list.first ?? -1, "last", list.last ?? -1)
+```
+
+```output
+10 -> 15 -> 20 -> 30 -> 40 -> nil
+false 3 20
+40 removed; last is now 30
+10 -> 15 -> 20 -> 30 -> 35 -> nil
+took 10 count 4
+took 15 count 3
+took 20 count 2
+took 30 count 1
+took 35 count 0
+nil true
+1 -> nil first 1 last 1
+```
+
+Appending `35` after removing `40` landed in the right place only because `remove(at:)` moved the tail back. Delete those three lines and `35` would be attached to the removed node, invisible from the head.
+
+## An edge-case checklist for list code
+
+Run these in your head (or in a test) for every list method you write. They're the linked-list version of [The edge-case checklist](/dsa/learn/algo-edge-cases):
+
+| Case | What tends to break |
+| --- | --- |
+| The list is empty | force-unwrapping `head` |
+| One element | head and tail are the same node |
+| Change at the front | the head must move |
+| Change at the end | the tail must move |
+| Remove the last remaining element | both head and tail must become `nil` |
+| Position `count` for insert | it's valid (it means "append") |
+
+## Testing it against an array
+
+Checking a few hand-picked cases catches the obvious bugs. The sneaky ones, like a tail left pointing at a removed node, only show up after a particular *sequence* of operations. A powerful way to find them is to run the same long sequence of operations on your list and on a plain `Array`, which you trust, and check after every step that they agree. With Swift Testing, from [Swift Testing: @Test and #expect](/dsa/learn/swift-testing-basics):
+
+```swift
+import Testing
+
+@Test func matchesAnArray() {
+    let list = LinkedList<Int>()
+    var model: [Int] = []
+    for step in 0..<1_000 {
+        switch step % 5 {
+        case 0, 1:
+            list.append(step)
+            model.append(step)
+        case 2:
+            list.prepend(step)
+            model.insert(step, at: 0)
+        case 3:
+            #expect(list.remove(at: 1) == (model.count > 1 ? model.remove(at: 1) : nil))
+        default:
+            #expect(list.removeFirst() == (model.isEmpty ? nil : model.removeFirst()))
+        }
+        #expect(list.count == model.count)
+        #expect(list.first == model.first)
+        #expect(list.last == model.last)
+    }
+}
+```
+
+The array is the **model**: it's slow at the front, but obviously correct. A thousand mixed operations exercise far more combinations than you'd think to write by hand, and the step where the two first disagree points straight at the bug. The tests for this lesson's practice problem work this way.
+
+## Why not a struct?
+
+Why not make `LinkedList` a struct, to get value semantics like `Array`? A struct that stores node references copies only the **references**, so two copies share one chain of nodes. Each copy has its own `count`, but they change the same nodes:
+
+```swift run
+final class Node {
+    var value: Int
+    var next: Node?
+    init(_ value: Int) { self.value = value }
+}
+
+struct BrokenList {
+    var head: Node?
+    var tail: Node?
+    var count = 0
+
+    mutating func append(_ value: Int) {
+        let node = Node(value)
+        if let tail { tail.next = node } else { head = node }
+        tail = node
+        count += 1
+    }
+
+    var values: [Int] {
+        var result: [Int] = []
+        var current = head
+        while let node = current {
+            result.append(node.value)
+            current = node.next
+        }
+        return result
+    }
+}
+
+var a = BrokenList()
+a.append(1)
+var b = a
+b.append(2)
+print(a.values, a.count)
+print(b.values, b.count)
+```
+
+```output
+[1, 2] 1
+[1, 2] 2
+```
+
+`a` now claims one element but shows two. The fix is copy-on-write, from [Writing your own copy-on-write](/dsa/learn/swift-implementing-cow), and that's exactly what DSAKit's `LinkedList` does, as you'll see in the last lesson of this module. Until then, a class is the honest choice: it *says* it shares.
+
+<Callout kind="gotcha" title="Swift gotcha: mutating a struct through a reference">
+`BrokenList.append` is `mutating`, yet it also changes a node that another copy can see. `mutating` only protects the struct's own stored properties. Anything reached *through* a reference stored in it is shared, whatever the struct's methods are marked.
+</Callout>
+
+## Crash or return nil?
+
+`Array` crashes on `numbers[10]` when there are three elements, using a `precondition` ([precondition, assert, fatalError and defer](/dsa/learn/swift-assertions-defer)). The reasoning: a bad index is a bug in the caller, and stopping loudly at the bug beats carrying on with nonsense. This lesson's list returns `false` or `nil` instead, which makes it easy to test and to use in a `while let` loop. Both are reasonable; what matters is that the choice is documented.
+
+The finished list in DSAKit follows `Array`: `insert(_:at:)` and `remove(at:)` trap on a bad index, and `popFirst()` returns `nil` on an empty list. You can use it in any later problem with `import DSAKit`:
+
+```swift
+import DSAKit
+
+var list: LinkedList = [1, 2, 3]
+list.prepend(0)
+list.remove(at: 2)
+print(list)               // 0 -> 1 -> 3 -> nil
+```
+
+## Practice
+
+**A linked list from scratch** asks you to write this class yourself, without peeking, plus two methods from the next lessons: `reverse()` and `removeAll(equalTo:)`. Write `append` and `count` first, then work down the edge-case checklist for every other method. The tests compare your list with an `Array` over thousands of random operations, so a stale tail won't go unnoticed.
+
+```cards
+- id: ll-tail-why
+  front: "Why does `LinkedList` keep a reference to its tail?"
+  back: "So `append` can jump straight to the last node: O(1) instead of walking the whole list every time."
+- id: ll-tail-updates
+  front: "Which operations must update the tail?"
+  back: "Any that can change the last node: appending, prepending or inserting into an empty list, removing the last node, and removing the only node (the tail becomes `nil`)."
+- id: ll-insert-before
+  front: "To insert at position i in a singly linked list, which node do you need to find?"
+  back: "The node before it, at position i − 1, so you can point it at the new node. Position 0 has no node before it, so it's handled as a prepend."
+- id: ll-struct-trap
+  front: "What goes wrong if a struct stores the head and tail nodes directly?"
+  back: "Copying the struct copies only the references, so copies share nodes: changing one changes the other's nodes while their counts disagree. Use a class, or copy-on-write."
+```
+
+```quiz
+- id: q1
+  type: bigo
+  prompt: "Your list has a `head` but no `tail`. What does building a list of n elements with `append` cost in total?"
+  answer: "O(n²)"
+  explain: "Each append walks from the head to the end: 0 + 1 + 2 + … + (n − 1) steps, which is about n²/2. A tail reference makes each append O(1), so building costs O(n)."
+- id: q2
+  type: bug
+  prompt: "After removing the only element, appending another element makes it disappear: the list still prints `nil`. Which line is missing a fix?"
+  code: |
+    func removeFirst() -> Element? {
+        guard let first = head else { return nil }
+        head = first.next
+        count -= 1
+        return first.value
+    }
+  answer: 3
+  explain: "When `head` becomes `nil`, the tail still points at the removed node. The next `append` sees a tail, links the new node onto the removed node, and never sets `head`. After line 3, add `if head == nil { tail = nil }`."
+- id: q3
+  type: blank
+  prompt: "Complete `append` for a list with a head and a tail."
+  code: |
+    func append(_ value: Element) {
+        let node = Node(value)
+        if let tail {
+            ___ = node
+        } else {
+            ___ = node
+        }
+        tail = node
+        count += 1
+    }
+  answers:
+    - "tail.next"
+    - "head"
+  explain: "If there's a last node, it points at the new node. If the list is empty, the new node is the head as well as the tail."
+- id: q4
+  type: mcq
+  prompt: "To remove the node at position 3 from a singly linked list, which node do you walk to?"
+  options:
+    - "The node at position 2"
+    - "The node at position 3"
+    - "The node at position 4"
+    - "The tail"
+  answer: 0
+  explain: "A node only points forwards. To unlink position 3 you change the `next` of the node before it, at position 2, to skip over it."
+- id: q5
+  type: output
+  prompt: "Using the lesson's `BrokenList` struct, what does this print?"
+  code: |
+    final class Node {
+        var value: Int
+        var next: Node?
+        init(_ value: Int) { self.value = value }
+    }
+
+    struct BrokenList {
+        var head: Node?
+        var tail: Node?
+        var count = 0
+
+        mutating func append(_ value: Int) {
+            let node = Node(value)
+            if let tail { tail.next = node } else { head = node }
+            tail = node
+            count += 1
+        }
+    }
+
+    var a = BrokenList()
+    a.append(1)
+    a.append(2)
+    var b = a
+    b.append(3)
+    print(a.count, a.head!.next!.next!.value)
+  answer: "2 3"
+  explain: "`b` is a copy of the struct, but its `tail` refers to the same node as `a`'s. Appending through `b` links 3 onto that shared node, so walking `a` reaches 3 even though `a.count` is still 2."
+- id: q6
+  type: truefalse
+  prompt: "Because `LinkedList` is a class, its `append` method doesn't need to be marked `mutating`."
+  answer: true
+  explain: "`mutating` is only for methods of value types. A class method can change the object's properties directly, and a `let` constant holding the list can still call it."
+```

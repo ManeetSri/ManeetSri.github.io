@@ -40,9 +40,11 @@ export const STACK_QUEUE_KINDS = Object.keys(KINDS);
 
 export const stackQueueTitle = (kind) => KINDS[kind].title;
 
+// "push 3" pushes the number 3; "push (" pushes the text "(", so brackets and words work too
 const parse = (operation) => {
     const [op, value] = operation.trim().split(/\s+/);
-    return [op, value === undefined ? undefined : Number(value)];
+    if (value === undefined) return [op, undefined];
+    return [op, Number.isNaN(Number(value)) ? value : Number(value)];
 };
 
 export const stackQueueFrames = (kind, operations) => {

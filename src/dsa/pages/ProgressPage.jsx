@@ -1,10 +1,12 @@
-import { Clock3, Code2, Flame, Layers, Sparkles, Target } from 'lucide-react';
+import { Award, Clock3, Code2, Flame, Layers, Lock, Radar, Sparkles, Target } from 'lucide-react';
 import { lessons as allLessons, parts } from '../data/curriculum.js';
 import { DIFFICULTIES, problems } from '../data/problems.js';
 import { addDays, dayKey, startOfDay } from '../engine/dates.js';
 import { completion } from '../engine/path.js';
 import { minutesOn, RANKS } from '../engine/stats.js';
-import { useStore } from '../store/store.js';
+import { badgesFor, longestStreak, masteryByPart } from '../engine/badges.js';
+import MasteryRadar from '../ui/MasteryRadar.jsx';
+import { useProfile, useStore } from '../store/store.js';
 import { formatDate, formatMinutes } from '../ui/format.js';
 import { useConsoleMeta, useNow, usePath, useStats } from '../ui/hooks.js';
 import { Card, PageHeader, ProgressBar } from '../ui/primitives.jsx';
@@ -61,6 +63,10 @@ const ProgressPage = () => {
         total: problems.filter((problem) => problem.difficulty === key).length,
         solved: problems.filter((problem) => problem.difficulty === key && state.problems[problem.id]?.status === 'solved').length,
     })).filter((entry) => entry.total > 0);
+    const { goal } = useProfile();
+    const mastery = masteryByPart({ lessons: state.lessons, problems: state.problems, goal });
+    const badges = badgesFor({ ...state, streak, bestStreak: longestStreak(days), goal });
+    const earnedCount = badges.filter((badge) => badge.isEarned).length;
     const answers = Object.values(state.lessons).flatMap((record) => Object.values(record.quiz ?? {}));
     const firstTry = answers.length ? answers.filter((answer) => answer.firstTry).length / answers.length : 0;
 
@@ -74,6 +80,27 @@ const ProgressPage = () => {
                 <Tile icon={Clock3} label="Time studied" value={formatMinutes(totalMinutes)} detail="Counted while you’re active" />
                 <Tile icon={Target} label="First-try accuracy" value={`${Math.round(firstTry * 100)}%`} detail={`${answers.length} questions answered`} />
             </div>
+
+            <Card className="mt-6 p-5">
+                <h2 className="mb-4 flex items-center gap-2 font-semibold"><Radar size={17} aria-hidden="true" className="text-amber" /> Mastery by part</h2>
+                <MasteryRadar entries={mastery} />
+                <p className="mt-3 text-xs text-muted">Half lessons finished, a quarter first-try quiz accuracy, a quarter problems solved, counting your path only.</p>
+            </Card>
+
+            <Card className="mt-6 p-5">
+                <h2 className="mb-4 flex items-center gap-2 font-semibold"><Award size={17} aria-hidden="true" className="text-amber" /> Badges <span className="font-mono text-xs font-normal text-muted">{earnedCount} of {badges.length}</span></h2>
+                <ul className="grid gap-2 sm:grid-cols-2 lg:grid-cols-3">
+                    {badges.map((badge) => (
+                        <li key={badge.id} className={`flex items-start gap-3 rounded-xl border p-3 ${badge.isEarned ? 'border-amber/50 bg-amber/[0.07]' : 'border-line opacity-60'}`}>
+                            {badge.isEarned ? <Award size={20} aria-hidden="true" className="mt-0.5 shrink-0 text-amber" /> : <Lock size={18} aria-hidden="true" className="mt-0.5 shrink-0 text-muted" />}
+                            <span>
+                                <span className="block text-sm font-semibold">{badge.title}<span className="sr-only">{badge.isEarned ? ' (earned)' : ' (locked)'}</span></span>
+                                <span className="block text-xs text-muted">{badge.detail}</span>
+                            </span>
+                        </li>
+                    ))}
+                </ul>
+            </Card>
 
             <Card className="mt-6 p-5">
                 <h2 className="mb-4 font-semibold">Study days</h2>

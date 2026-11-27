@@ -20,6 +20,16 @@ import complexity from './problems/complexity.js';
 import mathBasics from './problems/math-basics.js';
 import bits from './problems/bits.js';
 import recursion from './problems/recursion.js';
+import arrays from './problems/arrays.js';
+import matrices from './problems/matrices.js';
+import prefixSums from './problems/prefix-sums.js';
+import twoPointers from './problems/two-pointers.js';
+import slidingWindow from './problems/sliding-window.js';
+import stringsBasic from './problems/strings-basic.js';
+import hashing from './problems/hashing.js';
+import linkedLists from './problems/linked-lists.js';
+import stacks from './problems/stacks.js';
+import queues from './problems/queues.js';
 
 export const DIFFICULTIES = {
     warmup: { label: 'Warm-up', xp: 15 },
@@ -91,6 +101,16 @@ export const problems = [
     ...mathBasics,
     ...bits,
     ...recursion,
+    ...arrays,
+    ...matrices,
+    ...prefixSums,
+    ...twoPointers,
+    ...slidingWindow,
+    ...stringsBasic,
+    ...hashing,
+    ...linkedLists,
+    ...stacks,
+    ...queues,
 ];
 
 export const problemById = Object.fromEntries(problems.map((problem) => [problem.id, problem]));

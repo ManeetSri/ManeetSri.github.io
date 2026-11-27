@@ -331,7 +331,7 @@ const rawModules = [
 
     // Part III: Linear structures & core patterns ───────────────────────────────────────────
     {
-        id: 'arrays', code: 'M18', part: 3, title: 'Arrays in depth', level: 'intermediate', tracks: ['core'], requires: ['recursion'],
+        id: 'arrays', code: 'M18', part: 3, title: 'Arrays in depth', level: 'intermediate', tracks: ['core'], requires: ['recursion'], status: 'ready',
         summary: 'How arrays work, building a dynamic array, in-place techniques and classic array problems.',
         lessons: [
             ['arrays-memory', 'Contiguous memory and O(1) indexing'],
@@ -347,7 +347,7 @@ const rawModules = [
         ],
     },
     {
-        id: 'matrices', code: 'M19', part: 3, title: 'Matrices', level: 'intermediate', tracks: ['core'], requires: ['arrays'],
+        id: 'matrices', code: 'M19', part: 3, title: 'Matrices', level: 'intermediate', tracks: ['core'], requires: ['arrays'], status: 'ready',
         summary: 'Walking 2D grids in every order, rotating and searching them, and grid neighbour moves.',
         lessons: [
             ['matrix-traversals', 'Row-major, column-major, diagonal and snake traversals'],
@@ -360,7 +360,7 @@ const rawModules = [
         ],
     },
     {
-        id: 'prefix-sums', code: 'M20', part: 3, title: 'Prefix sums and difference arrays', level: 'intermediate', tracks: ['core'], requires: ['matrices'],
+        id: 'prefix-sums', code: 'M20', part: 3, title: 'Prefix sums and difference arrays', level: 'intermediate', tracks: ['core'], requires: ['matrices'], status: 'ready',
         summary: 'Answering range questions in O(1), and the prefix sum + hashmap pattern.',
         lessons: [
             ['prefix-1d', '1D prefix sums and range queries'],
@@ -373,7 +373,7 @@ const rawModules = [
         ],
     },
     {
-        id: 'two-pointers', code: 'M21', part: 3, title: 'Two pointers', level: 'intermediate', tracks: ['core'], requires: ['prefix-sums'],
+        id: 'two-pointers', code: 'M21', part: 3, title: 'Two pointers', level: 'intermediate', tracks: ['core'], requires: ['prefix-sums'], status: 'ready',
         summary: 'Opposite-end, read/write and merging pointers, and why a monotonic property makes them work.',
         lessons: [
             ['tp-opposite-ends', 'Opposite ends: pair sum and valid palindrome', { minutes: 25 }],
@@ -387,7 +387,7 @@ const rawModules = [
         ],
     },
     {
-        id: 'sliding-window', code: 'M22', part: 3, title: 'Sliding window', level: 'intermediate', tracks: ['core'], requires: ['two-pointers'],
+        id: 'sliding-window', code: 'M22', part: 3, title: 'Sliding window', level: 'intermediate', tracks: ['core'], requires: ['two-pointers'], status: 'ready',
         summary: 'Fixed and variable windows, windows with counts, and the at-most-K trick.',
         lessons: [
             ['sw-fixed', 'Fixed-size windows'],
@@ -401,7 +401,7 @@ const rawModules = [
         ],
     },
     {
-        id: 'strings-basic', code: 'M23', part: 3, title: 'String algorithms', level: 'intermediate', tracks: ['core'], requires: ['sliding-window'],
+        id: 'strings-basic', code: 'M23', part: 3, title: 'String algorithms', level: 'intermediate', tracks: ['core'], requires: ['sliding-window'], status: 'ready',
         summary: 'Palindromes, anagrams, parsing and string arithmetic.',
         lessons: [
             ['str-palindromes', 'Palindromes and expand-around-centre', { minutes: 25 }],
@@ -417,7 +417,7 @@ const rawModules = [
         ],
     },
     {
-        id: 'hashing', code: 'M24', part: 3, title: 'Hashing', level: 'intermediate', tracks: ['core'], requires: ['strings-basic'],
+        id: 'hashing', code: 'M24', part: 3, title: 'Hashing', level: 'intermediate', tracks: ['core'], requires: ['strings-basic'], status: 'ready',
         summary: 'How hash tables work, building one yourself, Swift\'s Dictionary internals and hashing patterns.',
         lessons: [
             ['hash-functions', 'Hash functions'],
@@ -432,7 +432,7 @@ const rawModules = [
         ],
     },
     {
-        id: 'linked-lists', code: 'M25', part: 3, title: 'Linked lists', level: 'intermediate', tracks: ['core'], requires: ['hashing'],
+        id: 'linked-lists', code: 'M25', part: 3, title: 'Linked lists', level: 'intermediate', tracks: ['core'], requires: ['hashing'], status: 'ready',
         summary: 'Building linked lists from scratch, fast and slow pointers, and every classic list problem.',
         lessons: [
             ['ll-why-linked-lists', 'Why linked lists, and nodes as classes'],
@@ -454,7 +454,7 @@ const rawModules = [
         ],
     },
     {
-        id: 'stacks', code: 'M26', part: 3, title: 'Stacks', level: 'intermediate', tracks: ['core'], requires: ['linked-lists'],
+        id: 'stacks', code: 'M26', part: 3, title: 'Stacks', level: 'intermediate', tracks: ['core'], requires: ['linked-lists'], status: 'ready',
         summary: 'Building stacks, the classic stack problems, expression parsing and the monotonic stack.',
         lessons: [
             ['stack-build', 'Build Stack<T>', { minutes: 25 }],
@@ -471,7 +471,7 @@ const rawModules = [
         ],
     },
     {
-        id: 'queues', code: 'M27', part: 3, title: 'Queues and deques', level: 'intermediate', tracks: ['core'], requires: ['stacks'],
+        id: 'queues', code: 'M27', part: 3, title: 'Queues and deques', level: 'intermediate', tracks: ['core'], requires: ['stacks'], status: 'ready',
         summary: 'Fast queues in Swift, ring buffers, deques and the monotonic deque.',
         lessons: [
             ['queue-why-not-removefirst', 'Why removeFirst() is O(n)', { minutes: 15 }],

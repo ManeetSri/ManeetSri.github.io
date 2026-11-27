@@ -1,0 +1,331 @@
+## Why it matters
+
+The `LinkedList` class you built behaves like a shared document: every variable sees every change. Swift programmers expect collections to behave like values instead, so that `var b = a; b.append(4)` leaves `a` alone. This lesson finishes the module two ways. First, you give the list **value semantics** with copy-on-write, which is how DSAKit's `LinkedList` works. Then you meet the opposite philosophy: **persistent** lists that are never changed at all, where every "change" makes a new version that shares most of its nodes with the old one. That's how undo histories, version control and functional languages keep many versions cheaply.
+
+## Copy-on-write for a linked list
+
+The recipe is the one from [Writing your own copy-on-write](/dsa/learn/swift-implementing-cow):
+
+1. Keep the nodes, plus `head`, `tail` and `count`, in a private **storage** class.
+2. Make the list a **struct** with one stored property: a reference to that storage. Copying the struct copies only the reference, so copies are O(1) and share the nodes.
+3. At the top of every mutating method, ask `isKnownUniquelyReferenced(&storage)`. If another copy shares the storage, replace it with a fresh copy of every node first.
+
+The difference from an array-backed type is the cost of step 3: duplicating a linked list means walking it and creating n new nodes. That only happens on the **first** change after a copy; later changes to the now-unique storage are as fast as ever.
+
+```swift run
+struct LinkedList<Element>: Sequence {
+    final class Node {
+        var value: Element
+        var next: Node?
+        init(_ value: Element) { self.value = value }
+    }
+
+    final class Storage {
+        var head: Node?
+        var tail: Node?
+        var count = 0
+
+        func copy() -> Storage {
+            print("  (copying \(count) nodes)")
+            let result = Storage()
+            var current = head
+            while let node = current {
+                result.append(node.value)
+                current = node.next
+            }
+            return result
+        }
+
+        func append(_ value: Element) {
+            let node = Node(value)
+            if let tail { tail.next = node } else { head = node }
+            tail = node
+            count += 1
+        }
+    }
+
+    private var storage = Storage()
+
+    private mutating func makeUnique() {
+        if !isKnownUniquelyReferenced(&storage) {
+            storage = storage.copy()
+        }
+    }
+
+    mutating func append(_ value: Element) {
+        makeUnique()
+        storage.append(value)
+    }
+
+    struct Iterator: IteratorProtocol {
+        let storage: Storage           // keeps the storage alive and shared during a loop
+        var current: Node?
+
+        mutating func next() -> Element? {
+            guard let node = current else { return nil }
+            current = node.next
+            return node.value
+        }
+    }
+
+    func makeIterator() -> Iterator {
+        Iterator(storage: storage, current: storage.head)
+    }
+}
+
+var a = LinkedList<Int>()
+a.append(1)
+a.append(2)
+var b = a                          // O(1): a and b share the nodes
+print("b.append(3)")
+b.append(3)                        // first write to shared storage: copy, then append
+print("b.append(4)")
+b.append(4)                        // b's storage is unique now: no copy
+print(Array(a), Array(b))
+
+print("looping over a while appending to it")
+for value in a {
+    a.append(value * 10)
+}
+print(Array(a))
+```
+
+```output
+b.append(3)
+  (copying 2 nodes)
+b.append(4)
+[1, 2] [1, 2, 3, 4]
+looping over a while appending to it
+  (copying 2 nodes)
+[1, 2, 10, 20]
+```
+
+What to notice:
+
+- `var b = a` printed nothing: no copying. The copy happened lazily, on `b`'s first change, and only once.
+- The iterator stores the **storage**, not just a node. While a loop is running, the storage therefore has two owners, the list and the iterator, so the first `append` inside the loop copies it. The loop carries on over the old nodes and sees exactly 1 and 2, just like looping over an array. Compare the class version in [Making LinkedList a Sequence](/dsa/learn/ll-sequence), where the same loop visited the new nodes too.
+- Nodes never escape the struct. If a node could be handed out, a caller could change it behind the storage's back, and no uniqueness check would notice.
+
+DSAKit's `LinkedList` is this design, with the full set of operations from [Build `LinkedList<T>`](/dsa/learn/ll-build-singly) and their documented costs.
+
+## Persistent lists: never change anything
+
+Copy-on-write lets a list be changed safely. A **persistent** data structure takes a different route: nodes are **immutable**, so nothing is ever changed. An operation that would change the list builds a new version and leaves the old one fully usable.
+
+That sounds expensive, but for a singly linked list the most important operation is free. Adding at the front creates one node that points at the existing list. The old list isn't touched, so both versions can share every node after the new one.
+
+You met the natural Swift shape in [Indirect enums for recursive data](/dsa/learn/swift-indirect-enums): a list is either empty, or a value followed by a list.
+
+```swift run
+indirect enum PersistentList: CustomStringConvertible {
+    case empty
+    case node(Int, PersistentList)
+
+    func prepending(_ value: Int) -> PersistentList {
+        .node(value, self)                     // O(1): the old list becomes the rest
+    }
+
+    var first: Int? {
+        if case .node(let value, _) = self { return value }
+        return nil
+    }
+
+    var rest: PersistentList {
+        if case .node(_, let rest) = self { return rest }
+        return .empty
+    }
+
+    var description: String {
+        var parts: [String] = []
+        var current = self
+        while case .node(let value, let rest) = current {
+            parts.append(String(value))
+            current = rest
+        }
+        parts.append("nil")
+        return parts.joined(separator: " -> ")
+    }
+}
+
+let base = PersistentList.empty.prepending(3).prepending(2)
+let withOne = base.prepending(1)
+let withNine = base.prepending(9)
+
+print(base)
+print(withOne)
+print(withNine)
+print(withOne.rest)
+print(withOne.first ?? 0, withNine.rest.first ?? 0)
+```
+
+```output
+2 -> 3 -> nil
+1 -> 2 -> 3 -> nil
+9 -> 2 -> 3 -> nil
+2 -> 3 -> nil
+1 2
+```
+
+Three versions exist at once, and `base` is unchanged by either prepend. `rest`, dropping the first element, is O(1) too: it hands back the existing tail.
+
+## Seeing the sharing
+
+Enum values have no identity you can test, so here's the same idea with an immutable class, where `===` can show that versions really share nodes. Every property is `let`, so a node can never change after it's created, which is what makes sharing it safe:
+
+```swift run
+final class PNode {
+    let value: Int
+    let next: PNode?
+
+    init(_ value: Int, next: PNode?) {
+        self.value = value
+        self.next = next
+    }
+}
+
+func describe(_ head: PNode?) -> String {
+    var parts: [String] = []
+    var current = head
+    while let node = current {
+        parts.append(String(node.value))
+        current = node.next
+    }
+    parts.append("nil")
+    return parts.joined(separator: " -> ")
+}
+
+/// A new version with the value at `index` replaced. Copies the nodes before it and shares the rest.
+func replacing(_ head: PNode?, at index: Int, with value: Int) -> PNode? {
+    guard let head else { return nil }
+    if index == 0 {
+        return PNode(value, next: head.next)                    // share everything after
+    }
+    return PNode(head.value, next: replacing(head.next, at: index - 1, with: value))
+}
+
+let original = PNode(1, next: PNode(2, next: PNode(3, next: PNode(4, next: nil))))
+let edited = replacing(original, at: 1, with: 20)
+
+print(describe(original))
+print(describe(edited))
+print("first node shared?", edited === original)
+print("tail from 3 shared?", edited?.next?.next === original.next?.next)
+```
+
+```output
+1 -> 2 -> 3 -> 4 -> nil
+1 -> 20 -> 3 -> 4 -> nil
+first node shared? false
+tail from 3 shared? true
+```
+
+Replacing the value at index 1 created two new nodes, for positions 0 and 1, and the new version points straight into the old list from position 2 on. This is called **path copying**: copy the path from the head to the change, share everything after it.
+
+| Operation on a persistent singly linked list | Cost | Shared with the old version |
+| --- | --- | --- |
+| Add at the front | O(1) | everything |
+| Drop the first element | O(1) | everything that remains |
+| Replace or insert at index i | O(i) | everything after i |
+| Append at the end | O(n) | nothing: every node is copied |
+
+Appending is the weak spot: the old last node can't be changed to point at a new node, so the whole path to it is copied. Persistent lists are at their best used like stacks: push and pop at the front.
+
+## Where persistence pays off
+
+- **Undo.** Keep every version of a document in an array of versions. With structure sharing, a hundred versions that each changed one thing cost little more than one.
+- **Version control.** Git's commits never change; each new commit points at its parent, and branches share their history. It's a persistent linked structure.
+- **Functional languages.** Lists in Lisp, Haskell and Clojure are persistent singly linked lists, and the language makes sharing invisible.
+- **Safe sharing.** An immutable list can be handed to any part of a program without anyone worrying that it might change underneath them.
+
+## Three kinds of list
+
+| | Class `LinkedList` | Copy-on-write struct | Persistent list |
+| --- | --- | --- | --- |
+| Copying | shares the one list | O(1), shares until a write | O(1), shares forever |
+| Changing | in place, seen by everyone | in place, after copying if shared | never: a new version is made |
+| Old versions | gone | gone (unless you kept a copy) | all still valid |
+| Best for | simple code, interview problems | a general-purpose value type | many versions, undo, safe sharing |
+
+<Callout kind="gotcha" title="Swift gotcha: freeing a long indirect enum recurses">
+When the last reference to a long indirect-enum list goes away, Swift frees the first node, which frees the rest of the list, which frees the rest, and so on, one nested call per node. When this lesson was written, freeing a 100,000-node `PersistentList` overflowed the stack in a script, and only 10,000 nodes were enough on a thread with a small stack, like the ones tests run on. Chains of class nodes didn't have this problem in the same tests. Keep indirect-enum lists short, or use immutable class nodes for long ones.
+</Callout>
+
+```cards
+- id: cow-list
+  front: "How does a copy-on-write linked list give value semantics?"
+  back: "The struct holds a reference to a storage class with the nodes. Every mutating method calls `isKnownUniquelyReferenced(&storage)` first and copies all the nodes if another copy shares them."
+- id: cow-iterator
+  front: "Why does the copy-on-write list's iterator hold the storage, not just a node?"
+  back: "So the storage isn't uniquely referenced during a loop. Changing the list inside the loop then copies it, and the loop keeps walking the old nodes, as with an array."
+- id: persistent-prepend
+  front: "Why is adding at the front of a persistent list O(1)?"
+  back: "The new node simply points at the existing list. Nothing is changed, so the old and new versions share every node after the new one."
+- id: path-copying
+  front: "What is path copying?"
+  back: "Changing a persistent structure by copying only the nodes on the path from the root (here, the head) to the change, and sharing everything else with the old version."
+```
+
+```quiz
+- id: q1
+  type: output
+  prompt: "What does this print?"
+  code: |
+    indirect enum PersistentList {
+        case empty
+        case node(Int, PersistentList)
+
+        var values: [Int] {
+            var result: [Int] = []
+            var current = self
+            while case .node(let value, let rest) = current {
+                result.append(value)
+                current = rest
+            }
+            return result
+        }
+    }
+
+    let base = PersistentList.node(5, .node(6, .empty))
+    let a = PersistentList.node(4, base)
+    let b = PersistentList.node(7, base)
+    print(a.values, b.values, base.values)
+  answer: "[4, 5, 6] [7, 5, 6] [5, 6]"
+  explain: "Prepending never changes `base`. Both new versions start with their own node and continue into the same `5 -> 6` nodes."
+- id: q2
+  type: mcq
+  prompt: "In the copy-on-write list, `var b = a` is followed by three appends to `b`. How many times are nodes copied?"
+  options:
+    - "Never"
+    - "Once, on the first append"
+    - "Three times, once per append"
+    - "Once for every node in `a`, on each append"
+  answer: 1
+  explain: "The first append finds the storage shared with `a` and copies it. After that, `b`'s storage is uniquely referenced, so later appends change it in place."
+- id: q3
+  type: truefalse
+  prompt: "Appending to the end of a persistent singly linked list is O(1)."
+  answer: false
+  explain: "The old last node can't be changed to point at the new node, so every node on the path from the head to the end is copied: O(n). Persistent lists are fast at the front."
+- id: q4
+  type: mcq
+  prompt: "Replacing the value at index 3 of a 10-node persistent list with path copying creates how many new nodes?"
+  options:
+    - "1"
+    - "3"
+    - "4"
+    - "10"
+  answer: 2
+  explain: "The nodes at indexes 0, 1, 2 and 3 are on the path from the head to the change, so they're copied. The 6 nodes after index 3 are shared."
+- id: q5
+  type: match
+  prompt: "Match each kind of list to what happens when you change it."
+  pairs:
+    - ["Class LinkedList", "every variable sees the change"]
+    - ["Copy-on-write struct", "copies its nodes first if they're shared"]
+    - ["Persistent list", "makes a new version and keeps the old one"]
+  explain: "A class is shared and mutable, copy-on-write is mutable but never shared while changing, and a persistent list is never changed at all."
+- id: q6
+  type: recall
+  prompt: "Why is it safe for two versions of a persistent list to share nodes, when sharing caused bugs for the struct that stored nodes directly?"
+  model: "Persistent nodes are immutable, so neither version can change a shared node and surprise the other. The broken struct shared nodes that could still be changed, so a change through one copy showed up in the other."
+```

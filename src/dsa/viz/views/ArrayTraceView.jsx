@@ -62,6 +62,17 @@ const ArrayTraceView = ({ program = 'reverse', input = {} }) => {
                             </ol>
                         </div>
                     )}
+                    {frame.list && (
+                        <div>
+                            <p className="mb-1.5 font-mono text-[11px] uppercase tracking-wider text-muted">{frame.list.title}</p>
+                            <ol className="flex flex-wrap gap-1" aria-label={frame.list.title}>
+                                {frame.list.items.length === 0 && <li className="font-mono text-xs text-muted">empty</li>}
+                                {frame.list.items.map((label, index) => (
+                                    <li key={`${label}-${index}`} className={`rounded-md border px-2.5 py-1 font-mono text-xs ${index === 0 ? 'border-[#30D158] bg-[#30D158]/15 text-[#30D158]' : 'border-line'}`}>{label}</li>
+                                ))}
+                            </ol>
+                        </div>
+                    )}
                     {Object.keys(frame.vars ?? {}).length > 0 && (
                         <div className="flex flex-wrap gap-2" aria-label="Variables">
                             {Object.entries(frame.vars).map(([name, value]) => (

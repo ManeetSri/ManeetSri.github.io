@@ -1,0 +1,301 @@
+## Why it matters
+
+The queues so far grow as needed. Sometimes you want the opposite: a queue with a **fixed** amount of memory, set aside once and never resized. That's a **ring buffer** (also called a circular buffer or circular queue). Audio code passes samples through one, because the real-time audio thread must never stop to allocate memory. Apps keep the last few hundred log lines in one, ready to attach to a bug report. An FPS meter keeps the last 60 frame times in one. In DSA, ring buffers power the "design a circular queue" problem, moving averages over a stream, and, in this module, your own `Deque`.
+
+## Slots in a circle
+
+Take an array with a fixed number of slots, its **capacity**. Imagine the end of the array joined to its start, like the numbers on a clock face: after the last slot comes slot 0 again.
+
+The queue occupies a run of slots somewhere round the circle. Two numbers describe it:
+
+- `head`: the slot holding the **oldest** element, the front of the queue;
+- `count`: how many elements there are.
+
+Dequeue takes the element in slot `head` and moves `head` one step round. Enqueue writes into the first free slot after the back. Nothing ever shifts, and the array never grows: when the back reaches the last slot, the next element goes into slot 0, if it's free.
+
+<Callout kind="analogy">
+A sushi conveyor belt has a fixed number of plates going round. The chef puts new dishes on the empty plates right after the newest dish; diners take the oldest dish. The belt never gets longer. When every plate is full, the chef has to wait.
+</Callout>
+
+## The arithmetic: wrapping with %
+
+"One step round" is where [modular arithmetic](/dsa/learn/math-modular-arithmetic) comes in. With capacity c, the remainder `% c` wraps any position back into `0..<c`:
+
+| What | Slot |
+| --- | --- |
+| the front (oldest) | `head` |
+| the element at position i from the front | `(head + i) % capacity` |
+| the free slot right after the back | `(head + count) % capacity` |
+| the front after a dequeue | `(head + 1) % capacity` |
+
+Here's a ring of `Int`s with capacity 4. It **refuses** new elements when it's full, returning `false`. Empty slots are shown as `_`:
+
+```swift run
+struct IntRing {
+    private var slots: [Int?]
+    private var head = 0                 // the slot holding the oldest value
+    private(set) var count = 0
+
+    init(capacity: Int) {
+        slots = Array(repeating: nil, count: capacity)
+    }
+
+    var capacity: Int { slots.count }
+    var isFull: Bool { count == capacity }
+
+    mutating func enqueue(_ value: Int) -> Bool {
+        guard !isFull else { return false }          // full: refuse
+        slots[(head + count) % capacity] = value     // the slot right after the back
+        count += 1
+        return true
+    }
+
+    mutating func dequeue() -> Int? {
+        guard count > 0 else { return nil }
+        let value = slots[head]
+        slots[head] = nil
+        head = (head + 1) % capacity                 // wraps from the last slot to 0
+        count -= 1
+        return value
+    }
+
+    var picture: String {
+        let cells = slots.map { slot in slot.map { String($0) } ?? "_" }
+        return cells.joined(separator: " ") + "   head \(head), count \(count)"
+    }
+}
+
+var ring = IntRing(capacity: 4)
+for value in [1, 2, 3] { _ = ring.enqueue(value) }
+print(ring.picture)
+_ = ring.dequeue()
+_ = ring.dequeue()
+print(ring.picture)
+for value in [4, 5, 6] { _ = ring.enqueue(value) }
+print(ring.picture)
+print("enqueue 7:", ring.enqueue(7))
+print(ring.dequeue() ?? 0, ring.dequeue() ?? 0)
+print(ring.picture)
+```
+
+```output
+1 2 3 _   head 0, count 3
+_ _ 3 _   head 2, count 1
+5 6 3 4   head 2, count 4
+enqueue 7: false
+3 4
+5 6 _ _   head 0, count 2
+```
+
+Walk through the third line. With `head` at 2 and one element, 4 went into slot (2 + 1) % 4 = 3. Then 5 went into slot (2 + 2) % 4 = **0**: the back wrapped round to the start. 6 filled slot 1, and the ring was full, so 7 was refused. The queue order is still 3, 4, 5, 6, reading round the circle from `head`, even though the array reads `5 6 3 4`. The two dequeues served 3 and 4, and `head` wrapped from slot 3 to slot 0.
+
+What to notice:
+
+- Every operation is a few arithmetic steps: **O(1)**, and no allocation after `init`.
+- The slots are `Int?`, so an empty slot is `nil`. That lets a generic ring hold any `Element` without needing a default value, and setting a slot back to `nil` on dequeue releases the element at once.
+- Storing `count` rather than the back's position makes every formula above one line.
+
+Step through a ring of capacity 4 as it fills, empties and wraps round. Notice that no value ever moves:
+
+```visual arrayTrace
+program: ringBuffer
+```
+
+## Telling full from empty
+
+Many textbook ring buffers store `head` and `tail` (the free slot past the back) instead of a count. That creates a puzzle: when `head == tail`, is the ring empty, or has the back gone all the way round and caught up with the front, so it's full? Both look identical.
+
+There are three standard ways out:
+
+| Approach | Empty when | Full when | Cost |
+| --- | --- | --- | --- |
+| keep a `count` (this lesson) | `count == 0` | `count == capacity` | one extra integer |
+| leave one slot always unused | `head == tail` | `(tail + 1) % capacity == head` | one wasted slot |
+| keep an `isFull` flag | `head == tail && !isFull` | `isFull` | a flag to keep in sync |
+
+Keeping a count is the easiest to get right, which is why both DSAKit types in this module use it. You'll meet the wasted-slot version in older C code and in some lock-free designs.
+
+## When it's full: refuse or overwrite?
+
+A full ring has to do something with a new element. There are two sensible choices, and the right one depends on what the buffer is for.
+
+**Refuse it.** Return `false` (as above), return an optional, or throw an error. Choose this when every element matters and losing one would be a bug: work items, commands, network packets you must acknowledge. The producer has to wait or handle the failure.
+
+**Overwrite the oldest.** The new element takes the oldest element's slot, and `head` moves one step on so the next oldest becomes the front. Choose this when only the most recent elements matter: the last few log lines, the last 60 frame times, the last second of sensor readings.
+
+```swift run
+struct RecentLog {
+    private var slots: [String?]
+    private var head = 0
+    private var count = 0
+
+    init(capacity: Int) {
+        slots = Array(repeating: nil, count: capacity)
+    }
+
+    mutating func record(_ line: String) {
+        if count == slots.count {
+            slots[head] = line                       // overwrite the oldest…
+            head = (head + 1) % slots.count          // …and the next oldest becomes the front
+        } else {
+            slots[(head + count) % slots.count] = line
+            count += 1
+        }
+    }
+
+    var lines: [String] {                            // oldest first
+        (0..<count).compactMap { slots[(head + $0) % slots.count] }
+    }
+}
+
+var log = RecentLog(capacity: 3)
+for event in ["launch", "login", "open feed", "like", "crash"] {
+    log.record(event)
+    print(log.lines)
+}
+```
+
+```output
+["launch"]
+["launch", "login"]
+["launch", "login", "open feed"]
+["login", "open feed", "like"]
+["open feed", "like", "crash"]
+```
+
+When the app crashes, the log holds exactly the three events before it, and it never used more than three slots, however long the app ran. That's why crash reporters and analytics tools keep "breadcrumbs" this way.
+
+<Callout kind="gotcha" title="Swift gotcha: % keeps the sign">
+Stepping **backwards** round a ring, as a deque must, means subtracting 1, and in Swift `%` gives a negative answer for a negative left side:
+
+```swift run
+let capacity = 4
+let index = 0
+print(index - 1)
+print((index - 1) % capacity)
+print((index - 1 + capacity) % capacity)
+```
+
+```output
+-1
+-1
+3
+```
+
+`-1 % 4` is `-1`, not 3, and using it as an index crashes. Add the capacity before taking the remainder, or write `index == 0 ? capacity - 1 : index - 1`.
+</Callout>
+
+## Making % cheaper
+
+Division is one of the slower things a processor does, and `%` is a division. When the capacity is a power of two, `index & (capacity - 1)` gives the same answer as `index % capacity` for non-negative indexes, using a single AND, as [Powers of two and the lowest set bit](/dsa/learn/bits-power-of-two) showed. High-performance ring buffers often round their capacity up to a power of two for exactly this reason. Another trick avoids division entirely: since `head + i` is always less than twice the capacity, one comparison and subtraction wraps it:
+
+```swift
+let index = head + offset
+let slot = index >= capacity ? index - capacity : index
+```
+
+For learning code, `%` is clearest. Reach for these when a profiler says the ring is hot.
+
+## Where ring buffers show up in apps
+
+- **Audio.** An audio render callback runs on a real-time thread hundreds of times a second, and must never allocate memory, take a lock or wait. Audio code hands samples between threads through a ring buffer allocated in advance. (Making one safe between two threads needs atomic operations, which wait for Part IX.)
+- **Logs and breadcrumbs.** The last N events, overwriting the oldest, ready to attach to a crash report.
+- **Smoothing.** The last N readings from the accelerometer, or the last N frame times for an FPS display, averaged as each new value arrives. You'll write that in the stream problems lesson.
+- **Undo with a limit.** Keep only the last 50 edits; the oldest falls off.
+
+## DSAKit's RingBuffer
+
+Your package has a finished `RingBuffer<Element>` in `dsa-swift/Sources/DSAKit/RingBuffer.swift`. It **overwrites the oldest element when full**, and its `append` returns the element it overwrote, or `nil` if there was room. If you need refuse-when-full instead, check `isFull` before appending.
+
+```swift
+import DSAKit
+
+var frameTimes = RingBuffer<Double>(capacity: 3)
+frameTimes.append(16.6)
+frameTimes.append(16.8)
+frameTimes.append(33.4)
+let evicted = frameTimes.append(16.7)            // full: overwrites 16.6 and returns it
+print(evicted ?? 0)                              // 16.6
+print(Array(frameTimes))                         // [16.8, 33.4, 16.7]
+print(frameTimes.isFull, frameTimes[0])          // true 16.8
+```
+
+It also has `popFirst()`, `popLast()`, `first`, `last`, a subscript where 0 is the oldest element, and `Sequence` conformance from oldest to newest. Its tests check wrap-around, capacity 1 and 10,000 mixed operations against a plain array.
+
+## Practice
+
+**Design a circular queue** asks you to build the refusing kind, generic over its element type, with `enqueue`, `dequeue`, `front`, `back`, `isEmpty` and `isFull`. **Moving average of a stream** is a natural fit for the overwriting kind; it comes back in the stream problems lesson.
+
+```cards
+- id: ring-slots
+  front: "In a ring buffer with `head` and `count`, which slot holds the element at position i from the front?"
+  back: "`(head + i) % capacity`. The free slot right after the back is `(head + count) % capacity`."
+- id: full-vs-empty
+  front: "Why does a ring buffer that stores only `head` and `tail` have trouble telling full from empty?"
+  back: "Both states have `head == tail`. Fix it by keeping a count, leaving one slot unused, or keeping a full flag."
+- id: refuse-or-overwrite
+  front: "When should a full ring buffer refuse a new element, and when should it overwrite the oldest?"
+  back: "Refuse when every element matters (work items, commands). Overwrite when only recent elements matter (log lines, frame times, sensor readings)."
+- id: negative-modulo
+  front: "What is `-1 % 4` in Swift, and how do you step backwards round a ring safely?"
+  back: "`-1`: Swift's remainder keeps the sign. Use `(index - 1 + capacity) % capacity`, or `index == 0 ? capacity - 1 : index - 1`."
+```
+
+```quiz
+- id: q1
+  type: output
+  prompt: "A ring of capacity 5 has `head` at 3 and holds 4 elements. Which slots are used, in queue order?"
+  code: |
+    let capacity = 5
+    let head = 3
+    let count = 4
+    var slots: [Int] = []
+    for i in 0..<count {
+        slots.append((head + i) % capacity)
+    }
+    print(slots, (head + count) % capacity)
+  answer: "[3, 4, 0, 1] 2"
+  explain: "From slot 3 the queue runs to slot 4, then wraps to 0 and 1. The next free slot, right after the back, is (3 + 4) % 5 = 2."
+- id: q2
+  type: mcq
+  prompt: "A ring buffer stores `head` and `tail` but no count, and you find `head == tail`. What can you conclude?"
+  options:
+    - "The ring is empty"
+    - "The ring is full"
+    - "Either: you can't tell without more information"
+    - "The ring is corrupted"
+  answer: 2
+  explain: "An empty ring and a full ring both have the back caught up with the front. That's why ring buffers keep a count, leave a slot unused, or keep a flag."
+- id: q3
+  type: trace
+  prompt: "A ring of capacity 3 that overwrites the oldest receives 1, 2, 3, 4, 5. List its contents, oldest first."
+  answer: "3, 4, 5"
+  explain: "After 1, 2 and 3 it's full. 4 overwrites 1 and 5 overwrites 2, so the three newest values remain: 3, 4, 5."
+- id: q4
+  type: bug
+  prompt: "This `prepend` for a ring buffer crashes when `head` is 0. Click the faulty line."
+  code: |
+    mutating func prepend(_ value: Int) {
+        guard count < capacity else { return }
+        head = (head - 1) % capacity
+        slots[head] = value
+        count += 1
+    }
+  answer: 3
+  explain: "When `head` is 0, `(0 - 1) % capacity` is -1 in Swift, which isn't a valid index. Use `(head - 1 + capacity) % capacity`."
+- id: q5
+  type: multi
+  prompt: "Which of these ring buffers should overwrite the oldest element when full? Choose all that apply."
+  options:
+    - "The last 100 log lines, for a crash report"
+    - "Payment requests waiting to be sent"
+    - "The last 60 frame times, for an FPS meter"
+    - "Print jobs that must not be lost"
+  answer: [0, 2]
+  explain: "When only the recent past matters, losing the oldest element is the point. When every element must be handled, the buffer has to refuse new ones and make the producer wait instead."
+- id: q6
+  type: bigo
+  prompt: "What is the time complexity of enqueue on a ring buffer of capacity n, when it isn't full?"
+  answer: "O(1)"
+  explain: "It computes one slot with `%`, writes it and adds 1 to the count. Nothing shifts and nothing is allocated."
+```

@@ -1,12 +1,12 @@
 import { useState } from 'react';
 import { Link, useNavigate } from 'react-router-dom';
 import { ArrowRight, CheckCircle2, Circle, CircleDot, Code2, Search, Shuffle } from 'lucide-react';
-import { lessonById } from '../data/curriculum.js';
+import { lessonById, lessons as allLessons, moduleById } from '../data/curriculum.js';
 import { DIFFICULTIES, LISTS, PATTERNS, problems } from '../data/problems.js';
 import { isDue } from '../engine/srs.js';
 import { cardId, useStore } from '../store/store.js';
 import { useConsoleMeta, useNow } from '../ui/hooks.js';
-import { Button, Chip, EmptyState, PageHeader } from '../ui/primitives.jsx';
+import { Button, Chip, EmptyState, PageHeader, ProgressBar } from '../ui/primitives.jsx';
 
 const STATUS = {
     solved: { icon: CheckCircle2, className: 'text-[#30D158]', label: 'Solved' },
@@ -34,10 +34,21 @@ const PracticePage = () => {
     const [pattern, setPattern] = useState('');
     const [status, setStatus] = useState('');
     const [list, setList] = useState('');
+    const [sort, setSort] = useState('course');
     const now = useNow();
 
     const statusOf = (id) => records[id]?.status ?? 'new';
     const due = (id) => cards[cardId.problem(id)] && isDue(cards[cardId.problem(id)], now);
+
+    // Course order follows the first lesson each problem practises
+    const lessonOrder = new Map(allLessons.map((lesson, index) => [lesson.id, index]));
+    const courseIndex = (problem) => Math.min(...problem.lessons.map((id) => lessonOrder.get(id) ?? Infinity));
+    const difficultyRank = Object.keys(DIFFICULTIES);
+    const sorters = {
+        course: (a, b) => courseIndex(a) - courseIndex(b),
+        difficulty: (a, b) => difficultyRank.indexOf(a.difficulty) - difficultyRank.indexOf(b.difficulty) || courseIndex(a) - courseIndex(b),
+        title: (a, b) => a.title.localeCompare(b.title),
+    };
 
     const filtered = problems.filter((problem) => {
         if (query && !problem.title.toLowerCase().includes(query.toLowerCase())) return false;
@@ -47,7 +58,15 @@ const PracticePage = () => {
         if (status === 'due') return due(problem.id);
         if (status && (records[problem.id]?.status ?? 'new') !== status) return false;
         return true;
-    });
+    }).sort(sorters[sort]);
+
+    const listProgress = Object.entries(LISTS).map(([key, label]) => {
+        const members = problems.filter((problem) => (problem.lists ?? []).includes(key));
+        return { key, label, total: members.length, solved: members.filter((problem) => statusOf(problem.id) === 'solved').length };
+    }).filter((entry) => entry.total > 0);
+    const patternCounts = Object.entries(PATTERNS)
+        .map(([key, label]) => ({ key, label, total: problems.filter((problem) => problem.patterns.includes(key)).length }))
+        .filter((entry) => entry.total > 0);
 
     // A random unsolved problem from lessons already finished, so it's fair game
     const randomFromLearned = () => {
@@ -64,6 +83,38 @@ const PracticePage = () => {
                 Every problem has hints, several approaches and tests you run in the companion Swift package. More arrive with each part.
             </PageHeader>
 
+            {listProgress.length > 0 && (
+                <section aria-label="Curated lists" className="mb-6 grid gap-3 sm:grid-cols-3">
+                    {listProgress.map((entry) => (
+                        <button
+                            key={entry.key}
+                            type="button"
+                            aria-pressed={list === entry.key}
+                            onClick={() => setList(list === entry.key ? '' : entry.key)}
+                            className={`rounded-2xl border p-4 text-left transition-colors ${list === entry.key ? 'border-amber bg-amber/10' : 'border-line bg-surface hover:border-white/25'}`}
+                        >
+                            <span className="block font-semibold">{entry.label}</span>
+                            <span className="mt-0.5 block font-mono text-xs text-muted">{entry.solved} of {entry.total} solved</span>
+                            <ProgressBar value={entry.total ? entry.solved / entry.total : 0} label={`${entry.label} progress`} className="mt-3" />
+                        </button>
+                    ))}
+                </section>
+            )}
+
+            <section aria-label="Patterns" className="mb-6 flex flex-wrap gap-1.5">
+                {patternCounts.map((entry) => (
+                    <button
+                        key={entry.key}
+                        type="button"
+                        aria-pressed={pattern === entry.key}
+                        onClick={() => setPattern(pattern === entry.key ? '' : entry.key)}
+                        className={`rounded-full px-3 py-1.5 text-xs ${pattern === entry.key ? 'bg-amber/20 text-amber ring-1 ring-amber' : 'bg-white/[0.06] text-muted hover:text-paper'}`}
+                    >
+                        {entry.label} <span className="font-mono opacity-70">{entry.total}</span>
+                    </button>
+                ))}
+            </section>
+
             <div className="mb-6 grid gap-3 sm:grid-cols-2 lg:grid-cols-[minmax(0,1.4fr)_repeat(4,minmax(0,1fr))]">
                 <label className="flex flex-col gap-1 text-xs text-muted sm:col-span-2 lg:col-span-1">
                     Search
@@ -78,7 +129,16 @@ const PracticePage = () => {
                 <Select label="List" value={list} onChange={setList} options={LISTS} />
             </div>
 
-            <div className="mb-4 flex justify-end">
+            <div className="mb-4 flex flex-wrap items-center justify-between gap-3">
+                <label className="flex items-center gap-2 text-sm text-muted">
+                    Sort by
+                    <select value={sort} onChange={(event) => setSort(event.target.value)} className="h-9 rounded-lg border border-line bg-surface px-2 text-paper">
+                        <option value="course">Course order</option>
+                        <option value="difficulty">Difficulty</option>
+                        <option value="title">Title</option>
+                    </select>
+                    <span className="font-mono text-xs">{filtered.length} shown</span>
+                </label>
                 <Button size="sm" onClick={randomFromLearned}><Shuffle size={15} aria-hidden="true" /> Random from what I’ve learned</Button>
             </div>
 
@@ -95,7 +155,7 @@ const PracticePage = () => {
                                     <span className="sr-only">{label}:</span>
                                     <span className="min-w-0 flex-1">
                                         <span className="block font-medium">{problem.title}</span>
-                                        <span className="block truncate text-xs text-muted">{problem.lessons.map((id) => lessonById[id]?.title).join(' · ')}</span>
+                                        <span className="block truncate text-xs text-muted">{moduleById[lessonById[problem.lessons[0]]?.module]?.code} · {problem.lessons.map((id) => lessonById[id]?.title).join(' · ')}</span>
                                     </span>
                                     {due(problem.id) && <Chip tone="amber">due</Chip>}
                                     <span className="hidden gap-1.5 md:flex">{problem.patterns.map((key) => <Chip key={key}>{PATTERNS[key]}</Chip>)}</span>

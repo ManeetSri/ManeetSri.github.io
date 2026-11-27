@@ -4,7 +4,7 @@ import { createContext, useContext, useSyncExternalStore } from 'react';
 import { addDays, dayKey, startOfDay } from '../engine/dates.js';
 import { newCard, reviewCard } from '../engine/srs.js';
 
-export const COLLECTIONS = ['meta', 'lessons', 'problems', 'cards', 'notes', 'activity', 'checkpoints'];
+export const COLLECTIONS = ['meta', 'lessons', 'problems', 'cards', 'notes', 'activity', 'checkpoints', 'mocks'];
 
 export const DEFAULT_PROFILE = {
     goal: 'foundations',
@@ -138,6 +138,15 @@ export const createStore = (adapter) => {
                 attempts: { [time]: { at: time, score, total, passed } },
                 ...(passed && !alreadyPassed ? { passedAt: time } : {}),
             });
+        },
+
+        // A mock interview keeps its rubric, and also counts as an attempt at the problem
+        recordMock: ({ problemId, seconds, status, scores, notes }) => {
+            const time = now();
+            const average = Object.values(scores).reduce((sum, value) => sum + value, 0) / Math.max(1, Object.values(scores).length);
+            const rating = status === 'attempted' || average < 2 ? 'again' : average < 2.75 ? 'hard' : average < 3.5 ? 'good' : 'easy';
+            put('mocks', String(time), { at: time, problemId, seconds, status, scores, notes });
+            actions.logAttempt(problemId, { status, seconds, rating });
         },
 
         addMinutes: (minutes) => {

@@ -1,7 +1,7 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
 import { Link, NavLink, useLocation, useNavigate } from 'react-router-dom';
 import {
-    BarChart3, BookOpen, ChevronDown, Code2, Flame, Layers, ListTree, Map as MapIcon, NotebookPen,
+    BarChart3, BookOpen, ChevronDown, Code2, Flame, Layers, ListTree, Map as MapIcon, Mic, NotebookPen,
     ScrollText, Search, Settings, Sparkles, Sun, X,
 } from 'lucide-react';
 import { lessons, modules, modulesInPart, parts } from '../data/curriculum.js';
@@ -16,6 +16,7 @@ const NAV = [
     { to: '/dsa/path', label: 'Path', icon: MapIcon },
     { to: '/dsa/practice', label: 'Practice', icon: Code2 },
     { to: '/dsa/review', label: 'Review', icon: Layers },
+    { to: '/dsa/mock', label: 'Mock interview', icon: Mic },
     { to: '/dsa/progress', label: 'Progress', icon: BarChart3 },
     { to: '/dsa/notes', label: 'Notes', icon: NotebookPen },
     { to: '/dsa/sheets', label: 'Cheat sheets', icon: ScrollText },
@@ -166,6 +167,13 @@ const searchIndex = [
     ...modules.map((module) => ({ id: `module-${module.id}`, label: module.title, detail: `${module.code} · Module`, to: `/dsa/learn/${module.lessons[0].id}`, keywords: module.summary })),
     ...lessons.map((lesson) => ({ id: `lesson-${lesson.id}`, label: lesson.title, detail: `${modules.find((module) => module.id === lesson.module).code} · Lesson${lesson.status === 'stub' ? ' · soon' : ''}`, to: `/dsa/learn/${lesson.id}` })),
     ...problems.map((problem) => ({ id: `problem-${problem.id}`, label: problem.title, detail: 'Problem', to: `/dsa/practice/${problem.id}` })),
+    ...[
+        ['big-o', 'Big-O reference', 'complexity table sorting costs'],
+        ['swift-collections', 'Swift collections cheat sheet', 'array set dictionary string api'],
+        ['templates', 'Code templates', 'binary search bfs dfs dijkstra union find backtracking dp'],
+        ['patterns', 'Pattern chooser', 'which technique signals'],
+        ['glossary', 'Glossary', 'terms definitions'],
+    ].map(([id, label, keywords]) => ({ id: `sheet-${id}`, label, detail: 'Cheat sheet', to: `/dsa/sheets/${id}`, keywords })),
 ];
 
 // Every word of the query has to appear, and titles that start with the query rank first

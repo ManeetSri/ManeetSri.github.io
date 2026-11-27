@@ -414,6 +414,115 @@ const PROGRAMS = {
     },
 };
 
+// Sliding window maximum with a monotonic deque, matching the queue-monotonic-deque lesson
+PROGRAMS.windowMax = {
+    title: 'Sliding window maximum with a monotonic deque',
+    defaults: { items: [4, 2, 12, 3, 1, 8, 5], k: 3 },
+    code: `func windowMaxima(_ values: [Int], k: Int) -> [Int] {
+    var result: [Int] = []
+    var window: [Int] = []       // indexes; their values decrease from window[head] to the end
+    var head = 0
+    for i in values.indices {
+        if head < window.count && window[head] <= i - k {
+            head += 1
+        }
+        while head < window.count && values[window[window.count - 1]] <= values[i] {
+            window.removeLast()
+        }
+        window.append(i)
+        if i >= k - 1 {
+            result.append(values[window[head]])
+        }
+    }
+    return result
+}`,
+    * run({ items, k }) {
+        const result = [];
+        const deque = [];
+        const frame = (line, message, i, marks = {}) => ({
+            rows: [row('values', items, { pointers: i === undefined ? {} : { i }, range: i === undefined ? null : { from: Math.max(0, i - k + 1), to: i, tone: 'window' }, marks }), row('maxima', [...result, ...Array(Math.max(0, items.length - k + 1 - result.length)).fill(null)])],
+            list: { title: 'deque, front first (indexes → values)', items: deque.map((index) => `${index}→${items[index]}`) },
+            vars: {},
+            line,
+            message,
+        });
+        yield frame(3, `The deque keeps indexes whose values decrease from front to back. The front is always the window's maximum. k = ${k}.`);
+        for (let i = 0; i < items.length; i += 1) {
+            if (deque.length && deque[0] <= i - k) {
+                const expired = deque.shift();
+                yield frame(7, `Index ${expired} (${items[expired]}) has slid out of the window: drop it from the front.`, i, { [expired]: 'out' });
+            }
+            while (deque.length && items[deque.at(-1)] <= items[i]) {
+                const popped = deque.pop();
+                yield frame(10, `${items[popped]} ≤ ${items[i]}: it can never be a maximum again. Pop it from the back.`, i, { [popped]: 'out' });
+            }
+            deque.push(i);
+            if (i >= k - 1) result.push(items[deque[0]]);
+            yield frame(i >= k - 1 ? 14 : 12, i >= k - 1 ? `Push index ${i}. Window ${i - k + 1}–${i} has maximum ${items[deque[0]]}, at the front.` : `Push index ${i}. The first window isn't full yet.`, i, { [deque[0]]: 'found' });
+        }
+        yield frame(17, `Maxima: ${result.join(', ')}. Each index is pushed and popped at most once: O(n).`);
+    },
+};
+
+// A fixed-capacity ring buffer that refuses new values when full, matching the queue-ring-buffer lesson
+PROGRAMS.ringBuffer = {
+    title: 'A ring buffer wrapping round',
+    defaults: { capacity: 4, operations: ['enqueue 1', 'enqueue 2', 'enqueue 3', 'dequeue', 'dequeue', 'enqueue 4', 'enqueue 5', 'enqueue 6', 'enqueue 7'] },
+    code: `mutating func enqueue(_ value: Int) -> Bool {
+    guard !isFull else { return false }          // full: refuse
+    slots[(head + count) % capacity] = value     // the slot right after the back
+    count += 1
+    return true
+}
+
+mutating func dequeue() -> Int? {
+    guard count > 0 else { return nil }
+    let value = slots[head]
+    slots[head] = nil
+    head = (head + 1) % capacity                 // wraps from the last slot to 0
+    count -= 1
+    return value
+}`,
+    * run({ capacity, operations }) {
+        const slots = Array(capacity).fill(null);
+        let head = 0;
+        let count = 0;
+        const frame = (line, message, marks = {}) => ({
+            rows: [row('slots', slots, { pointers: { head, next: (head + count) % capacity }, marks })],
+            vars: { head, count },
+            line,
+            message,
+        });
+        yield frame(1, `${capacity} slots in a circle. head is the oldest value; next is (head + count) % ${capacity}, where the next value goes.`);
+        for (const operation of operations) {
+            const [op, arg] = operation.trim().split(/\s+/);
+            if (op === 'enqueue') {
+                const value = Number(arg);
+                if (count === capacity) {
+                    yield frame(2, `enqueue(${value}): the ring is full, so it's refused (returns false).`);
+                    continue;
+                }
+                const slot = (head + count) % capacity;
+                slots[slot] = value;
+                count += 1;
+                yield frame(3, `enqueue(${value}) goes into slot (${head} + ${count - 1}) % ${capacity} = ${slot}.`, { [slot]: 'found' });
+            } else {
+                if (count === 0) {
+                    yield frame(9, 'dequeue() on an empty ring returns nil.');
+                    continue;
+                }
+                const value = slots[head];
+                const from = head;
+                slots[head] = null;
+                head = (head + 1) % capacity;
+                count -= 1;
+                yield frame(12, `dequeue() returns ${value} from slot ${from}; head moves to ${head}${from === capacity - 1 ? ', wrapping round to the start' : ''}.`, { [from]: 'out' });
+            }
+        }
+        yield frame(14, 'No element ever moved: only head and count changed. Every operation is O(1).');
+    },
+};
+
 // The prefix-sum program, defined separately to keep the table above readable
 PROGRAMS.prefixSum.run = function* run({ items, query: [from, to] }) {
     const prefix = [0];

@@ -3,7 +3,7 @@
 import { DIFFICULTIES, problemById } from '../data/problems.js';
 import { addDays, dayKey } from './dates.js';
 
-export const XP = { lesson: 50, firstTryAnswer: 10, review: 5, checkpoint: 200 };
+export const XP = { lesson: 50, firstTryAnswer: 10, review: 5, checkpoint: 200, mock: 50 };
 
 export const RANKS = [
     { min: 0, title: 'Novice' },
@@ -22,7 +22,7 @@ const problemXp = (id, record) => {
     return 0;
 };
 
-export const xpFrom = ({ lessons = {}, problems = {}, cards = {}, checkpoints = {} }) => {
+export const xpFrom = ({ lessons = {}, problems = {}, cards = {}, checkpoints = {}, mocks = {} }) => {
     const lessonXp = Object.values(lessons).reduce((sum, record) => {
         const answers = Object.values(record.quiz ?? {}).filter((answer) => answer.firstTry).length;
         return sum + (record.completedAt ? XP.lesson : 0) + answers * XP.firstTryAnswer;
@@ -30,7 +30,7 @@ export const xpFrom = ({ lessons = {}, problems = {}, cards = {}, checkpoints = 
     const solvedXp = Object.entries(problems).reduce((sum, [id, record]) => sum + problemXp(id, record), 0);
     const reviewXp = Object.values(cards).reduce((sum, card) => sum + (card.reviews ?? 0) * XP.review, 0);
     const checkpointXp = Object.values(checkpoints).filter((record) => record.passedAt).length * XP.checkpoint;
-    return lessonXp + solvedXp + reviewXp + checkpointXp;
+    return lessonXp + solvedXp + reviewXp + checkpointXp + Object.keys(mocks).length * XP.mock;
 };
 
 export const rankFor = (xp) => {
@@ -47,7 +47,7 @@ export const rankFor = (xp) => {
 export const minutesOn = (record) => Object.values(record?.minutes ?? {}).reduce((sum, value) => sum + value, 0);
 
 // Every day with any recorded learning
-export const activeDays = ({ lessons = {}, problems = {}, cards = {}, activity = {}, checkpoints = {} }) => {
+export const activeDays = ({ lessons = {}, problems = {}, cards = {}, activity = {}, checkpoints = {}, mocks = {} }) => {
     const days = new Set();
     const add = (ms) => ms && days.add(dayKey(ms));
     Object.values(lessons).forEach((record) => {
@@ -58,6 +58,7 @@ export const activeDays = ({ lessons = {}, problems = {}, cards = {}, activity =
     Object.values(problems).forEach((record) => Object.values(record.attempts ?? {}).forEach((attempt) => add(attempt.at)));
     Object.values(cards).forEach((card) => add(card.last));
     Object.values(checkpoints).forEach((record) => Object.values(record.attempts ?? {}).forEach((attempt) => add(attempt.at)));
+    Object.values(mocks).forEach((record) => add(record.at));
     Object.entries(activity).forEach(([day, record]) => minutesOn(record) > 0 && days.add(day));
     return days;
 };

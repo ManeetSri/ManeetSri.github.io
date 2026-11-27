@@ -115,10 +115,21 @@ n: 4
 | `traceTable` | `program`: `sum`, `largest`, `reverseDigits`, `gcd` or `fastPower`; `input`: `{ numbers: [...] }`, `{ number: 1234 }`, `{ first: 48, second: 18 }` or `{ base: 3, exponent: 13 }` | variables and a trace-table row per loop pass, with the code traced |
 | `growthChart` | `classes` (any of `O(1)`, `O(log n)`, `O(n)`, `O(n log n)`, `O(n²)`, `O(2ⁿ)`, `O(n!)`), `n`, `max` | growth curves with an n slider, a linear/log toggle and a table of counts |
 | `bitPlayground` | `value`, `operand` (0–255), `signed` (true for Int8), `operator` (`&`, `|`, `^`, `~`, `<<`, `>>`) | clickable 8-bit cells, an operator, and the result in binary, decimal and hex |
-| `arrayTrace` | `program` plus `input` (defaults shown): `reverse` `{items}`, `pairSum` `{items (sorted), target}`, `dedupe` `{items (sorted)}`, `dutchFlag` `{items of 0/1/2}`, `maxSumFixed` `{items, k}`, `shortestWindow` `{items (positive), target}`, `longestUnique` `{text}`, `prefixSum` `{items, query: [from, to]}`, `kadane` `{items}`, `dynamicAppend` `{count, capacity}`, `nextGreater` `{items}`, `bubbleSort` / `selectionSort` / `insertionSort` / `mergeSort` / `quickSort` `{items}`, `countingSort` `{items, max}`, `lowerBound` `{items (sorted), target}`, `sieve` `{n}` | array rows with named pointers, highlighted windows and swaps, variables, a stack for `nextGreater`, and the Swift code traced |
+| `arrayTrace` | `program` plus `input` (defaults shown): `reverse` `{items}`, `pairSum` `{items (sorted), target}`, `dedupe` `{items (sorted)}`, `dutchFlag` `{items of 0/1/2}`, `maxSumFixed` `{items, k}`, `shortestWindow` `{items (positive), target}`, `longestUnique` `{text}`, `prefixSum` `{items, query: [from, to]}`, `kadane` `{items}`, `dynamicAppend` `{count, capacity}`, `nextGreater` `{items}`, `bubbleSort` / `selectionSort` / `insertionSort` / `mergeSort` / `quickSort` `{items}`, `countingSort` `{items, max}`, `lowerBound` `{items (sorted), target}`, `sieve` `{n}`, `windowMax` `{items, k}`, `ringBuffer` `{capacity, operations: ["enqueue 1", "dequeue"]}` | array rows with named pointers, highlighted windows and swaps, variables, a stack for `nextGreater`, and the Swift code traced |
 | `linkedList` | `program`: `reverse`, `middle` or `cycle`; `input`: `{ values: [...], loopTo: index or null }` (loopTo is for cycle) | nodes and `next` arrows changing, with previous/current/next or slow/fast pointers |
 | `stackQueue` | `kind`: `stack`, `queue` or `deque`; `operations` such as `["push 3", "pop", "peek"]`, `["enqueue 3", "dequeue"]` or `["pushFront 1", "popBack"]` | the structure after each operation, and what each removal returns |
 | `hashTable` | `mode`: `chaining` or `probing`; `keys` (Ints or Strings); `size` | buckets with chains, or slots with probe sequences and clustering |
+| `bst` | `program`: `insert`, `search`, `remove` or `traversal`; `input`: `{ values: [...], target, order: inorder \| preorder \| postorder \| levelorder }` | the BST built from `values` in order, with the search path, the deletion cases (leaf, one child, two children via the successor) or the visiting order and output |
+| `avl` | `values` (inserted in order) | balance factors, the unbalanced tree after each insert, and the LL/RR/LR/RL rotation that fixes it |
+| `heap` | `operations`: numbers to push, `"pop"` to pop, e.g. `[5, 3, 8, "pop"]` | a min-heap as a tree and as an array side by side, sifting up and down |
+| `trie` | `words`, `prefix` | words inserted into a trie sharing prefixes, then a prefix search that lists completions |
+| `graph` | `program`: `bfs`, `dfs`, `dijkstra`, `topo` or `kruskal`; `graph`: `small` (unweighted), `weighted`, `dag`, or your own `{ directed, nodes: [{ id, x, y }] (x, y from 0 to 100), edges: [[from, to, weight]] }`; `start` | nodes coloured by state (frontier, current, done), labels for distance, order or in-degree, the queue/stack/heap, and tree or MST edges |
+| `grid` | `rows`: strings using `S` start, `G` goal, `#` wall and `.` open | BFS spreading out across a grid with distances, the queue, and the shortest path traced back |
+| `dpTable` | `program` plus `input`: `lcs` `{a, b}`, `editDistance` `{a, b}`, `knapsack` `{weights, values, capacity}`, `coinChange` `{coins, amount}`, `uniquePaths` `{rows, cols}`, `lis` `{items}` | a DP table filling cell by cell, with the cell being filled, the cells it depends on, and the answer (LCS also traces its letters back) |
+| `nQueens` | `n` (4–8), `all` (false stops at the first solution) | the board as queens are placed, the attacking queens that rule a square out, and backtracking |
+| `subsetsTree` | `items` (3 or 4 is plenty) | the include/exclude decision tree, the current recursion path, and the subsets recorded at the leaves |
+| `segmentTree` | `items` (8 is ideal), `operations`: `[["query", left, right], ["update", index, value]]` | range sums in a tree, which nodes a query uses whole, splits or skips, and the path an update changes |
+| `fenwick` | `items`, `query` (a prefix length, 1-indexed), `update`: `[index, delta]` | each entry's range of responsibility, and the `i & -i` jumps for prefix queries and updates |
 
 Need a visualiser that doesn't exist? Say so in your report instead of improvising one.
 
@@ -207,6 +218,19 @@ import Exercises
     }
 }
 ```
+
+## DSAKit: the reference data structures
+
+From Part III on, each data structure the course builds also gets a polished reference version in `dsa-swift/Sources/DSAKit/<TypeName>.swift`, tested in `dsa-swift/Tests/DSAKitTests/<TypeName>Tests.swift`. Later problems can `import DSAKit` and use them, for example a graph problem that needs a `Deque`.
+
+- **Make it generic and public**, with a doc comment on every public member that states its complexity.
+- **Conform where it's natural:** `Sequence`, `ExpressibleByArrayLiteral` and `CustomStringConvertible`.
+- **Prefer value semantics** (an array inside a struct) unless the lesson is about references.
+- **Test it thoroughly:** empty, single element, growth past the initial capacity, order of elements, and the edge cases of every operation.
+
+The learner still builds their own version as an exercise. That's a problem whose type is nested inside its enum, as usual. DSAKit is the finished one.
+
+`ListNode` (`public final class ListNode { public var value: Int; public var next: ListNode? }`, with helpers to build a list from an array and read it back) lives in DSAKit too, so every linked-list problem shares it.
 
 ## Checking your work
 

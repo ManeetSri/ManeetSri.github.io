@@ -1,0 +1,463 @@
+## Why it matters
+
+You now know every piece of a hash table: a hash function, a way to handle collisions, and a load factor that triggers growth. Building one yourself puts them together and removes the last of the magic from `Dictionary` and `Set`. It's also a favourite interview question ("design a hash map without using built-in hash tables"), and it's the first data structure in this course that's entirely yours, from storage to growth policy. The finished, tested version lives in DSAKit, so later modules can use it.
+
+## The design
+
+Before writing code, decide the shape. Every choice here comes from the last three lessons:
+
+- **Separate chaining.** An array of buckets, each an array of key-value pairs. It's the simplest strategy to get right, and deletion is easy.
+- **Swift's hasher for the hash value.** Requiring `Key: Hashable` lets you call `key.hashValue`, which runs the key's `hash(into:)` through a fresh `Hasher`. You get SipHash's mixing for free.
+- **A power-of-two bucket count, starting at 8.** Then `hashValue & (bucketCount - 1)` picks the bucket. The mask keeps the low bits, so the index is never negative, unlike `%`.
+- **Grow at a load factor of 0.75** by doubling and rehashing everything, for O(1) amortised inserts.
+- **A struct holding arrays**, so the map has value semantics and copy-on-write without any extra work, as [Copy-on-write explained](/dsa/learn/swift-copy-on-write-intro) described.
+
+The API copies `Dictionary`'s: a subscript that returns `Value?`, where assigning `nil` removes the key.
+
+## Step 1: storage and the bucket index
+
+```swift
+struct HashMap<Key: Hashable, Value> {
+    private var buckets: [[(key: Key, value: Value)]] = Array(repeating: [], count: 8)
+    private(set) var count = 0
+
+    private func index(for key: Key) -> Int {
+        key.hashValue & (buckets.count - 1)
+    }
+}
+```
+
+Each bucket is an array of **named tuples**, `(key: Key, value: Value)`. Tuples can't be keys, but they're perfectly good *values* to store. `private(set)` means code outside the type can read `count` but only the map can change it.
+
+## Step 2: reading
+
+To read, find the bucket and walk its chain, comparing keys with `==`. The hash only narrows the search to one bucket; `==` makes the final decision, which is why colliding keys never get mixed up:
+
+```swift
+subscript(key: Key) -> Value? {
+    get {
+        for entry in buckets[index(for: key)] where entry.key == key {
+            return entry.value
+        }
+        return nil
+    }
+    // set comes next
+}
+```
+
+## Step 3: writing, replacing and removing
+
+Assigning through the subscript means one of three things, and the setter sends each to the right place:
+
+```swift
+set {
+    if let newValue {
+        insert(newValue, for: key)
+    } else {
+        removeValue(forKey: key)       // map[key] = nil removes the key
+    }
+}
+```
+
+`if let newValue` is the shorthand for `if let newValue = newValue`, which you met in M04. Inserting must check whether the key is already in its bucket. If it is, replace the value and leave `count` alone. Only a genuinely new key adds to `count` and might trigger growth:
+
+```swift
+private mutating func insert(_ value: Value, for key: Key) {
+    let bucket = index(for: key)
+    if let position = buckets[bucket].firstIndex(where: { $0.key == key }) {
+        buckets[bucket][position].value = value      // existing key: replace
+        return
+    }
+    buckets[bucket].append((key, value))              // new key
+    count += 1
+    if count > buckets.count * 3 / 4 {
+        grow()
+    }
+}
+```
+
+## Step 4: removing
+
+Find the entry, then take it out of its chain. Order inside a bucket doesn't matter, so instead of `remove(at:)`, which shifts everything after the hole, swap the entry with the bucket's last one and remove the last: O(1).
+
+```swift
+@discardableResult
+mutating func removeValue(forKey key: Key) -> Value? {
+    let bucket = index(for: key)
+    guard let position = buckets[bucket].firstIndex(where: { $0.key == key }) else {
+        return nil
+    }
+    count -= 1
+    buckets[bucket].swapAt(position, buckets[bucket].count - 1)
+    return buckets[bucket].removeLast().value
+}
+```
+
+`@discardableResult` lets callers write `map.removeValue(forKey: k)` without using the result, exactly like `Dictionary`.
+
+## Step 5: growing
+
+Growing makes a new array twice the size and rehashes every entry into it. The index has to be computed with the *new* count, so this can't call `index(for:)`, which uses the old one:
+
+```swift
+private mutating func grow() {
+    var bigger = [[(key: Key, value: Value)]](repeating: [], count: buckets.count * 2)
+    for bucket in buckets {
+        for entry in bucket {
+            bigger[entry.key.hashValue & (bigger.count - 1)].append(entry)
+        }
+    }
+    buckets = bigger
+}
+```
+
+## The whole map, tested
+
+Here it is assembled, with a `keys` property and some checks. The last check is the most useful testing technique you'll ever use for a data structure: run thousands of mixed operations on your structure and on a trusted one, `Dictionary`, and count any disagreements.
+
+```swift run
+struct HashMap<Key: Hashable, Value> {
+    private var buckets: [[(key: Key, value: Value)]] = Array(repeating: [], count: 8)
+    private(set) var count = 0
+
+    var bucketCount: Int {
+        buckets.count
+    }
+
+    private func index(for key: Key) -> Int {
+        key.hashValue & (buckets.count - 1)
+    }
+
+    subscript(key: Key) -> Value? {
+        get {
+            for entry in buckets[index(for: key)] where entry.key == key {
+                return entry.value
+            }
+            return nil
+        }
+        set {
+            if let newValue {
+                insert(newValue, for: key)
+            } else {
+                removeValue(forKey: key)
+            }
+        }
+    }
+
+    private mutating func insert(_ value: Value, for key: Key) {
+        let bucket = index(for: key)
+        if let position = buckets[bucket].firstIndex(where: { $0.key == key }) {
+            buckets[bucket][position].value = value      // existing key: replace
+            return
+        }
+        buckets[bucket].append((key, value))              // new key
+        count += 1
+        if count > buckets.count * 3 / 4 {
+            grow()
+        }
+    }
+
+    @discardableResult
+    mutating func removeValue(forKey key: Key) -> Value? {
+        let bucket = index(for: key)
+        guard let position = buckets[bucket].firstIndex(where: { $0.key == key }) else {
+            return nil
+        }
+        count -= 1
+        buckets[bucket].swapAt(position, buckets[bucket].count - 1)
+        return buckets[bucket].removeLast().value
+    }
+
+    private mutating func grow() {
+        var bigger = [[(key: Key, value: Value)]](repeating: [], count: buckets.count * 2)
+        for bucket in buckets {
+            for entry in bucket {
+                bigger[entry.key.hashValue & (bigger.count - 1)].append(entry)
+            }
+        }
+        buckets = bigger
+    }
+
+    var keys: [Key] {
+        buckets.flatMap { bucket in bucket.map { $0.key } }
+    }
+}
+
+var ages = HashMap<String, Int>()
+ages["Asha"] = 31
+ages["Ben"] = 27
+ages["Asha"] = 32                       // replaces
+print(ages["Asha"] ?? -1, ages["Zoe"] ?? -1, ages.count)
+ages["Ben"] = nil
+print(ages.count, ages.keys)
+
+var squares = HashMap<Int, Int>()
+for number in 0..<1_000 {
+    squares[number] = number * number
+}
+print(squares.count, squares.bucketCount, squares[999] ?? -1)
+
+// A key with a terrible hash: only value % 2 counts, so keys collide constantly
+struct ClumsyKey: Hashable {
+    let value: Int
+    func hash(into hasher: inout Hasher) {
+        hasher.combine(value % 2)
+    }
+}
+var clumsy = HashMap<ClumsyKey, String>()
+for value in 0..<100 {
+    clumsy[ClumsyKey(value: value)] = "#\(value)"
+}
+clumsy[ClumsyKey(value: 42)] = nil
+print(clumsy.count, clumsy[ClumsyKey(value: 41)] ?? "missing", clumsy[ClumsyKey(value: 42)] ?? "missing")
+
+// Compare with Dictionary over a long, mixed run of operations
+var mine = HashMap<Int, Int>()
+var model: [Int: Int] = [:]
+var mismatches = 0
+for step in 0..<20_000 {
+    let key = (step * 7_919) % 1_000
+    if step % 3 == 0 {
+        if mine.removeValue(forKey: key) != model.removeValue(forKey: key) {
+            mismatches += 1
+        }
+    } else {
+        mine[key] = step
+        model[key] = step
+    }
+    if mine[key] != model[key] || mine.count != model.count {
+        mismatches += 1
+    }
+}
+print("mismatches:", mismatches)
+```
+
+```output
+32 -1 2
+1 ["Asha"]
+1000 2048 998001
+99 #41 missing
+mismatches: 0
+```
+
+What to notice:
+
+- Replacing Asha's age left `count` at 2, and removing Ben brought it to 1.
+- A thousand entries needed 2,048 buckets: 1,024 buckets allow only 768 entries at a load factor of 0.75.
+- `ClumsyKey` squeezes 100 keys into two long chains. Every operation is slow, but every answer is still right, because `==` has the final word.
+- Twenty thousand mixed operations agreed with `Dictionary` every time.
+
+The `keys` property prints in bucket order, which depends on the seeded hash. With one key left it's predictable; with more, sort the keys before printing them.
+
+## Making it feel built in
+
+A few small extensions make the map as pleasant to use as `Dictionary`. These are fragments to add to the type above.
+
+**A dictionary literal.** `ExpressibleByDictionaryLiteral` works like the array-literal protocol from [ExpressibleByArrayLiteral](/dsa/learn/swift-array-literal), with key-value pairs:
+
+```swift
+extension HashMap: ExpressibleByDictionaryLiteral {
+    init(dictionaryLiteral elements: (Key, Value)...) {
+        self.init()
+        for (key, value) in elements {
+            self[key] = value
+        }
+    }
+}
+
+let capitals: HashMap = ["France": "Paris", "Japan": "Tokyo"]
+```
+
+**A default subscript**, so counting is one line, as with `Dictionary`'s `default:` from M07:
+
+```swift
+extension HashMap {
+    subscript(key: Key, default defaultValue: Value) -> Value {
+        get { self[key] ?? defaultValue }
+        set { self[key] = newValue }
+    }
+}
+
+var counts = HashMap<Character, Int>()
+for letter in "banana" {
+    counts[letter, default: 0] += 1
+}
+```
+
+**Sequence conformance**, so `for (key, value) in map` works. The iterator walks the buckets in order and each bucket's entries in order, using the pattern from [Sequence and IteratorProtocol](/dsa/learn/swift-sequence-iterator). The DSAKit version below has the full code.
+
+## A HashSet
+
+A set is a map without values: each bucket holds elements instead of pairs. It's so close that one common approach is to wrap a `HashMap<Element, Bool>` and ignore the values. Written directly, it's short:
+
+```swift run
+struct HashSet<Element: Hashable> {
+    private var buckets: [[Element]] = Array(repeating: [], count: 8)
+    private(set) var count = 0
+
+    private func index(for element: Element) -> Int {
+        element.hashValue & (buckets.count - 1)
+    }
+
+    func contains(_ element: Element) -> Bool {
+        buckets[index(for: element)].contains(element)
+    }
+
+    @discardableResult
+    mutating func insert(_ element: Element) -> Bool {
+        guard !contains(element) else {
+            return false                  // already there: sets hold each value once
+        }
+        buckets[index(for: element)].append(element)
+        count += 1
+        if count > buckets.count * 3 / 4 {
+            let old = buckets
+            buckets = Array(repeating: [], count: old.count * 2)
+            for bucket in old {
+                for item in bucket {
+                    buckets[index(for: item)].append(item)   // index(for:) now uses the new count
+                }
+            }
+        }
+        return true
+    }
+
+    @discardableResult
+    mutating func remove(_ element: Element) -> Bool {
+        let bucket = index(for: element)
+        guard let position = buckets[bucket].firstIndex(of: element) else {
+            return false
+        }
+        buckets[bucket].swapAt(position, buckets[bucket].count - 1)
+        buckets[bucket].removeLast()
+        count -= 1
+        return true
+    }
+}
+
+var words = HashSet<String>()
+for word in "the cat and the hat and the bat".split(separator: " ") {
+    words.insert(String(word))
+}
+print(words.count)
+print(words.contains("hat"), words.contains("rat"))
+print(words.insert("cat"), words.remove("cat"), words.remove("cat"))
+print(words.count)
+```
+
+```output
+5
+true false
+false true false
+4
+```
+
+`insert` returns whether the element was new, like `Set.insert`'s `inserted` flag. Here, rehashing can use `index(for:)`, because `buckets` has already been replaced by the bigger array when it's called.
+
+## How fast is it?
+
+With a good hash and the load factor capped at 0.75, chains average under one entry:
+
+| Operation | Average | Worst case (every key collides) |
+| --- | --- | --- |
+| lookup `map[key]` | O(1) | O(n) |
+| insert or replace | O(1) amortised | O(n) |
+| `removeValue(forKey:)` | O(1) | O(n) |
+| `count`, `isEmpty` | O(1) | O(1) |
+| iterate everything | O(n + buckets) | O(n + buckets) |
+
+The worst case needs a broken or attacked hash function. The pitfalls lesson at the end of this module explains how Swift's random seeding defends against the attack.
+
+## The DSAKit version
+
+The companion package's `DSAKit` module has the polished `HashMap<Key: Hashable, Value>`, tested with thousands of insertions, removals, overwrites and deliberately colliding keys. On top of what you built here it adds `removeValue(forKey:)` returning the old value, `updateValue(_:forKey:)`, `contains(key:)`, the `default:` subscript, `keys` and `values` sequences, `Sequence` conformance yielding `(key, value)` pairs, a dictionary literal, `Equatable` when values are, and a `description` that prints like a dictionary. Problems in later modules can use it with `import DSAKit`:
+
+```swift
+import DSAKit
+
+var stock: HashMap = ["apples": 4, "pears": 0]
+stock["plums"] = 9
+stock["pears"] = nil
+for (fruit, count) in stock {
+    print(fruit, count)        // in no particular order
+}
+```
+
+<Callout kind="gotcha" title="Common mistakes when building a hash map">
+- **`hashValue % buckets.count` can be negative.** Hash values use the whole `Int` range. Mask with a power-of-two count, or fix the sign.
+- **Counting replacements as insertions.** If assigning to an existing key adds to `count`, the map grows for no reason and reports the wrong size.
+- **Rehashing with the old bucket count.** Every entry's new index must use the new count.
+- **Comparing hash values instead of keys.** Two different keys can share a hash value. Use the hash to choose the bucket, then `==` to find the key.
+</Callout>
+
+## Practice
+
+**A hash map from scratch** asks you to build `Map<Key, Value>` with exactly the rules from this lesson, including the bucket count, and to keep it correct when every key collides. Write it without looking back, then compare.
+
+```cards
+- id: hashmap-design
+  front: "What are the main design choices in a simple chained hash map?"
+  back: "An array of buckets holding (key, value) pairs; a power-of-two bucket count with `hashValue & (count - 1)` as the index; doubling and rehashing when count passes 3/4 of the buckets."
+- id: hashmap-equality-decides
+  front: "In a hash map, what decides whether a stored key matches the one you're looking up?"
+  back: "`==`. The hash only chooses the bucket; colliding keys share a bucket and are told apart by comparing them."
+- id: swap-remove
+  front: "How can you remove from a chain in O(1)?"
+  back: "Order inside a bucket doesn't matter, so swap the entry with the last one and call `removeLast()`, instead of `remove(at:)`, which shifts the rest."
+- id: test-against-model
+  front: "What's the best way to test a data structure you've built?"
+  back: "Run many mixed operations on it and on a trusted equivalent (like `Dictionary`) and check that they always agree, plus edge cases like colliding keys."
+```
+
+```quiz
+- id: q1
+  type: order
+  prompt: "Put the steps of inserting a key into a chained hash map in order."
+  lines:
+    - "Compute the bucket index from the key's hash value"
+    - "Search that bucket for an entry whose key is equal"
+    - "If found, replace its value and stop"
+    - "Otherwise append the new pair and add 1 to count"
+    - "If count is now above 3/4 of the bucket count, double and rehash"
+  explain: "Replacements leave the count alone and never trigger growth. Only a new key increases `count`, and only then is the load factor checked."
+- id: q2
+  type: output
+  prompt: "What does this print?"
+  code: |
+    let bucketCount = 8
+    let hashes = [-1, 13, -16, 7]
+    print(hashes.map { $0 & (bucketCount - 1) })
+  answer: "[7, 5, 0, 7]"
+  explain: "Masking with 7 keeps the lowest three bits. In two's complement, -1 has every bit set, so it gives 7; -16 ends in four zero bits, so it gives 0. A mask never produces a negative index."
+- id: q3
+  type: bug
+  prompt: "This map's count is wrong after `map[\"a\"] = 1; map[\"a\"] = 2`. Which line is the bug?"
+  code: |
+    mutating func insert(_ value: Value, for key: Key) {
+        let bucket = index(for: key)
+        if let position = buckets[bucket].firstIndex(where: { $0.key == key }) {
+            buckets[bucket][position].value = value
+        }
+        buckets[bucket].append((key, value))
+        count += 1
+        if count > buckets.count * 3 / 4 {
+            grow()
+        }
+    }
+  answer: 4
+  explain: "After replacing the value, the function carries on and appends a duplicate entry. Line 4 needs a `return` after it, so replacements stop there."
+- id: q4
+  type: truefalse
+  prompt: "If two different keys have the same `hashValue`, a correct hash map can still store both and return the right value for each."
+  answer: true
+  explain: "They share a bucket, and lookups compare keys with `==`, so each finds its own entry. Collisions cost time, not correctness."
+- id: q5
+  type: bigo
+  prompt: "A hash map's key type has a `hash(into:)` that combines only a constant. What does one lookup cost in a map with n entries?"
+  answer: "O(n)"
+  explain: "Every key lands in the same bucket, so a lookup walks one chain holding all n entries."
+- id: q6
+  type: recall
+  prompt: "Why does growing the map rehash every entry instead of copying the old buckets into the first half of the new array?"
+  model: "A key's bucket is its hash value masked with the bucket count minus one. Doubling the count adds one more bit to the mask, so roughly half the keys in each old bucket belong in a different new bucket. Copying buckets across unchanged would leave keys where lookups would never look."
+```
