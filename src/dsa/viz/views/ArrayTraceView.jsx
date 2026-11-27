@@ -12,8 +12,51 @@ const RANGE_TONES = {
     kept: 'border-[#30D158]/50 bg-[#30D158]/[0.07]',
 };
 const POINTER_COLOURS = ['text-sky-300', 'text-amber', 'text-violet-300', 'text-[#FF9D96]'];
+const BAR_TONES = {
+    swap: 'bg-amber',
+    found: 'bg-[#30D158]',
+    out: 'bg-[#FF9D96]',
+};
+const BAR_AREA = 112;
+
+const Pointers = ({ names, here }) => (
+    <span className="flex min-h-4 flex-col items-center font-mono text-[10px] font-semibold leading-tight">
+        {here.map((name) => <span key={name} className={POINTER_COLOURS[names.indexOf(name) % POINTER_COLOURS.length]}>{name}</span>)}
+    </span>
+);
+
+// Heights as bars: `area` shades a container between two walls, and `water` stacks settled water on each bar
+const BarRow = ({ row }) => {
+    const pointerNames = Object.keys(row.pointers);
+    const top = Math.max(1, ...row.values.map((value, index) => value + (row.water?.[index] ?? 0)), row.area?.level ?? 0);
+    const px = (value) => Math.round((value / top) * BAR_AREA);
+    return (
+        <div>
+            <p className="mb-1.5 font-mono text-[11px] text-muted">{row.label}</p>
+            <ol className="flex min-w-max gap-1">
+                {row.values.map((value, index) => {
+                    const inArea = row.area && index >= row.area.from && index <= row.area.to;
+                    const water = row.water?.[index];
+                    return (
+                        <li key={index} className="flex w-9 flex-col items-center gap-1" aria-label={`index ${index}: height ${value}${water ? `, water ${water}` : ''}`}>
+                            <div className="relative w-full" style={{ height: BAR_AREA }} aria-hidden="true">
+                                {inArea && <span className="absolute bottom-0 border-t border-sky-400/80 bg-sky-400/15" style={{ height: px(row.area.level), left: index === row.area.from ? 0 : -2, right: index === row.area.to ? 0 : -2 }} />}
+                                {water > 0 && <span className="absolute inset-x-1 bg-sky-400/45" style={{ bottom: px(value), height: px(water) }} />}
+                                <span className={`absolute inset-x-1 bottom-0 rounded-t-md transition-colors ${BAR_TONES[row.marks[index]] ?? 'bg-zinc-500'}`} style={{ height: px(value) }} />
+                            </div>
+                            <span className="font-mono text-xs">{value}</span>
+                            <span className="font-mono text-[10px] text-muted">{index}</span>
+                            <Pointers names={pointerNames} here={pointerNames.filter((name) => row.pointers[name] === index)} />
+                        </li>
+                    );
+                })}
+            </ol>
+        </div>
+    );
+};
 
 const ArrayRow = ({ row }) => {
+    if (row.bars) return <BarRow row={row} />;
     const pointerNames = Object.keys(row.pointers);
     return (
         <div>
@@ -27,9 +70,7 @@ const ArrayRow = ({ row }) => {
                         <li key={index} className="flex w-11 flex-col items-center gap-1">
                             <span className={`flex h-11 w-11 items-center justify-center rounded-lg border font-mono text-sm transition-colors ${tone}`}>{value === null ? '' : String(value)}</span>
                             <span className="font-mono text-[10px] text-muted">{index}</span>
-                            <span className="flex min-h-4 flex-col items-center font-mono text-[10px] font-semibold leading-tight">
-                                {here.map((name) => <span key={name} className={POINTER_COLOURS[pointerNames.indexOf(name) % POINTER_COLOURS.length]}>{name}</span>)}
-                            </span>
+                            <Pointers names={pointerNames} here={here} />
                         </li>
                     );
                 })}

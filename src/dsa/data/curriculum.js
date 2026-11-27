@@ -489,7 +489,7 @@ const rawModules = [
 
     // Part IV: Searching & sorting ──────────────────────────────────────────────────────────
     {
-        id: 'binary-search', code: 'M28', part: 4, title: 'Binary search', level: 'intermediate', tracks: ['core'], requires: ['queues'],
+        id: 'binary-search', code: 'M28', part: 4, title: 'Binary search', level: 'intermediate', tracks: ['core'], requires: ['queues'], status: 'ready',
         summary: 'Binary search without off-by-one bugs, bounds, rotated arrays and other searches.',
         lessons: [
             ['bs-linear-search', 'Linear search', { minutes: 10 }],
@@ -498,15 +498,15 @@ const rawModules = [
             ['bs-bounds', 'Lower bound, upper bound, first and last occurrence', { minutes: 25 }],
             ['bs-rotated', 'Rotated sorted arrays', { minutes: 30 }],
             ['bs-peak-mountain', 'Peak element and mountain arrays'],
-            ['bs-sqrt-matrix', 'sqrt(x) and searching a 2D matrix'],
+            ['bs-sqrt-matrix', 'sqrt(x) and searching a 2D matrix', { minutes: 25 }],
             ['bs-single-element', 'Single element in a sorted array', INTERVIEW],
-            ['bs-median-two-arrays', 'Median of two sorted arrays', { level: 'expert', ...INTERVIEW }],
+            ['bs-median-two-arrays', 'Median of two sorted arrays', { level: 'expert', minutes: 30, ...INTERVIEW }],
             ['bs-other-searches', 'Exponential, jump, interpolation and ternary search', DEEP],
             ['bs-partitioning-index', 'partitioningIndex in swift-algorithms', { minutes: 15 }],
         ],
     },
     {
-        id: 'bs-on-answer', code: 'M29', part: 4, title: 'Binary search on the answer', level: 'advanced', tracks: ['core'], requires: ['binary-search'],
+        id: 'bs-on-answer', code: 'M29', part: 4, title: 'Binary search on the answer', level: 'advanced', tracks: ['core'], requires: ['binary-search'], status: 'ready',
         summary: 'Searching over possible answers with a monotonic predicate.',
         lessons: [
             ['bsa-idea', 'The monotonic predicate idea', { minutes: 25 }],
@@ -520,7 +520,7 @@ const rawModules = [
         ],
     },
     {
-        id: 'elementary-sorts', code: 'M30', part: 4, title: 'Elementary sorting', level: 'beginner', tracks: ['core'], requires: ['bs-on-answer'],
+        id: 'elementary-sorts', code: 'M30', part: 4, title: 'Elementary sorting', level: 'beginner', tracks: ['core'], requires: ['bs-on-answer'], status: 'ready',
         summary: 'What sorting properties mean, and the three simple sorts.',
         lessons: [
             ['sort-properties', 'Stable, in-place, adaptive and online'],
@@ -532,7 +532,7 @@ const rawModules = [
         ],
     },
     {
-        id: 'efficient-sorts', code: 'M31', part: 4, title: 'Efficient sorting', level: 'intermediate', tracks: ['core'], requires: ['elementary-sorts'],
+        id: 'efficient-sorts', code: 'M31', part: 4, title: 'Efficient sorting', level: 'intermediate', tracks: ['core'], requires: ['elementary-sorts'], status: 'ready',
         summary: 'Merge sort, quick sort, quickselect, the lower bound, and how Swift sorts.',
         lessons: [
             ['sort-merge', 'Merge sort, top-down and bottom-up', { minutes: 35 }],
@@ -547,7 +547,7 @@ const rawModules = [
         ],
     },
     {
-        id: 'linear-sorts', code: 'M32', part: 4, title: 'Non-comparison sorts and cyclic sort', level: 'intermediate', tracks: ['core'], requires: ['efficient-sorts'],
+        id: 'linear-sorts', code: 'M32', part: 4, title: 'Non-comparison sorts and cyclic sort', level: 'intermediate', tracks: ['core'], requires: ['efficient-sorts'], status: 'ready',
         summary: 'Sorting faster than n log n when the data allows it, and the cyclic sort pattern.',
         lessons: [
             ['sort-counting', 'Counting sort', { minutes: 25 }],
@@ -558,7 +558,7 @@ const rawModules = [
         ],
     },
     {
-        id: 'intervals', code: 'M33', part: 4, title: 'Intervals and sweep line', level: 'intermediate', tracks: ['core'], requires: ['linear-sorts'],
+        id: 'intervals', code: 'M33', part: 4, title: 'Intervals and sweep line', level: 'intermediate', tracks: ['core'], requires: ['linear-sorts'], status: 'ready',
         summary: 'Merging, inserting and scheduling intervals, and the sweep-line technique.',
         lessons: [
             ['iv-merge-insert', 'Merge and insert intervals', { minutes: 25 }],

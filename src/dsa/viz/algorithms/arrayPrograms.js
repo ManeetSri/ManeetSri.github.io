@@ -523,6 +523,251 @@ mutating func dequeue() -> Int? {
     },
 };
 
+// Container with most water, drawn as bars, matching the tp-container-water lesson
+PROGRAMS.container = {
+    title: 'Container with most water: move the shorter wall',
+    defaults: { heights: [3, 7, 2, 5, 4, 8, 3, 6] },
+    code: `func mostWater(_ heights: [Int]) -> Int {
+    var left = 0
+    var right = heights.count - 1
+    var best = 0
+    while left < right {
+        let water = min(heights[left], heights[right]) * (right - left)
+        best = max(best, water)
+        if heights[left] < heights[right] {
+            left += 1
+        } else {
+            right -= 1
+        }
+    }
+    return best
+}`,
+    * run({ heights }) {
+        let left = 0;
+        let right = heights.length - 1;
+        let best = 0;
+        let bestPair = null;
+        const bars = (extra) => [row('heights', heights, { bars: true, pointers: { left, right }, ...extra })];
+        yield { rows: bars(), vars: { best }, line: 4, message: 'Start with the widest container: the first wall and the last. Every other container is narrower.' };
+        while (left < right) {
+            const level = Math.min(heights[left], heights[right]);
+            const water = level * (right - left);
+            const record = water > best;
+            if (record) {
+                best = water;
+                bestPair = [left, right];
+            }
+            const area = { from: left, to: right, level };
+            yield { rows: bars({ area, marks: { [left]: 'swap', [right]: 'swap' } }), vars: { left, right, water, best }, line: 7, message: `Walls ${heights[left]} and ${heights[right]}, ${right - left} apart: min(${heights[left]}, ${heights[right]}) × ${right - left} = ${water}.${record ? ' A new best.' : ''}` };
+            const moveLeft = heights[left] < heights[right];
+            const dropped = moveLeft ? left : right;
+            yield { rows: bars({ area, marks: { [dropped]: 'out', [moveLeft ? right : left]: 'swap' } }), vars: { left, right, water, best }, line: moveLeft ? 9 : 11, message: heights[left] === heights[right] ? 'Equal heights: neither wall can do better with a narrower partner, so either can go. The code moves right.' : `The ${moveLeft ? 'left' : 'right'} wall (${heights[dropped]}) is shorter. Any narrower container using it can't be taller, so drop it.` };
+            if (moveLeft) left += 1; else right -= 1;
+        }
+        yield {
+            rows: [row('heights', heights, { bars: true, ...(bestPair ? { area: { from: bestPair[0], to: bestPair[1], level: Math.min(heights[bestPair[0]], heights[bestPair[1]]) }, marks: { [bestPair[0]]: 'found', [bestPair[1]]: 'found' } } : {}) })],
+            vars: { best },
+            line: 14,
+            message: `The pointers met after ${Math.max(0, heights.length - 1)} containers instead of ${(heights.length * (heights.length - 1)) / 2}. The best holds ${best}.`,
+        };
+    },
+};
+
+// Trapping rain water with two pointers, drawn as bars, matching the tp-trapping-rain-water lesson
+PROGRAMS.rainWater = {
+    title: 'Trapping rain water with two pointers',
+    defaults: { heights: [4, 1, 3, 0, 2, 5, 1, 2] },
+    code: `func trappedWater(_ heights: [Int]) -> Int {
+    var left = 0
+    var right = heights.count - 1
+    var leftMax = 0
+    var rightMax = 0
+    var total = 0
+    while left <= right {
+        leftMax = max(leftMax, heights[left])
+        rightMax = max(rightMax, heights[right])
+        if leftMax <= rightMax {
+            total += leftMax - heights[left]
+            left += 1
+        } else {
+            total += rightMax - heights[right]
+            right -= 1
+        }
+    }
+    return total
+}`,
+    * run({ heights }) {
+        let left = 0;
+        let right = heights.length - 1;
+        let leftMax = 0;
+        let rightMax = 0;
+        let total = 0;
+        const water = heights.map(() => null);
+        const bars = (extra) => [row('heights', heights, { bars: true, water: [...water], pointers: { left, right }, ...extra })];
+        yield { rows: bars(), vars: { leftMax, rightMax, total }, line: 6, message: 'Two walkers start at the ends, each remembering the tallest bar it has passed. Whoever remembers the lower wall knows the water level at its feet.' };
+        while (left <= right) {
+            leftMax = Math.max(leftMax, heights[left]);
+            rightMax = Math.max(rightMax, heights[right]);
+            if (leftMax <= rightMax) {
+                water[left] = leftMax - heights[left];
+                total += water[left];
+                yield { rows: bars({ marks: { [left]: 'swap' } }), vars: { leftMax, rightMax, total }, line: 11, message: `leftMax ${leftMax} ≤ rightMax ${rightMax}, so the level at position ${left} is certain: ${leftMax} − ${heights[left]} = ${water[left]} unit${water[left] === 1 ? '' : 's'}.` };
+                left += 1;
+            } else {
+                water[right] = rightMax - heights[right];
+                total += water[right];
+                yield { rows: bars({ marks: { [right]: 'swap' } }), vars: { leftMax, rightMax, total }, line: 14, message: `rightMax ${rightMax} < leftMax ${leftMax}, so the level at position ${right} is certain: ${rightMax} − ${heights[right]} = ${water[right]} unit${water[right] === 1 ? '' : 's'}.` };
+                right -= 1;
+            }
+        }
+        yield { rows: [row('heights', heights, { bars: true, water: [...water] })], vars: { leftMax, rightMax, total }, line: 18, message: `Every position settled exactly once: ${total} units of water, in O(n) time and O(1) space.` };
+    },
+};
+
+// Largest rectangle in a histogram with a monotonic stack and a sentinel, matching the stack-histogram lesson
+PROGRAMS.histogram = {
+    title: 'Largest rectangle: measure each bar when it’s popped',
+    defaults: { heights: [2, 1, 5, 6, 2, 3] },
+    code: `func largestArea(_ heights: [Int]) -> Int {
+    var rising: [Int] = []                        // bar indexes, heights increasing bottom to top
+    var best = 0
+    for i in 0...heights.count {
+        let height = i < heights.count ? heights[i] : 0     // a sentinel bar of height 0 at the end
+        while let top = rising.last, heights[top] >= height {
+            rising.removeLast()
+            let left = rising.last ?? -1          // the previous shorter bar
+            let width = i - left - 1              // bar i is the next shorter bar
+            best = max(best, heights[top] * width)
+        }
+        rising.append(i)
+    }
+    return best
+}`,
+    * run({ heights }) {
+        const n = heights.length;
+        const withSentinel = [...heights, 0];
+        const rising = [];
+        let best = 0;
+        const labels = () => rising.map((index) => `${index} (${withSentinel[index]})`);
+        const bars = (extra) => [row(`heights + sentinel at ${n}`, withSentinel, { bars: true, ...extra })];
+        yield { rows: bars(), stack: labels(), vars: { best }, line: 3, message: `The stack holds bar indexes whose heights rise from bottom to top. Index ${n} is a pretend bar of height 0 that will pop everything left at the end.` };
+        for (let i = 0; i <= n; i += 1) {
+            const height = withSentinel[i];
+            while (rising.length && heights[rising.at(-1)] >= height) {
+                const top = rising.pop();
+                const left = rising.length ? rising.at(-1) : -1;
+                const width = i - left - 1;
+                const area = heights[top] * width;
+                const record = area > best;
+                best = Math.max(best, area);
+                yield {
+                    rows: bars({ pointers: { i }, area: { from: left + 1, to: i - 1, level: heights[top] }, marks: { [top]: 'swap', [i]: 'out' } }),
+                    stack: labels(),
+                    vars: { i, top, left, width, best },
+                    line: 10,
+                    message: `${i === n ? 'The sentinel (0)' : `Height ${height} at index ${i}`} is no taller than ${heights[top]} at index ${top}: pop it. Its walls are ${left === -1 ? 'the start' : `index ${left}`} and index ${i}, so its rectangle is ${heights[top]} × ${width} = ${area}.${record ? ' A new best.' : ''}`,
+                };
+            }
+            rising.push(i);
+            yield { rows: bars({ pointers: { i }, marks: { [i]: 'found' } }), stack: labels(), vars: { i, best }, line: 12, message: i === n ? 'The sentinel popped every real bar, so each one has been measured.' : `Push index ${i} (height ${height}). The stack's heights still rise from bottom to top.` };
+        }
+        yield { rows: bars(), stack: labels(), vars: { best }, line: 14, message: `The largest rectangle has area ${best}. Each index was pushed once and popped at most once: O(n).` };
+    },
+};
+
+// Searching a rotated sorted array in one pass: one half is always sorted. Matches the bs-rotated lesson.
+PROGRAMS.rotatedSearch = {
+    title: 'Searching a rotated array: one half is always sorted',
+    defaults: { items: [40, 50, 60, 70, 10, 20, 30], target: 20 },
+    code: `func search(_ items: [Int], for target: Int) -> Int? {
+    var low = 0
+    var high = items.count - 1
+    while low <= high {
+        let mid = low + (high - low) / 2
+        if items[mid] == target {
+            return mid
+        }
+        if items[low] <= items[mid] {
+            if items[low] <= target && target < items[mid] {
+                high = mid - 1
+            } else {
+                low = mid + 1
+            }
+        } else {
+            if items[mid] < target && target <= items[high] {
+                low = mid + 1
+            } else {
+                high = mid - 1
+            }
+        }
+    }
+    return nil
+}`,
+    * run({ items, target }) {
+        let low = 0;
+        let high = items.length - 1;
+        const window = () => (low <= high ? { from: low, to: high, tone: 'window' } : null);
+        const frame = (line, message, extra = {}) => ({ rows: [row('items', items, { pointers: { low, high }, range: window(), ...extra })], vars: { low, high, target }, line, message });
+        yield frame(3, `Search for ${target}. The array was sorted, then rotated, so somewhere there's a break.`);
+        while (low <= high) {
+            const mid = low + Math.floor((high - low) / 2);
+            const pointers = { low, mid, high };
+            if (items[mid] === target) {
+                yield { ...frame(7, `items[${mid}] is ${target}: found it at index ${mid}.`, { pointers, marks: { [mid]: 'found' } }), vars: { low, mid, high, target } };
+                return;
+            }
+            const leftSorted = items[low] <= items[mid];
+            const [from, to] = leftSorted ? [low, mid] : [mid, high];
+            yield { ...frame(leftSorted ? 9 : 15, `${items[mid]} isn't ${target}. items[${low}] = ${items[low]} ${leftSorted ? '≤' : '>'} items[${mid}] = ${items[mid]}, so the ${leftSorted ? 'left' : 'right'} half ${items[from]}…${items[to]} is sorted.`, { pointers, range: { from, to, tone: 'kept' } }), vars: { low, mid, high, target } };
+            const inside = leftSorted ? items[low] <= target && target < items[mid] : items[mid] < target && target <= items[high];
+            const goLeft = leftSorted ? inside : !inside;
+            if (goLeft) high = mid - 1; else low = mid + 1;
+            const line = leftSorted ? (inside ? 11 : 13) : (inside ? 17 : 19);
+            yield { ...frame(line, `${target} is ${inside ? '' : 'not '}between ${items[from]} and ${items[to]}, so it can only be in the ${goLeft ? 'left' : 'right'} part: ${goLeft ? `high = ${high}` : `low = ${low}`}.`), vars: { low, mid, high, target } };
+        }
+        yield frame(23, `low passed high: ${target} isn't in the array.`);
+    },
+};
+
+// Cyclic sort for values 1...n, matching the sort-cyclic lesson. Values at home are marked green.
+PROGRAMS.cyclicSort = {
+    title: 'Cyclic sort: swap every value to its home',
+    defaults: { items: [3, 5, 2, 1, 4] },
+    code: `func cyclicSort(_ numbers: inout [Int]) {
+    var i = 0
+    while i < numbers.count {
+        let home = numbers[i] - 1                 // where numbers[i] belongs
+        if numbers[i] != numbers[home] {
+            numbers.swapAt(i, home)
+        } else {
+            i += 1                                // index i is settled: move on
+        }
+    }
+}`,
+    * run({ items }) {
+        const numbers = [...items];
+        let i = 0;
+        let swaps = 0;
+        let moves = 0;
+        const atHome = (extra = {}) => ({ ...Object.fromEntries(numbers.flatMap((value, index) => (value === index + 1 ? [[index, 'found']] : []))), ...extra });
+        const frame = (line, message, pointers, marks) => ({ rows: [row('numbers', numbers, { pointers, marks })], vars: { i, swaps, moves }, line, message });
+        yield frame(2, `Each value v belongs at index v − 1. Green values are already home.`, { i }, atHome());
+        while (i < numbers.length) {
+            const home = numbers[i] - 1;
+            if (numbers[i] !== numbers[home]) {
+                [numbers[i], numbers[home]] = [numbers[home], numbers[i]];
+                swaps += 1;
+                yield frame(6, `Send ${numbers[home]} home to index ${home}. ${numbers[i]} comes back to index ${i}${numbers[i] === i + 1 ? ', and it’s home too' : ', and it isn’t home yet, so stay on i'}.`, { i, home }, atHome({ [i]: numbers[i] === i + 1 ? 'found' : 'swap', [home]: 'found' }));
+            } else {
+                moves += 1;
+                yield frame(8, home === i ? `${numbers[i]} is at home: move on.` : `${numbers[i]} is already at its home, index ${home}, so this one is a duplicate: leave it and move on.`, { i }, atHome());
+                i += 1;
+            }
+        }
+        yield frame(11, `Sorted with ${swaps} swaps and ${moves} move-ons: at most n of each, so O(n).`, {}, atHome());
+    },
+};
+
 // The prefix-sum program, defined separately to keep the table above readable
 PROGRAMS.prefixSum.run = function* run({ items, query: [from, to] }) {
     const prefix = [0];

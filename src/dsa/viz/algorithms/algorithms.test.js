@@ -255,3 +255,73 @@ test('window maxima and ring buffers', () => {
 test('stacks hold text as well as numbers', () => {
     assert.deepEqual(stackQueueFrames('stack', ['push (', 'push [', 'pop']).at(-1).items, ['(']);
 });
+
+test('container and rain water bars reach the lessons’ answers', async () => {
+    const { arrayFrames } = await import('./arrayPrograms.js');
+    const container = arrayFrames('container');
+    assert.equal(container.at(-1).vars.best, 36);
+    assert.deepEqual(container.at(-1).rows[0].area, { from: 1, to: 7, level: 6 });
+    const rain = arrayFrames('rainWater');
+    assert.equal(rain.at(-1).vars.total, 11);
+    assert.deepEqual(rain.at(-1).rows[0].water, [0, 3, 1, 4, 2, 0, 1, 0]);
+    // Water settled in an early frame stays as it was
+    assert.deepEqual(rain[1].rows[0].water, [null, null, null, null, null, null, null, 0]);
+    assert.equal(arrayFrames('rainWater', { heights: [] }).at(-1).vars.total, 0);
+});
+
+test('histogram measures every bar once and finds the lesson’s answers', async () => {
+    const { arrayFrames } = await import('./arrayPrograms.js');
+    const cases = [[[2, 1, 5, 6, 2, 3], 10], [[3, 3, 3], 9], [[1, 2, 3, 4, 5], 9], [[6, 2, 5, 4, 5, 1, 6], 12], [[], 0], [[7], 7]];
+    cases.forEach(([heights, best]) => {
+        const frames = arrayFrames('histogram', { heights });
+        assert.equal(frames.at(-1).vars.best, best, JSON.stringify(heights));
+        assert.equal(frames.filter((frame) => frame.line === 10).length, heights.length);
+    });
+});
+
+test('quadratic probing can miss free slots, and tombstones keep probe sequences whole', async () => {
+    const { TOMBSTONE } = await import('./hashTable.js');
+    const quadratic = hashTableFrames('quadratic', [10, 17, 24, 31, 38], 7);
+    assert.deepEqual(quadratic.at(-2).slots, [24, null, null, 10, 17, 31, null]);
+    assert.match(quadratic.at(-2).message, /can't go in, even though 3 slots are free/);
+
+    const operations = ['insert 10', 'insert 17', 'insert 24', 'delete 17', 'find 24', 'insert 31'];
+    const tombstones = hashTableFrames('probing', [], 7, operations);
+    assert.equal(tombstones[4].slots[4], TOMBSTONE);
+    assert.equal(tombstones[5].active, 5);
+    assert.match(tombstones[5].message, /Found in slot 5/);
+    assert.equal(tombstones[6].slots[4], 31);
+
+    // Emptying the slot instead cuts the probe sequence, so 24 is lost
+    const emptied = hashTableFrames('probing', [], 7, operations.slice(0, 5), 'empty');
+    assert.match(emptied.at(-2).message, /isn't in the table/);
+});
+
+test('rotated search finds every value and reports missing ones', async () => {
+    const { arrayFrames } = await import('./arrayPrograms.js');
+    const items = [40, 50, 60, 70, 10, 20, 30];
+    items.forEach((target, index) => {
+        const last = arrayFrames('rotatedSearch', { items, target }).at(-1);
+        assert.equal(last.rows[0].marks[index], 'found', `target ${target}`);
+    });
+    for (const target of [5, 35, 55, 80]) {
+        assert.equal(arrayFrames('rotatedSearch', { items, target }).at(-1).line, 23);
+    }
+    // Every rotation of a sorted array works too
+    const sorted = [1, 3, 5, 7, 9, 11];
+    sorted.forEach((_, shift) => {
+        const rotated = [...sorted.slice(shift), ...sorted.slice(0, shift)];
+        rotated.forEach((target, index) => {
+            assert.equal(arrayFrames('rotatedSearch', { items: rotated, target }).at(-1).rows[0].marks[index], 'found');
+        });
+    });
+});
+
+test('cyclic sort matches the lesson and stays within n swaps', async () => {
+    const { arrayFrames } = await import('./arrayPrograms.js');
+    const frames = arrayFrames('cyclicSort');
+    assert.deepEqual(frames.filter((frame) => frame.line === 6).map((frame) => frame.rows[0].values), [[2, 5, 3, 1, 4], [5, 2, 3, 1, 4], [4, 2, 3, 1, 5], [1, 2, 3, 4, 5]]);
+    const withRepeats = arrayFrames('cyclicSort', { items: [4, 3, 2, 4, 1, 2] }).at(-1);
+    assert.ok(withRepeats.vars.swaps <= 6 && withRepeats.vars.moves === 6);
+    assert.deepEqual(withRepeats.rows[0].values.slice(0, 4), [1, 2, 3, 4]);
+});

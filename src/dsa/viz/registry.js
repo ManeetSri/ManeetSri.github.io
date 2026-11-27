@@ -1,6 +1,7 @@
 // Each visualiser loads only when a lesson shows it. Names must match viz/names.js.
 export const VISUALS = {
     binarySearch: () => import('./views/BinarySearchView.jsx'),
+    answerSearch: () => import('./views/AnswerSearchView.jsx'),
     recursionTree: () => import('./views/RecursionTreeView.jsx'),
     traceTable: () => import('./views/TraceTableView.jsx'),
     growthChart: () => import('./views/GrowthChartView.jsx'),
@@ -9,6 +10,8 @@ export const VISUALS = {
     linkedList: () => import('./views/LinkedListView.jsx'),
     stackQueue: () => import('./views/StackQueueView.jsx'),
     hashTable: () => import('./views/HashTableView.jsx'),
+    intervals: () => import('./views/IntervalsView.jsx'),
+    matrix: () => import('./views/MatrixView.jsx'),
     bst: () => import('./views/TreeViews.jsx').then((module) => ({ default: module.BstView })),
     avl: () => import('./views/TreeViews.jsx').then((module) => ({ default: module.AvlView })),
     heap: () => import('./views/TreeViews.jsx').then((module) => ({ default: module.HeapView })),

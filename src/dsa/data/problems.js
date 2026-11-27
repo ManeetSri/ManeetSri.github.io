@@ -30,6 +30,12 @@ import hashing from './problems/hashing.js';
 import linkedLists from './problems/linked-lists.js';
 import stacks from './problems/stacks.js';
 import queues from './problems/queues.js';
+import binarySearch from './problems/binary-search.js';
+import bsOnAnswer from './problems/bs-on-answer.js';
+import elementarySorts from './problems/elementary-sorts.js';
+import efficientSorts from './problems/efficient-sorts.js';
+import linearSorts from './problems/linear-sorts.js';
+import intervals from './problems/intervals.js';
 
 export const DIFFICULTIES = {
     warmup: { label: 'Warm-up', xp: 15 },
@@ -111,6 +117,12 @@ export const problems = [
     ...linkedLists,
     ...stacks,
     ...queues,
+    ...binarySearch,
+    ...bsOnAnswer,
+    ...elementarySorts,
+    ...efficientSorts,
+    ...linearSorts,
+    ...intervals,
 ];
 
 export const problemById = Object.fromEntries(problems.map((problem) => [problem.id, problem]));
