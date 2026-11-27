@@ -27,7 +27,7 @@ export default [
         patterns: ['sorting'],
         lessons: ['sort-cyclic'],
         swiftTest: 'MissingAndDoubledTests',
-        lists: ['core75'],
+        lists: ['patterns150'],
         minutes: 25,
     },
     {

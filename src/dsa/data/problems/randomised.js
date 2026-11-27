@@ -7,7 +7,7 @@ export default [
         patterns: ['math'],
         lessons: ['rand-shuffle'],
         swiftTest: 'PinnedPlaylistShuffleTests',
-        lists: ['core75'],
+        lists: ['patterns150'],
         minutes: 25,
     },
     {

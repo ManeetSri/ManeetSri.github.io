@@ -17,7 +17,7 @@ export default [
         patterns: ['traversal'],
         lessons: ['start-problem-solving'],
         swiftTest: 'LargestElementTests',
-        lists: ['core75'],
+        lists: ['patterns150'],
         minutes: 15,
     },
 ];

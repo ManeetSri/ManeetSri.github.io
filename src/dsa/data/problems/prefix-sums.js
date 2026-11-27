@@ -7,7 +7,7 @@ export default [
         patterns: ['prefix-sum', 'design'],
         lessons: ['prefix-1d'],
         swiftTest: 'RangeSumQueriesTests',
-        lists: ['core75'],
+        lists: ['patterns150'],
         minutes: 15,
     },
     {
