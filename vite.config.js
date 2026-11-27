@@ -5,8 +5,10 @@ import remarkGfm from 'remark-gfm'
 import remarkDsaBlocks from './scripts/remark-dsa-blocks.js'
 import { seoContent } from './seo-plugin.js'
 import { securityHeaders } from './security-headers-plugin.js'
+import { dsaExerciseWriter } from './scripts/dsa-exercise-writer.js'
 
-const isLearningConsole = (id) => id.includes('/src/dsa/')
+// The console's code, and the exercise stubs its solution editor starts from
+const isLearningConsole = (id) => id.includes('/src/dsa/') || id.includes('/dsa-swift/')
 
 // https://vite.dev/config/
 export default defineConfig({
@@ -16,6 +18,7 @@ export default defineConfig({
     react({ include: /\.(mdx|js|jsx)$/ }),
     seoContent(),
     securityHeaders(),
+    dsaExerciseWriter(),
   ],
   build: {
     // Files stay files instead of data: URIs, so the Content Security Policy can stay strict

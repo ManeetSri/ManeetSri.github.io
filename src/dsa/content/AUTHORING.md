@@ -205,7 +205,7 @@ export default [
 See `problems/largest-element.mdx`. Code inside `<Approach>` needs a blank line after the opening tag.
 
 **Swift.** The type name is `swiftTest` without `Tests`. It's a caseless `public enum` with `public static` functions, so names never clash.
-- **Exercise stub:** a doc comment, a "Write your solution here, then run: swift test --filter XTests" comment, and a **placeholder return value that compiles** (`return 0`, `return ""`, `return []`, `return nil`). Never use `fatalError`.
+- **Exercise stub:** a doc comment, a "Write your solution here, then run: swift test --filter XTests" comment, and a **placeholder return value that compiles** (`return 0`, `return ""`, `return []`, `return nil`). Never use `fatalError`. The stub is also the **starter code in the problem page's editor**, so keep it short and readable, and name it after the test suite (`XTests` → `X.swift`): that's how the editor finds it.
 - **Solution:** the same API, clean and idiomatic, with a short comment on the approach and complexity.
 - **Tests:** Swift Testing. Cover normal cases, edge cases (empty, single, negative, large) and anything the statement promises. Prefer `@Test(arguments:)` for tables of cases.
 

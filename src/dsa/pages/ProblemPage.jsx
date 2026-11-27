@@ -9,6 +9,7 @@ import { CopyButton } from '../mdx/CodeBlock.jsx';
 import { mdxComponents } from '../mdx/components.js';
 import { cardId, useActions, useStore } from '../store/store.js';
 import { AutosaveTextarea } from '../ui/AutosaveTextarea.jsx';
+import { SolutionEditor } from '../ui/SolutionEditor.jsx';
 import { formatDate, formatDuration, relativeDays } from '../ui/format.js';
 import { useConsoleMeta, useNow } from '../ui/hooks.js';
 import { Button, Card, Chip, EmptyState } from '../ui/primitives.jsx';
@@ -66,8 +67,16 @@ const Workspace = ({ problem }) => {
     return (
         <div className="space-y-4">
             <Card className="p-4">
+                <SolutionEditor problem={problem} />
+            </Card>
+
+            <Card className="p-4">
                 <p className="mb-2 flex items-center gap-2 font-semibold"><TerminalSquare size={17} aria-hidden="true" className="text-amber" /> Run the tests</p>
-                <p className="mb-3 text-sm text-muted">Write your solution in <code className="font-mono text-amber">Sources/Exercises</code>, then run:</p>
+                <p className="mb-3 text-sm text-muted">
+                    {import.meta.env.DEV
+                        ? <>Save to package puts your code in <code className="font-mono text-amber">Sources/Exercises</code>. Then, in <code className="font-mono text-amber">dsa-swift</code>, run:</>
+                        : <>Your code is saved here. To test it, put it in the matching file in <code className="font-mono text-amber">dsa-swift/Sources/Exercises</code> (Download names it for you), then run:</>}
+                </p>
                 <div className="flex items-center gap-1 rounded-xl bg-[#101217] py-1 pl-3 pr-1">
                     <code className="min-w-0 flex-1 overflow-x-auto whitespace-nowrap font-mono text-[12px]">swift test --filter {problem.swiftTest}</code>
                     <CopyButton text={`swift test --filter ${problem.swiftTest}`} />
@@ -116,9 +125,7 @@ const Workspace = ({ problem }) => {
             )}
 
             <Card className="p-4">
-                <p className="mb-2 text-sm font-medium">Your solution</p>
-                <AutosaveTextarea initial={record?.solution} onSave={(text) => actions.saveProblemText(problem.id, 'solution', text)} label="Your Swift solution" placeholder="Paste your Swift solution to keep it with the problem." rows={8} mono />
-                <p className="mb-2 mt-2 text-sm font-medium">Notes</p>
+                <p className="mb-2 text-sm font-medium">Notes</p>
                 <AutosaveTextarea initial={record?.notes} onSave={(text) => actions.saveProblemText(problem.id, 'notes', text)} label="Notes on this problem" placeholder="The key insight, the mistake you made, what to remember." rows={3} />
             </Card>
         </div>
@@ -132,9 +139,10 @@ const ProblemView = ({ problem }) => {
     const { Content } = content;
 
     return (
-        <div className="mx-auto max-w-6xl">
+        <div className="mx-auto max-w-7xl">
             <Link to="/dsa/practice" className="mb-4 inline-flex min-h-11 items-center gap-1.5 text-sm text-amber hover:underline"><ArrowLeft size={16} aria-hidden="true" /> All problems</Link>
-            <div className="grid gap-8 xl:grid-cols-[minmax(0,1fr)_360px]">
+            {/* Wide screens put the statement and your code side by side */}
+            <div className="grid grid-cols-1 gap-8 xl:grid-cols-[minmax(0,1.1fr)_minmax(0,1fr)]">
                 <article className="min-w-0 max-w-3xl">
                     <h1 className="font-display text-[clamp(2rem,5vw,3rem)] font-semibold leading-[1.08] tracking-tight">{problem.title}</h1>
                     <div className="mt-4 flex flex-wrap items-center gap-2">
@@ -157,7 +165,7 @@ const ProblemView = ({ problem }) => {
                         {content.status === 'ready' && <Content components={mdxComponents} />}
                     </div>
                 </article>
-                <aside className="xl:sticky xl:top-20 xl:max-h-[calc(100svh-6rem)] xl:self-start xl:overflow-y-auto">
+                <aside className="min-w-0 xl:sticky xl:top-20 xl:max-h-[calc(100svh-6rem)] xl:self-start xl:overflow-y-auto">
                     <Workspace problem={problem} />
                 </aside>
             </div>

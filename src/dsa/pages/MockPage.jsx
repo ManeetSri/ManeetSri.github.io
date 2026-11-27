@@ -9,6 +9,7 @@ import { useActions, useStore } from '../store/store.js';
 import { formatDate, formatDuration } from '../ui/format.js';
 import { useConsoleMeta } from '../ui/hooks.js';
 import { Button, Card, Chip, EmptyState, PageHeader } from '../ui/primitives.jsx';
+import { SolutionEditor } from '../ui/SolutionEditor.jsx';
 
 const DURATIONS = [30, 45, 60];
 const CRITERIA = [
@@ -133,7 +134,10 @@ const MockPage = () => {
                 <h1 className="font-display text-[clamp(2rem,5vw,3rem)] font-semibold leading-tight tracking-tight">{session.problem.title}</h1>
                 <p className="mt-2 text-sm text-muted">Talk through your approach out loud before you write code. Hints and solutions are hidden until you finish.</p>
                 <div className="mt-6"><Statement problem={session.problem} /></div>
-                <Card className="mt-8 p-4 text-sm text-muted">Write your solution in Xcode or the companion package as you would in an interview, then press “I’m done”. Test with <code className="font-mono text-amber">swift test --filter {session.problem.swiftTest}</code> afterwards, not during.</Card>
+                <Card className="mt-8 p-4">
+                    <SolutionEditor problem={session.problem} />
+                    <p className="mt-3 text-sm text-muted">Write it as you would in an interview, then press “I’m done”. Test it with <code className="font-mono text-amber">swift test --filter {session.problem.swiftTest}</code> afterwards, not during.</p>
+                </Card>
             </div>
         );
     }

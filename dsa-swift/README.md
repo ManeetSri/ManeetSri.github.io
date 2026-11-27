@@ -12,7 +12,7 @@ swift Examples/orientation/start-problem-solving-1.swift  # run one of a lesson'
 
 | Folder | What's in it |
 | --- | --- |
-| `Sources/Exercises` | Your solutions. Each problem starts as a stub that compiles but fails its tests. |
+| `Sources/Exercises` | Your solutions. Each problem starts as a stub that compiles but fails its tests. The console's editor starts from the same stub; on the dev server its Save to package button writes your code here. |
 | `Sources/Solutions` | Reference solutions with the same API. Try first, use the hints, then peek. |
 | `Sources/DSAKit` | The data structures you build during the course. |
 | `Tests/DSATests` | One set of tests, compiled against `Exercises` by default or `Solutions` with `-DSOLUTIONS`. |

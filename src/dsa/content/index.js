@@ -36,3 +36,14 @@ export const useContent = (kind, id) => {
 
     return result.key === key ? result : { status: 'loading' };
 };
+
+// A problem's starter code, the exercise stub its tests run against: { file, code }, or null without one
+let starterMap = null;
+export const loadStarter = async (problem) => {
+    starterMap ??= import('./starterFiles.js').then((module) => module.default).catch((error) => {
+        starterMap = null;                      // a failed download can be retried
+        throw error;
+    });
+    const entry = (await starterMap)[problem.swiftTest.replace(/Tests$/, '')];
+    return entry ? { file: entry.file, code: await entry.load() } : null;
+};
