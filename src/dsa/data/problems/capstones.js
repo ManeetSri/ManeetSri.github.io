@@ -7,7 +7,7 @@ export default [
         patterns: ['strings', 'sorting'],
         lessons: ['cap-dsakit'],
         swiftTest: 'DependencyTagResolverTests',
-        lists: ['patterns150', 'swift'],
+        lists: ['swift'],
         minutes: 35,
     },
     {
@@ -17,7 +17,7 @@ export default [
         patterns: ['design', 'simulation'],
         lessons: ['cap-visualiser'],
         swiftTest: 'DeltaFrameRecorderTests',
-        lists: ['patterns150'],
+        lists: [],
         minutes: 40,
     },
     {
@@ -27,7 +27,7 @@ export default [
         patterns: ['backtracking', 'bits'],
         lessons: ['cap-sudoku'],
         swiftTest: 'SudokuSolutionCountTests',
-        lists: ['patterns150'],
+        lists: [],
         minutes: 50,
     },
     {
@@ -37,7 +37,7 @@ export default [
         patterns: ['bits', 'trie'],
         lessons: ['cap-huffman'],
         swiftTest: 'HuffmanBitPackingTests',
-        lists: ['patterns150'],
+        lists: [],
         minutes: 40,
     },
     {
@@ -47,7 +47,7 @@ export default [
         patterns: ['design', 'dp'],
         lessons: ['cap-spell-checker'],
         swiftTest: 'BKTreeTypoSearchTests',
-        lists: ['patterns150'],
+        lists: [],
         minutes: 45,
     },
     {
@@ -57,7 +57,7 @@ export default [
         patterns: ['dp', 'bfs'],
         lessons: ['cap-diff'],
         swiftTest: 'MyersEditBudgetTests',
-        lists: ['patterns150'],
+        lists: [],
         minutes: 50,
     },
     {
@@ -67,7 +67,7 @@ export default [
         patterns: ['heap', 'math'],
         lessons: ['cap-route-planner'],
         swiftTest: 'TurnPenaltyRoutesTests',
-        lists: ['patterns150'],
+        lists: [],
         minutes: 50,
     },
     {
@@ -77,7 +77,7 @@ export default [
         patterns: ['bfs', 'matrix'],
         lessons: ['cap-maze'],
         swiftTest: 'PerfectMazeAuditTests',
-        lists: ['patterns150'],
+        lists: [],
         minutes: 35,
     },
 ];

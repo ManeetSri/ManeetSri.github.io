@@ -27,7 +27,7 @@ export default [
         patterns: ['strings'],
         lessons: ['str-longest-common-prefix'],
         swiftTest: 'SharedPrefixTests',
-        lists: ['patterns150'],
+        lists: [],
         minutes: 15,
     },
     {
@@ -37,7 +37,7 @@ export default [
         patterns: ['strings', 'hashing'],
         lessons: ['str-isomorphic'],
         swiftTest: 'TwoWayMappingTests',
-        lists: ['patterns150'],
+        lists: [],
         minutes: 20,
     },
     {
@@ -47,7 +47,7 @@ export default [
         patterns: ['strings', 'math'],
         lessons: ['str-roman'],
         swiftTest: 'RomanNumeralCodecTests',
-        lists: ['patterns150'],
+        lists: [],
         minutes: 25,
     },
     {
@@ -77,7 +77,7 @@ export default [
         patterns: ['strings', 'two-pointers'],
         lessons: ['str-reverse-words'],
         swiftTest: 'WordBufferReversalTests',
-        lists: ['patterns150'],
+        lists: [],
         minutes: 25,
     },
     {
@@ -87,7 +87,7 @@ export default [
         patterns: ['strings', 'two-pointers'],
         lessons: ['str-compression'],
         swiftTest: 'InPlaceRunCompressorTests',
-        lists: ['patterns150'],
+        lists: [],
         minutes: 25,
     },
     {
@@ -97,7 +97,7 @@ export default [
         patterns: ['strings'],
         lessons: ['str-compression'],
         swiftTest: 'RunCodeExpanderTests',
-        lists: ['patterns150'],
+        lists: [],
         minutes: 15,
     },
     {
@@ -107,7 +107,7 @@ export default [
         patterns: ['strings'],
         lessons: ['str-naive-matching'],
         swiftTest: 'LeftToRightReplaceTests',
-        lists: ['patterns150'],
+        lists: [],
         minutes: 20,
     },
 ];

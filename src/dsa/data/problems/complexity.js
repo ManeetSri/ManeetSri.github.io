@@ -7,7 +7,7 @@ export default [
         patterns: ['math'],
         lessons: ['bigo-counting-operations', 'bigo-analysing-loops'],
         swiftTest: 'LoopStepCountTests',
-        lists: [],
+        lists: ['patterns150'],
         minutes: 20,
     },
     {
@@ -17,7 +17,7 @@ export default [
         patterns: ['traversal'],
         lessons: ['bigo-analysing-loops', 'bigo-feasibility-table'],
         swiftTest: 'BiggestRiseTests',
-        lists: [],
+        lists: ['patterns150'],
         minutes: 25,
     },
     {
@@ -27,7 +27,7 @@ export default [
         patterns: ['math'],
         lessons: ['bigo-amortised'],
         swiftTest: 'GrowthCopiesTests',
-        lists: [],
+        lists: ['patterns150'],
         minutes: 25,
     },
     {
@@ -37,7 +37,7 @@ export default [
         patterns: ['recursion', 'math'],
         lessons: ['bigo-recurrences'],
         swiftTest: 'RecursiveCallCountTests',
-        lists: [],
+        lists: ['patterns150'],
         minutes: 25,
     },
     {
@@ -47,7 +47,7 @@ export default [
         patterns: ['strings'],
         lessons: ['bigo-swift-hidden-costs'],
         swiftTest: 'CharactersAtOffsetsTests',
-        lists: ['swift'],
+        lists: ['patterns150', 'swift'],
         minutes: 15,
     },
     {
@@ -87,7 +87,7 @@ export default [
         patterns: ['math'],
         lessons: ['bigo-rules'],
         swiftTest: 'LoopNestBoundTests',
-        lists: ['patterns150'],
+        lists: [],
         minutes: 15,
     },
     {
@@ -97,7 +97,7 @@ export default [
         patterns: ['traversal'],
         lessons: ['bigo-cases'],
         swiftTest: 'SearchCaseTallyTests',
-        lists: ['patterns150'],
+        lists: [],
         minutes: 20,
     },
     {

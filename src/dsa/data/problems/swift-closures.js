@@ -57,7 +57,7 @@ export default [
         patterns: ['sorting'],
         lessons: ['swift-closure-syntax'],
         swiftTest: 'NearestFirstOrderTests',
-        lists: ['patterns150', 'swift'],
+        lists: ['swift'],
         minutes: 15,
     },
     {
@@ -67,7 +67,7 @@ export default [
         patterns: ['basics'],
         lessons: ['swift-escaping', 'swift-capturing'],
         swiftTest: 'ComputeOnceTests',
-        lists: ['patterns150', 'swift'],
+        lists: ['swift'],
         minutes: 20,
     },
     {
@@ -77,7 +77,7 @@ export default [
         patterns: ['traversal'],
         lessons: ['swift-enumerated-zip'],
         swiftTest: 'SteepestClimbLegTests',
-        lists: ['patterns150', 'swift'],
+        lists: ['swift'],
         minutes: 15,
     },
     {
@@ -87,7 +87,7 @@ export default [
         patterns: ['traversal'],
         lessons: ['swift-loop-or-hof'],
         swiftTest: 'FirstOverdraftDayTests',
-        lists: ['patterns150', 'swift'],
+        lists: ['swift'],
         minutes: 15,
     },
 ];

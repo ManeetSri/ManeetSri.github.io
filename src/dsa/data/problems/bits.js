@@ -37,7 +37,7 @@ export default [
         patterns: ['bits'],
         lessons: ['bits-xor-tricks', 'bits-power-of-two'],
         swiftTest: 'TwoUnpairedNumbersTests',
-        lists: [],
+        lists: ['patterns150'],
         minutes: 25,
     },
     {
@@ -47,7 +47,7 @@ export default [
         patterns: ['bits', 'backtracking'],
         lessons: ['bits-subsets'],
         swiftTest: 'BitmaskSubsetsTests',
-        lists: [],
+        lists: ['patterns150'],
         minutes: 20,
     },
     {
@@ -77,7 +77,7 @@ export default [
         patterns: ['bits'],
         lessons: ['bits-gray-code-bitsets'],
         swiftTest: 'DisjointLetterWordsTests',
-        lists: ['patterns150'],
+        lists: [],
         minutes: 20,
     },
 ];

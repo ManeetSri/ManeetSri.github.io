@@ -57,7 +57,7 @@ export default [
         patterns: ['design'],
         lessons: ['swift-protocols'],
         swiftTest: 'CheckoutPriceRulesTests',
-        lists: ['patterns150', 'swift'],
+        lists: ['swift'],
         minutes: 20,
     },
     {
@@ -67,7 +67,7 @@ export default [
         patterns: ['design', 'sorting'],
         lessons: ['swift-extensions'],
         swiftTest: 'ScoreboardDefaultsTests',
-        lists: ['patterns150', 'swift'],
+        lists: ['swift'],
         minutes: 20,
     },
     {
@@ -77,7 +77,7 @@ export default [
         patterns: ['design', 'hashing'],
         lessons: ['swift-associated-types'],
         swiftTest: 'AssociatedItemContainersTests',
-        lists: ['patterns150', 'swift'],
+        lists: ['swift'],
         minutes: 30,
     },
     {
@@ -87,7 +87,7 @@ export default [
         patterns: ['hashing', 'design'],
         lessons: ['swift-array-literal'],
         swiftTest: 'TallyLiteralsTests',
-        lists: ['patterns150', 'swift'],
+        lists: ['swift'],
         minutes: 20,
     },
     {
@@ -97,7 +97,7 @@ export default [
         patterns: ['strings', 'design'],
         lessons: ['swift-some-any'],
         swiftTest: 'SomeOrAnyShapesTests',
-        lists: ['patterns150', 'swift'],
+        lists: ['swift'],
         minutes: 25,
     },
 ];

@@ -7,7 +7,7 @@ export default [
         patterns: ['recursion', 'dfs'],
         lessons: ['tree-terminology', 'tree-node-swift'],
         swiftTest: 'TreeCensusTests',
-        lists: ['patterns150'],
+        lists: [],
         minutes: 20,
     },
     {
@@ -27,7 +27,7 @@ export default [
         patterns: ['bfs'],
         lessons: ['tree-build-level-order'],
         swiftTest: 'LevelOrderBuilderTests',
-        lists: ['patterns150'],
+        lists: [],
         minutes: 30,
     },
     {
@@ -47,7 +47,7 @@ export default [
         patterns: ['strings', 'monotonic-stack'],
         lessons: ['tree-printing'],
         swiftTest: 'SidewaysTreeReaderTests',
-        lists: ['patterns150'],
+        lists: [],
         minutes: 30,
     },
 ];

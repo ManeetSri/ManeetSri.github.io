@@ -47,7 +47,7 @@ export default [
         patterns: ['binary-search', 'math'],
         lessons: ['bs-sqrt-matrix'],
         swiftTest: 'IntegerSquareRootTests',
-        lists: ['patterns150'],
+        lists: [],
         minutes: 20,
     },
     {
@@ -57,7 +57,7 @@ export default [
         patterns: ['binary-search', 'matrix'],
         lessons: ['bs-sqrt-matrix'],
         swiftTest: 'SortedMatrixSearchTests',
-        lists: ['patterns150'],
+        lists: [],
         minutes: 25,
     },
     {
@@ -87,7 +87,7 @@ export default [
         patterns: ['traversal'],
         lessons: ['bs-linear-search'],
         swiftTest: 'NearestMatchScanTests',
-        lists: ['patterns150'],
+        lists: [],
         minutes: 15,
     },
     {
@@ -97,7 +97,7 @@ export default [
         patterns: ['binary-search'],
         lessons: ['bs-other-searches'],
         swiftTest: 'GallopingLowerBoundTests',
-        lists: ['patterns150'],
+        lists: [],
         minutes: 30,
     },
     {
@@ -107,7 +107,7 @@ export default [
         patterns: ['binary-search'],
         lessons: ['bs-other-searches'],
         swiftTest: 'UnimodalArgmaxTests',
-        lists: ['patterns150'],
+        lists: [],
         minutes: 25,
     },
 ];

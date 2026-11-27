@@ -7,7 +7,7 @@ export default [
         patterns: ['strings', 'dfs'],
         lessons: ['fs-avoiding-copies', 'fs-memory-layout'],
         swiftTest: 'FolderPathListingTests',
-        lists: ['patterns150', 'swift'],
+        lists: ['swift'],
         minutes: 30,
     },
     {
@@ -17,7 +17,7 @@ export default [
         patterns: ['design'],
         lessons: ['fs-cow-for-your-types'],
         swiftTest: 'CopyOnWriteGridTests',
-        lists: ['patterns150', 'swift'],
+        lists: ['swift'],
         minutes: 30,
     },
     {
@@ -27,7 +27,7 @@ export default [
         patterns: ['bfs', 'matrix'],
         lessons: ['fs-memory-layout', 'fs-instruments'],
         swiftTest: 'RepeatedGridRoutesTests',
-        lists: ['patterns150', 'swift'],
+        lists: ['swift'],
         minutes: 35,
     },
     {
@@ -37,7 +37,7 @@ export default [
         patterns: ['design'],
         lessons: ['fs-index-based-nodes'],
         swiftTest: 'SlotPoolListTests',
-        lists: ['patterns150', 'swift'],
+        lists: ['swift'],
         minutes: 35,
     },
     {
@@ -47,7 +47,7 @@ export default [
         patterns: ['trie', 'design'],
         lessons: ['fs-index-based-nodes'],
         swiftTest: 'FlatArrayTrieTests',
-        lists: ['patterns150', 'swift'],
+        lists: ['swift'],
         minutes: 30,
     },
     {
@@ -57,7 +57,7 @@ export default [
         patterns: ['bits', 'basics'],
         lessons: ['fs-build-settings'],
         swiftTest: 'TrapFreeChecksumsTests',
-        lists: ['patterns150', 'swift'],
+        lists: ['swift'],
         minutes: 20,
     },
     {
@@ -67,7 +67,7 @@ export default [
         patterns: ['design', 'sorting'],
         lessons: ['fs-dispatch-generics'],
         swiftTest: 'LeaderboardDispatchTests',
-        lists: ['patterns150', 'swift'],
+        lists: ['swift'],
         minutes: 30,
     },
     {
@@ -77,7 +77,7 @@ export default [
         patterns: ['design', 'sorting'],
         lessons: ['fs-benchmarking'],
         swiftTest: 'OperationCountBenchTests',
-        lists: ['patterns150', 'swift'],
+        lists: ['swift'],
         minutes: 30,
     },
 ];

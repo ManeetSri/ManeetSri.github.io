@@ -27,7 +27,7 @@ export default [
         patterns: ['dp', 'matrix'],
         lessons: ['dpg-falling-path'],
         swiftTest: 'SkiSlopeDescentTests',
-        lists: ['patterns150'],
+        lists: [],
         minutes: 25,
     },
     {
@@ -47,7 +47,7 @@ export default [
         patterns: ['dp', 'matrix'],
         lessons: ['dpg-maximal-square'],
         swiftTest: 'LargestSquareOfOnesTests',
-        lists: ['patterns150'],
+        lists: [],
         minutes: 25,
     },
     {
@@ -57,7 +57,7 @@ export default [
         patterns: ['dp', 'matrix'],
         lessons: ['dpg-cherry-pickup'],
         swiftTest: 'TwoWalkerCherryHarvestTests',
-        lists: ['patterns150'],
+        lists: [],
         minutes: 50,
     },
 ];

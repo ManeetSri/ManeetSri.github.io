@@ -77,7 +77,7 @@ export default [
         patterns: ['design', 'heap', 'hashing'],
         lessons: ['ds-ttl-store'],
         swiftTest: 'ExpiringKeyValueStoreTests',
-        lists: ['patterns150'],
+        lists: [],
         minutes: 40,
     },
     {
@@ -87,7 +87,7 @@ export default [
         patterns: ['design', 'hashing'],
         lessons: ['ds-randomized-set'],
         swiftTest: 'ConstantTimeRandomSetTests',
-        lists: ['patterns150'],
+        lists: [],
         minutes: 30,
     },
     {
@@ -97,7 +97,7 @@ export default [
         patterns: ['design', 'strings'],
         lessons: ['ds-undo-redo'],
         swiftTest: 'UndoRedoEditorTests',
-        lists: ['patterns150'],
+        lists: [],
         minutes: 40,
     },
 ];

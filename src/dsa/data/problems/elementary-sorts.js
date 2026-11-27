@@ -17,7 +17,7 @@ export default [
         patterns: ['sorting'],
         lessons: ['sort-selection'],
         swiftTest: 'PartialSelectionSortTests',
-        lists: ['patterns150'],
+        lists: [],
         minutes: 20,
     },
     {

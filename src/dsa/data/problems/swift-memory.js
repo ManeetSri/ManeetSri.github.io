@@ -47,7 +47,7 @@ export default [
         patterns: ['simulation'],
         lessons: ['swift-stack-heap'],
         swiftTest: 'CallFrameTrackerTests',
-        lists: ['patterns150', 'swift'],
+        lists: ['swift'],
         minutes: 20,
     },
     {
@@ -57,7 +57,7 @@ export default [
         patterns: ['simulation', 'hashing'],
         lessons: ['swift-arc'],
         swiftTest: 'RefCountSimulatorTests',
-        lists: ['patterns150', 'swift'],
+        lists: ['swift'],
         minutes: 30,
     },
     {
@@ -67,7 +67,7 @@ export default [
         patterns: ['two-pointers', 'traversal'],
         lessons: ['swift-unsafe-pointers'],
         swiftTest: 'BufferPointerWalkTests',
-        lists: ['patterns150', 'swift'],
+        lists: ['swift'],
         minutes: 15,
     },
 ];

@@ -7,7 +7,7 @@ export default [
         patterns: ['math'],
         lessons: ['nt-extended-euclid'],
         swiftTest: 'LinearCongruenceSolverTests',
-        lists: ['patterns150'],
+        lists: [],
         minutes: 30,
     },
     {
@@ -27,7 +27,7 @@ export default [
         patterns: ['math'],
         lessons: ['nt-totient-sieves'],
         swiftTest: 'LowestTermsFractionsTests',
-        lists: ['patterns150'],
+        lists: [],
         minutes: 30,
     },
     {
@@ -37,7 +37,7 @@ export default [
         patterns: ['math'],
         lessons: ['nt-totient-sieves'],
         swiftTest: 'PrimesInWindowTests',
-        lists: ['patterns150'],
+        lists: [],
         minutes: 30,
     },
     {
@@ -47,7 +47,7 @@ export default [
         patterns: ['math', 'bits'],
         lessons: ['nt-primality'],
         swiftTest: 'BigPrimeVerdictTests',
-        lists: ['patterns150'],
+        lists: [],
         minutes: 45,
     },
     {
@@ -57,7 +57,7 @@ export default [
         patterns: ['math'],
         lessons: ['nt-ncr-mod-p', 'nt-fermat-crt'],
         swiftTest: 'BinomialQueryBankTests',
-        lists: ['patterns150'],
+        lists: [],
         minutes: 25,
     },
     {
@@ -67,7 +67,7 @@ export default [
         patterns: ['math', 'bits'],
         lessons: ['nt-inclusion-exclusion'],
         swiftTest: 'AnyDivisorCounterTests',
-        lists: ['patterns150'],
+        lists: [],
         minutes: 30,
     },
     {
@@ -77,7 +77,7 @@ export default [
         patterns: ['math', 'dp'],
         lessons: ['nt-matrix-power'],
         swiftTest: 'RecurrenceJumperTests',
-        lists: ['patterns150'],
+        lists: [],
         minutes: 35,
     },
     {
@@ -87,7 +87,7 @@ export default [
         patterns: ['math', 'bits', 'dp'],
         lessons: ['nt-game-theory'],
         swiftTest: 'PileSplitGameTests',
-        lists: ['patterns150'],
+        lists: [],
         minutes: 45,
     },
     {
@@ -97,7 +97,7 @@ export default [
         patterns: ['math'],
         lessons: ['nt-fft'],
         swiftTest: 'DigitStringProductTests',
-        lists: ['patterns150'],
+        lists: [],
         minutes: 60,
     },
     {
@@ -107,7 +107,7 @@ export default [
         patterns: ['math', 'dp'],
         lessons: ['nt-special-numbers'],
         swiftTest: 'CrewSplitCountsTests',
-        lists: ['patterns150'],
+        lists: [],
         minutes: 35,
     },
     {
@@ -117,7 +117,7 @@ export default [
         patterns: ['math'],
         lessons: ['nt-special-numbers'],
         swiftTest: 'CatalanDisguisesTests',
-        lists: ['patterns150'],
+        lists: [],
         minutes: 30,
     },
 ];

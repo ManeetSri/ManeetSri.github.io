@@ -27,7 +27,7 @@ export default [
         patterns: ['dfs', 'prefix-sum', 'hashing'],
         lessons: ['bt-path-sums'],
         swiftTest: 'TargetSumPathsTests',
-        lists: ['patterns150'],
+        lists: [],
         minutes: 45,
     },
     {
@@ -107,7 +107,7 @@ export default [
         patterns: ['dfs'],
         lessons: ['bt-good-nodes'],
         swiftTest: 'GoodNodesAndNumbersTests',
-        lists: ['patterns150'],
+        lists: [],
         minutes: 25,
     },
 ];

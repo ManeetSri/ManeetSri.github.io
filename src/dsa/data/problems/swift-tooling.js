@@ -57,7 +57,7 @@ export default [
         patterns: ['strings'],
         lessons: ['swift-xctest'],
         swiftTest: 'XCTestTranslatorTests',
-        lists: ['patterns150', 'swift'],
+        lists: ['swift'],
         minutes: 30,
     },
     {
@@ -67,7 +67,7 @@ export default [
         patterns: ['hashing', 'strings'],
         lessons: ['swift-release-builds'],
         swiftTest: 'DeadCodeEliminatorTests',
-        lists: ['patterns150', 'swift'],
+        lists: ['swift'],
         minutes: 25,
     },
     {
@@ -77,7 +77,7 @@ export default [
         patterns: ['math', 'sorting'],
         lessons: ['swift-timing-code'],
         swiftTest: 'TimingExperimentReportTests',
-        lists: ['patterns150', 'swift'],
+        lists: ['swift'],
         minutes: 15,
     },
 ];

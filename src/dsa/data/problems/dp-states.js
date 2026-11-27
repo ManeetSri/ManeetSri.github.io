@@ -17,7 +17,7 @@ export default [
         patterns: ['dp'],
         lessons: ['dpsm-stocks-3-4'],
         swiftTest: 'StockTradesWithLimitTests',
-        lists: ['patterns150'],
+        lists: [],
         minutes: 40,
     },
     {
@@ -27,7 +27,7 @@ export default [
         patterns: ['dp'],
         lessons: ['dpsm-paint-flip'],
         swiftTest: 'HousePaintingCostTests',
-        lists: ['patterns150'],
+        lists: [],
         minutes: 30,
     },
     {
@@ -37,7 +37,7 @@ export default [
         patterns: ['dp', 'strings'],
         lessons: ['dpsm-paint-flip'],
         swiftTest: 'SwitchRowFlipsTests',
-        lists: ['patterns150'],
+        lists: [],
         minutes: 20,
     },
     {
@@ -47,7 +47,7 @@ export default [
         patterns: ['dp', 'greedy'],
         lessons: ['dpsm-stocks-1-2'],
         swiftTest: 'StockTradePlansTests',
-        lists: ['patterns150'],
+        lists: [],
         minutes: 20,
     },
 ];

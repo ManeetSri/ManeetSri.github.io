@@ -7,7 +7,7 @@ export default [
         patterns: ['greedy', 'two-pointers', 'sorting'],
         lessons: ['greedy-proofs', 'greedy-cookies-boats'],
         swiftTest: 'BiscuitsForChildrenTests',
-        lists: ['patterns150'],
+        lists: [],
         minutes: 15,
     },
     {
@@ -47,7 +47,7 @@ export default [
         patterns: ['greedy', 'two-pointers', 'sorting'],
         lessons: ['greedy-cookies-boats'],
         swiftTest: 'RescueBoatPairsTests',
-        lists: ['patterns150'],
+        lists: [],
         minutes: 20,
     },
     {
@@ -57,7 +57,7 @@ export default [
         patterns: ['greedy', 'simulation'],
         lessons: ['greedy-cookies-boats'],
         swiftTest: 'PieStallChangeTests',
-        lists: ['patterns150'],
+        lists: [],
         minutes: 15,
     },
     {
@@ -97,7 +97,7 @@ export default [
         patterns: ['greedy', 'heap'],
         lessons: ['greedy-huffman'],
         swiftTest: 'HuffmanEncodedLengthTests',
-        lists: ['patterns150'],
+        lists: [],
         minutes: 30,
     },
     {
@@ -117,7 +117,7 @@ export default [
         patterns: ['greedy', 'dp'],
         lessons: ['greedy-counterexamples'],
         swiftTest: 'GreedyChangeBreakerTests',
-        lists: ['patterns150'],
+        lists: [],
         minutes: 30,
     },
     {
@@ -127,7 +127,7 @@ export default [
         patterns: ['greedy', 'sorting'],
         lessons: ['greedy-activity-selection'],
         swiftTest: 'SpiceMarketBagfulTests',
-        lists: ['patterns150'],
+        lists: [],
         minutes: 20,
     },
 ];

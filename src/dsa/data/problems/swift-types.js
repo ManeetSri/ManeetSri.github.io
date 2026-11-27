@@ -47,7 +47,7 @@ export default [
         patterns: ['design'],
         lessons: ['swift-classes'],
         swiftTest: 'AccountWithdrawalRulesTests',
-        lists: ['patterns150', 'swift'],
+        lists: ['swift'],
         minutes: 20,
     },
     {
@@ -57,7 +57,7 @@ export default [
         patterns: ['simulation', 'hashing'],
         lessons: ['swift-value-vs-reference'],
         swiftTest: 'ValueReferenceSimulatorTests',
-        lists: ['patterns150', 'swift'],
+        lists: ['swift'],
         minutes: 25,
     },
     {
@@ -67,7 +67,7 @@ export default [
         patterns: ['traversal', 'hashing'],
         lessons: ['swift-identity'],
         swiftTest: 'RoundTableSeatsTests',
-        lists: ['patterns150', 'swift'],
+        lists: ['swift'],
         minutes: 20,
     },
     {
@@ -77,7 +77,7 @@ export default [
         patterns: ['simulation', 'hashing'],
         lessons: ['swift-copy-on-write-intro'],
         swiftTest: 'CowCopyCounterTests',
-        lists: ['patterns150', 'swift'],
+        lists: ['swift'],
         minutes: 30,
     },
     {
@@ -87,7 +87,7 @@ export default [
         patterns: ['design'],
         lessons: ['swift-observers-static'],
         swiftTest: 'ClampedScoreTrackerTests',
-        lists: ['patterns150', 'swift'],
+        lists: ['swift'],
         minutes: 15,
     },
     {
@@ -97,7 +97,7 @@ export default [
         patterns: ['design'],
         lessons: ['swift-access-control'],
         swiftTest: 'GuardedPinLockTests',
-        lists: ['patterns150', 'swift'],
+        lists: ['swift'],
         minutes: 20,
     },
 ];

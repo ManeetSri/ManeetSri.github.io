@@ -27,7 +27,7 @@ export default [
         patterns: ['union-find', 'greedy', 'sorting'],
         lessons: ['mst-definition', 'mst-problems'],
         swiftTest: 'MSTEdgeRolesTests',
-        lists: ['patterns150'],
+        lists: [],
         minutes: 50,
     },
     {
@@ -37,7 +37,7 @@ export default [
         patterns: ['union-find', 'greedy'],
         lessons: ['mst-boruvka'],
         swiftTest: 'BoruvkaGridRoundsTests',
-        lists: ['patterns150'],
+        lists: [],
         minutes: 35,
     },
 ];

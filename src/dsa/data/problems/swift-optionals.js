@@ -57,7 +57,7 @@ export default [
         patterns: ['basics'],
         lessons: ['swift-optional-chaining'],
         swiftTest: 'ChatPreviewChainsTests',
-        lists: ['patterns150', 'swift'],
+        lists: ['swift'],
         minutes: 15,
     },
     {
@@ -67,7 +67,7 @@ export default [
         patterns: ['basics'],
         lessons: ['swift-force-unwrap'],
         swiftTest: 'RecipeScalerDefusedTests',
-        lists: ['patterns150', 'swift'],
+        lists: ['swift'],
         minutes: 15,
     },
 ];

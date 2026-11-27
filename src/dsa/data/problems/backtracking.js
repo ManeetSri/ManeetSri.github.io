@@ -17,7 +17,7 @@ export default [
         patterns: ['backtracking', 'strings'],
         lessons: ['bk-permutations'],
         swiftTest: 'DistinctTileArrangementsTests',
-        lists: ['patterns150'],
+        lists: [],
         minutes: 25,
     },
     {
@@ -37,7 +37,7 @@ export default [
         patterns: ['backtracking', 'strings'],
         lessons: ['bk-phone-parentheses'],
         swiftTest: 'KeypadLetterWordsTests',
-        lists: ['patterns150'],
+        lists: [],
         minutes: 15,
     },
     {
@@ -47,7 +47,7 @@ export default [
         patterns: ['backtracking', 'recursion'],
         lessons: ['bk-phone-parentheses'],
         swiftTest: 'BracketStringGeneratorTests',
-        lists: ['patterns150'],
+        lists: [],
         minutes: 20,
     },
     {
@@ -87,7 +87,7 @@ export default [
         patterns: ['backtracking', 'bits', 'matrix'],
         lessons: ['bk-sudoku', 'bk-pruning'],
         swiftTest: 'SudokuGridSolverTests',
-        lists: ['patterns150'],
+        lists: [],
         minutes: 45,
     },
     {
@@ -97,7 +97,7 @@ export default [
         patterns: ['backtracking', 'matrix'],
         lessons: ['bk-maze-colouring'],
         swiftTest: 'MazeRunnerPathsTests',
-        lists: ['patterns150'],
+        lists: [],
         minutes: 20,
     },
     {

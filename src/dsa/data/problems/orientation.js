@@ -17,7 +17,7 @@ export default [
         patterns: ['traversal'],
         lessons: ['start-problem-solving'],
         swiftTest: 'LargestElementTests',
-        lists: ['patterns150'],
+        lists: [],
         minutes: 15,
     },
     {
@@ -27,7 +27,7 @@ export default [
         patterns: ['basics'],
         lessons: ['start-reading-problems'],
         swiftTest: 'ConstraintSpeedTargetTests',
-        lists: ['patterns150', 'swift'],
+        lists: ['swift'],
         minutes: 10,
     },
 ];

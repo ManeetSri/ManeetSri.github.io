@@ -7,7 +7,7 @@ export default [
         patterns: ['bfs', 'matrix'],
         lessons: ['sp-zero-one-bfs'],
         swiftTest: 'FewestWallsToBreakTests',
-        lists: ['patterns150'],
+        lists: [],
         minutes: 30,
     },
     {
@@ -37,7 +37,7 @@ export default [
         patterns: ['dp'],
         lessons: ['sp-bellman-ford', 'sp-spfa'],
         swiftTest: 'ProfitLoopFinderTests',
-        lists: ['patterns150'],
+        lists: [],
         minutes: 45,
     },
     {
@@ -57,7 +57,7 @@ export default [
         patterns: ['dp'],
         lessons: ['sp-floyd-warshall'],
         swiftTest: 'QuietestCityWithinReachTests',
-        lists: ['patterns150'],
+        lists: [],
         minutes: 30,
     },
     {
@@ -67,7 +67,7 @@ export default [
         patterns: ['heap', 'matrix'],
         lessons: ['sp-a-star'],
         swiftTest: 'WarehouseRobotRouteTests',
-        lists: ['patterns150'],
+        lists: [],
         minutes: 35,
     },
     {
@@ -97,7 +97,7 @@ export default [
         patterns: ['bfs'],
         lessons: ['sp-weighted'],
         swiftTest: 'DistanceTableAuditTests',
-        lists: ['patterns150'],
+        lists: [],
         minutes: 35,
     },
     {
@@ -107,7 +107,7 @@ export default [
         patterns: ['bfs', 'heap', 'topo-sort', 'dp'],
         lessons: ['sp-choosing'],
         swiftTest: 'ShortestPathDispatcherTests',
-        lists: ['patterns150'],
+        lists: [],
         minutes: 60,
     },
 ];

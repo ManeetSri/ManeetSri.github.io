@@ -7,7 +7,7 @@ export default [
         patterns: ['simulation', 'math'],
         lessons: ['algo-pseudocode', 'algo-dry-runs', 'algo-what-is-an-algorithm'],
         swiftTest: 'KaprekarTraceTests',
-        lists: [],
+        lists: ['patterns150'],
         minutes: 20,
     },
     {
@@ -17,7 +17,7 @@ export default [
         patterns: ['traversal'],
         lessons: ['algo-invariants', 'algo-dry-runs'],
         swiftTest: 'RecordBreakersTests',
-        lists: [],
+        lists: ['patterns150'],
         minutes: 15,
     },
     {
@@ -27,7 +27,7 @@ export default [
         patterns: ['traversal', 'sorting'],
         lessons: ['algo-brute-force-first', 'algo-constraints-to-complexity'],
         swiftTest: 'SmallestGapTests',
-        lists: [],
+        lists: ['patterns150'],
         minutes: 20,
     },
     {
@@ -37,7 +37,7 @@ export default [
         patterns: ['traversal'],
         lessons: ['algo-edge-cases', 'algo-invariants'],
         swiftTest: 'SecondLargestDistinctTests',
-        lists: [],
+        lists: ['patterns150'],
         minutes: 20,
     },
 ];

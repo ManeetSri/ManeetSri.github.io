@@ -9,7 +9,7 @@ export default [
         patterns: ['sliding-window'],
         lessons: ['pat-recognition', 'pat-mixed-drills'],
         swiftTest: 'TeamSeatingSwapsTests',
-        lists: ['patterns150'],
+        lists: [],
         minutes: 30,
     },
     {
@@ -19,7 +19,7 @@ export default [
         patterns: ['prefix-sum', 'hashing'],
         lessons: ['pat-recognition', 'pat-mixed-drills'],
         swiftTest: 'PracticeLogStretchTests',
-        lists: ['patterns150'],
+        lists: [],
         minutes: 30,
     },
     {
@@ -29,7 +29,7 @@ export default [
         patterns: ['binary-search'],
         lessons: ['pat-recognition', 'pat-mixed-drills'],
         swiftTest: 'BakeryOrderDeadlineTests',
-        lists: ['patterns150'],
+        lists: [],
         minutes: 30,
     },
     {
@@ -39,7 +39,7 @@ export default [
         patterns: ['dp'],
         lessons: ['pat-mixed-drills'],
         swiftTest: 'CommuterPassPlannerTests',
-        lists: ['patterns150'],
+        lists: [],
         minutes: 35,
     },
     {
@@ -49,7 +49,7 @@ export default [
         patterns: ['greedy', 'heap'],
         lessons: ['pat-mixed-drills'],
         swiftTest: 'FewestRefuelStopsTests',
-        lists: ['patterns150'],
+        lists: [],
         minutes: 40,
     },
     {
@@ -59,7 +59,7 @@ export default [
         patterns: ['union-find', 'binary-search', 'bfs'],
         lessons: ['pat-mixed-drills'],
         swiftTest: 'LastDryCrossingDayTests',
-        lists: ['patterns150'],
+        lists: [],
         minutes: 45,
     },
     {
@@ -69,7 +69,7 @@ export default [
         patterns: ['sliding-window'],
         lessons: ['pat-templates-linear'],
         swiftTest: 'LongestSteadyStretchTests',
-        lists: ['patterns150'],
+        lists: [],
         minutes: 30,
     },
     {
@@ -89,7 +89,7 @@ export default [
         patterns: ['binary-search', 'two-pointers', 'sorting'],
         lessons: ['pat-templates-search-sort'],
         swiftTest: 'KthSmallestHouseGapTests',
-        lists: ['patterns150'],
+        lists: [],
         minutes: 40,
     },
     {
@@ -99,7 +99,7 @@ export default [
         patterns: ['bfs', 'topo-sort'],
         lessons: ['pat-templates-trees-graphs'],
         swiftTest: 'TreeNetworkCentresTests',
-        lists: ['patterns150'],
+        lists: [],
         minutes: 30,
     },
     {
@@ -109,7 +109,7 @@ export default [
         patterns: ['backtracking', 'dp', 'bits'],
         lessons: ['pat-templates-paradigms'],
         swiftTest: 'EqualChoreTeamsTests',
-        lists: ['patterns150'],
+        lists: [],
         minutes: 45,
     },
 ];

@@ -7,7 +7,7 @@ export default [
         patterns: ['design', 'prefix-sum'],
         lessons: ['seg-range-queries', 'seg-build-query-update'],
         swiftTest: 'EditableRangeSumsTests',
-        lists: ['patterns150'],
+        lists: [],
         minutes: 30,
     },
     {
@@ -17,7 +17,7 @@ export default [
         patterns: ['design'],
         lessons: ['seg-generic'],
         swiftTest: 'LongestDrySpellTests',
-        lists: ['patterns150'],
+        lists: [],
         minutes: 45,
     },
     {
@@ -27,7 +27,7 @@ export default [
         patterns: ['design'],
         lessons: ['seg-lazy'],
         swiftTest: 'TrainSeatBookingsTests',
-        lists: ['patterns150'],
+        lists: [],
         minutes: 45,
     },
     {
@@ -37,7 +37,7 @@ export default [
         patterns: ['intervals', 'sorting', 'binary-search'],
         lessons: ['seg-lazy'],
         swiftTest: 'StackingCratesTests',
-        lists: ['patterns150'],
+        lists: [],
         minutes: 50,
     },
     {
@@ -47,7 +47,7 @@ export default [
         patterns: ['binary-search', 'sorting'],
         lessons: ['seg-merge-sort-tree'],
         swiftTest: 'RangeCountAtMostTests',
-        lists: ['patterns150'],
+        lists: [],
         minutes: 45,
     },
     {
@@ -57,7 +57,7 @@ export default [
         patterns: ['design', 'binary-search'],
         lessons: ['seg-persistent'],
         swiftTest: 'PersistentRangeKthTests',
-        lists: ['patterns150'],
+        lists: [],
         minutes: 50,
     },
     {
@@ -67,7 +67,7 @@ export default [
         patterns: ['design', 'prefix-sum'],
         lessons: ['seg-persistent'],
         swiftTest: 'VersionedLedgerSumsTests',
-        lists: ['patterns150'],
+        lists: [],
         minutes: 50,
     },
     {
@@ -77,7 +77,7 @@ export default [
         patterns: ['design', 'greedy'],
         lessons: ['seg-vs-others'],
         swiftTest: 'FirstFitServersTests',
-        lists: ['patterns150'],
+        lists: [],
         minutes: 35,
     },
 ];

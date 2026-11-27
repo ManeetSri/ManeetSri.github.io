@@ -37,7 +37,7 @@ export default [
         patterns: ['sorting', 'two-pointers'],
         lessons: ['sort-quick'],
         swiftTest: 'PivotIntoPlaceTests',
-        lists: ['patterns150'],
+        lists: [],
         minutes: 20,
     },
     {
@@ -77,7 +77,7 @@ export default [
         patterns: ['sorting', 'strings', 'greedy'],
         lessons: ['sort-swift-sort'],
         swiftTest: 'LargestConcatenationTests',
-        lists: ['patterns150'],
+        lists: [],
         minutes: 30,
     },
     {
@@ -87,7 +87,7 @@ export default [
         patterns: ['sorting', 'recursion'],
         lessons: ['sort-median-of-medians'],
         swiftTest: 'MedianOfMediansSelectTests',
-        lists: ['patterns150'],
+        lists: [],
         minutes: 45,
     },
     {
@@ -97,7 +97,7 @@ export default [
         patterns: ['sorting', 'binary-search'],
         lessons: ['sort-lower-bound'],
         swiftTest: 'FewestComparisonSortTests',
-        lists: ['patterns150'],
+        lists: [],
         minutes: 40,
     },
 ];

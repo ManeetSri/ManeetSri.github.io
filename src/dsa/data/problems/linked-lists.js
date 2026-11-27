@@ -7,7 +7,7 @@ export default [
         patterns: ['design'],
         lessons: ['ll-build-singly', 'll-sequence', 'll-sentinel'],
         swiftTest: 'LinkedListFromScratchTests',
-        lists: ['patterns150'],
+        lists: [],
         minutes: 45,
     },
     {
@@ -37,7 +37,7 @@ export default [
         patterns: ['two-pointers'],
         lessons: ['ll-remove-nth', 'll-sentinel'],
         swiftTest: 'RemoveKthFromEndTests',
-        lists: ['patterns150'],
+        lists: [],
         minutes: 25,
     },
     {
@@ -87,7 +87,7 @@ export default [
         patterns: ['traversal'],
         lessons: ['ll-why-linked-lists'],
         swiftTest: 'InsertAfterMarkersTests',
-        lists: ['patterns150'],
+        lists: [],
         minutes: 15,
     },
     {
@@ -147,7 +147,7 @@ export default [
         patterns: ['design', 'recursion'],
         lessons: ['ll-persistent'],
         swiftTest: 'PathCopyingListTests',
-        lists: ['patterns150'],
+        lists: [],
         minutes: 35,
     },
 ];

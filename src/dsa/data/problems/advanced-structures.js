@@ -7,7 +7,7 @@ export default [
         patterns: ['design'],
         lessons: ['as-skip-list'],
         swiftTest: 'SkipListFromScratchTests',
-        lists: ['patterns150'],
+        lists: [],
         minutes: 50,
     },
     {
@@ -27,7 +27,7 @@ export default [
         patterns: ['intervals', 'design'],
         lessons: ['as-interval-tree'],
         swiftTest: 'IntervalOverlapTreeTests',
-        lists: ['patterns150'],
+        lists: [],
         minutes: 55,
     },
     {
@@ -37,7 +37,7 @@ export default [
         patterns: ['design', 'math'],
         lessons: ['as-kd-quadtree'],
         swiftTest: 'NearestMapPinTests',
-        lists: ['patterns150'],
+        lists: [],
         minutes: 50,
     },
     {
@@ -47,7 +47,7 @@ export default [
         patterns: ['design', 'strings'],
         lessons: ['as-rope', 'as-persistent'],
         swiftTest: 'RopeTextBufferTests',
-        lists: ['patterns150'],
+        lists: [],
         minutes: 60,
     },
     {
@@ -57,7 +57,7 @@ export default [
         patterns: ['design', 'hashing', 'bits'],
         lessons: ['as-bloom-sketch'],
         swiftTest: 'UsernameBloomFilterTests',
-        lists: ['patterns150'],
+        lists: [],
         minutes: 35,
     },
     {
@@ -67,7 +67,7 @@ export default [
         patterns: ['hashing', 'design'],
         lessons: ['as-bloom-sketch'],
         swiftTest: 'TrendingTagsSketchTests',
-        lists: ['patterns150'],
+        lists: [],
         minutes: 35,
     },
     {
@@ -77,7 +77,7 @@ export default [
         patterns: ['design', 'hashing'],
         lessons: ['as-consistent-hashing'],
         swiftTest: 'ConsistentHashRingTests',
-        lists: ['patterns150'],
+        lists: [],
         minutes: 35,
     },
     {
@@ -87,7 +87,7 @@ export default [
         patterns: ['bits'],
         lessons: ['as-sparse-bitset'],
         swiftTest: 'BitSetFromWordsTests',
-        lists: ['patterns150'],
+        lists: [],
         minutes: 40,
     },
     {
@@ -97,7 +97,7 @@ export default [
         patterns: ['design', 'hashing', 'bits'],
         lessons: ['as-hyperloglog'],
         swiftTest: 'DistinctVisitorSketchTests',
-        lists: ['patterns150'],
+        lists: [],
         minutes: 35,
     },
     {
@@ -107,7 +107,7 @@ export default [
         patterns: ['design', 'hashing'],
         lessons: ['as-swift-collections'],
         swiftTest: 'InsertionOrderedMapTests',
-        lists: ['patterns150', 'swift'],
+        lists: ['swift'],
         minutes: 35,
     },
 ];

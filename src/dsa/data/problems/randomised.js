@@ -7,7 +7,7 @@ export default [
         patterns: ['math'],
         lessons: ['rand-shuffle'],
         swiftTest: 'PinnedPlaylistShuffleTests',
-        lists: ['patterns150'],
+        lists: [],
         minutes: 25,
     },
     {
@@ -37,7 +37,7 @@ export default [
         patterns: ['heap', 'sliding-window'],
         lessons: ['rand-streaming'],
         swiftTest: 'RollingWindowMedianTests',
-        lists: ['patterns150'],
+        lists: [],
         minutes: 45,
     },
     {
@@ -47,7 +47,7 @@ export default [
         patterns: ['design', 'heap'],
         lessons: ['rand-cache-policies'],
         swiftTest: 'CachePolicyReplayTests',
-        lists: ['patterns150'],
+        lists: [],
         minutes: 45,
     },
     {
@@ -57,7 +57,7 @@ export default [
         patterns: ['math'],
         lessons: ['rand-quickselect'],
         swiftTest: 'QuickselectComparisonForecastTests',
-        lists: ['patterns150'],
+        lists: [],
         minutes: 45,
     },
     {
@@ -67,7 +67,7 @@ export default [
         patterns: ['math', 'sorting'],
         lessons: ['rand-quickselect'],
         swiftTest: 'WeightedMedianDepotTests',
-        lists: ['patterns150'],
+        lists: [],
         minutes: 35,
     },
     {
@@ -77,7 +77,7 @@ export default [
         patterns: ['math', 'matrix'],
         lessons: ['rand-monte-carlo'],
         swiftTest: 'FreivaldsProductCheckTests',
-        lists: ['patterns150'],
+        lists: [],
         minutes: 30,
     },
     {
@@ -87,7 +87,7 @@ export default [
         patterns: ['math', 'simulation'],
         lessons: ['rand-monte-carlo'],
         swiftTest: 'CircleCoverEstimateTests',
-        lists: ['patterns150'],
+        lists: [],
         minutes: 30,
     },
     {
@@ -97,7 +97,7 @@ export default [
         patterns: ['greedy', 'math'],
         lessons: ['rand-online-offline'],
         swiftTest: 'RentOrBuyLedgerTests',
-        lists: ['patterns150'],
+        lists: [],
         minutes: 25,
     },
     {
@@ -107,7 +107,7 @@ export default [
         patterns: ['math', 'prefix-sum'],
         lessons: ['rand-online-offline'],
         swiftTest: 'SecretaryCutoffPlannerTests',
-        lists: ['patterns150'],
+        lists: [],
         minutes: 35,
     },
 ];

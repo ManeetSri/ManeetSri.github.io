@@ -7,7 +7,7 @@ export default [
         patterns: ['dfs', 'recursion'],
         lessons: ['bal-why-rotations'],
         swiftTest: 'RebalanceSearchTreeTests',
-        lists: ['patterns150'],
+        lists: [],
         minutes: 30,
     },
     {
@@ -17,7 +17,7 @@ export default [
         patterns: ['design', 'recursion'],
         lessons: ['bal-avl'],
         swiftTest: 'AVLSetFromScratchTests',
-        lists: ['patterns150'],
+        lists: [],
         minutes: 60,
     },
     {
@@ -27,7 +27,7 @@ export default [
         patterns: ['design', 'binary-search'],
         lessons: ['bal-treap', 'bal-avl'],
         swiftTest: 'ScoreRankTrackerTests',
-        lists: ['patterns150'],
+        lists: [],
         minutes: 50,
     },
     {
@@ -47,7 +47,7 @@ export default [
         patterns: ['sliding-window', 'hashing'],
         lessons: ['bal-ordered-map'],
         swiftTest: 'NearbyCloseValuesTests',
-        lists: ['patterns150'],
+        lists: [],
         minutes: 30,
     },
     {
@@ -57,7 +57,7 @@ export default [
         patterns: ['design', 'hashing'],
         lessons: ['bal-ordered-map'],
         swiftTest: 'PriceFeedCorrectionsTests',
-        lists: ['patterns150'],
+        lists: [],
         minutes: 30,
     },
     {
@@ -67,7 +67,7 @@ export default [
         patterns: ['dfs', 'recursion'],
         lessons: ['bal-red-black'],
         swiftTest: 'RedBlackAuditTests',
-        lists: ['patterns150'],
+        lists: [],
         minutes: 30,
     },
     {
@@ -77,7 +77,7 @@ export default [
         patterns: ['design'],
         lessons: ['bal-splay'],
         swiftTest: 'SplayingSetTests',
-        lists: ['patterns150'],
+        lists: [],
         minutes: 60,
     },
     {
@@ -87,7 +87,7 @@ export default [
         patterns: ['design', 'simulation'],
         lessons: ['bal-b-trees'],
         swiftTest: 'BTreeLevelsBuilderTests',
-        lists: ['patterns150'],
+        lists: [],
         minutes: 45,
     },
     {
@@ -97,7 +97,7 @@ export default [
         patterns: ['bfs'],
         lessons: ['bal-234'],
         swiftTest: 'RedBlackToTwoThreeFourTests',
-        lists: ['patterns150'],
+        lists: [],
         minutes: 25,
     },
 ];

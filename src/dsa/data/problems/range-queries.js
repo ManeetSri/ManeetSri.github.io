@@ -7,7 +7,7 @@ export default [
         patterns: ['dp', 'bits'],
         lessons: ['rq-sparse-table'],
         swiftTest: 'PriceSwingQueriesTests',
-        lists: ['patterns150'],
+        lists: [],
         minutes: 30,
     },
     {
@@ -17,7 +17,7 @@ export default [
         patterns: ['design'],
         lessons: ['rq-sqrt-decomposition'],
         swiftTest: 'RainGaugeBlocksTests',
-        lists: ['patterns150'],
+        lists: [],
         minutes: 35,
     },
     {
@@ -27,7 +27,7 @@ export default [
         patterns: ['sorting', 'sliding-window'],
         lessons: ['rq-mo', 'rq-coordinate-compression', 'rq-offline'],
         swiftTest: 'TrailSpeciesCounterTests',
-        lists: ['patterns150'],
+        lists: [],
         minutes: 45,
     },
     {
@@ -37,7 +37,7 @@ export default [
         patterns: ['prefix-sum', 'sorting'],
         lessons: ['rq-coordinate-compression'],
         swiftTest: 'RepeaterCoverageTests',
-        lists: ['patterns150'],
+        lists: [],
         minutes: 30,
     },
     {
@@ -47,7 +47,7 @@ export default [
         patterns: ['sorting', 'prefix-sum'],
         lessons: ['rq-offline'],
         swiftTest: 'FareWindowCountsTests',
-        lists: ['patterns150'],
+        lists: [],
         minutes: 40,
     },
 ];

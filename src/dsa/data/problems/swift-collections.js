@@ -57,7 +57,7 @@ export default [
         patterns: ['basics'],
         lessons: ['swift-array-basics'],
         swiftTest: 'NegativeIndexLookupTests',
-        lists: ['patterns150', 'swift'],
+        lists: ['swift'],
         minutes: 10,
     },
     {
@@ -67,7 +67,7 @@ export default [
         patterns: ['traversal'],
         lessons: ['swift-array-slices'],
         swiftTest: 'SliceLargestIndexTests',
-        lists: ['patterns150', 'swift'],
+        lists: ['swift'],
         minutes: 15,
     },
     {
@@ -77,7 +77,7 @@ export default [
         patterns: ['simulation'],
         lessons: ['swift-collections-are-values'],
         swiftTest: 'SwitchPanelUndoTests',
-        lists: ['patterns150', 'swift'],
+        lists: ['swift'],
         minutes: 25,
     },
     {
@@ -87,7 +87,7 @@ export default [
         patterns: ['hashing', 'simulation'],
         lessons: ['swift-choosing-collection', 'swift-sets'],
         swiftTest: 'OnePlaceInLineTests',
-        lists: ['patterns150', 'swift'],
+        lists: ['swift'],
         minutes: 25,
     },
 ];

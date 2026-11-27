@@ -7,7 +7,7 @@ export default [
         patterns: ['dfs'],
         lessons: ['ag-scc'],
         swiftTest: 'OneWayDistrictsTests',
-        lists: ['patterns150'],
+        lists: [],
         minutes: 40,
     },
     {
@@ -17,7 +17,7 @@ export default [
         patterns: ['dfs'],
         lessons: ['ag-bridges'],
         swiftTest: 'CriticalCablesTests',
-        lists: ['patterns150'],
+        lists: [],
         minutes: 50,
     },
     {
@@ -37,7 +37,7 @@ export default [
         patterns: ['dp', 'bits'],
         lessons: ['ag-hamiltonian'],
         swiftTest: 'GrandTourPlannerTests',
-        lists: ['patterns150'],
+        lists: [],
         minutes: 45,
     },
     {
@@ -57,7 +57,7 @@ export default [
         patterns: ['bfs'],
         lessons: ['ag-max-flow'],
         swiftTest: 'PipelineMaxFlowTests',
-        lists: ['patterns150'],
+        lists: [],
         minutes: 50,
     },
     {
@@ -67,7 +67,7 @@ export default [
         patterns: ['dfs'],
         lessons: ['ag-matching'],
         swiftTest: 'CrewJobMatchingTests',
-        lists: ['patterns150'],
+        lists: [],
         minutes: 35,
     },
     {
@@ -87,7 +87,7 @@ export default [
         patterns: ['dfs'],
         lessons: ['ag-two-sat'],
         swiftTest: 'MeetingSlotPlannerTests',
-        lists: ['patterns150'],
+        lists: [],
         minutes: 45,
     },
     {
@@ -97,7 +97,7 @@ export default [
         patterns: ['union-find'],
         lessons: ['ag-which-algorithm'],
         swiftTest: 'StormRoadClosuresTests',
-        lists: ['patterns150'],
+        lists: [],
         minutes: 35,
     },
 ];

@@ -7,7 +7,7 @@ export default [
         patterns: ['hashing'],
         lessons: ['cc-data-races'],
         swiftTest: 'ShardedWordTallyTests',
-        lists: ['patterns150', 'swift'],
+        lists: ['swift'],
         minutes: 25,
     },
     {
@@ -17,7 +17,7 @@ export default [
         patterns: ['design', 'hashing'],
         lessons: ['cc-actors', 'cc-sendable'],
         swiftTest: 'CoalescingMemoCacheTests',
-        lists: ['patterns150', 'swift'],
+        lists: ['swift'],
         minutes: 30,
     },
     {
@@ -27,7 +27,7 @@ export default [
         patterns: ['sorting'],
         lessons: ['cc-parallel-algorithms'],
         swiftTest: 'TaskGroupMergeSortTests',
-        lists: ['patterns150', 'swift'],
+        lists: ['swift'],
         minutes: 30,
     },
     {
@@ -37,7 +37,7 @@ export default [
         patterns: ['bfs'],
         lessons: ['cc-parallel-algorithms'],
         swiftTest: 'FrontierParallelBFSTests',
-        lists: ['patterns150', 'swift'],
+        lists: ['swift'],
         minutes: 35,
     },
     {
@@ -47,7 +47,7 @@ export default [
         patterns: ['design'],
         lessons: ['cc-mutex-atomics'],
         swiftTest: 'LockedStatsRecorderTests',
-        lists: ['patterns150', 'swift'],
+        lists: ['swift'],
         minutes: 35,
     },
 ];

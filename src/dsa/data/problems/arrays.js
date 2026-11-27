@@ -17,7 +17,7 @@ export default [
         patterns: ['two-pointers'],
         lessons: ['arrays-reverse-rotate'],
         swiftTest: 'UnrotateSortedTests',
-        lists: [],
+        lists: ['patterns150'],
         minutes: 20,
     },
     {
@@ -27,7 +27,7 @@ export default [
         patterns: ['two-pointers'],
         lessons: ['arrays-dedupe-move-zeroes'],
         swiftTest: 'ZeroesToTheFrontTests',
-        lists: ['patterns150'],
+        lists: [],
         minutes: 20,
     },
     {
@@ -37,7 +37,7 @@ export default [
         patterns: ['two-pointers'],
         lessons: ['arrays-merge-sorted'],
         swiftTest: 'MergeIntoFirstTests',
-        lists: ['patterns150'],
+        lists: [],
         minutes: 20,
     },
     {
@@ -77,7 +77,7 @@ export default [
         patterns: ['math'],
         lessons: ['arrays-memory'],
         swiftTest: 'ElementAtAddressTests',
-        lists: ['patterns150'],
+        lists: [],
         minutes: 15,
     },
 ];

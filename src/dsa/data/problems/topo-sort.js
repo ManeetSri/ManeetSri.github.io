@@ -57,7 +57,7 @@ export default [
         patterns: ['topo-sort', 'simulation'],
         lessons: ['topo-dags'],
         swiftTest: 'BuildOrderAuditTests',
-        lists: ['patterns150'],
+        lists: [],
         minutes: 20,
     },
 ];

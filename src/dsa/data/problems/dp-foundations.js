@@ -7,7 +7,7 @@ export default [
         patterns: ['dp', 'recursion', 'hashing'],
         lessons: ['dp-memoisation', 'dp-what-is-dp'],
         swiftTest: 'TokenExchangeMachineTests',
-        lists: ['patterns150'],
+        lists: [],
         minutes: 25,
     },
     {
@@ -47,7 +47,7 @@ export default [
         patterns: ['dp'],
         lessons: ['dp-house-robber'],
         swiftTest: 'RingRoadHeistTests',
-        lists: ['patterns150'],
+        lists: [],
         minutes: 25,
     },
     {
@@ -57,7 +57,7 @@ export default [
         patterns: ['dp', 'strings'],
         lessons: ['dp-decode-squares'],
         swiftTest: 'DigitMessageDecoderTests',
-        lists: ['patterns150'],
+        lists: [],
         minutes: 30,
     },
     {
@@ -67,7 +67,7 @@ export default [
         patterns: ['dp', 'math'],
         lessons: ['dp-decode-squares'],
         swiftTest: 'FewestSquarePanelsTests',
-        lists: ['patterns150'],
+        lists: [],
         minutes: 25,
     },
     {
@@ -77,7 +77,7 @@ export default [
         patterns: ['dp', 'strings'],
         lessons: ['dp-decode-squares'],
         swiftTest: 'SmudgedMessageDecoderTests',
-        lists: ['patterns150'],
+        lists: [],
         minutes: 45,
     },
     {
@@ -87,7 +87,7 @@ export default [
         patterns: ['dp'],
         lessons: ['dp-reconstruct'],
         swiftTest: 'BestHeistPlanTests',
-        lists: ['patterns150'],
+        lists: [],
         minutes: 30,
     },
 ];

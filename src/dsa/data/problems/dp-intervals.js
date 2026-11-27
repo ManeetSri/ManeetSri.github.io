@@ -17,7 +17,7 @@ export default [
         patterns: ['dp'],
         lessons: ['dpi-burst-balloons'],
         swiftTest: 'BubblePoppingPointsTests',
-        lists: ['patterns150'],
+        lists: [],
         minutes: 45,
     },
     {
@@ -27,7 +27,7 @@ export default [
         patterns: ['dp', 'strings'],
         lessons: ['dpi-palindrome-cuts'],
         swiftTest: 'PalindromeBannerCutsTests',
-        lists: ['patterns150'],
+        lists: [],
         minutes: 35,
     },
     {
@@ -37,7 +37,7 @@ export default [
         patterns: ['dp', 'sorting'],
         lessons: ['dpi-cut-stick'],
         swiftTest: 'TimberCuttingCostTests',
-        lists: ['patterns150'],
+        lists: [],
         minutes: 35,
     },
     {
@@ -47,7 +47,7 @@ export default [
         patterns: ['dp'],
         lessons: ['dpi-stone-games'],
         swiftTest: 'CoinRowDuelTests',
-        lists: ['patterns150'],
+        lists: [],
         minutes: 30,
     },
     {
@@ -57,7 +57,7 @@ export default [
         patterns: ['dp', 'strings'],
         lessons: ['dpi-strange-printer'],
         swiftTest: 'RibbonPrinterTurnsTests',
-        lists: ['patterns150'],
+        lists: [],
         minutes: 45,
     },
     {
@@ -67,7 +67,7 @@ export default [
         patterns: ['dp'],
         lessons: ['dpi-boolean'],
         swiftTest: 'CircuitBracketingsTests',
-        lists: ['patterns150'],
+        lists: [],
         minutes: 35,
     },
     {
@@ -77,7 +77,7 @@ export default [
         patterns: ['dp', 'prefix-sum'],
         lessons: ['dpi-optimal-bst'],
         swiftTest: 'SpellcheckLookupTreeTests',
-        lists: ['patterns150'],
+        lists: [],
         minutes: 40,
     },
 ];

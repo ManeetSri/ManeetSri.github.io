@@ -57,7 +57,7 @@ export default [
         patterns: ['basics', 'math'],
         lessons: ['swift-integers'],
         swiftTest: 'BitPatternRangeTests',
-        lists: ['patterns150', 'swift'],
+        lists: ['swift'],
         minutes: 10,
     },
     {
@@ -67,7 +67,7 @@ export default [
         patterns: ['basics', 'strings'],
         lessons: ['swift-bool-char-string'],
         swiftTest: 'UsernameRulesTests',
-        lists: ['patterns150', 'swift'],
+        lists: ['swift'],
         minutes: 15,
     },
     {
@@ -77,7 +77,7 @@ export default [
         patterns: ['basics'],
         lessons: ['swift-type-conversion'],
         swiftTest: 'ColourChannelConvertTests',
-        lists: ['patterns150', 'swift'],
+        lists: ['swift'],
         minutes: 15,
     },
 ];

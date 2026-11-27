@@ -37,7 +37,7 @@ export default [
         patterns: ['strings'],
         lessons: ['sa-manacher', 'sa-substring-hashing'],
         swiftTest: 'PalindromeCensusTests',
-        lists: ['patterns150'],
+        lists: [],
         minutes: 35,
     },
     {
@@ -57,7 +57,7 @@ export default [
         patterns: ['strings', 'binary-search', 'hashing'],
         lessons: ['sa-suffix-array', 'sa-substring-hashing'],
         swiftTest: 'SeenTwiceSubstringTests',
-        lists: ['patterns150'],
+        lists: [],
         minutes: 45,
     },
     {
@@ -67,7 +67,7 @@ export default [
         patterns: ['strings'],
         lessons: ['sa-suffix-array', 'sa-suffix-automaton'],
         swiftTest: 'DistinctSubstringsAtScaleTests',
-        lists: ['patterns150'],
+        lists: [],
         minutes: 45,
     },
     {
@@ -77,7 +77,7 @@ export default [
         patterns: ['strings', 'binary-search', 'hashing'],
         lessons: ['sa-substring-hashing', 'sa-suffix-array'],
         swiftTest: 'SharedDNAStretchTests',
-        lists: ['patterns150'],
+        lists: [],
         minutes: 40,
     },
     {
@@ -97,7 +97,7 @@ export default [
         patterns: ['strings'],
         lessons: ['sa-boyer-moore'],
         swiftTest: 'HorspoolSkipSearchTests',
-        lists: ['patterns150'],
+        lists: [],
         minutes: 30,
     },
 ];

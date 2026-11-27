@@ -7,7 +7,7 @@ export default [
         patterns: ['dp'],
         lessons: ['dpk-01'],
         swiftTest: 'HikingBackpackPackingTests',
-        lists: ['patterns150'],
+        lists: [],
         minutes: 35,
     },
     {
@@ -27,7 +27,7 @@ export default [
         patterns: ['dp', 'math'],
         lessons: ['dpk-count-subsets'],
         swiftTest: 'PlusMinusTargetTests',
-        lists: ['patterns150'],
+        lists: [],
         minutes: 30,
     },
     {
@@ -47,7 +47,7 @@ export default [
         patterns: ['dp'],
         lessons: ['dpk-unbounded'],
         swiftTest: 'RodCutForProfitTests',
-        lists: ['patterns150'],
+        lists: [],
         minutes: 25,
     },
     {
@@ -67,7 +67,7 @@ export default [
         patterns: ['dp'],
         lessons: ['dpk-coin-change'],
         swiftTest: 'ChangeMakingWaysTests',
-        lists: ['patterns150'],
+        lists: [],
         minutes: 25,
     },
     {
@@ -77,7 +77,7 @@ export default [
         patterns: ['dp', 'bits'],
         lessons: ['dpk-bounded'],
         swiftTest: 'LimitedStockKnapsackTests',
-        lists: ['patterns150'],
+        lists: [],
         minutes: 45,
     },
     {

@@ -7,7 +7,7 @@ export default [
         patterns: ['hashing', 'strings'],
         lessons: ['hash-functions'],
         swiftTest: 'PolynomialStringHashTests',
-        lists: [],
+        lists: ['patterns150'],
         minutes: 15,
     },
     {
@@ -27,7 +27,7 @@ export default [
         patterns: ['hashing', 'sliding-window'],
         lessons: ['hash-frequency-two-sum'],
         swiftTest: 'NearbyRepeatTests',
-        lists: ['patterns150'],
+        lists: [],
         minutes: 15,
     },
     {
@@ -37,7 +37,7 @@ export default [
         patterns: ['hashing', 'design'],
         lessons: ['hash-collisions', 'hash-load-factor', 'hash-build-hashmap'],
         swiftTest: 'HashMapFromScratchTests',
-        lists: ['patterns150'],
+        lists: [],
         minutes: 45,
     },
     {
@@ -77,7 +77,7 @@ export default [
         patterns: ['hashing', 'design'],
         lessons: ['hash-swift-dictionary'],
         swiftTest: 'BackshiftProbeSetTests',
-        lists: ['patterns150'],
+        lists: [],
         minutes: 45,
     },
 ];

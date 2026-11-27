@@ -67,7 +67,7 @@ export default [
         patterns: ['dfs'],
         lessons: ['trav-morris'],
         swiftTest: 'MorrisMedianTests',
-        lists: ['patterns150'],
+        lists: [],
         minutes: 35,
     },
     {
@@ -77,7 +77,7 @@ export default [
         patterns: ['dfs'],
         lessons: ['trav-choosing'],
         swiftTest: 'LookoutNodesTests',
-        lists: ['patterns150'],
+        lists: [],
         minutes: 35,
     },
 ];

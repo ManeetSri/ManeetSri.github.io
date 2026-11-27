@@ -67,7 +67,7 @@ export default [
         patterns: ['math'],
         lessons: ['math-series-logs'],
         swiftTest: 'SeriesAndLogsTests',
-        lists: ['patterns150'],
+        lists: [],
         minutes: 20,
     },
     {
@@ -77,7 +77,7 @@ export default [
         patterns: ['math'],
         lessons: ['math-floor-ceil-overflow'],
         swiftTest: 'RoundingDivisionTests',
-        lists: ['patterns150'],
+        lists: [],
         minutes: 15,
     },
     {
@@ -87,7 +87,7 @@ export default [
         patterns: ['math'],
         lessons: ['math-pigeonhole'],
         swiftTest: 'PigeonholeGuaranteesTests',
-        lists: ['patterns150'],
+        lists: [],
         minutes: 20,
     },
     {
@@ -97,7 +97,7 @@ export default [
         patterns: ['math'],
         lessons: ['math-probability'],
         swiftTest: 'DiceExactOddsTests',
-        lists: ['patterns150'],
+        lists: [],
         minutes: 30,
     },
     {
@@ -107,7 +107,7 @@ export default [
         patterns: ['math'],
         lessons: ['math-matrices'],
         swiftTest: 'MatrixProductPowerTests',
-        lists: ['patterns150'],
+        lists: [],
         minutes: 30,
     },
 ];

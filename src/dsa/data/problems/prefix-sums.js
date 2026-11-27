@@ -37,7 +37,7 @@ export default [
         patterns: ['prefix-sum', 'matrix', 'design'],
         lessons: ['prefix-2d'],
         swiftTest: 'GridRegionSumsTests',
-        lists: ['patterns150'],
+        lists: [],
         minutes: 25,
     },
     {
@@ -47,7 +47,7 @@ export default [
         patterns: ['prefix-sum', 'hashing', 'matrix'],
         lessons: ['prefix-2d', 'prefix-hashmap'],
         swiftTest: 'TargetSumSubmatricesTests',
-        lists: ['patterns150'],
+        lists: [],
         minutes: 45,
     },
     {
@@ -67,7 +67,7 @@ export default [
         patterns: ['prefix-sum'],
         lessons: ['prefix-pivot-index'],
         swiftTest: 'BalancePointIndexTests',
-        lists: ['patterns150'],
+        lists: [],
         minutes: 15,
     },
     {

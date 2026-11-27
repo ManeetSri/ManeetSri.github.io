@@ -7,7 +7,7 @@ export default [
         patterns: ['design', 'sliding-window'],
         lessons: ['int-ios-flavoured'],
         swiftTest: 'EndpointRateLimiterTests',
-        lists: ['patterns150'],
+        lists: [],
         minutes: 35,
     },
     {
@@ -17,7 +17,7 @@ export default [
         patterns: ['design', 'simulation'],
         lessons: ['int-ios-flavoured'],
         swiftTest: 'SearchFieldDebounceTests',
-        lists: ['patterns150'],
+        lists: [],
         minutes: 35,
     },
     {
@@ -27,7 +27,7 @@ export default [
         patterns: ['design', 'hashing'],
         lessons: ['int-ios-flavoured'],
         swiftTest: 'ThumbnailBudgetCacheTests',
-        lists: ['patterns150'],
+        lists: [],
         minutes: 45,
     },
     {
@@ -37,7 +37,7 @@ export default [
         patterns: ['dp'],
         lessons: ['int-ios-flavoured'],
         swiftTest: 'TableRowDiffTests',
-        lists: ['patterns150'],
+        lists: [],
         minutes: 40,
     },
     {
@@ -47,7 +47,7 @@ export default [
         patterns: ['hashing', 'traversal'],
         lessons: ['int-ios-flavoured'],
         swiftTest: 'SharedSuperviewTests',
-        lists: ['patterns150'],
+        lists: [],
         minutes: 30,
     },
     {
@@ -57,7 +57,7 @@ export default [
         patterns: ['hashing', 'strings'],
         lessons: ['int-clarifying'],
         swiftTest: 'BusiestChatMinuteTests',
-        lists: ['patterns150'],
+        lists: [],
         minutes: 25,
     },
     {
@@ -67,7 +67,7 @@ export default [
         patterns: ['sorting', 'binary-search', 'prefix-sum'],
         lessons: ['int-optimising'],
         swiftTest: 'PriceBandTotalsTests',
-        lists: ['patterns150'],
+        lists: [],
         minutes: 30,
     },
     {
@@ -77,7 +77,7 @@ export default [
         patterns: ['sorting', 'strings'],
         lessons: ['int-testing'],
         swiftTest: 'CompactNumberRangesTests',
-        lists: ['patterns150'],
+        lists: [],
         minutes: 25,
     },
     {
@@ -87,7 +87,7 @@ export default [
         patterns: ['bfs', 'matrix'],
         lessons: ['int-swift-gotchas'],
         swiftTest: 'ShortestPathCounterFixTests',
-        lists: ['patterns150', 'swift'],
+        lists: ['swift'],
         minutes: 30,
     },
 ];

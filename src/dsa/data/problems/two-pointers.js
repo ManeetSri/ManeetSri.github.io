@@ -7,7 +7,7 @@ export default [
         patterns: ['two-pointers', 'strings'],
         lessons: ['tp-opposite-ends'],
         swiftTest: 'PalindromeOneDeletionTests',
-        lists: ['patterns150'],
+        lists: [],
         minutes: 20,
     },
     {
@@ -57,7 +57,7 @@ export default [
         patterns: ['two-pointers'],
         lessons: ['tp-sorted-squares'],
         swiftTest: 'SortedSquaresTests',
-        lists: ['patterns150'],
+        lists: [],
         minutes: 15,
     },
     {

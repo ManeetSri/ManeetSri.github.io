@@ -110,6 +110,14 @@ problems.filter((problem) => problem.lessons.some((id) => inScope(moduleOfLesson
     if (!new RegExp(`enum\\s+${type}\\b`).test(solutions)) fail(`${name} expects "public enum ${type}" in dsa-swift/Sources/Solutions`);
 });
 
+// The curated lists are fixed sizes, so adding a problem to one means swapping another out
+if (!onlyModules.length) {
+    Object.entries({ core75: 75, patterns150: 150 }).forEach(([key, size]) => {
+        const count = problems.filter((problem) => (problem.lists ?? []).includes(key)).length;
+        if (count !== size) fail(`${LISTS[key]} has ${count} problems; it must have exactly ${size}`);
+    });
+}
+
 // Links between pages must point at lessons and problems that exist
 const problemIdSet = new Set(problems.map((problem) => problem.id));
 filesIn(join(root, 'src/dsa/content'), '.mdx').forEach((path) => {

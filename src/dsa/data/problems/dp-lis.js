@@ -27,7 +27,7 @@ export default [
         patterns: ['dp', 'sorting', 'binary-search'],
         lessons: ['lis-envelopes'],
         swiftTest: 'NestingGiftBoxesTests',
-        lists: ['patterns150'],
+        lists: [],
         minutes: 40,
     },
     {
@@ -37,7 +37,7 @@ export default [
         patterns: ['dp', 'strings', 'hashing'],
         lessons: ['lis-variants'],
         swiftTest: 'WordGrowthChainTests',
-        lists: ['patterns150'],
+        lists: [],
         minutes: 30,
     },
     {
@@ -47,7 +47,7 @@ export default [
         patterns: ['dp', 'hashing'],
         lessons: ['lis-arithmetic'],
         swiftTest: 'EvenlySpacedSubsequenceTests',
-        lists: ['patterns150'],
+        lists: [],
         minutes: 30,
     },
 ];

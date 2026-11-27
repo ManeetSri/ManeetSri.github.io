@@ -7,7 +7,7 @@ export default [
         patterns: ['sorting', 'basics'],
         lessons: ['lib-stdlib-algorithms', 'lib-swift-algorithms'],
         swiftTest: 'StablePartitionHelperTests',
-        lists: ['patterns150', 'swift'],
+        lists: ['swift'],
         minutes: 25,
     },
     {
@@ -17,7 +17,7 @@ export default [
         patterns: ['basics'],
         lessons: ['lib-swift-algorithms'],
         swiftTest: 'SliceWindowHelpersTests',
-        lists: ['patterns150', 'swift'],
+        lists: ['swift'],
         minutes: 30,
     },
     {
@@ -27,7 +27,7 @@ export default [
         patterns: ['design', 'prefix-sum'],
         lessons: ['lib-cp-template'],
         swiftTest: 'TemplateQueryRunnerTests',
-        lists: ['patterns150', 'swift'],
+        lists: ['swift'],
         minutes: 30,
     },
     {
@@ -37,7 +37,7 @@ export default [
         patterns: ['heap', 'design'],
         lessons: ['lib-swift-collections'],
         swiftTest: 'MinMaxPriorityQueueTests',
-        lists: ['patterns150', 'swift'],
+        lists: ['swift'],
         minutes: 50,
     },
 ];

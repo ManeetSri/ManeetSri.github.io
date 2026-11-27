@@ -7,7 +7,7 @@ export default [
         patterns: ['dp', 'dfs'],
         lessons: ['dpa-trees'],
         swiftTest: 'OfficePartyGuestListTests',
-        lists: ['patterns150'],
+        lists: [],
         minutes: 30,
     },
     {
@@ -17,7 +17,7 @@ export default [
         patterns: ['dp', 'dfs'],
         lessons: ['dpa-rerooting', 'dpa-trees'],
         swiftTest: 'GatheringCostEveryTownTests',
-        lists: ['patterns150'],
+        lists: [],
         minutes: 45,
     },
     {
@@ -27,7 +27,7 @@ export default [
         patterns: ['dp', 'bits', 'strings'],
         lessons: ['dpa-bitmask'],
         swiftTest: 'ShortestCommonStrandTests',
-        lists: ['patterns150'],
+        lists: [],
         minutes: 50,
     },
     {
@@ -37,7 +37,7 @@ export default [
         patterns: ['dp', 'math'],
         lessons: ['dpa-digit'],
         swiftTest: 'RangeDigitSumCountTests',
-        lists: ['patterns150'],
+        lists: [],
         minutes: 45,
     },
     {
@@ -47,7 +47,7 @@ export default [
         patterns: ['dp', 'topo-sort', 'math'],
         lessons: ['dpa-dags', 'dpa-counting-mod'],
         swiftTest: 'TrailRouteCountTests',
-        lists: ['patterns150'],
+        lists: [],
         minutes: 30,
     },
     {
@@ -57,7 +57,7 @@ export default [
         patterns: ['dp', 'bits', 'math'],
         lessons: ['dpa-probability', 'dpa-bitmask'],
         swiftTest: 'StickerAlbumExpectedPacksTests',
-        lists: ['patterns150'],
+        lists: [],
         minutes: 45,
     },
     {
@@ -67,7 +67,7 @@ export default [
         patterns: ['dp', 'bits'],
         lessons: ['dpa-sos'],
         swiftTest: 'DisjointSkillPairsTests',
-        lists: ['patterns150'],
+        lists: [],
         minutes: 40,
     },
     {
@@ -77,7 +77,7 @@ export default [
         patterns: ['dp', 'sliding-window'],
         lessons: ['dpa-optimisations'],
         swiftTest: 'BatonRelayCostTests',
-        lists: ['patterns150'],
+        lists: [],
         minutes: 35,
     },
     {
@@ -87,7 +87,7 @@ export default [
         patterns: ['dp', 'sorting'],
         lessons: ['dpa-optimisations'],
         swiftTest: 'PanelBulkOrdersTests',
-        lists: ['patterns150'],
+        lists: [],
         minutes: 60,
     },
 ];

@@ -7,7 +7,7 @@ export default [
         patterns: ['sorting', 'hashing', 'strings'],
         lessons: ['sort-counting', 'sort-bucket'],
         swiftTest: 'LettersByFrequencyTests',
-        lists: ['patterns150'],
+        lists: [],
         minutes: 25,
     },
     {
@@ -17,7 +17,7 @@ export default [
         patterns: ['sorting'],
         lessons: ['sort-bucket', 'sort-radix'],
         swiftTest: 'WidestGapTests',
-        lists: ['patterns150'],
+        lists: [],
         minutes: 45,
     },
     {
@@ -27,7 +27,7 @@ export default [
         patterns: ['sorting'],
         lessons: ['sort-cyclic'],
         swiftTest: 'MissingAndDoubledTests',
-        lists: ['patterns150'],
+        lists: [],
         minutes: 25,
     },
     {
@@ -37,7 +37,7 @@ export default [
         patterns: ['sorting'],
         lessons: ['sort-cyclic'],
         swiftTest: 'FewestSwapsToSortTests',
-        lists: ['patterns150'],
+        lists: [],
         minutes: 30,
     },
     {

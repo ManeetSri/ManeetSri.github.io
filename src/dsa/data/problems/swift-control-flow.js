@@ -57,7 +57,7 @@ export default [
         patterns: ['basics', 'traversal'],
         lessons: ['swift-break-continue'],
         swiftTest: 'VanParcelLoadingTests',
-        lists: ['patterns150', 'swift'],
+        lists: ['swift'],
         minutes: 15,
     },
     {
@@ -67,7 +67,7 @@ export default [
         patterns: ['basics'],
         lessons: ['swift-guard'],
         swiftTest: 'CashMachineRulesTests',
-        lists: ['patterns150', 'swift'],
+        lists: ['swift'],
         minutes: 15,
     },
 ];

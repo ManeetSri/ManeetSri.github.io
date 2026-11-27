@@ -47,7 +47,7 @@ export default [
         patterns: ['basics'],
         lessons: ['swift-what-is-a-program'],
         swiftTest: 'ThreeStepMachineTests',
-        lists: ['patterns150', 'swift'],
+        lists: ['swift'],
         minutes: 10,
     },
     {
@@ -57,7 +57,7 @@ export default [
         patterns: ['basics', 'strings'],
         lessons: ['swift-where-code-runs'],
         swiftTest: 'ReplResultEchoTests',
-        lists: ['patterns150', 'swift'],
+        lists: ['swift'],
         minutes: 10,
     },
     {
@@ -67,7 +67,7 @@ export default [
         patterns: ['basics', 'math'],
         lessons: ['swift-comments'],
         swiftTest: 'FencePostCountTests',
-        lists: ['patterns150', 'swift'],
+        lists: ['swift'],
         minutes: 10,
     },
     {
@@ -77,7 +77,7 @@ export default [
         patterns: ['basics'],
         lessons: ['swift-naming'],
         swiftTest: 'NamedTimeUnitsTests',
-        lists: ['patterns150', 'swift'],
+        lists: ['swift'],
         minutes: 10,
     },
 ];

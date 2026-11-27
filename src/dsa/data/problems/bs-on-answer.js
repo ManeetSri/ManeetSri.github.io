@@ -17,7 +17,7 @@ export default [
         patterns: ['binary-search', 'greedy'],
         lessons: ['bsa-shipping'],
         swiftTest: 'SmallestTruckCapacityTests',
-        lists: ['patterns150'],
+        lists: [],
         minutes: 30,
     },
     {
@@ -57,7 +57,7 @@ export default [
         patterns: ['binary-search', 'math'],
         lessons: ['bsa-kth-multiplication'],
         swiftTest: 'TimesTableKthTests',
-        lists: ['patterns150'],
+        lists: [],
         minutes: 40,
     },
     {
@@ -67,7 +67,7 @@ export default [
         patterns: ['binary-search', 'math'],
         lessons: ['bsa-real-numbers'],
         swiftTest: 'NthRootBisectionTests',
-        lists: ['patterns150'],
+        lists: [],
         minutes: 30,
     },
 ];

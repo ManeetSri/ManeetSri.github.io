@@ -188,7 +188,7 @@ export default [
         patterns: ['basics'],                 // keys of PATTERNS in src/dsa/data/problems.js
         lessons: ['swift-floating-point'],    // lessons of THIS module that it practises
         swiftTest: 'TemperatureConverterTests',
-        lists: [],                            // optional: 'core75', 'patterns150', 'swift'
+        lists: [],                            // optional: 'swift'; 'core75' and 'patterns150' are curated at exactly 75 and 150
         minutes: 15,
     },
 ];

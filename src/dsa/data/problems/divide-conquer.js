@@ -7,7 +7,7 @@ export default [
         patterns: ['recursion'],
         lessons: ['dc-paradigm'],
         swiftTest: 'BracketingOutcomesTests',
-        lists: ['patterns150'],
+        lists: [],
         minutes: 30,
     },
     {
@@ -17,7 +17,7 @@ export default [
         patterns: ['recursion'],
         lessons: ['dc-max-subarray'],
         swiftTest: 'CrossingSumSubarrayTests',
-        lists: ['patterns150'],
+        lists: [],
         minutes: 20,
     },
     {
@@ -27,7 +27,7 @@ export default [
         patterns: ['sorting', 'recursion'],
         lessons: ['dc-inversions-majority'],
         swiftTest: 'SmallerToTheRightTests',
-        lists: ['patterns150'],
+        lists: [],
         minutes: 40,
     },
     {
@@ -47,7 +47,7 @@ export default [
         patterns: ['math', 'recursion'],
         lessons: ['dc-karatsuba'],
         swiftTest: 'KaratsubaLongProductTests',
-        lists: ['patterns150'],
+        lists: [],
         minutes: 45,
     },
     {
@@ -57,7 +57,7 @@ export default [
         patterns: ['math', 'recursion'],
         lessons: ['dc-fast-power'],
         swiftTest: 'DigitExponentPowerTests',
-        lists: ['patterns150'],
+        lists: [],
         minutes: 25,
     },
     {
@@ -67,7 +67,7 @@ export default [
         patterns: ['math'],
         lessons: ['dc-master-theorem'],
         swiftTest: 'RecurrenceGrowthReaderTests',
-        lists: ['patterns150'],
+        lists: [],
         minutes: 20,
     },
     {
@@ -77,7 +77,7 @@ export default [
         patterns: ['math', 'recursion', 'matrix'],
         lessons: ['dc-strassen'],
         swiftTest: 'StrassenSevenProductsTests',
-        lists: ['patterns150'],
+        lists: [],
         minutes: 40,
     },
 ];

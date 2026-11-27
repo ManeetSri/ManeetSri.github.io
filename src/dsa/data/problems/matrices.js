@@ -57,7 +57,7 @@ export default [
         patterns: ['matrix'],
         lessons: ['matrix-directions'],
         swiftTest: 'MinesweeperCountsTests',
-        lists: [],
+        lists: ['patterns150'],
         minutes: 20,
     },
     {

@@ -27,7 +27,7 @@ export default [
         patterns: ['design'],
         lessons: ['queue-build-deque'],
         swiftTest: 'GrowableDequeTests',
-        lists: ['patterns150'],
+        lists: [],
         minutes: 40,
     },
     {
@@ -57,7 +57,7 @@ export default [
         patterns: ['design', 'hashing'],
         lessons: ['queue-streams'],
         swiftTest: 'FirstUniqueInStreamTests',
-        lists: ['patterns150'],
+        lists: [],
         minutes: 30,
     },
     {
@@ -77,7 +77,7 @@ export default [
         patterns: ['math', 'simulation'],
         lessons: ['queue-why-not-removefirst'],
         swiftTest: 'ArrayQueueShiftCountTests',
-        lists: ['patterns150'],
+        lists: [],
         minutes: 10,
     },
     {
@@ -87,7 +87,7 @@ export default [
         patterns: ['design'],
         lessons: ['queue-head-index'],
         swiftTest: 'CompactingIndexQueueTests',
-        lists: ['patterns150'],
+        lists: [],
         minutes: 30,
     },
     {
@@ -97,7 +97,7 @@ export default [
         patterns: ['design'],
         lessons: ['queue-linked'],
         swiftTest: 'SpliceableLinkedQueueTests',
-        lists: ['patterns150'],
+        lists: [],
         minutes: 30,
     },
     {

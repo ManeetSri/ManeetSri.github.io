@@ -7,7 +7,7 @@ export default [
         patterns: ['recursion', 'dfs'],
         lessons: ['rec-what-is-recursion', 'rec-explicit-stack'],
         swiftTest: 'NestedListFlattenTests',
-        lists: [],
+        lists: ['patterns150'],
         minutes: 20,
     },
     {
@@ -27,7 +27,7 @@ export default [
         patterns: ['recursion'],
         lessons: ['rec-multiple-recursion'],
         swiftTest: 'HanoiMovesTests',
-        lists: [],
+        lists: ['patterns150'],
         minutes: 30,
     },
     {
@@ -57,7 +57,7 @@ export default [
         patterns: ['recursion'],
         lessons: ['rec-call-stack'],
         swiftTest: 'CallStackSnapshotsTests',
-        lists: ['patterns150'],
+        lists: [],
         minutes: 20,
     },
     {
@@ -67,7 +67,7 @@ export default [
         patterns: ['recursion'],
         lessons: ['rec-vs-iteration'],
         swiftTest: 'UnrolledRecursionsTests',
-        lists: ['patterns150'],
+        lists: [],
         minutes: 20,
     },
     {
@@ -87,7 +87,7 @@ export default [
         patterns: ['recursion', 'traversal'],
         lessons: ['rec-stack-limits'],
         swiftTest: 'ParentChainDepthsTests',
-        lists: ['patterns150'],
+        lists: [],
         minutes: 25,
     },
 ];

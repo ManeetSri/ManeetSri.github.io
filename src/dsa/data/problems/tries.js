@@ -27,7 +27,7 @@ export default [
         patterns: ['trie', 'dfs', 'strings'],
         lessons: ['trie-autocomplete'],
         swiftTest: 'TypeaheadSuggestionsTests',
-        lists: ['patterns150'],
+        lists: [],
         minutes: 35,
     },
     {
@@ -67,7 +67,7 @@ export default [
         patterns: ['trie', 'bits'],
         lessons: ['trie-xor'],
         swiftTest: 'MaxXorPairTests',
-        lists: ['patterns150'],
+        lists: [],
         minutes: 40,
     },
     {
@@ -77,7 +77,7 @@ export default [
         patterns: ['trie', 'strings'],
         lessons: ['trie-radix'],
         swiftTest: 'DistinctSubstringCountTests',
-        lists: ['patterns150'],
+        lists: [],
         minutes: 35,
     },
 ];

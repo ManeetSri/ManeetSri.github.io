@@ -67,7 +67,7 @@ export default [
         patterns: ['union-find', 'hashing'],
         lessons: ['uf-rollback-weighted'],
         swiftTest: 'ExchangeRateQueriesTests',
-        lists: ['patterns150'],
+        lists: [],
         minutes: 40,
     },
 ];

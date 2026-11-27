@@ -27,7 +27,7 @@ export default [
         patterns: ['prefix-sum', 'design'],
         lessons: ['bit-range-updates'],
         swiftTest: 'BulkBonusTotalsTests',
-        lists: ['patterns150'],
+        lists: [],
         minutes: 35,
     },
     {
@@ -37,7 +37,7 @@ export default [
         patterns: ['binary-search', 'design'],
         lessons: ['bit-order-statistics', 'bit-point-update'],
         swiftTest: 'ChangingBagKthTests',
-        lists: ['patterns150'],
+        lists: [],
         minutes: 35,
     },
     {
@@ -47,7 +47,7 @@ export default [
         patterns: ['matrix', 'prefix-sum', 'design'],
         lessons: ['bit-2d'],
         swiftTest: 'OrchardPlotSumsTests',
-        lists: ['patterns150'],
+        lists: [],
         minutes: 40,
     },
     {
@@ -57,7 +57,7 @@ export default [
         patterns: ['bits'],
         lessons: ['bit-lowbit'],
         swiftTest: 'FenwickSlotWalksTests',
-        lists: ['patterns150'],
+        lists: [],
         minutes: 20,
     },
     {
@@ -67,7 +67,7 @@ export default [
         patterns: ['bits', 'prefix-sum'],
         lessons: ['bit-lowbit'],
         swiftTest: 'FenwickLinearBuildTests',
-        lists: ['patterns150'],
+        lists: [],
         minutes: 25,
     },
 ];

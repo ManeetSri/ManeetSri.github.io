@@ -7,7 +7,7 @@ export default [
         patterns: ['heap', 'simulation'],
         lessons: ['heap-sift'],
         swiftTest: 'HeaviestStonesTests',
-        lists: ['patterns150'],
+        lists: [],
         minutes: 20,
     },
     {
@@ -17,7 +17,7 @@ export default [
         patterns: ['design', 'heap'],
         lessons: ['heap-sift', 'heap-heapify', 'heap-build'],
         swiftTest: 'PriorityQueueFromScratchTests',
-        lists: ['patterns150'],
+        lists: [],
         minutes: 45,
     },
     {
@@ -37,7 +37,7 @@ export default [
         patterns: ['heap', 'design'],
         lessons: ['heap-top-k'],
         swiftTest: 'StreamKthLargestTests',
-        lists: ['patterns150'],
+        lists: [],
         minutes: 20,
     },
     {
@@ -67,7 +67,7 @@ export default [
         patterns: ['heap', 'sliding-window'],
         lessons: ['heap-k-way-merge'],
         swiftTest: 'SmallestSharedRangeTests',
-        lists: ['patterns150'],
+        lists: [],
         minutes: 45,
     },
     {
@@ -117,7 +117,7 @@ export default [
         patterns: ['heap', 'design'],
         lessons: ['heap-swift-collections'],
         swiftTest: 'MinMaxHeapQueueTests',
-        lists: ['patterns150'],
+        lists: [],
         minutes: 60,
     },
     {
@@ -127,7 +127,7 @@ export default [
         patterns: ['heap', 'design'],
         lessons: ['heap-variants'],
         swiftTest: 'DecreaseKeyQueueTests',
-        lists: ['patterns150'],
+        lists: [],
         minutes: 50,
     },
     {
@@ -137,7 +137,7 @@ export default [
         patterns: ['heap', 'design'],
         lessons: ['heap-advanced'],
         swiftTest: 'MeldableHeapBankTests',
-        lists: ['patterns150'],
+        lists: [],
         minutes: 55,
     },
     {
@@ -147,7 +147,7 @@ export default [
         patterns: ['heap'],
         lessons: ['heap-variants'],
         swiftTest: 'DaryHeapLayoutTests',
-        lists: ['patterns150'],
+        lists: [],
         minutes: 35,
     },
 ];

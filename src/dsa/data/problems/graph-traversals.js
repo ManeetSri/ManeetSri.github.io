@@ -7,7 +7,7 @@ export default [
         patterns: ['bfs'],
         lessons: ['gt-bfs'],
         swiftTest: 'StationHopRouteTests',
-        lists: ['patterns150'],
+        lists: [],
         minutes: 30,
     },
     {
@@ -17,7 +17,7 @@ export default [
         patterns: ['dfs', 'bfs'],
         lessons: ['gt-dfs', 'gt-components'],
         swiftTest: 'LockedRoomsTourTests',
-        lists: ['patterns150'],
+        lists: [],
         minutes: 20,
     },
     {
@@ -27,7 +27,7 @@ export default [
         patterns: ['dfs', 'matrix'],
         lessons: ['gt-components'],
         swiftTest: 'PaintBucketFillTests',
-        lists: ['patterns150'],
+        lists: [],
         minutes: 20,
     },
     {
@@ -67,7 +67,7 @@ export default [
         patterns: ['bfs', 'matrix'],
         lessons: ['gt-multi-source'],
         swiftTest: 'ZeroDistanceMapTests',
-        lists: ['patterns150'],
+        lists: [],
         minutes: 30,
     },
     {
@@ -97,7 +97,7 @@ export default [
         patterns: ['bfs'],
         lessons: ['gt-bipartite'],
         swiftTest: 'RivalTeamSplitTests',
-        lists: ['patterns150'],
+        lists: [],
         minutes: 30,
     },
     {
@@ -107,7 +107,7 @@ export default [
         patterns: ['dfs'],
         lessons: ['gt-cycles'],
         swiftTest: 'DependencyCycleFinderTests',
-        lists: ['patterns150'],
+        lists: [],
         minutes: 45,
     },
 ];

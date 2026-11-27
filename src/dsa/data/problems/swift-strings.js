@@ -57,7 +57,7 @@ export default [
         patterns: ['strings'],
         lessons: ['swift-unicode'],
         swiftTest: 'ByteBudgetPrefixTests',
-        lists: ['patterns150', 'swift'],
+        lists: ['swift'],
         minutes: 20,
     },
     {
@@ -67,7 +67,7 @@ export default [
         patterns: ['strings'],
         lessons: ['swift-string-index'],
         swiftTest: 'EveryKthCharacterTests',
-        lists: ['patterns150', 'swift'],
+        lists: ['swift'],
         minutes: 15,
     },
     {
@@ -77,7 +77,7 @@ export default [
         patterns: ['strings', 'hashing'],
         lessons: ['swift-substring'],
         swiftTest: 'FileExtensionTallyTests',
-        lists: ['patterns150', 'swift'],
+        lists: ['swift'],
         minutes: 20,
     },
 ];

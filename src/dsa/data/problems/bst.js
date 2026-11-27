@@ -7,7 +7,7 @@ export default [
         patterns: ['binary-search', 'dfs'],
         lessons: ['bst-property-search-insert'],
         swiftTest: 'BSTSearchInsertTests',
-        lists: ['patterns150'],
+        lists: [],
         minutes: 20,
     },
     {
@@ -17,7 +17,7 @@ export default [
         patterns: ['dfs', 'recursion'],
         lessons: ['bst-delete', 'bst-min-max-successor'],
         swiftTest: 'BSTDeleteNodeTests',
-        lists: ['patterns150'],
+        lists: [],
         minutes: 30,
     },
     {
@@ -47,7 +47,7 @@ export default [
         patterns: ['binary-search', 'dfs'],
         lessons: ['bst-kth-lca'],
         swiftTest: 'BSTCommonAncestorTests',
-        lists: ['patterns150'],
+        lists: [],
         minutes: 15,
     },
     {
@@ -57,7 +57,7 @@ export default [
         patterns: ['recursion', 'binary-search'],
         lessons: ['bst-from-sorted'],
         swiftTest: 'BSTFromSortedArrayTests',
-        lists: ['patterns150'],
+        lists: [],
         minutes: 20,
     },
     {
@@ -87,7 +87,7 @@ export default [
         patterns: ['design'],
         lessons: ['bst-generic'],
         swiftTest: 'BSTSetBuildTests',
-        lists: ['patterns150'],
+        lists: [],
         minutes: 45,
     },
     {
@@ -97,7 +97,7 @@ export default [
         patterns: ['sorting', 'simulation'],
         lessons: ['bst-degenerate'],
         swiftTest: 'InsertionOrderHeightTests',
-        lists: ['patterns150'],
+        lists: [],
         minutes: 45,
     },
 ];

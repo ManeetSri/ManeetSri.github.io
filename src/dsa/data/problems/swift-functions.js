@@ -57,7 +57,7 @@ export default [
         patterns: ['basics'],
         lessons: ['swift-defining-functions'],
         swiftTest: 'TriangleKindTests',
-        lists: ['patterns150', 'swift'],
+        lists: ['swift'],
         minutes: 10,
     },
     {
@@ -67,7 +67,7 @@ export default [
         patterns: ['math', 'basics'],
         lessons: ['swift-argument-labels'],
         swiftTest: 'MultipleRoundingTests',
-        lists: ['patterns150', 'swift'],
+        lists: ['swift'],
         minutes: 20,
     },
 ];

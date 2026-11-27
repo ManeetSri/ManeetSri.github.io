@@ -17,7 +17,7 @@ export default [
         patterns: ['dp', 'strings'],
         lessons: ['dps-common-substring'],
         swiftTest: 'LongestSharedSubstringTests',
-        lists: ['patterns150'],
+        lists: [],
         minutes: 25,
     },
     {
@@ -37,7 +37,7 @@ export default [
         patterns: ['dp', 'strings'],
         lessons: ['dps-palindromic'],
         swiftTest: 'PalindromeByInsertionsTests',
-        lists: ['patterns150'],
+        lists: [],
         minutes: 30,
     },
     {
@@ -87,7 +87,7 @@ export default [
         patterns: ['dp', 'backtracking', 'strings'],
         lessons: ['dps-word-break'],
         swiftTest: 'DictionarySentenceSplitterTests',
-        lists: ['patterns150'],
+        lists: [],
         minutes: 45,
     },
     {
@@ -97,7 +97,7 @@ export default [
         patterns: ['dp', 'strings'],
         lessons: ['dps-interleaving-scramble'],
         swiftTest: 'InterleavedStringsCheckTests',
-        lists: ['patterns150'],
+        lists: [],
         minutes: 35,
     },
 ];

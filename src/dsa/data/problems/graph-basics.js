@@ -7,7 +7,7 @@ export default [
         patterns: ['basics'],
         lessons: ['graph-terminology'],
         swiftTest: 'TrustedArchivistTests',
-        lists: ['patterns150'],
+        lists: [],
         minutes: 20,
     },
     {
@@ -17,7 +17,7 @@ export default [
         patterns: ['basics'],
         lessons: ['graph-representations', 'graph-dense-sparse'],
         swiftTest: 'StationNeighbourListsTests',
-        lists: ['patterns150'],
+        lists: [],
         minutes: 20,
     },
     {
@@ -27,7 +27,7 @@ export default [
         patterns: ['design', 'hashing'],
         lessons: ['graph-build'],
         swiftTest: 'AdjacencyGraphDesignTests',
-        lists: ['patterns150'],
+        lists: [],
         minutes: 40,
     },
     {
@@ -37,7 +37,7 @@ export default [
         patterns: ['basics', 'matrix'],
         lessons: ['graph-implicit'],
         swiftTest: 'MazeCellDegreesTests',
-        lists: ['patterns150'],
+        lists: [],
         minutes: 20,
     },
 ];

@@ -7,7 +7,7 @@ export default [
         patterns: ['math'],
         lessons: ['geo-points-vectors', 'geo-cross-orientation'],
         swiftTest: 'WaypointTurnsTests',
-        lists: ['patterns150'],
+        lists: [],
         minutes: 20,
     },
     {
@@ -17,7 +17,7 @@ export default [
         patterns: ['math'],
         lessons: ['geo-segment-intersection'],
         swiftTest: 'SegmentContactTests',
-        lists: ['patterns150'],
+        lists: [],
         minutes: 35,
     },
     {
@@ -27,7 +27,7 @@ export default [
         patterns: ['math'],
         lessons: ['geo-polygons'],
         swiftTest: 'OrchardTreesInsideTests',
-        lists: ['patterns150'],
+        lists: [],
         minutes: 30,
     },
     {
@@ -37,7 +37,7 @@ export default [
         patterns: ['math'],
         lessons: ['geo-polygons'],
         swiftTest: 'PlotPointLocatorTests',
-        lists: ['patterns150'],
+        lists: [],
         minutes: 35,
     },
     {
@@ -57,7 +57,7 @@ export default [
         patterns: ['sorting', 'two-pointers'],
         lessons: ['geo-closest-pair'],
         swiftTest: 'ClosestBeaconPairTests',
-        lists: ['patterns150'],
+        lists: [],
         minutes: 45,
     },
     {
@@ -67,7 +67,7 @@ export default [
         patterns: ['intervals', 'sorting'],
         lessons: ['geo-line-sweep'],
         swiftTest: 'CoveredFloorAreaTests',
-        lists: ['patterns150'],
+        lists: [],
         minutes: 50,
     },
     {
@@ -77,7 +77,7 @@ export default [
         patterns: ['math'],
         lessons: ['geo-segment-intersection', 'geo-epsilon'],
         swiftTest: 'PipeGapTests',
-        lists: ['patterns150'],
+        lists: [],
         minutes: 35,
     },
 ];
