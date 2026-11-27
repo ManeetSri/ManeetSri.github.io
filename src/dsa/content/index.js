@@ -1,19 +1,19 @@
 // Lessons and problems load one at a time: each MDX file becomes its own small chunk, fetched when opened.
-// A file's name is its id, so lessons can move between folders without losing progress.
+// The maps from ids to those chunks are split by kind too, so opening a lesson doesn't also download the
+// map of every problem and sheet.
 import { useEffect, useState } from 'react';
 
-const lessonFiles = import.meta.glob('./lessons/**/*.mdx');
-const problemFiles = import.meta.glob('./problems/*.mdx');
-const sheetFiles = import.meta.glob('./sheets/*.mdx');
+const maps = {
+    lesson: () => import('./lessonFiles.js'),
+    problem: () => import('./problemFiles.js'),
+    sheet: () => import('./sheetFiles.js'),
+};
+const loadedMaps = {};
+const filesOf = (kind) => (loadedMaps[kind] ??= maps[kind]().then((module) => module.default));
 
-const byId = (files) => Object.fromEntries(Object.entries(files).map(([path, load]) => [path.split('/').pop().replace(/\.mdx$/, ''), load]));
-
-const loaders = { lesson: byId(lessonFiles), problem: byId(problemFiles), sheet: byId(sheetFiles) };
-
-export const hasContent = (kind, id) => Boolean(loaders[kind][id]);
-
+// Resolves to null when there's no such file
 export const loadContent = async (kind, id) => {
-    const load = loaders[kind][id];
+    const load = (await filesOf(kind))[id];
     if (!load) return null;
     const module = await load();
     return { Content: module.default, data: JSON.parse(module.dsa ?? '{"questions":[],"cards":[],"headings":[]}') };
@@ -26,15 +26,13 @@ export const useContent = (kind, id) => {
 
     useEffect(() => {
         let cancelled = false;
-        if (!hasContent(kind, id)) return undefined;
         loadContent(kind, id)
-            .then((loaded) => !cancelled && setResult({ status: 'ready', key, ...loaded }))
+            .then((loaded) => !cancelled && setResult(loaded ? { status: 'ready', key, ...loaded } : { status: 'missing', key }))
             .catch(() => !cancelled && setResult({ status: 'error', key }));
         return () => {
             cancelled = true;
         };
     }, [kind, id, key]);
 
-    if (!hasContent(kind, id)) return { status: 'missing' };
     return result.key === key ? result : { status: 'loading' };
 };

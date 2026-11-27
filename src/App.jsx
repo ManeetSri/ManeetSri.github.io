@@ -16,12 +16,13 @@ import Instruments from './sections/Instruments';
 import Services from './sections/Services';
 import Notes from './sections/Notes';
 import Contact from './sections/Contact';
-import BlogsPage from './pages/BlogsPage';
 import NotFoundPage from './pages/NotFoundPage';
-import PrivacyPage from './pages/PrivacyPage';
 import { usePageMeta } from './hooks/usePageMeta';
 import { isPrivatePath } from './utils/privatePaths';
 
+// Secondary pages load when first visited, keeping the home page's bundle small
+const BlogsPage = lazy(() => import('./pages/BlogsPage'));
+const PrivacyPage = lazy(() => import('./pages/PrivacyPage'));
 const BuildPage = lazy(() => import('./pages/BuildPage'));
 const DsaApp = lazy(() => import('./dsa/DsaApp'));
 
@@ -81,8 +82,8 @@ function App() {
           <Routes>
           <Route path="/" element={<Home />} />
           <Route path="/projects" element={<Navigate to="/#work" replace />} />
-          <Route path="/blogs" element={<BlogsPage />} />
-          <Route path="/privacy" element={<PrivacyPage />} />
+          <Route path="/blogs" element={<Suspense fallback={<div className="min-h-svh bg-ink" />}><BlogsPage /></Suspense>} />
+          <Route path="/privacy" element={<Suspense fallback={<div className="min-h-svh bg-ink" />}><PrivacyPage /></Suspense>} />
           <Route path="/build" element={<Suspense fallback={<div className="min-h-svh bg-ink" />}><BuildPage /></Suspense>} />
           <Route path="/dsa/*" element={<Suspense fallback={<div className="min-h-svh bg-ink" />}><DsaApp /></Suspense>} />
           <Route path="*" element={<NotFoundPage />} />

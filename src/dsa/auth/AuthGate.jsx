@@ -90,11 +90,21 @@ const AuthGate = ({ children }) => {
             .then((module) => {
                 if (cancelled) return;
                 setServices(module);
+                // Fetch the sync code now, while the passphrase is being typed
+                const sync = module.loadSync();
+                let latest = 0;
                 stopWatching = module.watchUser((user) => {
                     if (usingLocalData.current) return;
-                    setSession(user
-                        ? { state: 'signed-in', store: createStore(module.createFirestoreAdapter(user.uid)) }
-                        : { state: 'signed-out', store: null });
+                    const attempt = ++latest;
+                    if (!user) {
+                        setSession({ state: 'signed-out', store: null });
+                        return;
+                    }
+                    sync.then(({ createFirestoreAdapter }) => {
+                        // A later sign-in or sign-out wins over this one
+                        if (cancelled || attempt !== latest || usingLocalData.current) return;
+                        setSession({ state: 'signed-in', store: createStore(createFirestoreAdapter(user.uid)) });
+                    }).catch(() => !cancelled && setLoadError(true));
                 });
             })
             .catch(() => !cancelled && setLoadError(true));

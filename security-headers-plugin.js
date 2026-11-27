@@ -68,9 +68,12 @@ const headersFile = (html) => `/*
   Permissions-Policy: accelerometer=(), camera=(), geolocation=(), gyroscope=(), magnetometer=(), microphone=(), payment=(), usb=(), browsing-topics=()
   Cross-Origin-Opener-Policy: same-origin
   Cross-Origin-Resource-Policy: same-site
+/assets/*
+  Cache-Control: public, max-age=31536000, immutable
 ${PRIVATE_PATHS.map((path) => `${path}\n  X-Robots-Tag: noindex, nofollow, noarchive\n`).join('')}`;
 
-// Writes Netlify's _headers file after the build, because the hashes depend on the final HTML
+// Writes Netlify's _headers file after the build, because the hashes depend on the final HTML.
+// Everything under /assets has a content hash in its name, so browsers can keep it for a year.
 export const securityHeaders = () => {
     let outDir = 'dist';
 
