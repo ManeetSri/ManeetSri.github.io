@@ -1,0 +1,283 @@
+## Why it matters
+
+An editor's undo history, a version-control system, and a spreadsheet that can show "what this column added up to last Tuesday" all need the same thing: change the data, but keep every **old version** readable. A structure that does this is called **persistent**. Copying the whole array on every change works, but costs O(n) time and memory per change. A persistent segment tree keeps every version for an extra O(log n) per change, and the same trick answers "the kth smallest value in `items[l...r]`" in O(log n), beating the merge-sort tree's O(log³ n). It's a deep-dive lesson: the ideas matter more than memorising the code.
+
+## What an update really changes
+
+Look at a point update in an ordinary segment tree: it changes the leaf and the nodes on the path up to the root, about log₂ n + 1 nodes. **Every other node stays exactly as it was.** So a new version doesn't need a new tree. It needs:
+
+- new copies of the nodes on that one path, holding the new sums;
+- each copy's other child pointing at the **old** version's unchanged child.
+
+This is **path copying**. The new root leads to a tree that looks complete and correct, but most of it is shared with the old version. The old root still leads to the old tree, untouched, because no existing node was ever modified. Each version is just the index of its root.
+
+<Callout kind="analogy" title="Swift's copy-on-write, at the level of nodes">
+You've met a cousin of this idea in Swift's arrays: copying an array is free until one copy is changed. Path copying goes further. Instead of copying a whole buffer on the first write, it copies only the handful of nodes the write touches, and keeps sharing everything else forever.
+</Callout>
+
+## Nodes that can be shared
+
+The 1-indexed layout, with children at `2k` and `2k + 1`, can't express sharing: a node's children are fixed by its position. A persistent tree stores **explicit child links** instead. Rather than a class per node, which costs a heap allocation and reference counting each, the usual choice is three parallel arrays, with nodes referring to each other by index:
+
+- `lefts[i]` and `rights[i]`: the indexes of node i's children;
+- `sums[i]`: node i's sum.
+
+Making a node appends to all three. Nothing is ever overwritten. Node 0 is a handy convention: it's the **empty tree**, with sum 0 and both children pointing back at node 0, so a tree of zeros needs no build at all.
+
+```swift run
+// A persistent sum tree: every update makes a new version and keeps every old one
+struct PersistentSumTree {
+    // Nodes live in three parallel arrays and refer to each other by index. Node 0 is the
+    // empty tree: sum 0, and both its children are node 0 itself.
+    private var lefts = [0]
+    private var rights = [0]
+    private var sums = [0]
+    private var roots: [Int] = []                 // roots[v] is the root of version v
+    let count: Int
+
+    init(_ items: [Int]) {
+        count = items.count
+        roots.append(build(items, 0, count - 1))  // version 0
+    }
+
+    var nodeCount: Int { sums.count }
+
+    private mutating func makeNode(_ left: Int, _ right: Int, _ sum: Int) -> Int {
+        lefts.append(left)
+        rights.append(right)
+        sums.append(sum)
+        return sums.count - 1
+    }
+
+    private mutating func build(_ items: [Int], _ low: Int, _ high: Int) -> Int {
+        if low == high { return makeNode(0, 0, items[low]) }
+        let mid = (low + high) / 2
+        let left = build(items, low, mid)
+        let right = build(items, mid + 1, high)
+        return makeNode(left, right, sums[left] + sums[right])
+    }
+
+    /// Sets items[index] = value in a new version based on `version`, and returns the new version.
+    mutating func update(_ version: Int, _ index: Int, _ value: Int) -> Int {
+        roots.append(update(roots[version], 0, count - 1, index, value))
+        return roots.count - 1
+    }
+
+    // Returns a NEW node for this block. The old node is never changed, so old versions survive.
+    private mutating func update(_ node: Int, _ low: Int, _ high: Int, _ index: Int, _ value: Int) -> Int {
+        if low == high { return makeNode(0, 0, value) }
+        let mid = (low + high) / 2
+        var left = lefts[node], right = rights[node]          // share both children...
+        if index <= mid {
+            left = update(left, low, mid, index, value)          // ...except the one on the path
+        } else {
+            right = update(right, mid + 1, high, index, value)
+        }
+        return makeNode(left, right, sums[left] + sums[right])
+    }
+
+    /// The sum of items[left...right] as they were in `version`.
+    func sum(_ version: Int, _ left: Int, _ right: Int) -> Int {
+        query(roots[version], 0, count - 1, left, right)
+    }
+
+    private func query(_ node: Int, _ low: Int, _ high: Int, _ left: Int, _ right: Int) -> Int {
+        if right < low || high < left { return 0 }
+        if left <= low && high <= right { return sums[node] }
+        let mid = (low + high) / 2
+        return query(lefts[node], low, mid, left, right) + query(rights[node], mid + 1, high, left, right)
+    }
+}
+
+var tree = PersistentSumTree([5, 3, 7, 9, 6, 4, 1, 2])   // version 0
+print("nodes after the build:", tree.nodeCount)
+let v1 = tree.update(0, 3, 1)                            // version 1: items[3] = 1
+let v2 = tree.update(v1, 0, 10)                          // version 2: version 1 with items[0] = 10
+let v3 = tree.update(0, 7, 20)                           // version 3: a branch from version 0
+for version in [0, v1, v2, v3] {
+    print("version \(version): total \(tree.sum(version, 0, 7)), items 2...6: \(tree.sum(version, 2, 6))")
+}
+print("nodes after three updates:", tree.nodeCount)
+```
+
+```output
+nodes after the build: 16
+version 0: total 37, items 2...6: 27
+version 1: total 29, items 2...6: 19
+version 2: total 34, items 2...6: 19
+version 3: total 55, items 2...6: 27
+nodes after three updates: 28
+```
+
+What to notice:
+
+- The build makes 15 nodes for 8 items, plus node 0. Each update adds exactly 4 nodes, one per level: log₂ 8 + 1.
+- Version 3 is built from version 0, not from version 2. Versions form a tree of histories, not just a line, and any of them can be the base for a new one.
+- `update` never assigns into an existing slot of `lefts`, `rights` or `sums`. That single rule is what keeps every old version valid.
+
+| | Time | Extra memory |
+| --- | --- | --- |
+| Build version 0 | O(n) | 2n nodes |
+| Update, making a new version | O(log n) | log n + 1 nodes |
+| Query any version | O(log n) | none |
+
+With 100,000 items and 100,000 updates, that's about 200,000 + 1,800,000 nodes: a few tens of megabytes in three `Int` arrays.
+
+## Kth smallest in a range, in outline
+
+Here's the classic use, which needs no updates from the caller at all. The question: **what's the kth smallest value in `items[l...r]`?**
+
+**Step 1: count values, not positions.** Sort the distinct values and replace each item with its **rank**, its position in that sorted list. This is coordinate compression, which M62 covers in full. Now build a segment tree over the *ranks*, where each leaf counts how many times that rank has been seen.
+
+**Step 2: one version per prefix.** Version 0 is empty (node 0). Version i is version i − 1 with one more count at the rank of `items[i - 1]`. So version i counts the values in `items[0..<i]`. Each version costs O(log n) new nodes, so all n + 1 versions take O(n log n) memory.
+
+**Step 3: subtract two versions.** The counts for `items[l...r]` are version `r + 1` minus version `l`, node by node, because both trees have the same shape: the same node position covers the same range of ranks in every version. You never build the difference. You walk down both trees at once and subtract as you go.
+
+**Step 4: walk down by counts.** At each step, the number of values in the range whose rank falls in the left half is `count(left child of newer) − count(left child of older)`. If k is at most that, the answer is in the left half: go left. Otherwise skip those values, subtract them from k, and go right. When the walk reaches a leaf, its rank is the answer. One step per level: **O(log n)** per query.
+
+```swift run
+// Kth smallest in items[l...r]: a persistent tree of value counts for every prefix of the array
+struct PrefixCountTrees {
+    private var lefts = [0], rights = [0], counts = [0]   // node 0: the empty tree
+    private var roots = [0]                       // roots[i] counts the values in items[0..<i]
+    private let values: [Int]                     // the distinct values, sorted: rank r is values[r]
+
+    init(_ items: [Int]) {
+        values = Array(Set(items)).sorted()
+        let rankOf = Dictionary(uniqueKeysWithValues: values.enumerated().map { ($0.element, $0.offset) })
+        for item in items {
+            roots.append(insert(roots.last!, 0, values.count - 1, rankOf[item]!))
+        }
+    }
+
+    var nodeCount: Int { counts.count }
+
+    // A copy of the path to `rank`, with one more value counted there
+    private mutating func insert(_ node: Int, _ low: Int, _ high: Int, _ rank: Int) -> Int {
+        var left = lefts[node], right = rights[node]
+        if low < high {
+            let mid = (low + high) / 2
+            if rank <= mid { left = insert(left, low, mid, rank) } else { right = insert(right, mid + 1, high, rank) }
+        }
+        lefts.append(left)
+        rights.append(right)
+        counts.append(counts[node] + 1)
+        return counts.count - 1
+    }
+
+    /// The kth smallest (from 1) of items[left...right].
+    func kthSmallest(_ k: Int, _ left: Int, _ right: Int) -> Int {
+        var newer = roots[right + 1], older = roots[left]  // counts in left...right: newer minus older
+        var low = 0, high = values.count - 1
+        var k = k
+        while low < high {
+            let mid = (low + high) / 2
+            let inLeftHalf = counts[lefts[newer]] - counts[lefts[older]]
+            if k <= inLeftHalf {                  // the answer's rank is in low...mid
+                newer = lefts[newer]
+                older = lefts[older]
+                high = mid
+            } else {                              // skip the smaller values and go right
+                k -= inLeftHalf
+                newer = rights[newer]
+                older = rights[older]
+                low = mid + 1
+            }
+        }
+        return values[low]
+    }
+}
+
+let items = [5, 1, 7, 3, 8, 2, 6, 4]
+let trees = PrefixCountTrees(items)
+print(trees.kthSmallest(1, 1, 6), trees.kthSmallest(3, 1, 6), trees.kthSmallest(6, 1, 6))
+print("nodes:", trees.nodeCount)
+
+var mismatches = 0
+for left in 0..<items.count {
+    for right in left..<items.count {
+        let range = items[left...right].sorted()
+        for k in 1...range.count where trees.kthSmallest(k, left, right) != range[k - 1] {
+            mismatches += 1
+        }
+    }
+}
+print("mismatches:", mismatches)
+let repeated = PrefixCountTrees([4, 4, 1, 4, 9, 1])
+print(repeated.kthSmallest(2, 0, 5), repeated.kthSmallest(3, 0, 5), repeated.kthSmallest(2, 3, 5))
+```
+
+```output
+1 3 8
+nodes: 33
+mismatches: 0
+1 4 4
+```
+
+The answers match the merge-sort tree's from the last lesson, at O(log n) per query instead of O(log³ n). Duplicates need no special care: they're counted at the same rank. The cost is memory: O(n log n), the same order as a merge-sort tree, since each item adds about log₂ m + 1 nodes, where m is the number of distinct values.
+
+## Where persistence goes next
+
+The same pattern answers "how many values in `items[l...r]` are at most x?" in O(log n): walk down towards x's rank in both versions and add up the left-child differences you skip. Range updates can be made persistent too, but a lazy tag on a shared node can't be pushed down in place, because the children belong to other versions as well. Pushing has to copy the children first. It works, at the cost of more nodes per operation, and it's rare outside contests.
+
+<Callout kind="gotcha" title="Common mistakes">
+- **Modifying a node in place.** One `sums[node] += delta` on a shared node silently changes every version that shares it. A persistent update must always make a new node.
+- **Off-by-one between versions and positions.** With version i covering `items[0..<i]`, the range `l...r` is version `r + 1` minus version `l`. Writing `roots[r]` drops the last item.
+- **Running out of memory.** Every update allocates about log n nodes, and none are freed. Call `reserveCapacity` on the arrays if you know the total in advance, and estimate it before you start: (n + q) × (log₂ n + 1).
+- **Using a class per node.** It works, but each node is a separate heap allocation with reference counting. Parallel arrays of indexes are smaller and much faster.
+</Callout>
+
+```cards
+- id: persistence-definition
+  front: "What makes a data structure persistent?"
+  back: "Every update produces a new version, and every old version stays readable and unchanged."
+- id: path-copying
+  front: "How does path copying make a segment tree persistent?"
+  back: "An update copies only the O(log n) nodes on its root-to-leaf path; each copy keeps pointing at the old version's unchanged child. Each version is identified by its root."
+- id: persistent-kth
+  front: "How does a persistent segment tree find the kth smallest in items[l...r]?"
+  back: "Keep one version per prefix, counting value ranks. Walk down versions r + 1 and l together: the left-child count difference says whether the kth smallest is in the left half. O(log n)."
+```
+
+```quiz
+- id: q1
+  type: mcq
+  prompt: "A persistent segment tree over 1,024 items gets one point update. How many new nodes does it create?"
+  options:
+    - "1"
+    - "11"
+    - "1,024"
+    - "2,047"
+  answer: 1
+  explain: "The update copies the nodes on one root-to-leaf path: log₂ 1,024 + 1 = 11 levels. Every other node is shared with the old version."
+- id: q2
+  type: truefalse
+  prompt: "After an update in a persistent segment tree, the old version's root still gives correct answers for the old data."
+  answer: true
+  explain: "No existing node is modified. The old root leads to exactly the nodes it led to before, so it still describes the old array."
+- id: q3
+  type: bug
+  prompt: "This is meant to be a persistent update. Which line breaks persistence?"
+  code: |
+    mutating func update(_ node: Int, _ low: Int, _ high: Int, _ index: Int, _ value: Int) -> Int {
+        if low == high { return makeNode(0, 0, value) }
+        let mid = (low + high) / 2
+        var left = lefts[node], right = rights[node]
+        if index <= mid { left = update(left, low, mid, index, value) }
+        else { right = update(right, mid + 1, high, index, value) }
+        sums[node] = sums[left] + sums[right]
+        return node
+    }
+  answer: 7
+  explain: "Writing into `sums[node]` changes a node that older versions share, so they see the new data too. The function must make a new node, `makeNode(left, right, sums[left] + sums[right])`, and return that instead."
+- id: q4
+  type: trace
+  prompt: "Version i counts the ranks among items[0..<i]. To find the kth smallest of items[3...7], which two versions do you walk down together? Give the newer first."
+  answer: "8, 3"
+  explain: "Version 8 counts items[0..<8] and version 3 counts items[0..<3]. Their difference counts items[3...7] exactly."
+- id: q5
+  type: bigo
+  prompt: "With a persistent tree of prefix counts built, what does one kth-smallest-in-a-range query cost?"
+  answer: "O(log n)"
+  explain: "It walks down two trees in step, one level at a time, doing O(1) work per level. The merge-sort tree needed O(log³ n) for the same question."
+```

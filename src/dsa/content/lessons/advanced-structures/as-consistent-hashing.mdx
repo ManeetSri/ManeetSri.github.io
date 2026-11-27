@@ -1,0 +1,264 @@
+## Why it matters
+
+A photo service keeps its images on many cache servers, and every request must go to the server that holds that image. The obvious rule, "server number = hash(key) % number of servers", works perfectly until a server is added or fails. Then almost every key maps to a different server, every cache is suddenly wrong, and the database behind them is hit by a flood of misses. **Consistent hashing** is the rule that fixes this: when a server joins or leaves, only about 1/n of the keys move. It's how distributed caches, databases such as Cassandra and Amazon's Dynamo, and content delivery networks spread data over machines that come and go. Whenever several devices or servers must agree on "who owns this key?" without asking each other, this is the technique.
+
+## The trouble with % n
+
+With n servers, `hash(key) % n` spreads keys evenly, and every client computes the same answer without coordination. But the answer depends on n itself. Change n, and a key stays on the same server only if its hash happens to give the same remainder for both values of n:
+
+```swift run
+func fnv1a(_ text: String) -> UInt64 {
+    var hash: UInt64 = 0xcbf2_9ce4_8422_2325
+    for byte in text.utf8 {
+        hash ^= UInt64(byte)
+        hash = hash &* 0x0000_0100_0000_01B3
+    }
+    return hash
+}
+
+func mix(_ x: UInt64) -> UInt64 {
+    var z = x
+    z = (z ^ (z >> 30)) &* 0xBF58_476D_1CE4_E5B9
+    z = (z ^ (z >> 27)) &* 0x94D0_49BB_1331_11EB
+    return z ^ (z >> 31)
+}
+
+func stableHash(_ text: String) -> UInt64 { mix(fnv1a(text)) }
+
+let keys = (0..<10_000).map { "user\($0)" }
+
+// The obvious way: server number = hash % number of servers
+for (before, after) in [(4, 5), (10, 11), (10, 9)] {
+    let moved = keys.filter { stableHash($0) % UInt64(before) != stableHash($0) % UInt64(after) }.count
+    print("\(before) → \(after) servers: \(moved) of \(keys.count) keys move")
+}
+```
+
+```output
+4 → 5 servers: 7964 of 10000 keys move
+10 → 11 servers: 9077 of 10000 keys move
+10 → 9 servers: 9002 of 10000 keys move
+```
+
+Going from 4 servers to 5 moves about 80% of the keys; from 10 to 11, about 91%. Only 1 in 5 (or 1 in 11) keys was going to need moving, because the new server should end up with a fifth (or an eleventh) of them. Everything else moves for nothing. The hash is the same stable FNV-1a plus mixing from [Bloom filters and count-min sketches](/dsa/learn/as-bloom-sketch): every device must compute the same answer.
+
+## The ring
+
+Consistent hashing stops the answer depending on n:
+
+1. Picture the hash values, 0 to 2⁶⁴ − 1, bent into a **circle**, so the largest value is followed by 0.
+2. Hash each **server's name** to a position on the circle.
+3. Hash each **key** to a position too. The key belongs to the **first server clockwise** from it: the first server position at or after the key's, wrapping past the top back to the smallest.
+
+```text
+                  0
+             .----+----.
+         D  /           \  A        key k1 lies between D and A: it goes to A
+           |             |          key k2 lies between A and B: it goes to B
+         C  \           /  B
+             '----+----'
+```
+
+Now add a server E between A and B. Only the keys on the arc between A and E change hands: they used to go clockwise to B, and now they meet E first. Every other key still reaches the same server as before. Removing a server is the mirror image: only its own keys move, to the next server clockwise. Either way, about 1/n of the keys move, the minimum possible.
+
+### Finding the server is a binary search
+
+Keep the servers' positions in a **sorted array**. A key's server is the first position **≥** the key's hash: the lower bound from [Lower bound, upper bound, first and last occurrence](/dsa/learn/bs-bounds). If the lower bound falls off the end of the array, the key has passed the top of the circle: wrap around to index 0. Each lookup is O(log p) for p positions.
+
+## Virtual nodes
+
+With only one position per server, the arcs between servers are random lengths, and so are the servers' shares of the keys. Four servers might get 34%, 25%, 31% and 10%. The fix is to give each server **many positions**, called **virtual nodes**: hash "A#0", "A#1", …, "A#99" and place A at all of them. Each server now owns a hundred small arcs scattered round the circle, and their total length is close to a quarter.
+
+Virtual nodes help in three more ways:
+
+- **Joining spreads the load.** A new server's hundred positions each take a slice from whichever server was next clockwise, so it takes keys from **every** server, a little from each, instead of halving one neighbour's work.
+- **Leaving spreads it too.** A failed server's arcs are inherited by many different servers.
+- **Weights are easy.** A server with twice the memory gets twice as many virtual nodes.
+
+```swift run
+func fnv1a(_ text: String) -> UInt64 {
+    var hash: UInt64 = 0xcbf2_9ce4_8422_2325
+    for byte in text.utf8 {
+        hash ^= UInt64(byte)
+        hash = hash &* 0x0000_0100_0000_01B3
+    }
+    return hash
+}
+
+func mix(_ x: UInt64) -> UInt64 {
+    var z = x
+    z = (z ^ (z >> 30)) &* 0xBF58_476D_1CE4_E5B9
+    z = (z ^ (z >> 27)) &* 0x94D0_49BB_1331_11EB
+    return z ^ (z >> 31)
+}
+
+func stableHash(_ text: String) -> UInt64 { mix(fnv1a(text)) }
+
+struct HashRing {
+    let virtualNodes: Int
+    private var points: [(position: UInt64, server: String)] = []    // sorted by position
+
+    init(virtualNodes: Int) {
+        self.virtualNodes = virtualNodes
+    }
+
+    // Each server appears at several places on the ring: "A#0", "A#1", …
+    mutating func add(_ server: String) {
+        for i in 0..<virtualNodes {
+            points.append((stableHash("\(server)#\(i)"), server))
+        }
+        points.sort { $0.position < $1.position }
+    }
+
+    mutating func remove(_ server: String) {
+        points.removeAll { $0.server == server }
+    }
+
+    // The first point at or after the key's position, going clockwise; past the end, wrap to the start
+    func server(for key: String) -> String {
+        let position = stableHash(key)
+        var low = 0
+        var high = points.count
+        while low < high {                       // lower bound: the first point ≥ position
+            let mid = (low + high) / 2
+            if points[mid].position < position { low = mid + 1 } else { high = mid }
+        }
+        return points[low == points.count ? 0 : low].server
+    }
+}
+
+func loads(_ ring: HashRing, _ keys: [String]) -> String {
+    var count: [String: Int] = [:]
+    for key in keys {
+        count[ring.server(for: key), default: 0] += 1
+    }
+    return count.keys.sorted().map { "\($0) \(count[$0]!)" }.joined(separator: ", ")
+}
+
+let keys = (0..<10_000).map { "user\($0)" }
+
+for v in [1, 100] {
+    var ring = HashRing(virtualNodes: v)
+    for server in ["A", "B", "C", "D"] {
+        ring.add(server)
+    }
+    print("\(v) point(s) per server: \(loads(ring, keys))")
+}
+
+var ring = HashRing(virtualNodes: 100)
+for server in ["A", "B", "C", "D"] {
+    ring.add(server)
+}
+let before = keys.map { ring.server(for: $0) }
+ring.add("E")
+let after = keys.map { ring.server(for: $0) }
+var movedFrom: [String: Int] = [:]
+for i in keys.indices where before[i] != after[i] {
+    movedFrom[before[i], default: 0] += 1
+    precondition(after[i] == "E")                // every key that moved went to the new server
+}
+let moved = movedFrom.values.reduce(0, +)
+print("adding E moved \(moved) keys, all to E, taken from:",
+      movedFrom.keys.sorted().map { "\($0) \(movedFrom[$0]!)" }.joined(separator: ", "))
+print("after adding E: \(loads(ring, keys))")
+
+ring.remove("B")
+let withoutB = keys.map { ring.server(for: $0) }
+let changed = keys.indices.filter { after[$0] != withoutB[$0] }
+print("removing B moved \(changed.count) keys, all of them B's:", changed.allSatisfy { after[$0] == "B" })
+```
+
+```output
+1 point(s) per server: A 3374, B 2494, C 3108, D 1024
+100 point(s) per server: A 2446, B 2596, C 2568, D 2390
+adding E moved 2136 keys, all to E, taken from: A 677, B 651, C 379, D 429
+after adding E: A 1769, B 1945, C 2189, D 1961, E 2136
+removing B moved 1945 keys, all of them B's: true
+```
+
+What to notice:
+
+- **One point per server is badly uneven**: D gets about 10% of the keys and A about 34%. With 100 virtual nodes each, every server is within 5% of a fair quarter.
+- **Adding E moved 2,136 keys**, about a fifth: the share E should own. The `precondition` checks that **every** moved key went to E; no key moved between the old servers.
+- **E took keys from all four servers**, thanks to its hundred scattered positions.
+- **Removing B moved exactly B's 1,945 keys**, and nothing else.
+- **The loads are printed with sorted keys.** Printing the `count` dictionary directly would show the servers in a different order on every run.
+
+This ring re-sorts all its points whenever a server joins. That's fine: servers join rarely, and lookups, the frequent operation, stay O(log p). A ring that changes often could merge the new server's sorted points into the array in O(p) instead.
+
+## Beyond the basic ring
+
+- **Replication.** To keep 3 copies of each key, walk clockwise from its position and take the first 3 **different** servers, skipping further virtual nodes of a server already chosen. If one fails, the next one clockwise already has a copy.
+- **Rendezvous hashing** skips the ring: for each key, compute hash(key, server) for every server and choose the highest. It moves the same minimal number of keys and balances well without virtual nodes, but each lookup is O(number of servers).
+- **Jump consistent hashing** needs no memory at all and computes a bucket number in O(log n) with a short loop, but servers must be numbered 0 to n − 1 and only added or removed at the end.
+
+<Callout kind="gotcha" title="Swift gotcha: everyone must hash the same way">
+Consistent hashing only works if every client, server and app version puts each key at the same position. Swift's `hashValue` is seeded randomly per process, so two devices, or two launches of the same app, would disagree about everything. Use a fixed hash over the key's UTF-8 bytes, document it, and never change it without migrating the data: a new hash function moves nearly every key, exactly like changing n.
+</Callout>
+
+<Callout kind="gotcha" title="Common mistakes">
+- **Forgetting to wrap.** A key whose hash is beyond the last server position belongs to the **first** server. Without the wrap, the lookup indexes past the end of the array and crashes.
+- **Searching for "greater than" instead of "at least".** If a key's hash equals a server position exactly, it belongs to that server. Use the lower bound (the first position ≥ the key), and test the exact-match case.
+- **Ties between positions.** Two virtual nodes can hash to the same position. Decide a rule, such as the smaller server name wins, so every client agrees.
+- **Moving keys, not data.** The ring tells you where a key belongs now; the data still lives where it was. Real systems copy the moved arcs' data to the new owner before switching over.
+</Callout>
+
+## Practice
+
+**Consistent hash ring** asks for a ring with virtual nodes, a hash function supplied by the tests, and an exact tie-breaking rule, so every lookup can be checked. The tests compare it with a simple scan of every position, check that adding or removing a server moves only the keys it should, and look up 100,000 keys on a ring of 500 servers with 100 virtual nodes each, which a linear scan per lookup can't do in time.
+
+```cards
+- id: mod-n-moves
+  front: "Why is hash(key) % n a bad way to assign keys to servers that come and go?"
+  back: "Changing n changes almost every remainder: going from 4 to 5 servers moves about 80% of the keys, though only 20% needed to move."
+- id: ring-lookup
+  front: "On a consistent hashing ring, which server owns a key?"
+  back: "The first server position at or after the key's hash, going clockwise, wrapping past the largest position to the smallest. With sorted positions, it's a lower-bound binary search."
+- id: ring-join
+  front: "Which keys move when a server joins a consistent hashing ring?"
+  back: "Only the keys on the arcs immediately before each of the new server's positions; they move to the new server. Every other key stays put, so about 1/n of the keys move."
+- id: virtual-nodes
+  front: "What are virtual nodes for?"
+  back: "Each server gets many positions on the ring, which evens out the load, spreads a joining or leaving server's keys over all the others, and lets bigger servers take more positions."
+```
+
+```quiz
+- id: q1
+  type: output
+  prompt: "What fraction of keys keep their server when going from 2 servers to 3 with `hash % n`? This checks all hashes from 0 to 5,999."
+  code: |
+    let hashes = 0..<6_000
+    let kept = hashes.filter { $0 % 2 == $0 % 3 }.count
+    print(kept, Double(kept) / 6_000)
+  answer: "2000 0.3333333333333333"
+  explain: "A hash keeps its server only when its remainders mod 2 and mod 3 agree, which happens for 2 of every 6 consecutive values (0 and 1). So two thirds of the keys move, though only a third needed to."
+- id: q2
+  type: trace
+  prompt: "Server positions on a ring of 0 to 99 are A at 10, B at 40 and C at 75. Which server owns keys at positions 5, 40, 41 and 90? Write them in that order."
+  answer: "A, B, C, A"
+  explain: "Each key goes to the first position at or after it. 5 → A (10). 40 → B exactly (at least, not greater than). 41 → C (75). 90 is past the last position, so it wraps round to A."
+- id: q3
+  type: mcq
+  prompt: "On that ring, server D joins at position 60. Which keys move?"
+  options:
+    - "All keys between 0 and 60"
+    - "Keys from 41 to 60, which move from C to D"
+    - "Keys from 61 to 75, which move from C to D"
+    - "About a quarter of all keys, from every server"
+  answer: 1
+  explain: "Keys from 41 to 60 used to reach C first; now D at 60 comes first. Every other key reaches the same server as before. With virtual nodes, D would take small slices from every server instead."
+- id: q4
+  type: truefalse
+  prompt: "With virtual nodes, a server that joins takes keys from many servers, not only one neighbour."
+  answer: true
+  explain: "Each of its many positions takes the arc immediately before it from whichever server was next clockwise, and those positions are scattered round the ring."
+- id: q5
+  type: bigo
+  prompt: "With p positions stored in a sorted array, what does looking up a key's server cost?"
+  options: ["O(1)", "O(log p)", "O(p)", "O(p log p)"]
+  answer: "O(log p)"
+  explain: "It's a lower-bound binary search for the first position at or after the key's hash, plus an O(1) wrap-around check."
+- id: q6
+  type: recall
+  prompt: "Why must a consistent hashing ring use a fixed hash function rather than Swift's hashValue?"
+  model: "Every client and server must place each key and server at the same position, across devices, launches and app versions. Swift's Hasher is seeded randomly per process, so hashValue differs between runs and machines, and they'd disagree about which server owns each key. A fixed hash of the UTF-8 bytes gives everyone the same ring."

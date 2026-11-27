@@ -62,6 +62,14 @@ import dpIntervals from './problems/dp-intervals.js';
 import dpStates from './problems/dp-states.js';
 import dpAdvanced from './problems/dp-advanced.js';
 import patterns from './problems/patterns.js';
+import segmentTrees from './problems/segment-trees.js';
+import fenwick from './problems/fenwick.js';
+import rangeQueries from './problems/range-queries.js';
+import stringAlgorithms from './problems/string-algorithms.js';
+import advancedStructures from './problems/advanced-structures.js';
+import geometry from './problems/geometry.js';
+import numberTheory from './problems/number-theory.js';
+import randomised from './problems/randomised.js';
 
 export const DIFFICULTIES = {
     warmup: { label: 'Warm-up', xp: 15 },
@@ -175,6 +183,14 @@ export const problems = [
     ...dpStates,
     ...dpAdvanced,
     ...patterns,
+    ...segmentTrees,
+    ...fenwick,
+    ...rangeQueries,
+    ...stringAlgorithms,
+    ...advancedStructures,
+    ...geometry,
+    ...numberTheory,
+    ...randomised,
 ];
 
 export const problemById = Object.fromEntries(problems.map((problem) => [problem.id, problem]));

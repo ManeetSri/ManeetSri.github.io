@@ -1,0 +1,328 @@
+## Why it matters
+
+Some questions don't need an exact answer, and giving up exactness buys enormous savings. "Is this username taken?" can be answered on the phone, before any network request, by a **Bloom filter**: about 1.2 KB for a thousand names, answering either "definitely not" or "probably". Databases such as LevelDB and RocksDB keep a Bloom filter for each file on disk, so a lookup for a missing key can skip reading the file at all. "Which hashtags are trending in this stream of millions?" can be answered by a **count-min sketch**: a small grid of counters that never forgets an item's count and never undercounts it, using the same memory for a billion distinct items as for a thousand. Both are **probabilistic structures**: their errors are one-sided, and you choose how big they're allowed to be.
+
+## A Bloom filter: bits and several hashes
+
+A Bloom filter is an array of **m bits**, all 0 at first, and **k hash functions**, each mapping an item to one of the m positions:
+
+- **Insert** an item: compute its k positions and set those bits to 1.
+- **Query** an item: compute its k positions. If **any** of them is 0, the item was **definitely never inserted**: inserting it would have set that bit. If all k are 1, it was **probably** inserted.
+
+The "probably" is because other items may have set those same bits between them. That's a **false positive**: the filter says "maybe" for something it never saw. There are **no false negatives**: an inserted item's bits stay 1 forever, so it's always found.
+
+It's like asking several people "have you seen this person?", where each one only remembers a single feature they saw (a red coat, a beard, a hat). If anyone says "nobody with that feature came by", you're sure. If all say yes, it was probably that person, or a few different people who happened to share those features.
+
+Two consequences follow from the design:
+
+- **You can't remove an item.** Clearing its bits might clear bits that other items also need, creating false negatives. (A **counting** Bloom filter keeps a small counter instead of each bit, so it can decrement, at several times the memory.)
+- **It never stores the items.** You can't list what's in it, and a Bloom filter of passwords or emails reveals little about them.
+
+### Hashes you can rely on
+
+The k positions must be the same every time for the same item: today, tomorrow, and on another device, if the filter is built on a server and downloaded by the app. That rules out Swift's `Hasher`: as you saw in [Hash functions](/dsa/learn/hash-functions), it's seeded randomly each time a program runs, so a filter built with `hashValue` is meaningless after a relaunch. You need a **fixed** hash function you write yourself.
+
+This lesson uses FNV-1a, a short, classic string hash, followed by a few bit-mixing steps (SplitMix64's finishing step) that spread every input bit across all 64 output bits. And rather than writing k different hash functions, it uses **double hashing**: compute two hashes h₁ and h₂ once, and take positions h₁, h₁ + h₂, h₁ + 2h₂, … modulo m. It's a well-studied shortcut that performs as well as k independent hashes.
+
+```swift run
+import Foundation
+
+// FNV-1a: a simple, fixed hash of a string's UTF-8 bytes. Same answer on every run and every device.
+func fnv1a(_ text: String) -> UInt64 {
+    var hash: UInt64 = 0xcbf2_9ce4_8422_2325
+    for byte in text.utf8 {
+        hash ^= UInt64(byte)
+        hash = hash &* 0x0000_0100_0000_01B3
+    }
+    return hash
+}
+
+// SplitMix64's finishing step: spreads every input bit across the whole output
+func mix(_ x: UInt64) -> UInt64 {
+    var z = x
+    z = (z ^ (z >> 30)) &* 0xBF58_476D_1CE4_E5B9
+    z = (z ^ (z >> 27)) &* 0x94D0_49BB_1331_11EB
+    return z ^ (z >> 31)
+}
+
+struct BloomFilter {
+    let bitCount: Int
+    let hashCount: Int
+    private var words: [UInt64]
+
+    init(bitCount: Int, hashCount: Int) {
+        self.bitCount = bitCount
+        self.hashCount = hashCount
+        words = Array(repeating: 0, count: (bitCount + 63) / 64)
+    }
+
+    // k bit positions from two hashes: h1, h1 + h2, h1 + 2·h2, … (double hashing)
+    private func positions(of item: String) -> [Int] {
+        let h1 = mix(fnv1a(item))
+        let h2 = mix(h1 ^ 0x9E37_79B9_7F4A_7C15) | 1      // odd, so never 0
+        return (0..<hashCount).map { Int((h1 &+ UInt64($0) &* h2) % UInt64(bitCount)) }
+    }
+
+    mutating func insert(_ item: String) {
+        for bit in positions(of: item) {
+            words[bit >> 6] |= 1 << (bit & 63)
+        }
+    }
+
+    // false means definitely absent; true means probably present
+    func mightContain(_ item: String) -> Bool {
+        positions(of: item).allSatisfy { words[$0 >> 6] & (1 << ($0 & 63)) != 0 }
+    }
+
+    var bitsSet: Int {
+        words.reduce(0) { $0 + $1.nonzeroBitCount }
+    }
+}
+
+var taken = BloomFilter(bitCount: 10_000, hashCount: 7)    // 1,250 bytes
+for i in 0..<1_000 {
+    taken.insert("user\(i)")
+}
+print("bits set:", taken.bitsSet, "of", taken.bitCount)
+print("user42:", taken.mightContain("user42"), " user999:", taken.mightContain("user999"))
+print("every inserted name found:", (0..<1_000).allSatisfy { taken.mightContain("user\($0)") })
+
+let falsePositives = (0..<10_000).filter { taken.mightContain("guest\($0)") }.count
+let predicted = pow(1 - exp(-7.0 * 1_000 / 10_000), 7)
+print("false positives:", falsePositives, "of 10000 =", String(format: "%.2f%%", Double(falsePositives) / 100))
+print("formula predicts:", String(format: "%.2f%%", predicted * 100))
+```
+
+```output
+bits set: 5052 of 10000
+user42: true  user999: true
+every inserted name found: true
+false positives: 84 of 10000 = 0.84%
+formula predicts: 0.82%
+```
+
+What to notice:
+
+- **Every inserted name is found.** No false negatives, ever.
+- **84 of 10,000 names never inserted were wrongly reported as "maybe"**: 0.84%, close to the 0.82% the formula below predicts.
+- **The bits are stored in `UInt64` words**, 64 to a word, with the word index `bit >> 6` and the bit `bit & 63` from [Gray code and UInt64 bitsets](/dsa/learn/bits-gray-code-bitsets). 10,000 bits fit in 157 words: 1,256 bytes, where a `Set<String>` of the same thousand names takes tens of kilobytes.
+- **About half the bits are set.** That's not an accident: it's what the best choice of k produces.
+
+### The false positive rate, with numbers
+
+Take this filter: m = 10,000 bits, k = 7 hashes, n = 1,000 items.
+
+1. One hash sets one particular bit with probability 1/m. After all kn = 7,000 bit-settings, a particular bit is **still 0** with probability (1 − 1/m)^(kn), which is very close to e^(−kn/m) = e^(−0.7) ≈ 0.497.
+2. So about half the bits, roughly 5,034, are 1. The filter above has 5,052.
+3. A name never inserted is a false positive if all 7 of its bits happen to be 1: about (1 − 0.497)⁷ = 0.503⁷ ≈ **0.0082**, or 0.82%.
+
+The general formula is p ≈ (1 − e^(−kn/m))^k. Two rules of thumb come out of it:
+
+| Target false positive rate | Bits per item (m/n) | Best k |
+| --- | --- | --- |
+| 1% | 9.6 | 7 |
+| 0.1% | 14.4 | 10 |
+
+The best k is (m/n) · ln 2, which is exactly the choice that leaves half the bits set. Each extra 4.8 bits per item divides the false positive rate by 10, and none of this depends on how long the items are: a filter of 1,000 URLs is the same size as a filter of 1,000 short names.
+
+Sizing assumes you know n. Keep inserting past it and the filter fills with 1s: at 2,000 names, this filter's rate rises to about 14%. Choose m for the most items you'll ever insert.
+
+## A count-min sketch: counting with collisions
+
+A Bloom filter answers "seen it?". A **count-min sketch** answers "**how many times**?" for a stream far too large to count exactly. It's a grid of counters with **d rows** of **w** counters each, and one hash function per row:
+
+- **Add** an item: in each row, hash the item to one column and add 1 to that counter.
+- **Estimate** an item's count: look at its counter in each row and take the **minimum**.
+
+Each counter holds the true count of every item hashed to it, added together. So each row's counter is **at least** the item's true count, too big by whatever else collided there. Taking the minimum over several rows, each with a different hash, picks the row where the item collided least. The estimate can be too high, but **never too low**.
+
+How much too high is controlled by the grid's size. With w = ⌈e/ε⌉ columns and d = ⌈ln(1/δ)⌉ rows, every estimate exceeds the true count by at most ε times the total number of items added, with probability at least 1 − δ. For w = 272 and d = 5, that's an overcount of at most **1% of the stream**, for each item, with probability about **99.3%**: 1,360 counters, whether the stream holds a thousand distinct items or a billion.
+
+```swift run
+struct SeededGenerator: RandomNumberGenerator {
+    var state: UInt64
+    mutating func next() -> UInt64 {
+        state &+= 0x9E37_79B9_7F4A_7C15
+        var z = state
+        z = (z ^ (z >> 30)) &* 0xBF58_476D_1CE4_E5B9
+        z = (z ^ (z >> 27)) &* 0x94D0_49BB_1331_11EB
+        return z ^ (z >> 31)
+    }
+}
+
+func fnv1a(_ text: String) -> UInt64 {
+    var hash: UInt64 = 0xcbf2_9ce4_8422_2325
+    for byte in text.utf8 {
+        hash ^= UInt64(byte)
+        hash = hash &* 0x0000_0100_0000_01B3
+    }
+    return hash
+}
+
+func mix(_ x: UInt64) -> UInt64 {
+    var z = x
+    z = (z ^ (z >> 30)) &* 0xBF58_476D_1CE4_E5B9
+    z = (z ^ (z >> 27)) &* 0x94D0_49BB_1331_11EB
+    return z ^ (z >> 31)
+}
+
+struct CountMinSketch {
+    let width: Int
+    let depth: Int
+    private var counters: [[Int]]                // depth rows of width counters
+    private(set) var total = 0
+
+    init(width: Int, depth: Int) {
+        self.width = width
+        self.depth = depth
+        counters = Array(repeating: Array(repeating: 0, count: width), count: depth)
+    }
+
+    // Each row has its own hash: the item's hash mixed with the row number
+    private func column(of item: String, row: Int) -> Int {
+        Int(mix(fnv1a(item) &+ UInt64(row)) % UInt64(width))
+    }
+
+    mutating func add(_ item: String) {
+        for row in 0..<depth {
+            counters[row][column(of: item, row: row)] += 1
+        }
+        total += 1
+    }
+
+    // Every row overcounts (other items share its counter), never undercounts: take the smallest
+    func estimate(_ item: String) -> Int {
+        (0..<depth).map { counters[$0][column(of: item, row: $0)] }.min()!
+    }
+}
+
+// A stream of 10,000 hashtags: a few popular ones, and a long tail seen once or twice
+var stream: [String] = []
+for (tag, count) in [("swift", 1_200), ("ios", 900), ("wwdc", 600), ("xcode", 300), ("swiftui", 150)] {
+    stream += Array(repeating: tag, count: count)
+}
+var generator = SeededGenerator(state: 8)
+while stream.count < 10_000 {
+    stream.append("tag\(generator.next() % 5_000)")
+}
+for i in stream.indices.reversed() {             // Fisher–Yates shuffle with the seeded generator
+    stream.swapAt(i, Int(generator.next() % UInt64(i + 1)))
+}
+
+var sketch = CountMinSketch(width: 272, depth: 5)
+var exact: [String: Int] = [:]                   // only for checking; a real stream can't afford it
+var trending: [String] = []                      // tags whose estimate reached 200, in order
+var reported: Set<String> = []
+for tag in stream {
+    sketch.add(tag)
+    exact[tag, default: 0] += 1
+    if sketch.estimate(tag) >= 200 && reported.insert(tag).inserted {
+        trending.append(tag)
+    }
+}
+for tag in ["swift", "xcode", "swiftui", "tag7", "tag4242"] {
+    print(tag, "exact:", exact[tag] ?? 0, "estimate:", sketch.estimate(tag))
+}
+let worst = exact.keys.map { sketch.estimate($0) - exact[$0]! }.max()!
+print("distinct tags:", exact.count, " largest overcount:", worst, " 1% of the stream:", sketch.total / 100)
+print("trending:", trending)
+```
+
+```output
+swift exact: 1200 estimate: 1224
+xcode exact: 300 estimate: 313
+swiftui exact: 150 estimate: 163
+tag7 exact: 2 estimate: 14
+tag4242 exact: 1 estimate: 23
+distinct tags: 3728  largest overcount: 30  1% of the stream: 100
+trending: ["swift", "ios", "wwdc", "xcode"]
+```
+
+What to notice:
+
+- **Every estimate is at least the exact count**, and the largest overcount among all 3,728 tags is 30, well inside the promised 1% of the stream (100).
+- **The error is absolute, not relative.** Overcounting by 13 barely matters for "xcode" at 300, but it makes "tag7", seen twice, look like 14. A count-min sketch is good at finding the **big** items and poor at telling small ones apart.
+- **The trending list is the heavy hitters**: each tag is reported the first time its estimate reaches 200. Because estimates never undercount, every tag that truly appears 200 times is guaranteed to be reported. A tag could also be reported early, or wrongly, if collisions pushed it over; with this grid, none was.
+- **`exact` is only there to check the sketch.** A dictionary of every tag grows with the number of distinct tags; the sketch stays at 1,360 counters.
+
+## Where these turn up
+
+- **Skipping work.** A database checks a file's Bloom filter before reading it from disk; a sync client checks a filter of known file hashes before uploading; an app checks a downloaded filter of taken usernames before asking the server.
+- **Caches.** Some high-performance caches use a count-min sketch to estimate how often every key has been requested, cached or not, and admit a new key only if it's more popular than the one it would evict: the LFU idea from [LFU cache](/dsa/learn/as-lfu), without storing a count for every key ever seen.
+- **Streams.** Counting page views per URL, requests per IP address for rate limiting, or words per document, when the set of distinct items is huge or unbounded. You'll meet more streaming algorithms in M67, starting with [Reservoir sampling](/dsa/learn/rand-reservoir).
+
+<Callout kind="gotcha" title="Swift gotcha: never build these on hashValue">
+`hashValue` and `Hasher` are seeded randomly per process, so the same string hashes differently every launch. A Bloom filter saved to disk, sent to a server, or merely compared between two runs of a test would be garbage. Write a fixed hash, such as FNV-1a plus a mixing step, and test it with known inputs and outputs.
+</Callout>
+
+<Callout kind="gotcha" title="Common mistakes">
+- **Removing from a plain Bloom filter.** Clearing an item's bits can clear bits other items rely on, so they'd be reported absent: a false negative, the one error a Bloom filter promises never to make.
+- **Overfilling.** The false positive rate depends on n. A filter sized for 1,000 items and given 10,000 says "maybe" to almost everything.
+- **Weak or related hashes.** If the k positions are correlated, items collide together and the real rate is far above the formula. Mix the hash bits well, and measure the rate on items you never inserted, as the example does.
+- **Averaging instead of taking the minimum.** Every count-min row overcounts, so the average is always worse than the minimum.
+</Callout>
+
+## Practice
+
+**Username Bloom filter** asks you to build the filter with the exact hash recipe above, so the tests can check your bits word for word, plus the false positive estimate and the best k for a given size. **Trending tags sketch** asks for a count-min sketch with given row hashes and a heavy-hitters report, checked against exact counts on a stream of 200,000 tags.
+
+```cards
+- id: bloom-no-false-negatives
+  front: "What errors can a Bloom filter make?"
+  back: "Only false positives: it can say \"maybe\" for an item never inserted. It never says \"no\" for an item that was inserted, because that item's bits are never cleared."
+- id: bloom-formula
+  front: "What is the false positive rate of a Bloom filter with m bits, k hashes and n items?"
+  back: "About (1 − e^(−kn/m))^k. With 10 bits per item and k = 7 it's under 1%; the best k is (m/n) · ln 2, which leaves half the bits set."
+- id: count-min-estimate
+  front: "How does a count-min sketch estimate an item's count, and in which direction can it be wrong?"
+  back: "Take the minimum of the item's counter in each row. Collisions only add, so the estimate is never too low, only too high."
+- id: bloom-hasher
+  front: "Why can't a Bloom filter use Swift's hashValue?"
+  back: "Hasher is seeded randomly per process, so positions change every launch. A filter must use a fixed hash, such as FNV-1a with a mixing step."
+```
+
+```quiz
+- id: q1
+  type: mcq
+  prompt: "A Bloom filter's query for \"anna\" finds that one of its 7 bits is 0. What do you know?"
+  options:
+    - "\"anna\" was probably inserted"
+    - "\"anna\" was definitely never inserted"
+    - "\"anna\" was inserted and then removed"
+    - "Nothing: Bloom filters can be wrong either way"
+  answer: 1
+  explain: "Inserting \"anna\" would have set all 7 of its bits, and bits are never cleared. One 0 proves it was never inserted."
+- id: q2
+  type: output
+  prompt: "What does this print? It's the fraction of bits still 0 after n insertions, and the resulting false positive rate."
+  code: |
+    import Foundation
+    let m = 8_000.0, n = 1_000.0, k = 4.0
+    let zero = exp(-k * n / m)
+    print(String(format: "%.3f %.4f", zero, pow(1 - zero, k)))
+  answer: "0.607 0.0240"
+  explain: "kn/m = 0.5, and e^(−0.5) ≈ 0.607 of the bits stay 0. A false positive needs all 4 bits set: (1 − 0.607)⁴ ≈ 0.393⁴ ≈ 0.024, or 2.4%. With 8 bits per item, the best k would be about 5.5."
+- id: q3
+  type: truefalse
+  prompt: "A count-min sketch can report a count lower than an item's true count."
+  answer: false
+  explain: "Each counter the item maps to includes all of its additions, plus other items' collisions. So every row's value, and therefore the minimum, is at least the true count."
+- id: q4
+  type: multi
+  prompt: "Which of these are true of a standard Bloom filter? Choose all that apply."
+  options:
+    - "Its size doesn't depend on how long the items are"
+    - "You can remove an item by clearing its bits"
+    - "You can list the items it contains"
+    - "Inserting more items than it was sized for raises its false positive rate"
+  answer: [0, 3]
+  explain: "It stores only bits, so item length doesn't matter, and it doesn't keep the items, so it can't list them. Clearing bits could create false negatives. More items set more bits, so more queries find all their bits set."
+- id: q5
+  type: trace
+  prompt: "A count-min sketch has 3 rows. An item's counters are 14 in row 0, 9 in row 1 and 11 in row 2. Write the estimate, then the most the true count could be."
+  answer: "9, 9"
+  explain: "The estimate is the minimum, 9. Every row's counter is at least the true count, so the true count is at most 9, and could be less if row 1 also had collisions."
+- id: q6
+  type: recall
+  prompt: "Why does a count-min sketch use several rows with different hashes instead of one long row?"
+  model: "In one row, an item that collides with a popular item gets a big overcount and there's nothing to compare it with. With several rows and independent hashes, it's unlikely to collide badly in all of them, and the minimum picks the row with the least collision. More rows shrink the probability of a large error; wider rows shrink the size of the typical error."

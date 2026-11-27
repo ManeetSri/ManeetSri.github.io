@@ -1,0 +1,376 @@
+## Why it matters
+
+A map app holds thousands of pins. Every time the user pans, it must find the pins inside the visible rectangle; when they tap "nearest café", it must find the closest one; and when they zoom out, it must merge crowded pins into bubbles marked "128". Checking every pin each time is O(n) per question, and maps ask many questions per second. **Spatial trees** answer them by cutting space into regions and skipping the regions that can't matter: a **k-d tree** splits by one coordinate at a time, and a **quadtree** splits a square into four. Games use the same trees to find which objects might collide, and image tools use quadtrees to describe large regions of one colour cheaply.
+
+## Why one coordinate isn't enough
+
+In one dimension, a sorted array answers "nearest value" with binary search. In two, sort the pins by x and binary search for the query's x: you've found the pins with a similar **x**, but the nearest pin might be far away in x and right next door in y. Sorting by one coordinate gives you a vertical strip, not a neighbourhood. You need a structure that narrows both coordinates.
+
+## k-d trees: take turns
+
+A **k-d tree** (k-dimensional tree; here k = 2) is a binary tree where each node holds one point and splits the remaining points by one coordinate, **alternating** by depth:
+
+- The root splits by **x**: points with smaller x go left, the rest go right.
+- Its children split by **y**, their children by x again, and so on.
+
+Each node therefore owns a rectangle of the plane, and its two children own the two halves of it. Build the tree by choosing the **median** point at each level (sort the points by the current coordinate and take the middle one), and each half has at most half the points: the tree is balanced, with depth about log₂ n.
+
+```text
+          (50, 40) split x           the plane:   |
+           /           \                          |  right: x ≥ 50
+   (20, 70) split y   (80, 20) split y    left:   |
+                                          x < 50  |
+```
+
+## Nearest neighbour with pruning
+
+To find the point nearest to a query q, start at the root:
+
+1. Compute the distance from q to this node's point, and keep it if it's the best so far.
+2. Go first into the child on **q's side** of the split: that's where the nearest point probably is.
+3. When that returns, consider the **other side**. Every point there is on the far side of the splitting line, so it's at least as far from q as the line is. If the gap between q and the line is **already larger than the best distance**, nothing over there can win: skip that whole subtree.
+
+Step 3 is the pruning, and it's what makes the search fast. The first descent usually finds a close point, and then most of the "other sides" on the way back are too far away to bother with.
+
+Distances are compared as **squared** distances, dx² + dy², all in integers. The point with the smallest squared distance also has the smallest distance, so there's no need for square roots or `Double` rounding.
+
+```swift run
+struct SeededGenerator: RandomNumberGenerator {
+    var state: UInt64
+    mutating func next() -> UInt64 {
+        state &+= 0x9E37_79B9_7F4A_7C15
+        var z = state
+        z = (z ^ (z >> 30)) &* 0xBF58_476D_1CE4_E5B9
+        z = (z ^ (z >> 27)) &* 0x94D0_49BB_1331_11EB
+        return z ^ (z >> 31)
+    }
+}
+
+struct Point {
+    let x: Int
+    let y: Int
+}
+
+func squaredDistance(_ a: Point, _ b: Point) -> Int {
+    (a.x - b.x) * (a.x - b.x) + (a.y - b.y) * (a.y - b.y)   // no square root needed to compare
+}
+
+final class KDNode {
+    let point: Point
+    let index: Int
+    let splitsOnX: Bool                         // true: left has smaller x; false: smaller y
+    var left: KDNode?
+    var right: KDNode?
+
+    init(point: Point, index: Int, splitsOnX: Bool) {
+        self.point = point
+        self.index = index
+        self.splitsOnX = splitsOnX
+    }
+}
+
+// Split at the median, alternating between x and y, so the tree is balanced
+func build(_ items: [(point: Point, index: Int)], depth: Int = 0) -> KDNode? {
+    guard !items.isEmpty else { return nil }
+    let onX = depth % 2 == 0
+    let sorted = items.sorted { onX ? $0.point.x < $1.point.x : $0.point.y < $1.point.y }
+    let middle = sorted.count / 2
+    let node = KDNode(point: sorted[middle].point, index: sorted[middle].index, splitsOnX: onX)
+    node.left = build(Array(sorted[..<middle]), depth: depth + 1)
+    node.right = build(Array(sorted[(middle + 1)...]), depth: depth + 1)
+    return node
+}
+
+var checked = 0                                 // distances computed, to measure the pruning
+
+func nearest(to query: Point, in node: KDNode?, best: inout (index: Int, distance: Int)) {
+    guard let node else { return }
+    checked += 1
+    let distance = squaredDistance(node.point, query)
+    if distance < best.distance { best = (node.index, distance) }
+    let gap = node.splitsOnX ? query.x - node.point.x : query.y - node.point.y
+    let (near, far) = gap < 0 ? (node.left, node.right) : (node.right, node.left)
+    nearest(to: query, in: near, best: &best)           // the side the query is on, first
+    if gap * gap < best.distance {                      // could the other side hold anything closer?
+        nearest(to: query, in: far, best: &best)
+    }
+}
+
+var generator = SeededGenerator(state: 5)
+let pins = (0..<2_000).map { _ in Point(x: Int(generator.next() % 10_000), y: Int(generator.next() % 10_000)) }
+let root = build(pins.enumerated().map { ($0.element, $0.offset) })
+
+func bruteForce(_ query: Point) -> Int {
+    pins.indices.min { squaredDistance(pins[$0], query) < squaredDistance(pins[$1], query) }!
+}
+
+for query in [Point(x: 5_000, y: 5_000), Point(x: 0, y: 0), Point(x: 9_999, y: 123)] {
+    var best = (index: -1, distance: Int.max)
+    checked = 0
+    nearest(to: query, in: root, best: &best)
+    print("(\(query.x), \(query.y)) → pin \(best.index), distance² \(best.distance),",
+          "\(checked) distances, brute force agrees: \(best.index == bruteForce(query))")
+}
+
+checked = 0
+for _ in 0..<1_000 {
+    let query = Point(x: Int(generator.next() % 10_000), y: Int(generator.next() % 10_000))
+    var best = (index: -1, distance: Int.max)
+    nearest(to: query, in: root, best: &best)
+}
+print("average distances per query:", checked / 1_000, "of", pins.count)
+```
+
+```output
+(5000, 5000) → pin 1502, distance² 25092, 23 distances, brute force agrees: true
+(0, 0) → pin 1986, distance² 26725, 12 distances, brute force agrees: true
+(9999, 123) → pin 233, distance² 3770, 12 distances, brute force agrees: true
+average distances per query: 16 of 2000
+```
+
+What to notice:
+
+- **16 distances instead of 2,000** on average. The tree has about 11 levels, so the first descent costs 11, and pruning cuts nearly every detour on the way back.
+- **The corner queries are cheapest.** Near (0, 0), most splitting lines are far from the query, so their other sides are skipped at once.
+- **`gap * gap < best.distance`** compares squared numbers on both sides, so it never needs a square root either.
+- **The brute force agrees**, which is how to test any spatial structure: compare it with the O(n) scan on many random queries.
+
+### How fast, and when it struggles
+
+Building with a sort at every level costs O(n log² n), or O(n log n) if you find each median with [Quickselect](/dsa/learn/sort-quickselect) instead. A nearest-neighbour query is close to O(log n) for ordinary data, but there's no good worst-case guarantee: put the points on a circle and the query at its centre, and every point is nearly the best, so little can be pruned.
+
+Two more limits are worth knowing:
+
+- **k-d trees prefer to be built once.** Inserting points one by one, like a plain BST, can unbalance them, and there are no rotations that respect the alternating splits. Apps rebuild the tree when the data changes a lot.
+- **High dimensions defeat them.** In 2 or 3 dimensions the pruning is excellent. In 100 dimensions, as with the vectors used for "similar photos" or text search, almost every splitting plane is closer than the nearest point, nothing is pruned, and approximate methods take over.
+
+## Quadtrees: split the space, not the points
+
+A **quadtree** divides **space** instead of the set of points. Each node owns a square region and holds up to some small number of points, say 4. When a fifth arrives, the node **splits** into four equal quadrants, hands its points down to them, and keeps only the total count.
+
+The result adapts to the data: a dense city ends up deep and finely divided, and empty countryside stays as a few big leaves. That makes quadtrees natural for **dynamic** data, such as pins added as you scroll, and for **region** questions, such as "what's in this rectangle?" or "how many pins are in each part of the map?":
+
+```swift run
+struct SeededGenerator: RandomNumberGenerator {
+    var state: UInt64
+    mutating func next() -> UInt64 {
+        state &+= 0x9E37_79B9_7F4A_7C15
+        var z = state
+        z = (z ^ (z >> 30)) &* 0xBF58_476D_1CE4_E5B9
+        z = (z ^ (z >> 27)) &* 0x94D0_49BB_1331_11EB
+        return z ^ (z >> 31)
+    }
+}
+
+struct Point {
+    let x: Int
+    let y: Int
+}
+
+// A half-open rectangle: minX ≤ x < maxX and minY ≤ y < maxY
+struct Rect {
+    let minX: Int, minY: Int, maxX: Int, maxY: Int
+
+    func contains(_ p: Point) -> Bool {
+        minX <= p.x && p.x < maxX && minY <= p.y && p.y < maxY
+    }
+
+    func contains(_ other: Rect) -> Bool {
+        minX <= other.minX && other.maxX <= maxX && minY <= other.minY && other.maxY <= maxY
+    }
+
+    func intersects(_ other: Rect) -> Bool {
+        minX < other.maxX && other.minX < maxX && minY < other.maxY && other.minY < maxY
+    }
+}
+
+final class QuadTree {
+    let bounds: Rect
+    let capacity = 4
+    private(set) var count = 0                  // points anywhere in this region
+    private var points: [Point] = []            // only a leaf holds points
+    private var children: [QuadTree] = []       // empty, or four quadrants
+
+    init(_ bounds: Rect) {
+        self.bounds = bounds
+    }
+
+    @discardableResult
+    func insert(_ p: Point) -> Bool {
+        guard bounds.contains(p) else { return false }
+        count += 1
+        if children.isEmpty {
+            if points.count < capacity || bounds.maxX - bounds.minX <= 1 {
+                points.append(p)                // room here, or too small to split
+                return true
+            }
+            split()
+        }
+        return children.contains { $0.insert(p) }
+    }
+
+    private func split() {
+        let midX = (bounds.minX + bounds.maxX) / 2
+        let midY = (bounds.minY + bounds.maxY) / 2
+        children = [
+            QuadTree(Rect(minX: bounds.minX, minY: bounds.minY, maxX: midX, maxY: midY)),
+            QuadTree(Rect(minX: midX, minY: bounds.minY, maxX: bounds.maxX, maxY: midY)),
+            QuadTree(Rect(minX: bounds.minX, minY: midY, maxX: midX, maxY: bounds.maxY)),
+            QuadTree(Rect(minX: midX, minY: midY, maxX: bounds.maxX, maxY: bounds.maxY)),
+        ]
+        for p in points {
+            _ = children.contains { $0.insert(p) }
+        }
+        points = []
+    }
+
+    // How many points lie in area, and how many regions the search opened
+    func count(in area: Rect, visited: inout Int) -> Int {
+        guard bounds.intersects(area) else { return 0 }     // no overlap: skip the region
+        visited += 1
+        if area.contains(bounds) { return count }           // wholly inside: no need to look
+        if children.isEmpty {
+            return points.filter { area.contains($0) }.count
+        }
+        return children.reduce(0) { $0 + $1.count(in: area, visited: &visited) }
+    }
+
+    // One cluster per region at the given depth: its centre and how many points it holds
+    func clusters(depth: Int) -> [(x: Int, y: Int, count: Int)] {
+        if count == 0 { return [] }
+        if depth == 0 || children.isEmpty {
+            return [((bounds.minX + bounds.maxX) / 2, (bounds.minY + bounds.maxY) / 2, count)]
+        }
+        return children.flatMap { $0.clusters(depth: depth - 1) }
+    }
+}
+
+// 3,000 map pins: two dense cities and some countryside, on a 1,024 × 1,024 map
+var generator = SeededGenerator(state: 11)
+let map = QuadTree(Rect(minX: 0, minY: 0, maxX: 1_024, maxY: 1_024))
+for i in 0..<3_000 {
+    let (cx, cy, spread) = i % 3 == 0 ? (512, 512, 1_024) : i % 3 == 1 ? (200, 260, 80) : (800, 700, 120)
+    let x = cx + Int(generator.next() % UInt64(spread)) - spread / 2
+    let y = cy + Int(generator.next() % UInt64(spread)) - spread / 2
+    map.insert(Point(x: x, y: y))
+}
+print("pins on the map:", map.count)
+
+var visited = 0
+for screen in [Rect(minX: 150, minY: 200, maxX: 300, maxY: 330), Rect(minX: 0, minY: 900, maxX: 120, maxY: 1_024)] {
+    visited = 0
+    print("pins on screen:", map.count(in: screen, visited: &visited), "after opening", visited, "regions")
+}
+
+for depth in [1, 2] {
+    let bubbles = map.clusters(depth: depth).filter { $0.count >= 100 }
+    print("zoom depth \(depth): \(bubbles.map { "\($0.count) near (\($0.x), \($0.y))" })")
+}
+```
+
+```output
+pins on the map: 3000
+pins on screen: 1017 after opening 47 regions
+pins on screen: 10 after opening 8 regions
+zoom depth 1: ["1229 near (256, 256)", "274 near (768, 256)", "252 near (256, 768)", "1245 near (768, 768)"]
+zoom depth 2: ["509 near (128, 128)", "593 near (128, 384)", "283 near (640, 640)", "841 near (896, 640)"]
+```
+
+What to notice:
+
+- **Counting 1,017 pins opened only 47 regions.** The screen covers most of the first city, and every region lying **wholly inside** the screen answers with its stored `count` without being opened. Only regions straddling the screen's edge need a closer look.
+- **The countryside query opened 8 regions** and found 10 pins: big, sparse leaves.
+- **`clusters(depth:)` is map clustering.** Zoomed out (depth 1), the map shows four bubbles; one level in, the two cities each split into a couple of bubbles and the sparse quadrants drop below the cut-off of 100. Each bubble's count is already stored in its node, so clustering costs nothing extra.
+- **Points on a dividing line** belong to exactly one quadrant, because every rectangle is half-open. Closed rectangles would put a point on the line into two quadrants.
+- **The size guard** in `insert` stops a region of width 1 from splitting forever when more than 4 pins share one spot.
+
+### Quadtrees in iOS
+
+- **Map tiles.** Web and MapKit tile overlays address tiles by zoom level and (x, y): each tile at zoom z splits into four at zoom z + 1. That tiling is a quadtree, which is why zooming in loads exactly four new tiles per old one.
+- **Clustering.** MapKit can cluster annotation views for you when they share a clustering identifier. A quadtree is how you'd build clustering yourself: on a server, in a custom map, or with your own rules for where a bubble goes.
+- **Image regions.** An image quadtree splits a square of pixels until each region is one colour (or close to it). A large plain sky becomes a few big leaves, which is the idea behind some compression schemes and fast "which region was tapped?" lookups.
+
+## k-d tree or quadtree?
+
+| | k-d tree | Quadtree |
+| --- | --- | --- |
+| Splits | the points, at the median | the space, into four equal squares |
+| Balance | balanced when built from the medians | follows the data: deep where it's dense |
+| Inserts and deletes | awkward; rebuild | natural |
+| Best at | nearest neighbour on a fixed set | region counts, viewports, clustering |
+| Dimensions | any k (but weak when k is large) | 2 (an octree splits 3D space into eight) |
+
+Both are tools for 2D geometry, which M65 develops properly, starting with [Points and vector maths in Swift](/dsa/learn/geo-points-vectors). For the closest **pair** among all the points, rather than the nearest to a query, the divide-and-conquer algorithm from [Closest pair of points](/dsa/learn/dc-closest-pair) is the classic answer.
+
+<Callout kind="gotcha" title="Swift gotcha: squared distances can overflow">
+With `Int` coordinates up to a million, a squared distance is at most about 8 × 10¹², far inside `Int`'s range. With coordinates near `Int.max`, `dx * dx` traps with an overflow. Keep coordinates to a known range (map points in metres or pixels are fine), or compare distances as `Double` and accept the rounding.
+</Callout>
+
+<Callout kind="gotcha" title="Ties and the pruning test">
+`gap * gap < best.distance` skips the far side when it can only **tie** the best distance. That's correct for finding *a* nearest point, but if ties must go to, say, the smallest index, a tying point on the far side could be the one you need. Then use `<=`, and compare (distance, index) pairs when choosing the best.
+</Callout>
+
+## Practice
+
+**Nearest map pin** gives you up to 50,000 pins and 50,000 queries, and asks for the index of the nearest pin to each query, with ties going to the smallest index. A brute-force scan is 2.5 billion distance calculations; a k-d tree with careful pruning, ties included, does it in a moment. The tests check your answers against brute force on smaller random inputs, including many duplicate and collinear pins.
+
+```cards
+- id: kd-tree-split
+  front: "How does a 2D k-d tree split the points?"
+  back: "Each node splits by one coordinate, alternating x and y by depth. Choosing the median at each level makes the tree balanced, with depth about log₂ n."
+- id: kd-tree-prune
+  front: "When can a k-d tree nearest-neighbour search skip the far side of a node?"
+  back: "When the squared gap between the query and the node's splitting line is at least the best squared distance found so far: every point over there is at least that far away."
+- id: quadtree-split
+  front: "When does a quadtree node split, and into what?"
+  back: "When it holds more points than its capacity. It divides its square into four equal quadrants and moves its points into them."
+- id: quadtree-count
+  front: "How does a quadtree count the points in a rectangle quickly?"
+  back: "Skip regions that don't intersect the rectangle, return the stored count of regions wholly inside it, and only look at individual points in leaves that straddle its edge."
+```
+
+```quiz
+- id: q1
+  type: mcq
+  prompt: "A k-d tree search for the point nearest to (40, 10) is at a node that splits on x at x = 50. The best squared distance so far is 64. What happens with the node's right subtree, where x ≥ 50?"
+  options:
+    - "It must be searched: it might hold the answer"
+    - "It's skipped: every point there is at least 10 away in x, and 10² = 100 is more than 64"
+    - "It's skipped because the query is on the left"
+    - "The search stops completely"
+  answer: 1
+  explain: "The gap to the splitting line is 50 − 40 = 10, so any point on the right is at least 10 away, a squared distance of at least 100. The best so far is 64, so nothing there can win."
+- id: q2
+  type: output
+  prompt: "What does this print?"
+  code: |
+    let points = [(3, 4), (-2, 1), (5, -1), (0, 6)]
+    let query = (1, 2)
+    let squared = points.map { ($0.0 - query.0) * ($0.0 - query.0) + ($0.1 - query.1) * ($0.1 - query.1) }
+    print(squared, squared.firstIndex(of: squared.min()!)!)
+  answer: "[8, 10, 25, 17] 0"
+  explain: "(3, 4) is 2 across and 2 up: 4 + 4 = 8. (−2, 1): 9 + 1 = 10. (5, −1): 16 + 9 = 25. (0, 6): 1 + 16 = 17. The smallest is 8, at index 0. No square roots are needed to compare."
+- id: q3
+  type: truefalse
+  prompt: "A quadtree region that lies entirely inside the query rectangle must still be opened to count its points."
+  answer: false
+  explain: "Each node stores how many points its region holds, so a region wholly inside the rectangle contributes its count directly. Only regions crossing the rectangle's edge are opened."
+- id: q4
+  type: match
+  prompt: "Match each structure or idea to what it's best at."
+  pairs:
+    - ["k-d tree", "Nearest neighbour on a fixed set of points"]
+    - ["Quadtree", "Viewport counts and clustering as points are added"]
+    - ["Squared distances", "Comparing distances without square roots"]
+    - ["Map tiles by zoom level", "A quadtree of square regions"]
+  explain: "k-d trees split points at medians and prune well for nearest-neighbour queries; quadtrees split space and store counts per region. Squared distances keep the arithmetic in integers, and each map tile divides into four at the next zoom level."
+- id: q5
+  type: bigo
+  prompt: "Building a k-d tree by sorting the points by the current coordinate at every level costs what, for n points?"
+  options: ["O(n)", "O(n log n)", "O(n log² n)", "O(n²)"]
+  answer: "O(n log² n)"
+  explain: "Each of the log n levels sorts all n points in total, O(n log n) per level. Finding medians with quickselect instead brings it down to O(n log n)."
+- id: q6
+  type: recall
+  prompt: "Why does a quadtree need a minimum region size, or some other guard, when splitting?"
+  model: "If more points than the capacity share exactly the same position, splitting never separates them: they all land in the same quadrant every time, so the node would split forever. A guard such as 'don't split regions of width 1' lets that leaf hold the extra points."

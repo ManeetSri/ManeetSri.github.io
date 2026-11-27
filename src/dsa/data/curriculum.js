@@ -946,7 +946,7 @@ const rawModules = [
 
     // Part VIII: Advanced structures & algorithms ───────────────────────────────────────────
     {
-        id: 'segment-trees', code: 'M60', part: 8, title: 'Segment trees', level: 'expert', tracks: ['cp'], requires: ['patterns'],
+        id: 'segment-trees', code: 'M60', part: 8, title: 'Segment trees', level: 'expert', tracks: ['cp'], requires: ['patterns'], status: 'ready',
         summary: 'Range queries with updates, generic segment trees and lazy propagation.',
         lessons: [
             ['seg-range-queries', 'The range query problem', { minutes: 15 }],
@@ -959,7 +959,7 @@ const rawModules = [
         ],
     },
     {
-        id: 'fenwick', code: 'M61', part: 8, title: 'Fenwick trees (BIT)', level: 'expert', tracks: ['cp'], requires: ['segment-trees'],
+        id: 'fenwick', code: 'M61', part: 8, title: 'Fenwick trees (BIT)', level: 'expert', tracks: ['cp'], requires: ['segment-trees'], status: 'ready',
         summary: 'Prefix sums with updates in a few lines of code.',
         lessons: [
             ['bit-lowbit', 'The lowest set bit, i & -i', { minutes: 15 }],
@@ -971,7 +971,7 @@ const rawModules = [
         ],
     },
     {
-        id: 'range-queries', code: 'M62', part: 8, title: 'Range query techniques', level: 'expert', tracks: ['cp'], requires: ['fenwick'],
+        id: 'range-queries', code: 'M62', part: 8, title: 'Range query techniques', level: 'expert', tracks: ['cp'], requires: ['fenwick'], status: 'ready',
         summary: 'Sparse tables, sqrt decomposition, Mo\'s algorithm and offline processing.',
         lessons: [
             ['rq-sparse-table', 'Sparse tables and O(1) RMQ', { minutes: 30 }],
@@ -982,7 +982,7 @@ const rawModules = [
         ],
     },
     {
-        id: 'string-algorithms', code: 'M63', part: 8, title: 'Advanced string algorithms', level: 'expert', tracks: ['cp'], requires: ['range-queries'],
+        id: 'string-algorithms', code: 'M63', part: 8, title: 'Advanced string algorithms', level: 'expert', tracks: ['cp'], requires: ['range-queries'], status: 'ready',
         summary: 'Linear-time matching, hashing, palindromes and suffix structures.',
         lessons: [
             ['sa-kmp', 'KMP and the prefix function', { minutes: 40, tracks: ['cp', 'interview'] }],
@@ -997,24 +997,24 @@ const rawModules = [
         ],
     },
     {
-        id: 'advanced-structures', code: 'M64', part: 8, title: 'More advanced structures', level: 'expert', tracks: ['deep'], requires: ['string-algorithms'],
+        id: 'advanced-structures', code: 'M64', part: 8, title: 'More advanced structures', level: 'expert', tracks: ['deep'], requires: ['string-algorithms'], status: 'ready',
         summary: 'Skip lists, spatial trees, probabilistic structures and persistent data.',
         lessons: [
             ['as-skip-list', 'Skip lists', { minutes: 35 }],
-            ['as-lfu', 'LFU cache', { tracks: ['interview', 'ios'] }],
-            ['as-interval-tree', 'Interval trees'],
-            ['as-kd-quadtree', 'k-d trees and quadtrees', { tracks: ['deep', 'ios'] }],
-            ['as-rope', 'Ropes for text editors'],
-            ['as-bloom-sketch', 'Bloom filters and count-min sketches'],
-            ['as-hyperloglog', 'HyperLogLog'],
-            ['as-consistent-hashing', 'Consistent hashing'],
-            ['as-persistent', 'Persistent and immutable structures'],
-            ['as-sparse-bitset', 'Sparse matrices and bitsets'],
-            ['as-swift-collections', 'TreeSet, TreeDictionary, OrderedSet and OrderedDictionary', { tracks: ['deep', 'ios'] }],
+            ['as-lfu', 'LFU cache', { minutes: 25, tracks: ['interview', 'ios'] }],
+            ['as-interval-tree', 'Interval trees', { minutes: 25 }],
+            ['as-kd-quadtree', 'k-d trees and quadtrees', { minutes: 25, tracks: ['deep', 'ios'] }],
+            ['as-rope', 'Ropes for text editors', { minutes: 25 }],
+            ['as-bloom-sketch', 'Bloom filters and count-min sketches', { minutes: 25 }],
+            ['as-hyperloglog', 'HyperLogLog', { minutes: 25 }],
+            ['as-consistent-hashing', 'Consistent hashing', { minutes: 25 }],
+            ['as-persistent', 'Persistent and immutable structures', { minutes: 25 }],
+            ['as-sparse-bitset', 'Sparse matrices and bitsets', { minutes: 25 }],
+            ['as-swift-collections', 'TreeSet, TreeDictionary, OrderedSet and OrderedDictionary', { minutes: 25, tracks: ['deep', 'ios'] }],
         ],
     },
     {
-        id: 'geometry', code: 'M65', part: 8, title: 'Computational geometry', level: 'expert', tracks: ['cp'], requires: ['advanced-structures'],
+        id: 'geometry', code: 'M65', part: 8, title: 'Computational geometry', level: 'expert', tracks: ['cp'], requires: ['advanced-structures'], status: 'ready',
         summary: 'Points, vectors, orientation, hulls and sweeps.',
         lessons: [
             ['geo-points-vectors', 'Points and vector maths in Swift'],
@@ -1028,7 +1028,7 @@ const rawModules = [
         ],
     },
     {
-        id: 'number-theory', code: 'M66', part: 8, title: 'Number theory and combinatorics', level: 'expert', tracks: ['cp'], requires: ['geometry'],
+        id: 'number-theory', code: 'M66', part: 8, title: 'Number theory and combinatorics', level: 'expert', tracks: ['cp'], requires: ['geometry'], status: 'ready',
         summary: 'Modular inverses, CRT, sieves, primality tests, counting, matrix power, game theory and FFT.',
         lessons: [
             ['nt-extended-euclid', 'Extended Euclid and modular inverse', { minutes: 30 }],
@@ -1044,7 +1044,7 @@ const rawModules = [
         ],
     },
     {
-        id: 'randomised', code: 'M67', part: 8, title: 'Randomised and streaming algorithms', level: 'advanced', tracks: ['deep'], requires: ['number-theory'],
+        id: 'randomised', code: 'M67', part: 8, title: 'Randomised and streaming algorithms', level: 'advanced', tracks: ['deep'], requires: ['number-theory'], status: 'ready',
         summary: 'Shuffling, sampling, randomised selection and algorithms over streams.',
         lessons: [
             ['rand-shuffle', 'Fisher–Yates and shuffle()', { tracks: ['core'] }],
