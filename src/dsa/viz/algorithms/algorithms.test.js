@@ -180,7 +180,7 @@ test('trie shares prefixes and completes them', () => {
     assert.match(trieFrames({ words: ['dog'], prefix: 'ca' }).at(-1).message, /no word starts with "ca"/);
 });
 
-import { graphFrames, gridFrames, GRAPHS } from './graphs.js';
+import { astarFrames, graphFrames, gridFrames, GRAPHS } from './graphs.js';
 
 test('graph programs', () => {
     assert.match(graphFrames('bfs').frames.at(-1).message, /A, B, C, D, E, F/);
@@ -467,4 +467,24 @@ test('Floyd–Warshall rounds match the shortest-paths lesson', async () => {
         .filter((frame) => frame.line === 5).map((frame) => frame.table);
     assert.deepEqual(rounds.at(0), [[0, 3, 8, '∞'], ['∞', 0, 2, '∞'], ['∞', '∞', 0, 1], [4, 7, 12, 0]]);
     assert.deepEqual(rounds.at(-1), [[0, 3, 5, 6], [7, 0, 2, 3], [5, 8, 0, 1], [4, 7, 9, 0]]);
+});
+
+test('A* on a grid matches the lesson: same cost as Dijkstra, fewer cells expanded', () => {
+    const astar = astarFrames().at(-1);
+    const dijkstra = astarFrames({ algorithm: 'dijkstra' }).at(-1);
+    assert.equal(astar.g[4][11], 21);
+    assert.equal(dijkstra.g[4][11], 21);
+    assert.equal(astar.count, 48);
+    assert.equal(dijkstra.count, 63);
+    assert.equal(astar.path.length, 22);
+    assert.match(astarFrames({ rows: ['S#G'] }).at(-1).message, /no path/);
+});
+
+test('KMP programs build π and find overlapping matches', () => {
+    assert.deepEqual(arrayFrames('prefixFunction').at(-1).rows[1].values, [0, 0, 1, 0, 1, 2, 3, 2]);
+    assert.deepEqual(arrayFrames('prefixFunction', { pattern: 'aabaaab' }).at(-1).rows[1].values, [0, 1, 0, 1, 2, 2, 3]);
+    assert.deepEqual(arrayFrames('kmpSearch').at(-1).list.items, ['4']);
+    assert.deepEqual(arrayFrames('kmpSearch', { text: 'aaaa', pattern: 'aa' }).at(-1).list.items, ['0', '1', '2']);
+    assert.deepEqual(arrayFrames('kmpSearch', { text: 'abracadabra', pattern: 'abra' }).at(-1).list.items, ['0', '7']);
+    assert.match(arrayFrames('kmpSearch', { text: 'abc', pattern: 'xyz' }).at(-1).message, /No match/);
 });

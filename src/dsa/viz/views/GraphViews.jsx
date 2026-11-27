@@ -1,6 +1,6 @@
 import { useId, useMemo } from 'react';
 import Player from '../Player.jsx';
-import { edgeKey, graphFrames, graphProgram, GRID_CODE, gridFrames } from '../algorithms/graphs.js';
+import { ASTAR_CODE, astarFrames, edgeKey, graphFrames, graphProgram, GRID_CODE, gridFrames } from '../algorithms/graphs.js';
 
 const WIDTH = 560;
 const HEIGHT = 250;
@@ -97,7 +97,46 @@ export const GraphView = ({ program = 'bfs', graph, start, end }) => {
 };
 
 // ```visual grid with { rows: ["S..#", ".#..", "...G"] } where S is the start, G the goal and # a wall
-export const GridView = ({ rows }) => {
+// A* (or Dijkstra, with h = 0) on a grid: each reached cell shows g and h in its top corners and f = g + h in the middle
+const HeapSearchGrid = ({ rows, algorithm }) => {
+    const stableRows = useStable(rows);
+    const frames = useMemo(() => astarFrames({ ...(stableRows ? { rows: stableRows } : {}), algorithm }), [stableRows, algorithm]);
+    const isAStar = algorithm === 'astar';
+    return (
+        <Player frames={frames} code={ASTAR_CODE[algorithm]} title={isAStar ? 'A* on a grid: f = g + h' : 'Dijkstra on a grid: A* with h = 0'}>
+            {(frame) => (
+                <div className="overflow-x-auto">
+                    <div className="inline-grid gap-1" style={{ gridTemplateColumns: `repeat(${frame.grid[0].length}, 2.75rem)` }} role="img" aria-label={isAStar ? 'Grid; each reached cell shows g, h and f' : 'Grid; numbers are distances from S'}>
+                        {frame.grid.flatMap((row, r) => row.map((cell, c) => {
+                            const key = `${r},${c}`;
+                            const g = frame.g[r][c];
+                            const isCurrent = frame.current && frame.current[0] === r && frame.current[1] === c;
+                            const queued = frame.open.some((entry) => entry.key === key);
+                            const tone = cell === '#' ? 'bg-white/25 border-transparent'
+                                : isCurrent ? 'border-amber bg-amber/25 text-amber'
+                                    : frame.path.includes(key) ? 'border-[#30D158] bg-[#30D158]/25 text-[#30D158]'
+                                        : frame.expanded[r][c] ? 'border-[#30D158]/40 bg-[#30D158]/[0.07]'
+                                            : queued ? 'border-sky-400 bg-sky-400/15 text-sky-300' : 'border-line text-muted';
+                            return (
+                                <span key={key} className={`relative flex h-11 w-11 items-center justify-center rounded-md border font-mono text-xs ${tone}`}>
+                                    {isAStar && g !== null && cell !== '#' && (
+                                        <span className="absolute inset-x-1 top-0.5 flex justify-between text-[9px] leading-none opacity-75"><span>{g}</span><span>{frame.h[r][c]}</span></span>
+                                    )}
+                                    <span className={isAStar ? 'mt-2' : ''}>{cell === 'S' || cell === 'G' ? (g === null || !isAStar ? cell : `${cell}${g + frame.h[r][c]}`) : cell === '#' || g === null ? '' : g + frame.h[r][c]}</span>
+                                </span>
+                            );
+                        }))}
+                    </div>
+                    {isAStar && <p className="mt-2 font-mono text-[11px] text-muted">top left g · top right h · middle f = g + h</p>}
+                    <p className="mt-2 font-mono text-xs text-muted">heap, smallest {isAStar ? 'f' : 'g'} first: <span className="text-sky-300">{frame.open.slice(0, 8).map((entry) => `${entry.key} ${isAStar ? 'f' : 'g'}${entry.f}`).join('  ') || '—'}{frame.open.length > 8 ? `  +${frame.open.length - 8} more` : ''}</span></p>
+                    <p className="mt-1 font-mono text-xs text-muted">expanded: <span className="text-[#30D158]">{frame.count}</span></p>
+                </div>
+            )}
+        </Player>
+    );
+};
+
+const BfsGrid = ({ rows }) => {
     const stableRows = useStable(rows);
     const frames = useMemo(() => gridFrames(stableRows ? { rows: stableRows } : {}), [stableRows]);
     return (
@@ -129,3 +168,6 @@ export const GridView = ({ rows }) => {
         </Player>
     );
 };
+
+// `algorithm`: 'bfs' (the default), 'astar', or 'dijkstra'
+export const GridView = ({ rows, algorithm = 'bfs' }) => (algorithm === 'bfs' ? <BfsGrid rows={rows} /> : <HeapSearchGrid rows={rows} algorithm={algorithm} />);

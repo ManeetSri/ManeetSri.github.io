@@ -828,6 +828,142 @@ PROGRAMS.prefixSum.run = function* run({ items, query: [from, to] }) {
     };
 };
 
+// KMP's prefix function, matching the sa-kmp lesson: k is the length of the border being extended
+const prefixTable = (chars) => {
+    const pi = chars.map(() => 0);
+    let k = 0;
+    for (let i = 1; i < chars.length; i += 1) {
+        while (k > 0 && chars[i] !== chars[k]) k = pi[k - 1];
+        if (chars[i] === chars[k]) k += 1;
+        pi[i] = k;
+    }
+    return pi;
+};
+
+PROGRAMS.prefixFunction = {
+    title: 'Building KMP’s prefix function',
+    defaults: { pattern: 'abacabab' },
+    code: `func prefixFunction(_ s: [Character]) -> [Int] {
+    var pi = [Int](repeating: 0, count: s.count)
+    var k = 0                          // length of the border being extended
+    for i in s.indices.dropFirst() {
+        while k > 0 && s[i] != s[k] {
+            k = pi[k - 1]              // fall back to the next shorter border
+        }
+        if s[i] == s[k] {
+            k += 1                     // the border grows by one character
+        }
+        pi[i] = k
+    }
+    return pi
+}`,
+    * run({ pattern }) {
+        const chars = [...pattern];
+        const pi = chars.map((_, index) => (index === 0 ? 0 : null));
+        let k = 0;
+        const quote = (from, to) => `“${chars.slice(from, to).join('')}”`;
+        const frame = (line, message, i, marks = {}, piMarks = {}) => ({
+            rows: [
+                row('s', chars, { pointers: i === undefined ? {} : { i, k }, range: k > 0 ? { from: 0, to: k - 1, tone: 'kept' } : null, marks }),
+                row('π', pi, { pointers: i === undefined ? {} : { i }, marks: piMarks }),
+            ],
+            vars: { k, border: k ? quote(0, k) : '“”' },
+            line,
+            message,
+        });
+        yield frame(3, `π[0] = 0: one character has no proper border. k, the length of the border being extended, starts at 0.`);
+        for (let i = 1; i < chars.length; i += 1) {
+            while (k > 0 && chars[i] !== chars[k]) {
+                const longer = k;
+                k = pi[k - 1];
+                yield frame(6, `s[${i}] = ${chars[i]} ≠ s[${longer}] = ${chars[longer]}, so the border ${quote(0, longer)} can’t grow. A border of a border is a border: fall back to π[${longer - 1}] = ${k}${k ? `, the border ${quote(0, k)}` : ''}.`, i, { [i]: 'out' }, { [longer - 1]: 'swap' });
+            }
+            if (chars[i] === chars[k]) {
+                k += 1;
+                pi[i] = k;
+                yield frame(11, `s[${i}] = s[${k - 1}] = ${chars[i]}: the border grows to ${quote(0, k)}, so π[${i}] = ${k}.`, i, { [i]: 'found', [k - 1]: 'found' }, { [i]: 'found' });
+            } else {
+                pi[i] = 0;
+                yield frame(11, `s[${i}] = ${chars[i]} ≠ s[0] = ${chars[0]}: no border ends here, so π[${i}] = 0.`, i, { [i]: 'out' }, { [i]: 'out' });
+            }
+        }
+        yield frame(13, `π = [${pi.join(', ')}]. k rises by at most 1 per step and every fallback lowers it, so all the fallbacks together cost at most m − 1 steps: O(m).`);
+    },
+};
+
+PROGRAMS.kmpSearch = {
+    title: 'KMP matching: the text pointer never moves back',
+    defaults: { text: 'abacabacabab', pattern: 'abacabab' },
+    code: `func kmpSearch(_ pattern: [Character], in text: [Character]) -> [Int] {
+    let pi = prefixFunction(pattern)
+    var result: [Int] = []
+    var j = 0                          // how many pattern characters match so far
+    for (i, c) in text.enumerated() {
+        while j > 0 && c != pattern[j] {
+            j = pi[j - 1]              // shift the pattern; i stays put
+        }
+        if c == pattern[j] {
+            j += 1
+        }
+        if j == pattern.count {
+            result.append(i - j + 1)
+            j = pi[j - 1]              // matches can overlap, so keep the border
+        }
+    }
+    return result
+}`,
+    * run({ text, pattern }) {
+        const chars = [...text];
+        const needle = [...pattern];
+        const pi = prefixTable(needle);
+        const matches = [];
+        let j = 0;
+        // The pattern row is lined up under the text: pattern[0] sits under text index `shift`
+        const frame = (line, message, { i, shift = 0, matched = 0, textMarks = {}, piMarks = {} } = {}) => {
+            const width = Math.max(chars.length, shift + needle.length);
+            const aligned = Array.from({ length: width }, (_, index) => (index >= shift && index < shift + needle.length ? needle[index - shift] : null));
+            const range = matched > 0 ? { from: shift, to: shift + matched - 1, tone: 'kept' } : null;
+            return {
+                rows: [
+                    row('text', chars, { pointers: i === undefined ? {} : { i }, range, marks: textMarks }),
+                    row('pattern, lined up', aligned, { pointers: i === undefined ? {} : { j: shift + j }, range, marks: Object.fromEntries(Object.entries(textMarks).filter(([index]) => aligned[index] !== null)) }),
+                    row('π (pattern)', pi, { marks: piMarks }),
+                ],
+                list: { title: 'matches start at', items: matches.map(String) },
+                vars: { j },
+                line,
+                message,
+            };
+        };
+        yield frame(4, `π for “${pattern}” is [${pi.join(', ')}]. j counts the pattern characters matched so far; the text pointer i only ever moves forward.`);
+        for (let i = 0; i < chars.length; i += 1) {
+            const c = chars[i];
+            while (j > 0 && c !== needle[j]) {
+                const before = j;
+                yield frame(6, `text[${i}] = ${c} ≠ pattern[${j}] = ${needle[j]}. Of the ${j} matched characters “${needle.slice(0, j).join('')}”, the longest border is π[${j - 1}] = ${pi[j - 1]} long.`, { i, shift: i - j, matched: j, textMarks: { [i]: 'out' }, piMarks: { [j - 1]: 'swap' } });
+                j = pi[j - 1];
+                const skipped = before - j - 1;
+                yield frame(7, `${j ? `Slide the pattern so ${j === 1 ? 'its first character sits under the text it already matches' : `its first ${j} characters sit under the text they already match`}: j = ${j}.` : 'No border: slide the pattern past everything matched, j = 0.'}${skipped > 0 ? ` Starts ${i - before + 1}${skipped > 1 ? `–${i - j - 1}` : ''} are skipped without a comparison: none can match.` : ''} i stays at ${i}.`, { i, shift: i - j, matched: j, piMarks: { [before - 1]: 'swap' } });
+            }
+            if (c === needle[j]) {
+                j += 1;
+                yield frame(10, `text[${i}] = pattern[${j - 1}] = ${c}: ${j} character${j === 1 ? '' : 's'} match.`, { i, shift: i - j + 1, matched: j, textMarks: { [i]: 'found' } });
+            } else {
+                yield frame(9, `text[${i}] = ${c} ≠ pattern[0] = ${needle[0]}: nothing matches yet. Move on.`, { i, shift: i, textMarks: { [i]: 'out' } });
+            }
+            if (j === needle.length) {
+                const at = i - j + 1;
+                matches.push(at);
+                yield frame(13, `All ${needle.length} characters match: a match starts at ${at}.`, { i, shift: at, matched: j, textMarks: Object.fromEntries(needle.map((_, index) => [at + index, 'found'])) });
+                j = pi[j - 1];
+                yield frame(14, `Keep the border so overlapping matches count: j = π[${needle.length - 1}] = ${j}. The next text character is compared with pattern[${j}].`, { i, shift: i + 1 - j, matched: j, piMarks: { [needle.length - 1]: 'swap' } });
+            }
+        }
+        const found = Object.fromEntries(matches.flatMap((at) => needle.map((_, index) => [at + index, 'found'])));
+        yield frame(17, `${matches.length ? `Matches start at ${matches.join(', ')}.` : 'No match.'} i moved forward ${chars.length} times and every slide lowered j, so the search is O(n + m).`, { shift: matches.at(-1) ?? 0, textMarks: found });
+    },
+};
+
 Object.assign(PROGRAMS, SORT_PROGRAMS);
 
 export const ARRAY_PROGRAMS = Object.keys(PROGRAMS);

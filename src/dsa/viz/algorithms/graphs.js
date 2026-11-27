@@ -768,3 +768,111 @@ export const gridFrames = ({ rows = ['S..#....', '.#.#.##.', '.#...#..', '...#..
     snapshot('The queue ran dry before reaching G: there is no path.');
     return frames;
 };
+
+// A* on a grid, matching the sp-a-star lesson: unit steps in the order right, down, left, up, a heap ordered by
+// (f, h, row, col), stale entries skipped, and the search stops when the goal comes out of the heap.
+// `algorithm: 'dijkstra'` runs the same code with h = 0, which is Dijkstra.
+const astarCode = (heuristic) => `func aStar(_ grid: [[Character]], from start: Cell, to goal: Cell) -> Int? {
+    ${heuristic}
+    var best: [Cell: Int] = [start: 0]
+    var open = Heap<(f: Int, h: Int, cell: Cell)>(areInIncreasingOrder: {
+        ($0.f, $0.h, $0.cell.row, $0.cell.col) < ($1.f, $1.h, $1.cell.row, $1.cell.col)
+    })
+    open.insert((h(start), h(start), start))
+    while let entry = open.pop() {
+        let g = entry.f - entry.h
+        if g > best[entry.cell]! { continue }               // a stale entry
+        if entry.cell == goal { return g }
+        for next in neighbours(of: entry.cell, in: grid) {  // right, down, left, up
+            if g + 1 < best[next, default: .max] {
+                best[next] = g + 1
+                open.insert((g + 1 + h(next), h(next), next))
+            }
+        }
+    }
+    return nil
+}`;
+
+export const ASTAR_CODE = {
+    astar: astarCode('let h = { (cell: Cell) in abs(cell.row - goal.row) + abs(cell.col - goal.col) }'),
+    dijkstra: astarCode('let h = { (_: Cell) in 0 }                          // no estimate: Dijkstra'),
+};
+
+export const astarFrames = ({ rows = ['S....#......', '.....#......', '.....#......', '.....#....#.', '.....#....#G', '..........#.'], algorithm = 'astar' } = {}) => {
+    const grid = rows.map((row) => [...row]);
+    const height = grid.length;
+    const width = grid[0].length;
+    let start = null;
+    let goal = null;
+    grid.forEach((row, r) => row.forEach((cell, c) => {
+        if (cell === 'S') start = [r, c];
+        if (cell === 'G') goal = [r, c];
+    }));
+    const estimate = algorithm === 'dijkstra' ? () => 0 : (r, c) => Math.abs(r - goal[0]) + Math.abs(c - goal[1]);
+    const best = grid.map((row) => row.map(() => null));
+    const expanded = grid.map((row) => row.map(() => false));
+    const previous = {};
+    const open = [];
+    const order = (a, b) => a.f - b.f || a.h - b.h || a.r - b.r || a.c - b.c;
+    const frames = [];
+    let count = 0;
+    const snapshot = (line, message, current, path = []) => frames.push({
+        grid,
+        algorithm,
+        g: best.map((row) => [...row]),
+        h: best.map((row, r) => row.map((g, c) => (g === null ? null : estimate(r, c)))),
+        expanded: expanded.map((row) => [...row]),
+        open: [...open].sort(order).map(({ r, c, f }) => ({ key: `${r},${c}`, f })),
+        current,
+        path: path.map(([r, c]) => `${r},${c}`),
+        count,
+        line,
+        message,
+    });
+    const push = (r, c, g) => {
+        best[r][c] = g;
+        const h = estimate(r, c);
+        open.push({ r, c, h, f: g + h });
+    };
+    push(start[0], start[1], 0);
+    snapshot(7, algorithm === 'dijkstra'
+        ? 'Start at S with g = 0. With h = 0 everywhere, f = g: the heap hands out the closest cell, like a ripple.'
+        : `Start at S: g = 0, h = ${estimate(...start)} (the Manhattan distance, as if there were no walls), so f = ${estimate(...start)}.`);
+    while (open.length) {
+        open.sort(order);
+        const { r, c, h, f } = open.shift();
+        const g = f - h;
+        if (g > best[r][c]) {
+            snapshot(10, `(${r}, ${c}) with g = ${g} is stale: a cheaper path to it (g = ${best[r][c]}) was found after this entry went in. Skip it.`, [r, c]);
+            continue;
+        }
+        expanded[r][c] = true;
+        count += 1;
+        const tied = open.some((entry) => entry.f === f);
+        if (r === goal[0] && c === goal[1]) {
+            const path = [];
+            let key = `${r},${c}`;
+            while (key) {
+                path.unshift(key.split(',').map(Number));
+                key = previous[key];
+            }
+            const openCells = grid.flat().filter((cell) => cell !== '#').length;
+            snapshot(11, `G comes out of the heap with g = ${g}: that's the shortest path. ${algorithm === 'dijkstra' ? 'Dijkstra' : 'A*'} expanded ${count} of the ${openCells} open cells. Following each cell back to the one that improved it gives the route.`, [r, c], path);
+            return frames;
+        }
+        const added = [];
+        for (const [dr, dc] of [[0, 1], [1, 0], [0, -1], [-1, 0]]) {
+            const nr = r + dr;
+            const nc = c + dc;
+            if (nr < 0 || nr >= height || nc < 0 || nc >= width || grid[nr][nc] === '#') continue;
+            if (best[nr][nc] !== null && g + 1 >= best[nr][nc]) continue;
+            push(nr, nc, g + 1);
+            previous[`${nr},${nc}`] = `${r},${c}`;
+            added.push(`(${nr}, ${nc}) f ${g + 1 + estimate(nr, nc)}`);
+        }
+        const popped = algorithm === 'dijkstra' ? `g = ${g}, the smallest in the heap` : `f = ${g} + ${h} = ${f}, the smallest f in the heap${tied ? ' (ties go to the smaller h)' : ''}`;
+        snapshot(added.length ? 15 : 12, `Expand (${r}, ${c}): ${popped}. ${added.length ? `Add ${added.join(', ')}.` : 'No neighbour gets cheaper.'}`, [r, c]);
+    }
+    snapshot(19, 'The heap ran dry before G came out: there is no path.');
+    return frames;
+};
