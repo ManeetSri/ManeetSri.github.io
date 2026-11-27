@@ -20,4 +20,14 @@ export default [
         lists: ['patterns150'],
         minutes: 15,
     },
+    {
+        id: 'constraint-speed-target',
+        title: 'What speed do the constraints ask for?',
+        difficulty: 'warmup',
+        patterns: ['basics'],
+        lessons: ['start-reading-problems'],
+        swiftTest: 'ConstraintSpeedTargetTests',
+        lists: ['patterns150', 'swift'],
+        minutes: 10,
+    },
 ];

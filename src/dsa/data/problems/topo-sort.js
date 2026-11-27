@@ -50,4 +50,14 @@ export default [
         lists: ['patterns150'],
         minutes: 45,
     },
+    {
+        id: 'build-order-audit',
+        title: 'Audit a build order',
+        difficulty: 'easy',
+        patterns: ['topo-sort', 'simulation'],
+        lessons: ['topo-dags'],
+        swiftTest: 'BuildOrderAuditTests',
+        lists: ['patterns150'],
+        minutes: 20,
+    },
 ];

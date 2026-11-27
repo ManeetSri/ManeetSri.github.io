@@ -70,4 +70,14 @@ export default [
         lists: ['patterns150'],
         minutes: 20,
     },
+    {
+        id: 'strassen-seven-products',
+        title: 'Strassen with a cutoff',
+        difficulty: 'medium',
+        patterns: ['math', 'recursion', 'matrix'],
+        lessons: ['dc-strassen'],
+        swiftTest: 'StrassenSevenProductsTests',
+        lists: ['patterns150'],
+        minutes: 40,
+    },
 ];

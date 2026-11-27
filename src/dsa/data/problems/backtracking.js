@@ -100,4 +100,14 @@ export default [
         lists: ['patterns150'],
         minutes: 20,
     },
+    {
+        id: 'safe-dial-codes',
+        title: 'Codes for a safe dial',
+        difficulty: 'easy',
+        patterns: ['backtracking'],
+        lessons: ['bk-template'],
+        swiftTest: 'SafeDialCodesTests',
+        lists: ['patterns150'],
+        minutes: 20,
+    },
 ];

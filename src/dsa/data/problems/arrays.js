@@ -70,4 +70,14 @@ export default [
         lists: ['core75'],
         minutes: 25,
     },
+    {
+        id: 'element-at-address',
+        title: 'Which element owns this byte?',
+        difficulty: 'warmup',
+        patterns: ['math'],
+        lessons: ['arrays-memory'],
+        swiftTest: 'ElementAtAddressTests',
+        lists: ['patterns150'],
+        minutes: 15,
+    },
 ];

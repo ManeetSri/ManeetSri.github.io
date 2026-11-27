@@ -1,0 +1,126 @@
+An image server records how long each request takes, from many tasks at once, and hands out ticket numbers to uploads. Its API must stay **synchronous** (no `await`), so an actor doesn't fit. Swift 6's `Mutex` would, but the companion package targets macOS 14, where `Mutex` and `Atomic` aren't available. Build a small `Mutex`-like lock on `NSLock`, then use it for request statistics and a ticket dispenser that are safe to share between tasks.
+
+`LockedStatsRecorder.LockedValue<Value>`, `LockedStatsRecorder.RequestStats` and `LockedStatsRecorder.TicketDispenser`, with the `LockedStatsRecorder.Summary` struct the stub provides
+
+- **`LockedValue(_ value:)`** owns a value, and the only way to reach it is `withLock(_ body: (inout Value) throws -> Result) rethrows -> Result`: lock, run `body` with the value as `inout`, unlock (even if `body` throws), and return what `body` returned.
+- **`RequestStats`**: `record(milliseconds:)` adds one request. `summary` returns a `Summary` (`requests`, `totalMilliseconds`, `slowest`), with all three figures from the **same moment**. `drain()` returns the summary and resets everything to zero **in one step**, so no request is ever counted twice or lost between a read and a reset.
+- **`TicketDispenser(startingAt:)`**: `next()` returns the next ticket number, starting from the given one, never handing out the same number twice. `next(batch: n)` reserves n consecutive tickets in one step and returns them as a range (empty when n is 0).
+
+All three are classes that many tasks share at once.
+
+## Examples
+
+| Code | Result |
+| --- | --- |
+| `LockedValue([1, 2])`, then `withLock { $0.append(3); return $0.count }` | `3`, and the value is now `[1, 2, 3]` |
+| `record(milliseconds: 40)`, `record(milliseconds: 15)`, then `summary` | `Summary(requests: 2, totalMilliseconds: 55, slowest: 40)` |
+| then `drain()`, then `summary` | the same summary, then `Summary(requests: 0, totalMilliseconds: 0, slowest: 0)` |
+| `TicketDispenser(startingAt: 100)`: `next()`, `next()`, `next(batch: 3)`, `next()` | `100`, `101`, `102..<105`, `105` |
+| 300 tasks each calling `record(milliseconds: 1)` | `summary.requests == 300` and `summary.totalMilliseconds == 300` |
+
+## Constraints
+
+- Every method may be called from many tasks at the same time. The tests record tens of thousands of requests from hundreds of child tasks, take summaries and drains while that's happening, and check that the figures always agree and that nothing is lost or counted twice.
+- Use `NSLock` from Foundation (`import Foundation`): no actors and no `async` in the API. `Mutex` and `Atomic` need macOS 15, so they won't compile against the package's macOS 14 target.
+- Keep each critical section short, and never call `withLock` on a lock from inside its own `withLock`: `NSLock` isn't recursive, so that waits forever.
+
+<Hints>
+<Hint>
+`LockedValue` is a `final class` holding a `private var value` and a `private let lock = NSLock()`. In `withLock`, call `lock.lock()`, then `defer { lock.unlock() }`, then `return try body(&value)`. The `defer` runs however the function exits, including by throwing. Mark the class `@unchecked Sendable`: you're promising the compiler that the lock protects the value.
+</Hint>
+<Hint>
+Keep all of `RequestStats`' figures in **one** `LockedValue<Summary>`. Three separate locked counters would each be correct, but a reader could see the request count from one moment and the total from another. One lock around all three makes `summary` a consistent snapshot.
+</Hint>
+<Hint>
+`drain()` is a check-then-act: reading the summary and then resetting it in two separate `withLock` calls lets a `record` slip in between and vanish. Do both inside one closure: `stats.withLock { current in let copy = current; current = Summary(); return copy }`. The same goes for `next(batch:)`: read the next ticket and advance it by n in one closure.
+</Hint>
+</Hints>
+
+## Solutions
+
+<Approach title="One lock per piece of shared state" time="O(1) per call" space="O(1)">
+
+```swift
+import Foundation
+
+public enum LockedStatsRecorder {
+    public final class LockedValue<Value>: @unchecked Sendable {
+        private var value: Value
+        private let lock = NSLock()
+
+        public init(_ value: Value) { self.value = value }
+
+        public func withLock<Result>(_ body: (inout Value) throws -> Result) rethrows -> Result {
+            lock.lock()
+            defer { lock.unlock() }
+            return try body(&value)
+        }
+    }
+
+    public struct Summary: Equatable, Sendable {
+        public var requests: Int
+        public var totalMilliseconds: Int
+        public var slowest: Int
+        public init(requests: Int = 0, totalMilliseconds: Int = 0, slowest: Int = 0) {
+            self.requests = requests
+            self.totalMilliseconds = totalMilliseconds
+            self.slowest = slowest
+        }
+    }
+
+    public final class RequestStats: Sendable {
+        private let stats = LockedValue(Summary())
+
+        public init() {}
+
+        public func record(milliseconds: Int) {
+            stats.withLock { stats in
+                stats.requests += 1
+                stats.totalMilliseconds += milliseconds
+                stats.slowest = max(stats.slowest, milliseconds)
+            }
+        }
+
+        public var summary: Summary { stats.withLock { $0 } }
+
+        public func drain() -> Summary {
+            stats.withLock { stats in
+                let current = stats
+                stats = Summary()
+                return current
+            }
+        }
+    }
+
+    public final class TicketDispenser: Sendable {
+        private let nextTicket: LockedValue<Int>
+
+        public init(startingAt first: Int) { nextTicket = LockedValue(first) }
+
+        public func next() -> Int {
+            nextTicket.withLock { ticket in
+                defer { ticket += 1 }
+                return ticket
+            }
+        }
+
+        public func next(batch count: Int) -> Range<Int> {
+            nextTicket.withLock { ticket in
+                let start = ticket
+                ticket += count
+                return start..<ticket
+            }
+        }
+    }
+}
+```
+
+`RequestStats` and `TicketDispenser` are plain `Sendable`, checked by the compiler: their only stored properties are `let`s of a `Sendable` type. All the trust is concentrated in one small place, `LockedValue`'s `@unchecked`, which is exactly the shape of Swift 6's `Mutex`. On macOS 15 or iOS 18 and later you'd replace `LockedValue` with `Mutex` and change nothing else.
+
+</Approach>
+
+<Approach title="Separate locks for each figure" time="O(1) per call" space="O(1)">
+
+A lock (or an atomic) per figure makes each number correct on its own, and it's what many first attempts do. But `summary` then reads three numbers at three different moments, and `drain` can't reset them all at once. The tests catch both: under concurrent recording, a summary's total no longer matches its count, and drained totals no longer add up.
+
+</Approach>

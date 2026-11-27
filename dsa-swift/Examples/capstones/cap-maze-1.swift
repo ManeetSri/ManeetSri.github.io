@@ -69,14 +69,16 @@ struct Maze {
         return result
     }
 
+    /// Neighbours in the same row share a right-hand wall. Comparing rows, not `high - low == 1`, keeps a
+    /// one-column maze right: there, the cell below is also one number up.
     func isOpen(_ a: Int, _ b: Int) -> Bool {
         let (low, high) = (min(a, b), max(a, b))
-        return high - low == 1 ? openRight[low / columns][low % columns] : openDown[low / columns][low % columns]
+        return low / columns == high / columns ? openRight[low / columns][low % columns] : openDown[low / columns][low % columns]
     }
 
     mutating func knockDown(_ a: Int, _ b: Int) {
         let (low, high) = (min(a, b), max(a, b))
-        if high - low == 1 {
+        if low / columns == high / columns {
             openRight[low / columns][low % columns] = true
         } else {
             openDown[low / columns][low % columns] = true

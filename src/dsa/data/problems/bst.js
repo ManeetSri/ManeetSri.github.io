@@ -90,4 +90,14 @@ export default [
         lists: ['patterns150'],
         minutes: 45,
     },
+    {
+        id: 'insertion-order-height',
+        title: 'How tall will the ticket tree get?',
+        difficulty: 'hard',
+        patterns: ['sorting', 'simulation'],
+        lessons: ['bst-degenerate'],
+        swiftTest: 'InsertionOrderHeightTests',
+        lists: ['patterns150'],
+        minutes: 45,
+    },
 ];

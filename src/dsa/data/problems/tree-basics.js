@@ -40,4 +40,14 @@ export default [
         lists: ['patterns150'],
         minutes: 35,
     },
+    {
+        id: 'sideways-tree-reader',
+        title: 'Read a sideways tree drawing',
+        difficulty: 'medium',
+        patterns: ['strings', 'monotonic-stack'],
+        lessons: ['tree-printing'],
+        swiftTest: 'SidewaysTreeReaderTests',
+        lists: ['patterns150'],
+        minutes: 30,
+    },
 ];

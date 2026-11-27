@@ -70,4 +70,14 @@ export default [
         lists: ['patterns150'],
         minutes: 15,
     },
+    {
+        id: 'equal-xor-triples',
+        title: 'Triples that split into equal XORs',
+        difficulty: 'medium',
+        patterns: ['prefix-sum', 'bits', 'hashing'],
+        lessons: ['prefix-xor'],
+        swiftTest: 'EqualXorTriplesTests',
+        lists: ['patterns150'],
+        minutes: 30,
+    },
 ];

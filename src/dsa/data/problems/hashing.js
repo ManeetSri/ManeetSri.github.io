@@ -70,4 +70,14 @@ export default [
         lists: ['patterns150'],
         minutes: 40,
     },
+    {
+        id: 'backshift-probe-set',
+        title: 'A probing set without tombstones',
+        difficulty: 'hard',
+        patterns: ['hashing', 'design'],
+        lessons: ['hash-swift-dictionary'],
+        swiftTest: 'BackshiftProbeSetTests',
+        lists: ['patterns150'],
+        minutes: 45,
+    },
 ];

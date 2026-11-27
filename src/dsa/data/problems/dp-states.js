@@ -40,4 +40,14 @@ export default [
         lists: ['patterns150'],
         minutes: 20,
     },
+    {
+        id: 'stock-trade-plans',
+        title: 'One trade or many',
+        difficulty: 'easy',
+        patterns: ['dp', 'greedy'],
+        lessons: ['dpsm-stocks-1-2'],
+        swiftTest: 'StockTradePlansTests',
+        lists: ['patterns150'],
+        minutes: 20,
+    },
 ];

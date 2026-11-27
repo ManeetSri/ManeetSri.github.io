@@ -40,4 +40,14 @@ export default [
         lists: ['patterns150', 'swift'],
         minutes: 35,
     },
+    {
+        id: 'locked-stats-recorder',
+        title: 'Lock-guarded request stats',
+        difficulty: 'medium',
+        patterns: ['design'],
+        lessons: ['cc-mutex-atomics'],
+        swiftTest: 'LockedStatsRecorderTests',
+        lists: ['patterns150', 'swift'],
+        minutes: 35,
+    },
 ];

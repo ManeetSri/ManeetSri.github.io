@@ -90,4 +90,14 @@ export default [
         lists: ['patterns150'],
         minutes: 45,
     },
+    {
+        id: 'storm-road-closures',
+        title: 'Groups after each road closure',
+        difficulty: 'medium',
+        patterns: ['union-find'],
+        lessons: ['ag-which-algorithm'],
+        swiftTest: 'StormRoadClosuresTests',
+        lists: ['patterns150'],
+        minutes: 35,
+    },
 ];

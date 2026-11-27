@@ -30,4 +30,14 @@ export default [
         lists: ['patterns150'],
         minutes: 50,
     },
+    {
+        id: 'boruvka-grid-rounds',
+        title: 'Build the grid in rounds',
+        difficulty: 'medium',
+        patterns: ['union-find', 'greedy'],
+        lessons: ['mst-boruvka'],
+        swiftTest: 'BoruvkaGridRoundsTests',
+        lists: ['patterns150'],
+        minutes: 35,
+    },
 ];

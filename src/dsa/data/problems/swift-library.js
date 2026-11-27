@@ -30,4 +30,14 @@ export default [
         lists: ['patterns150', 'swift'],
         minutes: 30,
     },
+    {
+        id: 'min-max-priority-queue',
+        title: 'A priority queue with both ends',
+        difficulty: 'hard',
+        patterns: ['heap', 'design'],
+        lessons: ['lib-swift-collections'],
+        swiftTest: 'MinMaxPriorityQueueTests',
+        lists: ['patterns150', 'swift'],
+        minutes: 50,
+    },
 ];

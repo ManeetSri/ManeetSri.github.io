@@ -90,4 +90,14 @@ export default [
         lists: ['patterns150'],
         minutes: 45,
     },
+    {
+        id: 'horspool-skip-search',
+        title: 'Skip-ahead text search',
+        difficulty: 'medium',
+        patterns: ['strings'],
+        lessons: ['sa-boyer-moore'],
+        swiftTest: 'HorspoolSkipSearchTests',
+        lists: ['patterns150'],
+        minutes: 30,
+    },
 ];
