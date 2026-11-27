@@ -43,6 +43,13 @@ import bst from './problems/bst.js';
 import balancedTrees from './problems/balanced-trees.js';
 import heaps from './problems/heaps.js';
 import tries from './problems/tries.js';
+import graphBasics from './problems/graph-basics.js';
+import graphTraversals from './problems/graph-traversals.js';
+import topoSort from './problems/topo-sort.js';
+import shortestPaths from './problems/shortest-paths.js';
+import unionFind from './problems/union-find.js';
+import mst from './problems/mst.js';
+import advancedGraphs from './problems/advanced-graphs.js';
 
 export const DIFFICULTIES = {
     warmup: { label: 'Warm-up', xp: 15 },
@@ -137,6 +144,13 @@ export const problems = [
     ...balancedTrees,
     ...heaps,
     ...tries,
+    ...graphBasics,
+    ...graphTraversals,
+    ...topoSort,
+    ...shortestPaths,
+    ...unionFind,
+    ...mst,
+    ...advancedGraphs,
 ];
 
 export const problemById = Object.fromEntries(problems.map((problem) => [problem.id, problem]));

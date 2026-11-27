@@ -680,7 +680,7 @@ const rawModules = [
 
     // Part VI: Graphs ───────────────────────────────────────────────────────────────────────
     {
-        id: 'graph-basics', code: 'M41', part: 6, title: 'Graph fundamentals', level: 'intermediate', tracks: ['core'], requires: ['tries'],
+        id: 'graph-basics', code: 'M41', part: 6, title: 'Graph fundamentals', level: 'intermediate', tracks: ['core'], requires: ['tries'], status: 'ready',
         summary: 'Graph vocabulary, representations, a generic Graph in Swift and implicit graphs.',
         lessons: [
             ['graph-terminology', 'Graph terminology', { minutes: 25 }],
@@ -691,7 +691,7 @@ const rawModules = [
         ],
     },
     {
-        id: 'graph-traversals', code: 'M42', part: 6, title: 'Graph traversals', level: 'intermediate', tracks: ['core'], requires: ['graph-basics'],
+        id: 'graph-traversals', code: 'M42', part: 6, title: 'Graph traversals', level: 'intermediate', tracks: ['core'], requires: ['graph-basics'], status: 'ready',
         summary: 'BFS and DFS, and the grid, multi-source and state-space problems built on them.',
         lessons: [
             ['gt-bfs', 'BFS and unweighted shortest paths', { minutes: 30 }],
@@ -708,7 +708,7 @@ const rawModules = [
         ],
     },
     {
-        id: 'topo-sort', code: 'M43', part: 6, title: 'Topological sort', level: 'intermediate', tracks: ['core'], requires: ['graph-traversals'],
+        id: 'topo-sort', code: 'M43', part: 6, title: 'Topological sort', level: 'intermediate', tracks: ['core'], requires: ['graph-traversals'], status: 'ready',
         summary: 'Ordering dependencies with Kahn\'s algorithm and DFS, and paths in DAGs.',
         lessons: [
             ['topo-dags', 'DAGs and dependency ordering', { minutes: 15 }],
@@ -721,7 +721,7 @@ const rawModules = [
         ],
     },
     {
-        id: 'shortest-paths', code: 'M44', part: 6, title: 'Shortest paths', level: 'advanced', tracks: ['core'], requires: ['topo-sort'],
+        id: 'shortest-paths', code: 'M44', part: 6, title: 'Shortest paths', level: 'advanced', tracks: ['core'], requires: ['topo-sort'], status: 'ready',
         summary: 'Dijkstra, Bellman–Ford, Floyd–Warshall, 0-1 BFS, A* and choosing between them.',
         lessons: [
             ['sp-weighted', 'Weighted graphs and the shortest-path problem', { minutes: 15 }],
@@ -736,7 +736,7 @@ const rawModules = [
         ],
     },
     {
-        id: 'union-find', code: 'M45', part: 6, title: 'Union-Find', level: 'intermediate', tracks: ['core'], requires: ['shortest-paths'],
+        id: 'union-find', code: 'M45', part: 6, title: 'Union-Find', level: 'intermediate', tracks: ['core'], requires: ['shortest-paths'], status: 'ready',
         summary: 'Disjoint sets with path compression and union by rank, and the problems they solve.',
         lessons: [
             ['uf-idea', 'Disjoint sets and the parent array'],
@@ -748,7 +748,7 @@ const rawModules = [
         ],
     },
     {
-        id: 'mst', code: 'M46', part: 6, title: 'Minimum spanning trees', level: 'advanced', tracks: ['core'], requires: ['union-find'],
+        id: 'mst', code: 'M46', part: 6, title: 'Minimum spanning trees', level: 'advanced', tracks: ['core'], requires: ['union-find'], status: 'ready',
         summary: 'Spanning trees, the cut property, Kruskal and Prim.',
         lessons: [
             ['mst-definition', 'Spanning trees and the cut property', { minutes: 25 }],
@@ -759,7 +759,7 @@ const rawModules = [
         ],
     },
     {
-        id: 'advanced-graphs', code: 'M47', part: 6, title: 'Advanced graph algorithms', level: 'expert', tracks: ['cp'], requires: ['mst'],
+        id: 'advanced-graphs', code: 'M47', part: 6, title: 'Advanced graph algorithms', level: 'expert', tracks: ['cp'], requires: ['mst'], status: 'ready',
         summary: 'Strongly connected components, bridges, Euler paths, max flow, matching, LCA and 2-SAT.',
         lessons: [
             ['ag-scc', 'Strongly connected components: Kosaraju and Tarjan', { minutes: 40 }],

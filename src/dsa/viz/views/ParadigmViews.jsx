@@ -2,7 +2,8 @@ import { useMemo } from 'react';
 import Player from '../Player.jsx';
 import TreeDiagram from './TreeDiagram.jsx';
 import { dpFrames, dpProgram } from '../algorithms/dp.js';
-import { QUEENS_CODE, queensFrames, SUBSETS_CODE, subsetsFrames } from '../algorithms/backtracking.js';
+import { HUFFMAN_CODE, huffmanFrames } from '../algorithms/huffman.js';
+import { COMBINATION_SUM_CODE, combinationSumFrames, PERMUTATIONS_CODE, permutationsFrames, QUEENS_CODE, queensFrames, SUBSETS_CODE, subsetsFrames } from '../algorithms/backtracking.js';
 
 const useStable = (value) => {
     const key = JSON.stringify(value ?? null);
@@ -76,22 +77,60 @@ export const QueensView = ({ n = 4, all = false }) => {
 };
 
 // ```visual subsetsTree with { items: [1, 2, 3] }
-export const SubsetsTreeView = ({ items }) => {
-    const stableItems = useStable(items);
-    const frames = useMemo(() => subsetsFrames(stableItems ? { items: stableItems } : {}), [stableItems]);
+const DECISION_TREES = {
+    subsets: { code: SUBSETS_CODE, title: 'The decision tree behind subsets: in or out, item by item', frames: (props) => subsetsFrames(props.items ? { items: props.items } : {}) },
+    permutations: { code: PERMUTATIONS_CODE, title: 'The decision tree behind permutations: choose, explore, unchoose', frames: (props) => permutationsFrames(props.items ? { items: props.items } : {}) },
+    combinationSum: { code: COMBINATION_SUM_CODE, title: 'Combination sum: reuse allowed, with pruning', frames: (props) => combinationSumFrames({ ...(props.items ? { candidates: props.items } : {}), ...(props.target !== undefined ? { target: props.target } : {}) }) },
+};
+
+export const SubsetsTreeView = ({ program = 'subsets', items, target }) => {
+    const props = useStable({ items, target });
+    const spec = DECISION_TREES[program] ?? DECISION_TREES.subsets;
+    const frames = useMemo(() => spec.frames(props), [spec, props]);
     return (
-        <Player frames={frames} code={SUBSETS_CODE} title="The decision tree behind subsets: in or out, item by item">
+        <Player frames={frames} code={spec.code} title={spec.title}>
             {(frame) => (
                 <div>
                     <TreeDiagram
                         tree={{ root: frame.root, nodes: frame.nodes }}
-                        marks={Object.fromEntries(frame.path.map((id) => [id, 'path']))}
+                        marks={{ ...Object.fromEntries(Object.entries(frame.nodes).filter(([, node]) => node.pruned).map(([id]) => [id, 'out'])), ...Object.fromEntries(frame.path.map((id) => [id, 'path'])) }}
                         childrenOf={(id) => frame.nodes[id].children}
                         nodeLabel={(node) => node.value}
                         badge={(node) => node.leaf}
-                        label="Decision tree; green dots mark recorded subsets"
+                        label="Decision tree; green dots mark recorded answers, red nodes were pruned"
                     />
-                    <p className="mt-3 font-mono text-xs text-muted">recorded: <span className="text-amber">{frame.results.map((subset) => `[${subset.join(',')}]`).join(' ') || '—'}</span></p>
+                    <p className="mt-3 font-mono text-xs text-muted">recorded: <span className="text-amber">{frame.results.map((answer) => `[${answer.join(',')}]`).join(' ') || '—'}</span></p>
+                </div>
+            )}
+        </Player>
+    );
+};
+
+// ```visual huffman with { frequencies: { a: 5, b: 9, … } }
+export const HuffmanView = ({ frequencies }) => {
+    const stable = useStable(frequencies);
+    const frames = useMemo(() => huffmanFrames(stable ? { frequencies: stable } : {}), [stable]);
+    return (
+        <Player frames={frames} code={HUFFMAN_CODE} title="Huffman coding: always merge the two lightest trees">
+            {(frame) => (
+                <div className="space-y-3">
+                    <div className="flex flex-wrap items-end gap-x-3 gap-y-2">
+                        {frame.forest.map((tree) => (
+                            <div key={tree.root} className="rounded-xl border border-line/60 px-1 pt-1">
+                                <TreeDiagram tree={tree} marks={frame.marks} label={`Tree weighing ${tree.nodes[tree.root].weight}`} />
+                            </div>
+                        ))}
+                    </div>
+                    {frame.codes && (
+                        <table className="font-mono text-xs">
+                            <thead><tr className="text-muted"><th className="pr-4 text-left font-medium">symbol</th><th className="pr-4 text-left font-medium">count</th><th className="text-left font-medium">code</th></tr></thead>
+                            <tbody>
+                                {frame.codes.map(({ symbol, weight, code }) => (
+                                    <tr key={symbol}><td className="pr-4">{symbol}</td><td className="pr-4">{weight}</td><td className="text-amber">{code}</td></tr>
+                                ))}
+                            </tbody>
+                        </table>
+                    )}
                 </div>
             )}
         </Player>

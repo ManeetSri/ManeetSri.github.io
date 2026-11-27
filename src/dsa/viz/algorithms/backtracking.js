@@ -112,3 +112,128 @@ export const subsetsFrames = ({ items = [1, 2, 3] } = {}) => {
     snapshot(12, `All ${results.length} subsets, one per leaf.`);
     return frames;
 };
+
+export const PERMUTATIONS_CODE = `func permutations(_ items: [Int]) -> [[Int]] {
+    var result: [[Int]] = []
+    var chosen: [Int] = []
+    var used = Array(repeating: false, count: items.count)
+    func explore() {
+        if chosen.count == items.count { result.append(chosen); return }
+        for i in items.indices where !used[i] {
+            used[i] = true
+            chosen.append(items[i])          // choose
+            explore()                        // explore
+            chosen.removeLast()              // unchoose
+            used[i] = false
+        }
+    }
+    explore()
+    return result
+}`;
+
+export const COMBINATION_SUM_CODE = `func combinationSum(_ candidates: [Int], _ target: Int) -> [[Int]] {
+    let sorted = candidates.sorted()
+    var result: [[Int]] = []
+    var chosen: [Int] = []
+    func explore(_ start: Int, _ remaining: Int) {
+        if remaining == 0 { result.append(chosen); return }
+        for i in start..<sorted.count {
+            if sorted[i] > remaining { break }       // sorted, so every later candidate is too big
+            chosen.append(sorted[i])
+            explore(i, remaining - sorted[i])        // i, not i + 1: a number can be reused
+            chosen.removeLast()
+        }
+    }
+    explore(0, target)
+    return result
+}`;
+
+// Shared bookkeeping for decision trees: nodes { id: { value, children, leaf, pruned } }
+const decisionTree = () => {
+    const nodes = {};
+    let nextId = 0;
+    const add = (label, parent, extra = {}) => {
+        const id = String(nextId);
+        nextId += 1;
+        nodes[id] = { value: label, children: [], leaf: false, ...extra };
+        if (parent !== null) nodes[parent].children.push(id);
+        return id;
+    };
+    return { nodes, add };
+};
+
+export const permutationsFrames = ({ items = [1, 2, 3] } = {}) => {
+    const { nodes, add } = decisionTree();
+    const frames = [];
+    const results = [];
+    const path = [];
+    const chosen = [];
+    const used = items.map(() => false);
+    const snapshot = (line, message) => frames.push({ root: '0', nodes: JSON.parse(JSON.stringify(nodes)), path: [...path], results: [...results], line, message });
+    const explore = (id) => {
+        path.push(id);
+        if (chosen.length === items.length) {
+            nodes[id].leaf = true;
+            results.push([...chosen]);
+            snapshot(6, `All ${items.length} placed: record [${chosen.join(', ')}].`);
+            path.pop();
+            return;
+        }
+        for (let i = 0; i < items.length; i += 1) {
+            if (used[i]) continue;
+            used[i] = true;
+            chosen.push(items[i]);
+            const child = add(`[${chosen.join(',')}]`, id);
+            snapshot(9, chosen.length > 1 ? `Choose ${items[i]}, skipping the items already used.` : `Choose ${items[i]} first.`);
+            explore(child);
+            chosen.pop();
+            used[i] = false;
+            snapshot(12, `Unchoose ${items[i]}: it's free again for the next branch.`);
+        }
+        path.pop();
+    };
+    add('[]', null);
+    const factorial = items.reduce((product, _, index) => product * (index + 1), 1);
+    snapshot(15, `Each level picks one unused item. ${items.length} items give ${items.length}! = ${factorial} leaves.`);
+    explore('0');
+    snapshot(16, `All ${results.length} permutations, one per leaf.`);
+    return frames;
+};
+
+export const combinationSumFrames = ({ candidates = [2, 3, 5], target = 7 } = {}) => {
+    const sorted = [...candidates].sort((a, b) => a - b);
+    const { nodes, add } = decisionTree();
+    const frames = [];
+    const results = [];
+    const path = [];
+    const chosen = [];
+    const snapshot = (line, message) => frames.push({ root: '0', nodes: JSON.parse(JSON.stringify(nodes)), path: [...path], results: [...results], line, message });
+    const explore = (start, remaining, id) => {
+        path.push(id);
+        if (remaining === 0) {
+            nodes[id].leaf = true;
+            results.push([...chosen]);
+            snapshot(6, `The sum is exactly ${target}: record [${chosen.join(', ')}].`);
+            path.pop();
+            return;
+        }
+        for (let i = start; i < sorted.length; i += 1) {
+            if (sorted[i] > remaining) {
+                add(`+${sorted[i]}`, id, { pruned: true });
+                snapshot(8, `${sorted[i]} is more than the ${remaining} left. The candidates are sorted, so everything after it is too: stop this branch.`);
+                break;
+            }
+            chosen.push(sorted[i]);
+            const child = add(`[${chosen.join(',')}]`, id);
+            snapshot(9, `Take ${sorted[i]}: ${remaining - sorted[i]} left. Its children start at ${sorted[i]} again, because numbers can repeat.`);
+            explore(i, remaining - sorted[i], child);
+            chosen.pop();
+        }
+        path.pop();
+    };
+    add('[]', null);
+    snapshot(14, `Find every multiset of {${sorted.join(', ')}} that sums to ${target}. Starting each loop at the current index stops [2,3] and [3,2] both appearing.`);
+    explore(0, target, '0');
+    snapshot(15, `${results.length} combination${results.length === 1 ? '' : 's'}: ${results.map((r) => `[${r.join(',')}]`).join(' ')}. Red branches were cut before they were explored.`);
+    return frames;
+};

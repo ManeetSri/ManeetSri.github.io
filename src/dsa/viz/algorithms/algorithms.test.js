@@ -404,3 +404,67 @@ test('heapify and heap sort match the heaps lessons', async () => {
     }
     assert.deepEqual(heapSortFrames().filter((frame) => frame.line === 23).map((frame) => frame.heapSize), [5, 4, 3, 2, 1]);
 });
+
+test('Part VII DP tables match brute-force answers', async () => {
+    const { dpFrames } = await import('./dp.js');
+    // House robber: compare with trying every subset with no two neighbours
+    const robBrute = (houses) => {
+        let best = 0;
+        for (let mask = 0; mask < 1 << houses.length; mask += 1) {
+            if (mask & (mask >> 1)) continue;
+            best = Math.max(best, houses.reduce((sum, value, index) => sum + ((mask >> index) & 1 ? value : 0), 0));
+        }
+        return best;
+    };
+    for (const houses of [[2, 7, 9, 3, 1], [5], [1, 2], [4, 1, 1, 4, 2, 1]]) {
+        assert.equal(dpFrames('houseRobber', { houses }).at(-1).table[1][houses.length], robBrute(houses));
+    }
+    assert.equal(dpFrames('minPathSum').at(-1).table[2][3], 10);
+    assert.equal(dpFrames('matrixChain').at(-1).table[0][3], 5000);
+    assert.equal(dpFrames('matrixChain', { dims: [40, 20, 30, 10, 30] }).at(-1).table[0][3], 26000);
+    assert.equal(dpFrames('wordBreak').at(-1).table[0].at(-1), '✓');
+    assert.equal(dpFrames('wordBreak', { text: 'creamx' }).at(-1).table[0].at(-1), '✗');
+    const last = dpFrames('stockCooldown').at(-1);
+    assert.equal(Math.max(last.table[2].at(-1), last.table[3].at(-1)), 6);
+});
+
+test('permutation and combination-sum trees find every answer', async () => {
+    const { permutationsFrames, combinationSumFrames } = await import('./backtracking.js');
+    const perms = permutationsFrames({ items: [1, 2, 3, 4] }).at(-1).results.map((r) => r.join(''));
+    assert.equal(perms.length, 24);
+    assert.equal(new Set(perms).size, 24);
+    const sums = (candidates, target) => combinationSumFrames({ candidates, target }).at(-1).results.map((r) => r.join('+'));
+    assert.deepEqual(sums([2, 3, 5], 8), ['2+2+2+2', '2+3+3', '3+5']);
+    assert.deepEqual(sums([5, 3, 2], 7), ['2+2+3', '2+5']);
+    assert.deepEqual(sums([4], 3), []);
+});
+
+test('Huffman codes are prefix-free and match the textbook total', async () => {
+    const { huffmanFrames } = await import('./huffman.js');
+    const { codes } = huffmanFrames().at(-1);
+    assert.equal(codes.reduce((sum, { weight, code }) => sum + weight * code.length, 0), 224);
+    const all = codes.map(({ code }) => code);
+    all.forEach((code, i) => all.forEach((other, j) => assert.ok(i === j || !other.startsWith(code), `${code} prefixes ${other}`)));
+    assert.equal(huffmanFrames({ frequencies: { x: 3 } }).at(-1).codes[0].code, '0');
+});
+
+test('jump game counts the fewest jumps', async () => {
+    const { arrayFrames } = await import('./arrayPrograms.js');
+    const fewest = (steps) => {
+        const best = steps.map(() => Infinity);
+        best[0] = 0;
+        steps.forEach((step, i) => { for (let j = i + 1; j <= Math.min(i + step, steps.length - 1); j += 1) best[j] = Math.min(best[j], best[i] + 1); });
+        return best.at(-1);
+    };
+    for (const steps of [[2, 3, 1, 1, 4, 2, 1, 3, 1], [2, 3, 1, 1, 4], [1, 1, 1, 1], [5, 1, 1], [1], [3, 2, 1, 1, 4]]) {
+        assert.equal(arrayFrames('jumpGame', { steps }).at(-1).vars.jumps, fewest(steps), JSON.stringify(steps));
+    }
+});
+
+test('Floyd–Warshall rounds match the shortest-paths lesson', async () => {
+    const { dpFrames } = await import('./dp.js');
+    const rounds = dpFrames('floydWarshall', { nodes: ['0', '1', '2', '3'], edges: [['0', '1', 3], ['0', '2', 8], ['1', '2', 2], ['2', '3', 1], ['3', '0', 4]] })
+        .filter((frame) => frame.line === 5).map((frame) => frame.table);
+    assert.deepEqual(rounds.at(0), [[0, 3, 8, '∞'], ['∞', 0, 2, '∞'], ['∞', '∞', 0, 1], [4, 7, 12, 0]]);
+    assert.deepEqual(rounds.at(-1), [[0, 3, 5, 6], [7, 0, 2, 3], [5, 8, 0, 1], [4, 7, 9, 0]]);
+});

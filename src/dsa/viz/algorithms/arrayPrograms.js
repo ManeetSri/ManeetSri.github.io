@@ -768,6 +768,47 @@ PROGRAMS.cyclicSort = {
     },
 };
 
+// Jump game II: fewest jumps to the last index, treating each jump's reachable range as one BFS level
+PROGRAMS.jumpGame = {
+    title: 'Fewest jumps: each jump covers a range of indexes',
+    defaults: { steps: [2, 3, 1, 1, 4, 2, 1, 3, 1] },
+    code: `func fewestJumps(_ steps: [Int]) -> Int {
+    var jumps = 0
+    var reachEnd = 0          // the last index reachable with \`jumps\` jumps
+    var farthest = 0          // the farthest any index up to here can reach
+    for i in 0..<(steps.count - 1) {
+        farthest = max(farthest, i + steps[i])
+        if i == reachEnd {    // this range is used up: one more jump is needed
+            jumps += 1
+            reachEnd = farthest
+        }
+    }
+    return jumps
+}`,
+    * run({ steps }) {
+        let jumps = 0;
+        let reachEnd = 0;
+        let farthest = 0;
+        let rangeStart = 0;
+        const last = steps.length - 1;
+        const frame = (line, message, i, extra = {}) => ({ rows: [row('steps', steps, { pointers: { ...(i !== undefined ? { i } : {}), farthest: Math.min(farthest, last) }, range: { from: rangeStart, to: Math.min(reachEnd, last), tone: 'window' }, ...extra })], vars: { jumps, reachEnd, farthest }, line, message });
+        yield frame(4, `steps[i] is the longest jump from index i. With 0 jumps you can only stand on index 0 (shaded).`, 0);
+        for (let i = 0; i < last; i += 1) {
+            farthest = Math.max(farthest, i + steps[i]);
+            if (i === reachEnd) {
+                yield frame(6, `From ${i} you can reach ${i + steps[i]}. The best from this range is ${farthest}, and the range ends here.`, i, { marks: { [i]: 'swap' } });
+                jumps += 1;
+                rangeStart = reachEnd + 1;
+                reachEnd = farthest;
+                yield frame(9, `One more jump: ${jumps}. Everything up to ${Math.min(reachEnd, last)} is now reachable (shaded); which index you jumped from doesn't matter.`, i);
+            } else {
+                yield frame(6, `From ${i} you can reach ${i + steps[i]}. The farthest so far is ${farthest}.`, i, { marks: { [i]: 'swap' } });
+            }
+        }
+        yield { ...frame(12, `The last index is inside the shaded range: ${jumps} jump${jumps === 1 ? '' : 's'}. One pass, O(n), like BFS over ranges instead of single cells.`, undefined, { marks: { [last]: 'found' } }) };
+    },
+};
+
 // The prefix-sum program, defined separately to keep the table above readable
 PROGRAMS.prefixSum.run = function* run({ items, query: [from, to] }) {
     const prefix = [0];

@@ -43,8 +43,8 @@ const GraphDiagram = ({ graph, frame }) => {
                                 stroke={EDGE_TONES[tone] ?? 'rgba(242,240,235,0.25)'} strokeWidth={tone === 'tree' ? 3 : 1.5} strokeDasharray={tone === 'rejected' ? '4 4' : undefined}
                                 markerEnd={graph.directed ? `url(#${marker})` : undefined}
                             />
-                            {weight !== undefined && (
-                                <text x={(from.x + to.x) / 2 + uy * 10} y={(from.y + to.y) / 2 - ux * 10 + 4} textAnchor="middle" fontSize="11" fontFamily="var(--font-mono)" fill="var(--color-muted)">{weight}</text>
+                            {(frame.edgeLabels?.[edgeKey(a, b, graph.directed)] ?? weight) !== undefined && (
+                                <text x={(from.x + to.x) / 2 + uy * 10} y={(from.y + to.y) / 2 - ux * 10 + 4} textAnchor="middle" fontSize="11" fontFamily="var(--font-mono)" fill="var(--color-muted)">{frame.edgeLabels?.[edgeKey(a, b, graph.directed)] ?? weight}</text>
                             )}
                         </g>
                     );
@@ -79,11 +79,11 @@ const SidePanels = ({ side }) => (
     </div>
 );
 
-// ```visual graph with { program: bfs | dfs | dijkstra | topo | kruskal, graph: small | weighted | dag or { directed, nodes, edges }, start }
-export const GraphView = ({ program = 'bfs', graph, start }) => {
+// ```visual graph with { program, graph: a built-in name or { directed, nodes, edges }, start, end (maxFlow's sink) }
+export const GraphView = ({ program = 'bfs', graph, start, end }) => {
     const stableGraph = useStable(graph);
     const { title, code } = graphProgram(program);
-    const { graph: resolved, frames } = useMemo(() => graphFrames(program, { graph: stableGraph ?? undefined, start }), [program, stableGraph, start]);
+    const { graph: resolved, frames } = useMemo(() => graphFrames(program, { graph: stableGraph ?? undefined, start, end }), [program, stableGraph, start, end]);
     return (
         <Player frames={frames} code={code} title={title}>
             {(frame) => (

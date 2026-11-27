@@ -4,7 +4,7 @@ export const VISUAL_NAMES = [
     'binarySearch', 'answerSearch', 'recursionTree', 'traceTable', 'growthChart', 'bitPlayground',
     'arrayTrace', 'linkedList', 'stackQueue', 'hashTable', 'intervals',
     'bst', 'binaryTree', 'avl', 'heap', 'trie',
-    'graph', 'grid', 'matrix',
-    'dpTable', 'nQueens', 'subsetsTree',
+    'graph', 'grid', 'matrix', 'unionFind',
+    'dpTable', 'nQueens', 'subsetsTree', 'huffman',
     'segmentTree', 'fenwick',
 ];

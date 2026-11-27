@@ -1,0 +1,308 @@
+## Why it matters
+
+Plain union-find answers one question: are these two in the same set? Competitive programming stretches it in two directions. **Rollback** lets you undo the most recent unions, which powers backtracking searches and the offline "edges appear and disappear" technique. **Weighted** union-find stores a relationship along every parent link, so it can answer "a is how many times b?" or "how much taller is a than b?", not just "are they related?". Both are small changes to code you know, and both show exactly what path compression costs and buys.
+
+## Undoing unions
+
+Suppose you want to try a union, explore its consequences, then take it back, the way a backtracking search tries a choice and undoes it. Or you have edges that each exist only for a while, and you want to process them so that each union is undone when its edge's time is up.
+
+The obstacle is path compression. A single find can rewrite many parent pointers, and all of those writes would need undoing too. Worse, compression's speed is **amortised**: an expensive find is paid for by cheaper finds later. Undo throws the flattened paths away, so the same expensive find can happen again after every rollback, and the guarantee is gone.
+
+So a rollback union-find makes a deliberate trade:
+
+- **No path compression.** find only reads, so it changes nothing, and it isn't even `mutating`.
+- **Union by size stays.** It alone keeps every depth at most log₂ n, so find is O(log n) in the **worst case**, with no amortisation to break.
+- **Every union changes exactly two values**: the smaller root's parent and the larger root's size. Push both onto a history stack. To undo, pop and restore them, in O(1).
+
+```swift run
+struct RollbackUnionFind {
+    private(set) var parent: [Int]
+    private var size: [Int]
+    private var history: [(child: Int, root: Int)?] = []   // nil: a union that changed nothing
+    private(set) var componentCount: Int
+
+    init(count: Int) {
+        parent = Array(0..<count)
+        size = Array(repeating: 1, count: count)
+        componentCount = count
+    }
+
+    /// No path compression, so find changes nothing: O(log n) thanks to union by size
+    func find(_ x: Int) -> Int {
+        var node = x
+        while parent[node] != node { node = parent[node] }
+        return node
+    }
+
+    @discardableResult
+    mutating func union(_ a: Int, _ b: Int) -> Bool {
+        var rootA = find(a)
+        var rootB = find(b)
+        if rootA == rootB {
+            history.append(nil)                  // still recorded, so every union can be undone
+            return false
+        }
+        if size[rootA] < size[rootB] { swap(&rootA, &rootB) }
+        parent[rootB] = rootA
+        size[rootA] += size[rootB]
+        componentCount -= 1
+        history.append((child: rootB, root: rootA))
+        return true
+    }
+
+    /// A marker to roll back to: the number of unions so far
+    var snapshot: Int { history.count }
+
+    /// Undoes unions, most recent first, until only `snapshot` remain. O(1) per union undone.
+    mutating func rollback(to snapshot: Int) {
+        while history.count > snapshot {
+            guard let change = history.removeLast() else { continue }
+            parent[change.child] = change.child
+            size[change.root] -= size[change.child]
+            componentCount += 1
+        }
+    }
+}
+
+var sets = RollbackUnionFind(count: 6)
+sets.union(0, 1)
+sets.union(2, 3)
+let checkpoint = sets.snapshot
+print("checkpoint:", sets.parent, "sets:", sets.componentCount)
+sets.union(1, 2)
+sets.union(4, 5)
+sets.union(0, 3)                                 // already joined: recorded as nil
+print("3 unions on:", sets.parent, "sets:", sets.componentCount, "| 0 and 3 together?", sets.find(0) == sets.find(3))
+sets.rollback(to: checkpoint)
+print("rolled back:", sets.parent, "sets:", sets.componentCount, "| 0 and 3 together?", sets.find(0) == sets.find(3))
+```
+
+```output
+checkpoint: [0, 0, 2, 2, 4, 5] sets: 4
+3 unions on: [0, 0, 0, 2, 4, 4] sets: 2 | 0 and 3 together? true
+rolled back: [0, 0, 2, 2, 4, 5] sets: 4 | 0 and 3 together? false
+```
+
+What to notice:
+
+- **Rollback restores the exact parent array**, not just the same groups. That's only possible because nothing else ever writes to `parent`.
+- **Failed unions are recorded as `nil`.** Then "undo the last k unions" always means k entries, whether or not they changed anything, which keeps the bookkeeping of a recursive search simple.
+- **Undo must go in reverse order.** It's a stack, as in M26: undoing an older union while a newer one still depends on its root would corrupt the trees.
+
+### Where rollback is used
+
+The classic use is **offline dynamic connectivity**: edges are added and removed over time, all known in advance, with connectivity questions in between. Each edge is alive during some intervals of time. Those intervals are spread over a segment tree indexed by time (a structure you'll meet in Part VIII), and a DFS walks that tree: on the way down into a node it unions that node's edges, at a leaf it answers the question asked at that moment, and on the way back up it rolls back. Each edge is unioned O(log q) times for q moments, so the total is O(q log q log n). You don't need to build it now. Recognise the shape: **union going down, rollback coming back up**.
+
+## Weighted union-find: relations along the links
+
+Now give every parent link a **weight**: a fact relating a node to its parent. Combine the weights along a path and you get a fact relating any node to its root, and so any two nodes with the same root to each other.
+
+The cleanest example is division. You're told facts like `a / b = 2` and `b / c = 4`, and asked for `a / c`. Store
+
+- `weight[x] = x / parent[x]`, so a root's own ratio to itself is 1.
+
+Multiplying the weights from x up to the root gives `x / root`. If a and c share a root, then `a / c = (a / root) / (c / root)`. If they don't, the facts don't determine the answer.
+
+### find, keeping the weights right
+
+Path compression still works, with one extra step. When a node is re-pointed straight at the root, its weight must become the product of the weights along its old path. Walking the path from the node nearest the root back down, each node's parent already points at the root with the right weight, so one multiplication fixes the node:
+
+```swift
+mutating func find(_ x: Int) -> (root: Int, ratio: Double) {
+    var path: [Int] = []
+    var root = x
+    while parent[root] != root {
+        path.append(root)
+        root = parent[root]
+    }
+    for node in path.reversed() where parent[node] != root {
+        weight[node] *= weight[parent[node]]     // node / parent × parent / root = node / root
+        parent[node] = root
+    }
+    return (root, x == root ? 1 : weight[x])
+}
+```
+
+### union from a fact
+
+To record `a / b = k`, find both roots: `a = ratioA · rootA` and `b = ratioB · rootB`. Substituting into `a / b = k` gives the ratio between the roots:
+
+```text
+ratioA · rootA = k · ratioB · rootB
+        rootA / rootB = k · ratioB / ratioA
+```
+
+Hang one root under the other with that weight, or its reciprocal if they go the other way round. Union by size still decides which way.
+
+```swift run
+struct RatioUnionFind {
+    private var parent: [Int] = []
+    private var weight: [Double] = []      // weight[x] = x / parent[x]
+    private var size: [Int] = []
+
+    mutating func addElement() -> Int {
+        parent.append(parent.count)
+        weight.append(1)
+        size.append(1)
+        return parent.count - 1
+    }
+
+    /// The root of x, and the ratio x / root. Compresses the path, keeping each weight right.
+    mutating func find(_ x: Int) -> (root: Int, ratio: Double) {
+        var path: [Int] = []
+        var root = x
+        while parent[root] != root {
+            path.append(root)
+            root = parent[root]
+        }
+        for node in path.reversed() where parent[node] != root {
+            weight[node] *= weight[parent[node]]     // its parent already points at the root
+            parent[node] = root
+        }
+        return (root, x == root ? 1 : weight[x])
+    }
+
+    /// Records a / b = k. Returns false if a and b were already related.
+    mutating func union(_ a: Int, _ b: Int, ratio k: Double) -> Bool {
+        let (rootA, ratioA) = find(a)               // a = ratioA · rootA
+        let (rootB, ratioB) = find(b)               // b = ratioB · rootB
+        if rootA == rootB { return false }
+        let rootRatio = k * ratioB / ratioA         // rootA / rootB
+        if size[rootA] < size[rootB] {
+            parent[rootA] = rootB
+            weight[rootA] = rootRatio
+            size[rootB] += size[rootA]
+        } else {
+            parent[rootB] = rootA
+            weight[rootB] = 1 / rootRatio
+            size[rootA] += size[rootB]
+        }
+        return true
+    }
+
+    /// a / b, or nil if the facts so far don't determine it
+    mutating func ratio(_ a: Int, _ b: Int) -> Double? {
+        let (rootA, ratioA) = find(a)
+        let (rootB, ratioB) = find(b)
+        return rootA == rootB ? ratioA / ratioB : nil
+    }
+}
+
+var facts = RatioUnionFind()
+var indexOf: [String: Int] = [:]
+func index(_ name: String) -> Int {
+    if let known = indexOf[name] { return known }
+    let new = facts.addElement()
+    indexOf[name] = new
+    return new
+}
+
+for (a, b, k) in [("a", "b", 2.0), ("b", "c", 4.0), ("d", "e", 0.5), ("a", "c", 9.0)] {
+    let (x, y) = (index(a), index(b))
+    if !facts.union(x, y, ratio: k), let known = facts.ratio(x, y), abs(known - k) > 1e-9 {
+        print("\(a) / \(b) = \(k) contradicts what's known: \(known)")
+    }
+}
+for (a, b) in [("a", "c"), ("c", "a"), ("b", "a"), ("e", "d"), ("a", "e"), ("x", "x")] {
+    if let x = indexOf[a], let y = indexOf[b], let value = facts.ratio(x, y) {
+        print("\(a) / \(b) = \(value)")
+    } else {
+        print("\(a) / \(b) is unknown")
+    }
+}
+```
+
+```output
+a / c = 9.0 contradicts what's known: 8.0
+a / c = 8.0
+c / a = 0.125
+b / a = 0.5
+e / d = 2.0
+a / e is unknown
+x / x is unknown
+```
+
+What to notice:
+
+- **A union that returns false is a chance to check consistency.** a and c were already related (8.0, through b), so the new fact 9.0 is a contradiction. With floating point, compare with a tolerance, never `==`.
+- **Unknown names give no answer, not 1.** `x / x` looks like it should be 1, but x never appeared in a fact, so many problems want "unknown" there. Read the statement.
+- **a and e are in different groups.** Their facts never touch, so no ratio between them is implied.
+
+### Other weights
+
+The same machinery works for any relation you can combine along a path and reverse:
+
+| Fact | Weight on x | Along a path | Reversing |
+| --- | --- | --- | --- |
+| `a / b = k` | x / parent | multiply | 1 / w |
+| `a − b = k` (heights, times) | x − parent | add | −w |
+| a and b are on the same or opposite teams | 0 or 1 | add mod 2 (XOR) | the same |
+
+The last row is a union-find version of [Bipartite check](/dsa/learn/gt-bipartite) that works as facts arrive: "a and b are on opposite teams" is a contradiction exactly when a and b already share a root with the same parity.
+
+<Callout kind="gotcha" title="Common mistakes">
+- **Compressing weights in the wrong order.** Fix the nodes nearest the root first, so each parent's weight is already relative to the root when you multiply by it.
+- **Getting the direction backwards.** Write down what `weight[x]` means (x / parent, not parent / x) and derive the union formula from it, as above.
+- **Using path compression with rollback.** Undo can't restore the pointers compression rewrote. Rollback union-find uses union by size alone.
+- **Comparing doubles with `==`.** Ratios built from different paths can differ in the last bits. Use a small tolerance.
+</Callout>
+
+## Practice
+
+**Exchange-rate queries** is a weighted union-find over currency names: rates are facts, queries ask for the rate between any two currencies, and the tests include a chain of 50,000 currencies.
+
+```cards
+- id: rb-no-compression
+  front: "Why does a union-find with rollback drop path compression?"
+  back: "Compression rewrites many pointers that undo would have to restore, and its amortised bound breaks when work is undone. Union by size alone keeps find at O(log n) worst case and find changes nothing."
+- id: rb-undo
+  front: "What does a rollback union-find record for each union, and how is it undone?"
+  back: "The smaller root that moved and the root it joined. Undo restores the child's parent to itself and subtracts its size from the root, most recent first."
+- id: weighted-meaning
+  front: "In a weighted union-find for a / b = k facts, what does weight[x] store, and how do you get a / c?"
+  back: "weight[x] = x / parent[x]. The product up the path gives x / root, so if a and c share a root, a / c = (a / root) / (c / root)."
+- id: weighted-union
+  front: "To record a / b = k with a = ratioA · rootA and b = ratioB · rootB, what ratio links the roots?"
+  back: "rootA / rootB = k · ratioB / ratioA. Hang one root under the other with that weight, or its reciprocal."
+```
+
+```quiz
+- id: q1
+  type: mcq
+  prompt: "Which change makes a union-find support undoing its most recent unions?"
+  options:
+    - "Keep path compression, drop union by size"
+    - "Drop path compression, keep union by size, and push each union's changes onto a stack"
+    - "Store a full copy of the parent array before every union"
+    - "Use union by rank instead of size"
+  answer: 1
+  explain: "Without compression, only unions write to the arrays, two values each, so a stack undoes them in O(1). Union by size keeps find O(log n). A full copy works but costs O(n) per union."
+- id: q2
+  type: trace
+  prompt: "A rollback union-find on 0 to 3 starts empty. Do `union(0, 1)`, take a snapshot, then `union(2, 3)`, `union(1, 3)`, `union(0, 2)`. Write the number of sets after each of the three unions, then after rolling back to the snapshot."
+  answer: "2, 1, 1, 3"
+  explain: "After union(0, 1) there are 3 sets. union(2, 3) makes 2, union(1, 3) makes 1, and union(0, 2) finds them already joined (recorded as nil). Rolling back undoes all three, leaving {0, 1}, {2}, {3}: 3 sets."
+- id: q3
+  type: output
+  prompt: "Weights along a path multiply. If `weight[x] = x / parent[x]`, and the path from a to its root r is a → p → r with `weight[a] = 3` and `weight[p] = 0.5`, what does this print?"
+  code: |
+    let weightA = 3.0
+    let weightP = 0.5
+    let aOverRoot = weightA * weightP
+    print(aOverRoot, 1 / aOverRoot)
+  answer: "1.5 0.6666666666666666"
+  explain: "a / r = (a / p) · (p / r) = 3 × 0.5 = 1.5, and r / a is the reciprocal. That product is the weight a gets when compression points it straight at r."
+- id: q4
+  type: truefalse
+  prompt: "In a weighted union-find, a union that returns false can still reveal a contradiction."
+  answer: true
+  explain: "If a and b already share a root, the structure already knows a / b. If the new fact gives a different value (beyond rounding), the facts contradict each other."
+- id: q5
+  type: match
+  prompt: "Match each kind of fact with how weights combine along a path."
+  pairs:
+    - ["a / b = k", "multiply"]
+    - ["a − b = k", "add"]
+    - ["same or opposite team", "XOR (add mod 2)"]
+  explain: "Each relation needs a way to combine along a path and a way to reverse: reciprocal for ratios, negation for differences, and parity is its own reverse."
+```

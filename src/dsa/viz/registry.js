@@ -12,6 +12,7 @@ export const VISUALS = {
     hashTable: () => import('./views/HashTableView.jsx'),
     intervals: () => import('./views/IntervalsView.jsx'),
     matrix: () => import('./views/MatrixView.jsx'),
+    unionFind: () => import('./views/UnionFindView.jsx'),
     bst: () => import('./views/TreeViews.jsx').then((module) => ({ default: module.BstView })),
     binaryTree: () => import('./views/TreeViews.jsx').then((module) => ({ default: module.BinaryTreeView })),
     avl: () => import('./views/TreeViews.jsx').then((module) => ({ default: module.AvlView })),
@@ -22,6 +23,7 @@ export const VISUALS = {
     dpTable: () => import('./views/ParadigmViews.jsx').then((module) => ({ default: module.DpTableView })),
     nQueens: () => import('./views/ParadigmViews.jsx').then((module) => ({ default: module.QueensView })),
     subsetsTree: () => import('./views/ParadigmViews.jsx').then((module) => ({ default: module.SubsetsTreeView })),
+    huffman: () => import('./views/ParadigmViews.jsx').then((module) => ({ default: module.HuffmanView })),
     segmentTree: () => import('./views/RangeTreeViews.jsx').then((module) => ({ default: module.SegmentTreeView })),
     fenwick: () => import('./views/RangeTreeViews.jsx').then((module) => ({ default: module.FenwickView })),
 };

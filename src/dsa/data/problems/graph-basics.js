@@ -1,0 +1,43 @@
+// Problems for the graph-basics module. Fields are described in ../problems.js.
+export default [
+    {
+        id: 'trusted-archivist',
+        title: 'The trusted archivist',
+        difficulty: 'easy',
+        patterns: ['basics'],
+        lessons: ['graph-terminology'],
+        swiftTest: 'TrustedArchivistTests',
+        lists: ['patterns150'],
+        minutes: 20,
+    },
+    {
+        id: 'station-neighbour-lists',
+        title: 'Station neighbour lists',
+        difficulty: 'easy',
+        patterns: ['basics'],
+        lessons: ['graph-representations', 'graph-dense-sparse'],
+        swiftTest: 'StationNeighbourListsTests',
+        lists: ['patterns150'],
+        minutes: 20,
+    },
+    {
+        id: 'adjacency-graph-design',
+        title: 'Build a generic graph',
+        difficulty: 'medium',
+        patterns: ['design', 'hashing'],
+        lessons: ['graph-build'],
+        swiftTest: 'AdjacencyGraphDesignTests',
+        lists: ['patterns150'],
+        minutes: 40,
+    },
+    {
+        id: 'maze-cell-degrees',
+        title: 'Dead ends and junctions',
+        difficulty: 'easy',
+        patterns: ['basics', 'matrix'],
+        lessons: ['graph-implicit'],
+        swiftTest: 'MazeCellDegreesTests',
+        lists: ['patterns150'],
+        minutes: 20,
+    },
+];

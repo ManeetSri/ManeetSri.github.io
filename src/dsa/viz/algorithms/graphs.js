@@ -13,6 +13,25 @@ export const GRAPHS = {
         nodes: [{ id: 'A', x: 8, y: 50 }, { id: 'B', x: 34, y: 15 }, { id: 'C', x: 34, y: 85 }, { id: 'D', x: 64, y: 15 }, { id: 'E', x: 64, y: 85 }, { id: 'F', x: 92, y: 50 }],
         edges: [['A', 'B', 4], ['A', 'C', 2], ['B', 'C', 1], ['B', 'D', 5], ['C', 'E', 10], ['D', 'E', 2], ['D', 'F', 6], ['E', 'F', 3]],
     },
+    // Directed, with a negative edge (B→A) that Dijkstra gets wrong: it settles A at 2 before B→A could lower it
+    // to 1. The edges are listed in an unhelpful order, so Bellman–Ford needs a second round.
+    negative: {
+        directed: true,
+        nodes: [{ id: 'S', x: 8, y: 50 }, { id: 'A', x: 38, y: 15 }, { id: 'B', x: 38, y: 85 }, { id: 'C', x: 66, y: 15 }, { id: 'D', x: 92, y: 50 }],
+        edges: [['A', 'C', 3], ['C', 'D', 1], ['S', 'A', 2], ['S', 'B', 5], ['B', 'A', -4]],
+    },
+    // Directed, with three strongly connected components: {A, B, C}, {D, E} and {F}
+    scc: {
+        directed: true,
+        nodes: [{ id: 'A', x: 8, y: 30 }, { id: 'B', x: 32, y: 12 }, { id: 'C', x: 32, y: 85 }, { id: 'D', x: 62, y: 12 }, { id: 'E', x: 62, y: 85 }, { id: 'F', x: 92, y: 50 }],
+        edges: [['A', 'B'], ['B', 'C'], ['C', 'A'], ['B', 'D'], ['D', 'E'], ['E', 'D'], ['C', 'E'], ['E', 'F']],
+    },
+    // A flow network: capacities on directed edges, source S, sink T
+    flow: {
+        directed: true,
+        nodes: [{ id: 'S', x: 5, y: 50 }, { id: 'A', x: 35, y: 12 }, { id: 'B', x: 35, y: 88 }, { id: 'C', x: 65, y: 12 }, { id: 'D', x: 65, y: 88 }, { id: 'T', x: 95, y: 50 }],
+        edges: [['S', 'A', 10], ['S', 'B', 10], ['A', 'B', 2], ['A', 'C', 4], ['A', 'D', 8], ['B', 'D', 9], ['D', 'C', 6], ['C', 'T', 10], ['D', 'T', 10]],
+    },
     dag: {
         directed: true,
         nodes: [{ id: 'shirt', x: 10, y: 20 }, { id: 'tie', x: 38, y: 20 }, { id: 'jacket', x: 66, y: 50 }, { id: 'trousers', x: 10, y: 80 }, { id: 'belt', x: 38, y: 80 }, { id: 'shoes', x: 92, y: 80 }, { id: 'socks', x: 92, y: 20 }],
@@ -87,8 +106,129 @@ const CODE = {
     }
     return order.count == nodes.count ? order : nil
 }`,
+    prim: `func primTotal(_ graph: [Node: [(Node, Int)]], from start: Node) -> Int {
+    var inTree: Set<Node> = []
+    var heap = Heap<(weight: Int, from: Node, to: Node)> { $0.weight < $1.weight }
+    heap.insert((0, start, start))
+    var total = 0
+    while let edge = heap.pop() {
+        if inTree.contains(edge.to) { continue }    // a stale, heavier way in
+        inTree.insert(edge.to)
+        total += edge.weight
+        for (next, weight) in graph[edge.to, default: []] where !inTree.contains(next) {
+            heap.insert((weight, edge.to, next))
+        }
+    }
+    return total
+}`,
+    bellmanFord: `func bellmanFord(_ edges: [(Node, Node, Int)], nodeCount: Int, from source: Node) -> [Node: Int]? {
+    var distance: [Node: Int] = [source: 0]
+    for _ in 0..<(nodeCount - 1) {
+        for (from, to, weight) in edges {
+            guard let d = distance[from] else { continue }   // not reached yet
+            if d + weight < distance[to, default: .max] {
+                distance[to] = d + weight
+            }
+        }
+    }
+    for (from, to, weight) in edges {           // one more round: does anything still improve?
+        if let d = distance[from], d + weight < distance[to, default: .max] {
+            return nil                          // a negative cycle is reachable
+        }
+    }
+    return distance
+}`,
+    topoWaves: `func semesterPlan(_ courseCount: Int, _ prerequisites: [[Int]]) -> [[Int]]? {
+    var unlocks = Array(repeating: [Int](), count: courseCount)
+    var waitingOn = Array(repeating: 0, count: courseCount)
+    for pair in prerequisites {                      // [before, after]
+        unlocks[pair[0]].append(pair[1])
+        waitingOn[pair[1]] += 1
+    }
+    var current = (0..<courseCount).filter { waitingOn[$0] == 0 }
+    var plan: [[Int]] = []
+    var taken = 0
+    while !current.isEmpty {
+        plan.append(current)                         // take everything that's ready, together
+        taken += current.count
+        var next: [Int] = []
+        for course in current {
+            for after in unlocks[course] {
+                waitingOn[after] -= 1
+                if waitingOn[after] == 0 {
+                    next.append(after)               // ready next semester, not this one
+                }
+            }
+        }
+        current = next
+    }
+    return taken == courseCount ? plan : nil         // nil: a cycle blocks some courses
+}`,
+    topoDfs: `func topologicalOrder(_ graph: [Node: [Node]], _ nodes: [Node]) -> [Node] {
+    var visited: Set<Node> = []
+    var finished: [Node] = []
+    func visit(_ node: Node) {
+        visited.insert(node)
+        for next in graph[node, default: []] where !visited.contains(next) { visit(next) }
+        finished.append(node)                      // everything that must come after it is done
+    }
+    for node in nodes where !visited.contains(node) { visit(node) }
+    return finished.reversed()
+}`,
+    scc: `func stronglyConnectedComponents(_ graph: [Node: [Node]], _ nodes: [Node]) -> [[Node]] {
+    var visited: Set<Node> = []
+    var finished: [Node] = []
+    func firstPass(_ node: Node) {
+        visited.insert(node)
+        for next in graph[node, default: []] where !visited.contains(next) { firstPass(next) }
+        finished.append(node)                      // everything reachable from node is done
+    }
+    for node in nodes where !visited.contains(node) { firstPass(node) }
+
+    var reversed: [Node: [Node]] = [:]
+    for (node, targets) in graph { for target in targets { reversed[target, default: []].append(node) } }
+    var components: [[Node]] = []
+    visited.removeAll()
+    func secondPass(_ node: Node) {
+        visited.insert(node)
+        components[components.count - 1].append(node)
+        for next in reversed[node, default: []] where !visited.contains(next) { secondPass(next) }
+    }
+    for node in finished.reversed() where !visited.contains(node) {
+        components.append([])
+        secondPass(node)                           // it reaches exactly one component
+    }
+    return components
+}`,
+    maxFlow: `func maxFlow(_ capacity: [[Int]], from source: Int, to sink: Int) -> Int {
+    var residual = capacity                      // residual[u][v]: how much more can go u→v
+    var total = 0
+    while true {
+        var parent = [Int](repeating: -1, count: capacity.count)
+        parent[source] = source
+        var queue = [source], head = 0
+        while head < queue.count && parent[sink] == -1 {     // BFS: the shortest augmenting path
+            let u = queue[head]; head += 1
+            for v in residual.indices where parent[v] == -1 && residual[u][v] > 0 {
+                parent[v] = u
+                queue.append(v)
+            }
+        }
+        if parent[sink] == -1 { return total }   // no path left: the flow is maximal
+        var bottleneck = Int.max
+        var v = sink
+        while v != source { bottleneck = min(bottleneck, residual[parent[v]][v]); v = parent[v] }
+        v = sink
+        while v != source {
+            residual[parent[v]][v] -= bottleneck
+            residual[v][parent[v]] += bottleneck     // so the flow can be pushed back later
+            v = parent[v]
+        }
+        total += bottleneck
+    }
+}`,
     kruskal: `func minimumSpanningTree(_ nodeCount: Int, _ edges: [(Int, Int, Int)]) -> [(Int, Int, Int)] {
-    var sets = UnionFind(nodeCount)
+    var sets = UnionFind(count: nodeCount)
     var tree: [(Int, Int, Int)] = []
     for edge in edges.sorted(by: { $0.2 < $1.2 }) {
         if sets.union(edge.0, edge.1) {
@@ -268,12 +408,293 @@ function* kruskal(graph) {
     yield frame(10, `The minimum spanning tree uses ${Object.values(edges).filter((tone) => tone === 'tree').length} edges with a total weight of ${total}.`);
 }
 
+function* prim(graph, start) {
+    const neighbours = neighboursOf(graph);
+    const inTree = new Set();
+    const heap = [[0, start, start]];
+    const edges = {};
+    let total = 0;
+    const order = (entries) => [...entries].sort((a, b) => a[0] - b[0] || (a[2] < b[2] ? -1 : a[2] > b[2] ? 1 : 0));
+    const frame = (line, message, current) => ({
+        states: Object.fromEntries(graph.nodes.map((node) => [node.id, node.id === current ? 'current' : inTree.has(node.id) ? 'done' : heap.some((entry) => entry[2] === node.id) ? 'frontier' : 'idle'])),
+        edges: { ...edges },
+        labels: {},
+        side: [{ title: 'heap (lightest first)', items: order(heap).map(([w, from, to]) => (from === to ? `${to}:${w}` : `${from}${to}:${w}`)) }, { title: 'total weight', items: [String(total)] }],
+        line,
+        message,
+    });
+    yield frame(4, `Grow one tree from ${start}. The heap holds every edge leaving the tree; the lightest one is always safe to add.`);
+    while (heap.length) {
+        const [weight, from, to] = order(heap)[0];
+        heap.splice(heap.findIndex((entry) => entry[0] === weight && entry[1] === from && entry[2] === to), 1);
+        if (inTree.has(to)) {
+            edges[edgeKey(from, to, false)] = 'rejected';
+            yield frame(7, `${from}–${to} (${weight}) is stale: ${to} is already in the tree by a lighter edge. Skip it.`, to);
+            continue;
+        }
+        inTree.add(to);
+        total += weight;
+        if (from !== to) edges[edgeKey(from, to, false)] = 'tree';
+        for (const { to: next, weight: w } of neighbours[to]) {
+            if (!inTree.has(next)) heap.push([w, to, next]);
+        }
+        yield frame(11, from === to ? `Start the tree at ${to}, and push its edges.` : `Take ${from}–${to} (${weight}), the lightest edge leaving the tree. Push ${to}'s edges to nodes outside the tree.`, to);
+    }
+    yield frame(14, `Every node is in the tree. Total weight ${total}, the same as Kruskal's: the MST weight is unique even when the tree isn't.`);
+}
+
+function* bellmanFord(graph, start) {
+    const distance = { [start]: 0 };
+    const edges = {};
+    const label = () => Object.fromEntries(graph.nodes.map((node) => [node.id, distance[node.id] === undefined ? '∞' : String(distance[node.id])]));
+    const frame = (line, message, current, highlight) => ({
+        states: Object.fromEntries(graph.nodes.map((node) => [node.id, node.id === current ? 'current' : distance[node.id] !== undefined ? 'done' : 'idle'])),
+        edges: { ...edges, ...(highlight ? { [edgeKey(highlight[0], highlight[1], true)]: 'used' } : {}) },
+        labels: label(),
+        side: [{ title: 'edges, in the order they’re checked', items: graph.edges.map(([a, b, w]) => `${a}→${b}:${w}`) }],
+        line,
+        message,
+    });
+    const rounds = graph.nodes.length - 1;
+    yield frame(2, `distance[${start}] = 0, every other node ∞. Relax every edge, ${rounds} times: after round k, every shortest path of up to k edges is correct.`);
+    for (let round = 1; round <= rounds; round += 1) {
+        let changed = 0;
+        for (const [from, to, weight] of graph.edges) {
+            if (distance[from] === undefined) continue;
+            const candidate = distance[from] + weight;
+            if (distance[to] === undefined || candidate < distance[to]) {
+                const old = distance[to];
+                distance[to] = candidate;
+                changed += 1;
+                yield frame(7, `Round ${round}: ${from}→${to} (${weight}): ${distance[from]} + ${weight} = ${candidate} beats ${old === undefined ? '∞' : old}.`, to, [from, to]);
+            }
+        }
+        yield frame(3, changed ? `Round ${round} done: ${changed} distance${changed === 1 ? '' : 's'} improved.` : `Round ${round} changed nothing. The code still runs all ${rounds} rounds; stopping early here is a common, safe optimisation.`);
+    }
+    for (const [from, to, weight] of graph.edges) {
+        if (distance[from] !== undefined && distance[from] + weight < distance[to]) {
+            yield frame(13, `An extra round still improves ${from}→${to}: a negative cycle is reachable, so shortest distances don't exist.`, to, [from, to]);
+            return;
+        }
+    }
+    yield frame(16, `One more pass changes nothing, so there's no negative cycle. These are the shortest distances from ${start}, in O(V·E).`);
+}
+
+// DFS that records finishing order: a node finishes after everything reachable from it. Shared by topoDfs and scc.
+function* finishingPass(graph, neighbours, finished, makeFrame, lines) {
+    const visited = new Set();
+    const stack = [];
+    function* visit(node, from) {
+        visited.add(node);
+        stack.push(node);
+        yield makeFrame(lines.visit, `Visit ${node}${from ? ` from ${from}` : ''}.`, { stack, visited, from: from && [from, node] });
+        for (const { to } of neighbours[node]) {
+            if (!visited.has(to)) yield* visit(to, node);
+        }
+        stack.pop();
+        finished.push(node);
+        yield makeFrame(lines.finish, `${node} finishes (#${finished.length}): everything reachable from it is done.`, { stack, visited, finishedNode: node });
+    }
+    for (const node of graph.nodes) {
+        if (!visited.has(node.id)) yield* visit(node.id, null);
+    }
+}
+
+// Kahn's algorithm in waves: everything ready now is taken together, and what it unlocks waits for the next wave
+function* topoWaves(graph) {
+    const ids = graph.nodes.map((node) => node.id);
+    const unlocks = Object.fromEntries(ids.map((id) => [id, []]));
+    const waitingOn = Object.fromEntries(ids.map((id) => [id, 0]));
+    graph.edges.forEach(([before, after]) => { unlocks[before].push(after); waitingOn[after] += 1; });
+    let current = ids.filter((id) => waitingOn[id] === 0);
+    let next = [];
+    const semester = {};
+    const plan = [];
+    const edges = {};
+    const frame = (line, message, focus) => ({
+        states: Object.fromEntries(ids.map((id) => [id, id === focus ? 'current' : semester[id] !== undefined && !current.includes(id) ? 'done' : current.includes(id) ? 'current' : next.includes(id) ? 'frontier' : 'idle'])),
+        edges: { ...edges },
+        labels: Object.fromEntries(ids.map((id) => [id, semester[id] !== undefined ? `S${semester[id]}` : `wait ${waitingOn[id]}`])),
+        side: [{ title: 'this semester', items: [...current] }, { title: 'ready next', items: [...next] }, { title: 'plan', items: plan.map((wave, index) => `S${index + 1}: ${wave.join(' ')}`) }],
+        line,
+        message,
+    });
+    yield frame(8, `Count what each course waits on. ${current.join(', ')} wait${current.length === 1 ? 's' : ''} on nothing, so semester 1 takes ${current.length === 1 ? 'it' : 'them all at once'}.`);
+    while (current.length) {
+        plan.push([...current]);
+        current.forEach((id) => { semester[id] = plan.length; });
+        yield frame(12, `Semester ${plan.length}: take ${current.join(', ')} together.`);
+        next = [];
+        for (const course of current) {
+            for (const after of unlocks[course]) {
+                waitingOn[after] -= 1;
+                edges[edgeKey(course, after, true)] = 'used';
+                if (waitingOn[after] === 0) next.push(after);
+            }
+            if (unlocks[course].length) yield frame(19, `Finishing ${course} unlocks a prerequisite of ${unlocks[course].join(', ')}.${unlocks[course].some((after) => next.includes(after) && waitingOn[after] === 0) ? ` ${unlocks[course].filter((after) => next.includes(after)).join(', ')} now wait${unlocks[course].filter((after) => next.includes(after)).length === 1 ? 's' : ''} on nothing: next semester.` : ''}`, course);
+        }
+        current = next;
+        next = [];
+        yield frame(23, current.length ? `Semester ${plan.length + 1} will take ${current.join(', ')}.` : 'Nothing is ready for another semester.');
+    }
+    const taken = Object.keys(semester).length;
+    yield frame(25, taken === ids.length ? `${plan.length} semesters: the length of the longest prerequisite chain. Nothing could be done sooner, because every course waited only as long as its slowest prerequisite.` : `Only ${taken} of ${ids.length} courses could be taken: the rest sit on a cycle, so there's no plan.`);
+}
+
+function* topoDfs(graph) {
+    const neighbours = neighboursOf(graph);
+    const finished = [];
+    const edges = {};
+    const makeFrame = (line, message, { stack = [], visited = new Set(), from } = {}) => {
+        if (from) edges[edgeKey(from[0], from[1], true)] = 'tree';
+        return {
+            states: Object.fromEntries(graph.nodes.map((node) => [node.id, node.id === stack.at(-1) ? 'current' : stack.includes(node.id) ? 'frontier' : finished.includes(node.id) ? 'done' : visited.has(node.id) ? 'frontier' : 'idle'])),
+            edges: { ...edges },
+            labels: Object.fromEntries(finished.map((id, index) => [id, `f${index + 1}`])),
+            side: [{ title: 'call stack (top last)', items: [...stack] }, { title: 'finished', items: [...finished] }],
+            line,
+            message,
+        };
+    };
+    yield makeFrame(9, 'Run DFS from each unvisited node in turn, and note the order in which nodes finish.');
+    yield* finishingPass(graph, neighbours, finished, makeFrame, { visit: 5, finish: 7 });
+    const order = [...finished].reverse();
+    yield { ...makeFrame(10, `Reverse the finishing order: ${order.join(' → ')}. Every edge points from earlier to later, because a node always finishes after everything it points to.`), side: [{ title: 'topological order', items: order }] };
+}
+
+function* scc(graph) {
+    const neighbours = neighboursOf(graph);
+    const reversed = Object.fromEntries(graph.nodes.map((node) => [node.id, []]));
+    graph.edges.forEach(([a, b]) => reversed[b].push(a));
+    Object.values(reversed).forEach((list) => list.sort());
+    const finished = [];
+    const component = {};
+    const components = [];
+    const edges = {};
+    const firstFrame = (line, message, { stack = [], visited = new Set(), from } = {}) => {
+        if (from) edges[edgeKey(from[0], from[1], true)] = 'tree';
+        return {
+            states: Object.fromEntries(graph.nodes.map((node) => [node.id, node.id === stack.at(-1) ? 'current' : stack.includes(node.id) ? 'frontier' : finished.includes(node.id) ? 'done' : visited.has(node.id) ? 'frontier' : 'idle'])),
+            edges: { ...edges },
+            labels: Object.fromEntries(finished.map((id, index) => [id, `f${index + 1}`])),
+            side: [{ title: 'pass 1: call stack', items: [...stack] }, { title: 'finished', items: [...finished] }],
+            line,
+            message,
+        };
+    };
+    yield firstFrame(9, 'Pass 1: DFS over the whole graph, recording the order in which nodes finish.');
+    yield* finishingPass(graph, neighbours, finished, firstFrame, { visit: 5, finish: 7 });
+    const starts = [...finished].reverse();
+    Object.keys(edges).forEach((key) => delete edges[key]);
+    const secondFrame = (line, message, current) => ({
+        states: Object.fromEntries(graph.nodes.map((node) => [node.id, node.id === current ? 'current' : component[node.id] === components.length && component[node.id] !== undefined ? 'frontier' : component[node.id] !== undefined ? 'done' : 'idle'])),
+        edges: { ...edges },
+        labels: Object.fromEntries(graph.nodes.map((node) => [node.id, component[node.id] !== undefined ? `C${component[node.id]}` : `f${finished.indexOf(node.id) + 1}`])),
+        side: [{ title: 'pass 2 starts (latest finish first)', items: starts.filter((id) => component[id] === undefined) }, { title: 'components', items: components.map((members, index) => `C${index + 1}: ${members.join(' ')}`) }],
+        line,
+        message,
+    });
+    yield secondFrame(14, 'Pass 2 walks the reversed graph (every arrow flipped), starting from the node that finished last. Following arrows backwards can\'t leave a component without reaching one that\'s already been claimed.');
+    function* claim(node, from) {
+        component[node] = components.length;
+        components.at(-1).push(node);
+        if (from) edges[edgeKey(node, from, true)] = 'used';
+        yield secondFrame(17, from ? `${node} reaches back to ${from} (${node}→${from} in the original graph), so it joins C${components.length}.` : `${node} starts C${components.length}.`, node);
+        for (const next of reversed[node]) {
+            if (component[next] === undefined) yield* claim(next, node);
+        }
+    }
+    for (const node of starts) {
+        if (component[node] !== undefined) continue;
+        components.push([]);
+        yield* claim(node, null);
+        yield secondFrame(22, `C${components.length} is complete: {${components.at(-1).join(', ')}}. Every node in it can reach every other.`);
+    }
+    yield secondFrame(24, `${components.length} strongly connected components, found with two DFS passes: O(V + E).`);
+}
+
+// Edmonds–Karp on an adjacency matrix: BFS finds the shortest augmenting path in the residual graph.
+// Antiparallel edges (both u→v and v→u) aren't supported in a picture, because flow labels would be ambiguous.
+function* maxFlow(graph, source, sink) {
+    const ids = graph.nodes.map((node) => node.id);
+    const index = Object.fromEntries(ids.map((id, at) => [id, at]));
+    const n = ids.length;
+    const capacity = Array.from({ length: n }, () => Array(n).fill(0));
+    graph.edges.forEach(([a, b, c]) => { capacity[index[a]][index[b]] += c; });
+    const residual = capacity.map((row) => [...row]);
+    let total = 0;
+    let rounds = 0;
+    const flowLabels = () => Object.fromEntries(graph.edges.map(([a, b, c]) => [edgeKey(a, b, true), `${Math.max(0, c - residual[index[a]][index[b]])}/${c}`]));
+    const frame = (line, message, { path = [], states = {} } = {}) => {
+        const edges = {};
+        graph.edges.forEach(([a, b]) => { if (residual[index[a]][index[b]] === 0) edges[edgeKey(a, b, true)] = 'tree'; });
+        path.forEach(([u, v]) => {
+            if (capacity[u][v] > 0) edges[edgeKey(ids[u], ids[v], true)] = 'used';
+            else edges[edgeKey(ids[v], ids[u], true)] = 'rejected';
+        });
+        return {
+            states: { ...Object.fromEntries(ids.map((id) => [id, 'idle'])), [source]: 'current', [sink]: 'current', ...states },
+            edges,
+            edgeLabels: flowLabels(),
+            labels: {},
+            side: [{ title: 'total flow', items: [String(total)] }, { title: 'augmenting paths', items: [String(rounds)] }],
+            line,
+            message,
+        };
+    };
+    yield frame(3, `Every edge shows flow/capacity, starting at 0. Find a path from ${source} to ${sink} with room left, push as much as it can take, and repeat.`);
+    const s = index[source];
+    const t = index[sink];
+    for (;;) {
+        const parent = Array(n).fill(-1);
+        parent[s] = s;
+        const queue = [s];
+        for (let head = 0; head < queue.length && parent[t] === -1; head += 1) {
+            const u = queue[head];
+            for (let v = 0; v < n; v += 1) {
+                if (parent[v] === -1 && residual[u][v] > 0) {
+                    parent[v] = u;
+                    queue.push(v);
+                }
+            }
+        }
+        if (parent[t] === -1) {
+            const sourceSide = new Set(queue.map((at) => ids[at]));
+            const cut = graph.edges.filter(([a, b]) => sourceSide.has(a) && !sourceSide.has(b));
+            const states = Object.fromEntries(ids.map((id) => [id, sourceSide.has(id) ? 'done' : 'idle']));
+            const result = frame(15, `No path with room is left, so the flow is maximal: ${total}. The green nodes are still reachable from ${source}; the edges leaving them (${cut.map(([a, b]) => `${a}→${b}`).join(', ')}) are full and add up to ${cut.reduce((sum, edge) => sum + edge[2], 0)}: a minimum cut equal to the maximum flow.`, { states });
+            cut.forEach(([a, b]) => { result.edges[edgeKey(a, b, true)] = 'used'; });
+            yield result;
+            return;
+        }
+        const path = [];
+        for (let v = t; v !== s; v = parent[v]) path.unshift([parent[v], v]);
+        const bottleneck = Math.min(...path.map(([u, v]) => residual[u][v]));
+        const backwards = path.filter(([u, v]) => capacity[u][v] === 0);
+        const route = [ids[s], ...path.map(([, v]) => ids[v])].join('→');
+        yield frame(18, `BFS finds the shortest path with room: ${route}. Its tightest edge allows ${bottleneck}.${backwards.length ? ` It uses ${backwards.map(([u, v]) => `${ids[v]}→${ids[u]}`).join(', ')} backwards (dashed): that cancels flow sent earlier, rerouting it.` : ''}`, { path, states: Object.fromEntries(path.map(([, v]) => [ids[v], 'frontier'])) });
+        path.forEach(([u, v]) => {
+            residual[u][v] -= bottleneck;
+            residual[v][u] += bottleneck;
+        });
+        total += bottleneck;
+        rounds += 1;
+        yield frame(25, `Push ${bottleneck} along it. Total flow ${total}. Full edges are green.`, { path });
+    }
+}
+
 const PROGRAMS = {
     bfs: { title: 'Breadth-first search', graph: 'small', code: CODE.bfs, run: (graph, start) => bfs(graph, start ?? graph.nodes[0].id) },
     dfs: { title: 'Depth-first search', graph: 'small', code: CODE.dfs, run: (graph, start) => dfs(graph, start ?? graph.nodes[0].id) },
     dijkstra: { title: 'Dijkstra’s shortest paths', graph: 'weighted', code: CODE.dijkstra, run: (graph, start) => dijkstra(graph, start ?? graph.nodes[0].id) },
     topo: { title: 'Topological sort with Kahn’s algorithm', graph: 'dag', code: CODE.topo, run: (graph) => topo(graph) },
     kruskal: { title: 'Kruskal’s minimum spanning tree', graph: 'weighted', code: CODE.kruskal, run: (graph) => kruskal(graph) },
+    topoWaves: { title: 'Kahn’s algorithm in waves: the fewest semesters', graph: 'dag', code: CODE.topoWaves, run: (graph) => topoWaves(graph) },
+    topoDfs: { title: 'Topological sort with DFS finishing order', graph: 'dag', code: CODE.topoDfs, run: (graph) => topoDfs(graph) },
+    scc: { title: 'Strongly connected components (Kosaraju)', graph: 'scc', code: CODE.scc, run: (graph) => scc(graph) },
+    prim: { title: 'Prim’s minimum spanning tree', graph: 'weighted', code: CODE.prim, run: (graph, start) => prim(graph, start ?? graph.nodes[0].id) },
+    maxFlow: { title: 'Maximum flow with Edmonds–Karp', graph: 'flow', code: CODE.maxFlow, run: (graph, start, end) => maxFlow(graph, start ?? graph.nodes[0].id, end ?? graph.nodes.at(-1).id) },
+    bellmanFord: { title: 'Bellman–Ford shortest paths', graph: 'negative', code: CODE.bellmanFord, run: (graph, start) => bellmanFord(graph, start ?? graph.nodes[0].id) },
 };
 
 export const GRAPH_PROGRAMS = Object.keys(PROGRAMS);
@@ -284,10 +705,10 @@ export const graphProgram = (name) => {
     return program;
 };
 
-export const graphFrames = (name, { graph, start } = {}) => {
+export const graphFrames = (name, { graph, start, end } = {}) => {
     const program = graphProgram(name);
     const resolved = typeof graph === 'object' && graph !== null ? graph : GRAPHS[graph ?? program.graph];
-    return { graph: resolved, frames: [...program.run(resolved, start)] };
+    return { graph: resolved, frames: [...program.run(resolved, start, end)] };
 };
 
 // ── Grids ──────────────────────────────────────────────────────────────────────────────────────

@@ -121,6 +121,18 @@ filesIn(join(root, 'src/dsa/content'), '.mdx').forEach((path) => {
         const known = kind === 'learn' ? lessonIds.has(id) : kind === 'practice' ? problemIdSet.has(id) : modules.some((module) => module.id === id);
         if (!known) fail(`${where} links to /dsa/${kind}/${id}, which doesn't exist`);
     }
+    // MDX reads { … } in prose as a JavaScript expression: {A, B} crashes the page and {0, 1} prints just "1".
+    // Content never needs expressions, so any brace outside code must be escaped as \{ and \}.
+    let inFence = false;
+    text.split('\n').forEach((line, index) => {
+        if (line.trimStart().startsWith('```')) {
+            inFence = !inFence;
+            return;
+        }
+        if (inFence || /<[A-Za-z]/.test(line)) return;
+        const prose = line.replace(/`[^`]*`/g, '');
+        if (/(?<!\\)[{}]/.test(prose)) fail(`${where}:${index + 1} has a { or } outside code; write \\{ and \\} so MDX shows it as text`);
+    });
 });
 
 // Generated example files must match the lessons they come from
