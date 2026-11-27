@@ -1,0 +1,43 @@
+// Problems for the tree-basics module. Fields are described in ../problems.js.
+export default [
+    {
+        id: 'tree-census',
+        title: 'Tree census',
+        difficulty: 'easy',
+        patterns: ['recursion', 'dfs'],
+        lessons: ['tree-terminology', 'tree-node-swift'],
+        swiftTest: 'TreeCensusTests',
+        lists: ['patterns150'],
+        minutes: 20,
+    },
+    {
+        id: 'tree-shapes',
+        title: 'Name that tree shape',
+        difficulty: 'medium',
+        patterns: ['bfs', 'recursion'],
+        lessons: ['tree-types'],
+        swiftTest: 'TreeShapesTests',
+        lists: ['patterns150'],
+        minutes: 30,
+    },
+    {
+        id: 'level-order-builder',
+        title: 'Level order in and out',
+        difficulty: 'medium',
+        patterns: ['bfs'],
+        lessons: ['tree-build-level-order'],
+        swiftTest: 'LevelOrderBuilderTests',
+        lists: ['patterns150'],
+        minutes: 30,
+    },
+    {
+        id: 'folder-sizes',
+        title: 'Folder sizes',
+        difficulty: 'medium',
+        patterns: ['dfs', 'recursion'],
+        lessons: ['tree-nary', 'tree-real-world'],
+        swiftTest: 'FolderSizesTests',
+        lists: ['patterns150'],
+        minutes: 35,
+    },
+];

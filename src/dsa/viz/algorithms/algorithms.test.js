@@ -325,3 +325,82 @@ test('cyclic sort matches the lesson and stays within n swaps', async () => {
     assert.ok(withRepeats.vars.swaps <= 6 && withRepeats.vars.moves === 6);
     assert.deepEqual(withRepeats.rows[0].values.slice(0, 4), [1, 2, 3, 4]);
 });
+
+test('partition traces match the efficient-sorts lessons', async () => {
+    const { arrayFrames } = await import('./arrayPrograms.js');
+    const hoare = arrayFrames('hoarePartition').at(-1);
+    assert.deepEqual(hoare.rows[0].values, [3, 2, 1, 5, 7, 9]);
+    assert.equal(hoare.vars.j, 2);
+    const threeWay = arrayFrames('threeWay').at(-1);
+    assert.deepEqual(threeWay.rows[0].values, [1, 2, 4, 4, 4, 4, 7, 9]);
+    assert.deepEqual([threeWay.vars.less, threeWay.vars.greater], [2, 6]);
+    const landed = arrayFrames('quickselect').filter((frame) => frame.line === 19).map((frame) => Number(Object.keys(frame.rows[0].marks)[0]));
+    assert.deepEqual(landed, [4, 7, 5]);
+    // Every k finds the kth smallest
+    const items = [42, 7, 19, 88, 3, 56, 23, 71, 12, 64];
+    const sorted = [...items].sort((a, b) => a - b);
+    items.forEach((_, k) => {
+        const last = arrayFrames('quickselect', { k }).at(-1);
+        assert.equal(last.rows[0].values[k], sorted[k]);
+    });
+});
+
+test('inversion counting matches the lesson and a brute force', async () => {
+    const { arrayFrames } = await import('./arrayPrograms.js');
+    assert.deepEqual(arrayFrames('inversions').filter((frame) => frame.line === 21).map((frame) => frame.vars.across), [0, 1, 0, 0, 7]);
+    const brute = (items) => items.reduce((sum, value, i) => sum + items.slice(i + 1).filter((other) => other < value).length, 0);
+    for (const items of [[1, 2, 3], [3, 2, 1], [2, 2], [4, 1, 3, 1, 2], [9, 8, 7, 6, 5, 4, 3, 2, 1], []]) {
+        const last = arrayFrames('inversions', { items }).at(-1);
+        assert.equal(last.vars.total, brute(items), JSON.stringify(items));
+        assert.deepEqual(last.rows[0].values, [...items].sort((a, b) => a - b));
+    }
+});
+
+test('radix sort passes match the lesson', async () => {
+    const { arrayFrames } = await import('./arrayPrograms.js');
+    const passes = arrayFrames('radixSort').filter((frame) => frame.rows.length === 1 && frame.rows[0].label.startsWith('after')).map((frame) => frame.rows[0].values.map(Number));
+    assert.deepEqual(passes, [[260, 731, 512, 204, 45, 97, 38, 8], [204, 8, 512, 731, 38, 45, 260, 97], [8, 38, 45, 97, 204, 260, 512, 731]]);
+    for (const items of [[5], [10, 1, 100, 0], [3, 3, 1], [99, 9, 999, 0, 90]]) {
+        const last = arrayFrames('radixSort', { items }).at(-1);
+        assert.deepEqual(last.rows[0].values.map(Number), [...items].sort((a, b) => a - b));
+    }
+});
+
+test('merging two sorted lists relinks every node in order, and takes the first list on ties', async () => {
+    const { linkedListFrames } = await import('./linkedList.js');
+    const walk = (frame) => {
+        const values = [];
+        for (let id = frame.next[0]; id !== null; id = frame.next[id]) values.push(frame.nodes[id].value);
+        return values;
+    };
+    for (const [first, second] of [[[1, 4, 6], [2, 3, 7, 8]], [[5, 5, 9], [1, 5]], [[], [1, 2]], [[3], []], [[1, 2, 3], [4, 5, 6]]]) {
+        const last = linkedListFrames('merge', { first, second }).at(-1);
+        assert.deepEqual(walk(last), [...first, ...second].sort((a, b) => a - b));
+    }
+    // On a tie the first list's node comes first: ids 1–3 are the first list
+    const tie = linkedListFrames('merge', { first: [5, 5, 9], second: [1, 5] }).at(-1);
+    const ids = [];
+    for (let id = tie.next[0]; id !== null; id = tie.next[id]) ids.push(id);
+    assert.deepEqual(ids, [4, 1, 2, 5, 3]);
+});
+
+test('trie removal with pass counts matches the lesson and prunes unused branches', async () => {
+    const { trieFrames } = await import('./trees.js');
+    const count = (nodes, id = '0') => Object.values(nodes[id].children).reduce((sum, child) => sum + 1 + count(nodes, String(child)), 0);
+    const frames = trieFrames({ words: ['car', 'cart', 'care', 'dog'], remove: ['cart', 'ca', 'car', 'dog', 'care'] });
+    assert.deepEqual(frames.filter((frame) => [2, 10, 14].includes(frame.line)).map((frame) => count(frame.nodes)), [7, 7, 7, 4, 0]);
+    assert.equal(frames.at(-1).nodes[0].note, 0);
+    // Without remove, the prefix search still runs as before
+    assert.match(trieFrames().at(-1).message, /car, cart, cat/);
+});
+
+test('heapify and heap sort match the heaps lessons', async () => {
+    const { heapifyFrames, heapSortFrames } = await import('./trees.js');
+    assert.deepEqual(heapifyFrames().filter((frame) => frame.line === 9).map((frame) => frame.items), [[9, 4, 7, 1, 8, 2, 6, 3, 5], [9, 4, 2, 1, 8, 7, 6, 3, 5], [9, 1, 2, 3, 8, 7, 6, 4, 5], [1, 3, 2, 4, 8, 7, 6, 9, 5]]);
+    const isMinHeap = (items) => items.every((value, index) => index === 0 || items[Math.floor((index - 1) / 2)] <= value);
+    for (const items of [[3, 1, 2], [5, 4, 3, 2, 1], [1], [], [2, 2, 1, 1]]) {
+        assert.ok(isMinHeap(heapifyFrames({ items }).at(-1).items), JSON.stringify(items));
+        assert.deepEqual(heapSortFrames({ items }).at(-1).items, [...items].sort((a, b) => a - b));
+    }
+    assert.deepEqual(heapSortFrames().filter((frame) => frame.line === 23).map((frame) => frame.heapSize), [5, 4, 3, 2, 1]);
+});

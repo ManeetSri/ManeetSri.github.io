@@ -36,6 +36,13 @@ import elementarySorts from './problems/elementary-sorts.js';
 import efficientSorts from './problems/efficient-sorts.js';
 import linearSorts from './problems/linear-sorts.js';
 import intervals from './problems/intervals.js';
+import treeBasics from './problems/tree-basics.js';
+import treeTraversals from './problems/tree-traversals.js';
+import binaryTrees from './problems/binary-trees.js';
+import bst from './problems/bst.js';
+import balancedTrees from './problems/balanced-trees.js';
+import heaps from './problems/heaps.js';
+import tries from './problems/tries.js';
 
 export const DIFFICULTIES = {
     warmup: { label: 'Warm-up', xp: 15 },
@@ -123,6 +130,13 @@ export const problems = [
     ...efficientSorts,
     ...linearSorts,
     ...intervals,
+    ...treeBasics,
+    ...treeTraversals,
+    ...binaryTrees,
+    ...bst,
+    ...balancedTrees,
+    ...heaps,
+    ...tries,
 ];
 
 export const problemById = Object.fromEntries(problems.map((problem) => [problem.id, problem]));

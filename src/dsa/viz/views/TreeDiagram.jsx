@@ -34,7 +34,8 @@ const layout = (rootId, childrenOf) => {
 
 // A binary tree ({ root, nodes: { id: { value, left, right, note } } }) or any tree, given childrenOf.
 // Binary children keep their side: a lone right child sits to the right of its parent.
-const TreeDiagram = ({ tree, marks = {}, label, childrenOf: customChildren, nodeLabel = (node) => String(node.value), badge }) => {
+// Notes are AVL balance factors by default, shown in red beyond ±1; `plainNotes` shows any note in grey.
+const TreeDiagram = ({ tree, marks = {}, label, childrenOf: customChildren, nodeLabel = (node) => String(node.value), badge, plainNotes = false }) => {
     const binary = !customChildren;
     const childrenOf = useMemo(() => customChildren ?? ((id) => {
         const node = tree.nodes[id];
@@ -69,8 +70,8 @@ const TreeDiagram = ({ tree, marks = {}, label, childrenOf: customChildren, node
                         <g key={id}>
                             <circle cx={cx} cy={cy} r={NODE / 2} fill={tone.fill} stroke={tone.stroke} strokeWidth={marks[id] ? 2 : 1} />
                             <text x={cx} y={cy + 1} textAnchor="middle" dominantBaseline="middle" fontFamily="var(--font-mono)" fontSize="12" fill={tone.text}>{nodeLabel(node)}</text>
-                            {binary && node.note !== undefined && (
-                                <text x={cx + NODE / 2 + 2} y={cy - NODE / 2 + 4} fontFamily="var(--font-mono)" fontSize="9" fill={Math.abs(Number(node.note)) > 1 ? '#FF9D96' : 'var(--color-muted)'}>{node.note}</text>
+                            {(binary || plainNotes) && node.note !== undefined && (
+                                <text x={cx + NODE / 2 + 2} y={cy - NODE / 2 + 4} fontFamily="var(--font-mono)" fontSize="9" fill={!plainNotes && Math.abs(Number(node.note)) > 1 ? '#FF9D96' : 'var(--color-muted)'}>{node.note}</text>
                             )}
                             {badge?.(node) && <circle cx={cx + NODE / 2 - 4} cy={cy + NODE / 2 - 4} r="4" fill="#30D158" />}
                         </g>

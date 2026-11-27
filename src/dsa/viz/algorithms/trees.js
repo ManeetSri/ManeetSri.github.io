@@ -5,7 +5,7 @@ const clone = (tree) => ({ root: tree.root, nodes: Object.fromEntries(Object.ent
 
 // ── Binary search trees ────────────────────────────────────────────────────────────────────────
 
-const BST_CODE = {
+export const BST_CODE = {
     insert: `func insert(_ value: Int, into node: TreeNode?) -> TreeNode {
     guard let node else { return TreeNode(value) }
     if value < node.value {
@@ -174,7 +174,11 @@ function* bstRemove({ values, target }) {
 }
 
 function* traversal({ values, order }) {
-    const tree = buildBst(values);
+    yield* traversalFrames(buildBst(values), order, true);
+}
+
+// Any binary tree snapshot, visited in `order`. `sorted` adds the BST remark to the last message.
+export function* traversalFrames(tree, order, sorted = false) {
     const output = [];
     const lines = { inorder: 4, preorder: 3, postorder: 5, levelorder: 7 };
     if (order === 'levelorder') {
@@ -205,7 +209,7 @@ function* traversal({ values, order }) {
         }
         yield* walk(tree.root);
     }
-    yield { tree, marks: {}, line: lines[order], message: `${order === 'levelorder' ? 'Level order' : `${order[0].toUpperCase()}${order.slice(1)}`}: ${output.join(', ')}.${order === 'inorder' ? ' Sorted, because it’s a BST.' : ''}`, output };
+    yield { tree, marks: {}, line: lines[order], message: `${order === 'levelorder' ? 'Level order' : `${order[0].toUpperCase()}${order.slice(1)}`}: ${output.join(', ')}.${order === 'inorder' && sorted ? ' Sorted, because it’s a BST.' : ''}`, output };
 }
 
 const BST_PROGRAMS = {
@@ -390,6 +394,114 @@ export const heapFrames = ({ operations = [5, 3, 8, 1, 9, 2, 'pop', 'pop'] } = {
     return frames;
 };
 
+export const HEAPIFY_CODE = `func siftDown(_ items: inout [Int], from index: Int) {
+    var parent = index
+    while true {
+        let left = 2 * parent + 1
+        let right = left + 1
+        var smaller = parent
+        if left < items.count && items[left] < items[smaller] { smaller = left }
+        if right < items.count && items[right] < items[smaller] { smaller = right }
+        if smaller == parent { return }
+        items.swapAt(parent, smaller)
+        parent = smaller
+    }
+}
+
+for index in stride(from: items.count / 2 - 1, through: 0, by: -1) {
+    siftDown(&items, from: index)
+}`;
+
+export const HEAP_SORT_CODE = `func siftDown(_ items: inout [Int], from index: Int, end: Int) {
+    var parent = index
+    while true {
+        let left = 2 * parent + 1
+        let right = left + 1
+        var largest = parent
+        if left < end && items[left] > items[largest] { largest = left }
+        if right < end && items[right] > items[largest] { largest = right }
+        if largest == parent { return }
+        items.swapAt(parent, largest)
+        parent = largest
+    }
+}
+
+func heapSort(_ items: inout [Int]) {
+    for index in stride(from: items.count / 2 - 1, through: 0, by: -1) {
+        siftDown(&items, from: index, end: items.count)
+    }
+    var end = items.count - 1
+    while end > 0 {
+        items.swapAt(0, end)                     // the largest joins the sorted part
+        siftDown(&items, from: 0, end: end)      // repair the smaller heap
+        end -= 1
+    }
+}`;
+
+// Sifts items[index] down within items[0..<end]; `before(a, b)` is true when a belongs above b. Yields each swap.
+function* siftDownSteps(items, index, end, before) {
+    let parent = index;
+    for (;;) {
+        const left = 2 * parent + 1;
+        const right = left + 1;
+        let next = parent;
+        if (left < end && before(items[left], items[next])) next = left;
+        if (right < end && before(items[right], items[next])) next = right;
+        if (next === parent) return;
+        [items[parent], items[next]] = [items[next], items[parent]];
+        yield { parent, next };
+        parent = next;
+    }
+}
+
+const subtreeOf = (index, size) => (index >= size ? [] : [index, ...subtreeOf(2 * index + 1, size), ...subtreeOf(2 * index + 2, size)]);
+
+// Bottom-up heapify into a min-heap, matching the heap-heapify lesson
+export const heapifyFrames = ({ items: input = [9, 4, 7, 1, 8, 2, 6, 3, 5] } = {}) => {
+    const items = [...input];
+    const n = items.length;
+    const settled = new Set();
+    for (let index = Math.floor(n / 2); index < n; index += 1) settled.add(index);
+    const marks = (extra = {}) => ({ ...Object.fromEntries([...settled].map((index) => [index, 'found'])), ...extra });
+    const frames = [{ items: [...items], marks: marks(), line: 15, message: `The array as a tree, exactly as it is. Indexes ${Math.floor(n / 2)} to ${n - 1} are leaves (green): each is already a heap of one.` }];
+    for (let index = Math.floor(n / 2) - 1; index >= 0; index -= 1) {
+        const value = items[index];
+        frames.push({ items: [...items], marks: marks({ [index]: 'swap' }), line: 16, message: `Sift down index ${index} (${value}). Both of its subtrees are heaps already.` });
+        let moved = 0;
+        for (const { parent, next } of siftDownSteps(items, index, n, (a, b) => a < b)) {
+            moved += 1;
+            frames.push({ items: [...items], marks: marks({ [parent]: 'swap', [next]: 'swap' }), line: 10, message: `${items[parent]} is the smaller child, so it swaps up and ${value} moves down to index ${next}.` });
+        }
+        subtreeOf(index, n).forEach((step) => settled.add(step));
+        frames.push({ items: [...items], marks: marks(), line: 9, message: moved ? `${value} has settled. The subtree under index ${index} is a heap.` : `${value} is already no bigger than its children: nothing moves, and the subtree under index ${index} is a heap.` });
+    }
+    frames.push({ items: [...items], marks: {}, line: 17, message: `A min-heap after ${Math.max(0, Math.floor(n / 2))} sift-downs. Most were short, because most nodes are near the bottom: O(n) in total.` });
+    return frames;
+};
+
+// In-place heap sort with a max-heap, matching the heap-sort lesson. `heapSize` is how much of the array is still heap.
+export const heapSortFrames = ({ items: input = [5, 2, 9, 1, 6, 3] } = {}) => {
+    const items = [...input];
+    const n = items.length;
+    const frames = [{ items: [...items], heapSize: n, marks: {}, line: 16, message: 'Step 1: heapify the array into a max-heap, in place.' }];
+    for (let index = Math.floor(n / 2) - 1; index >= 0; index -= 1) {
+        [...siftDownSteps(items, index, n, (a, b) => a > b)];
+        frames.push({ items: [...items], heapSize: n, marks: Object.fromEntries(subtreeOf(index, n).map((step) => [step, 'path'])), line: 17, message: `Sift down index ${index}: its subtree is now a max-heap.` });
+    }
+    frames.push({ items: [...items], heapSize: n, marks: { 0: 'found' }, line: 19, message: `Max-heap: [${items.join(', ')}]. The largest value, ${items[0]}, is at the root.` });
+    for (let end = n - 1; end > 0; end -= 1) {
+        const largest = items[0];
+        [items[0], items[end]] = [items[end], items[0]];
+        frames.push({ items: [...items], heapSize: end, marks: { 0: 'swap', [end]: 'swap' }, line: 21, message: `Swap the root, ${largest}, with the last heap slot. ${largest} is now in its final place; the heap shrinks to ${end}.` });
+        for (const { parent, next } of siftDownSteps(items, 0, end, (a, b) => a > b)) {
+            frames.push({ items: [...items], heapSize: end, marks: { [parent]: 'swap', [next]: 'swap' }, line: 10, message: `${items[parent]} is the larger child, so it rises; ${items[next]} sinks to index ${next}.` });
+        }
+        frames.push({ items: [...items], heapSize: end, marks: { 0: 'found' }, line: 23, message: `Heap [${items.slice(0, end).join(', ')}] | sorted [${items.slice(end).join(', ')}].` });
+    }
+    frames.push({ items: [...items], heapSize: 0, marks: {}, line: 25, message: `Sorted in place: [${items.join(', ')}]. O(n log n) time, O(1) extra space, but not stable.` });
+    return frames;
+};
+
 export const heapAsTree = (items) => ({
     root: items.length ? 0 : null,
     nodes: Object.fromEntries(items.map((value, index) => [index, { value, left: 2 * index + 1 < items.length ? 2 * index + 1 : null, right: 2 * index + 2 < items.length ? 2 * index + 2 : null }])),
@@ -417,35 +529,103 @@ func hasPrefix(_ prefix: String) -> Bool {
     return true
 }`;
 
-export const trieFrames = ({ words = ['car', 'cat', 'cart', 'dog'], prefix = 'ca' } = {}) => {
-    const nodes = { 0: { value: '·', children: {}, isWord: false } };
+export const TRIE_REMOVE_CODE = `func remove(_ word: String) -> Bool {
+    guard search(word) else { return false }     // check first, or the counts go wrong
+    var node = root
+    node.passCount -= 1
+    for character in word {
+        let child = node.children[character]!
+        child.passCount -= 1
+        if child.passCount == 0 {
+            node.children[character] = nil       // no other word uses this branch: cut it off
+            return true
+        }
+        node = child
+    }
+    node.isWord = false                          // still needed by longer words: only unmark it
+    return true
+}`;
+
+// Inserts `words`, then either searches `prefix` or, with `remove`, deletes those words using pass counts
+// (shown beside each node as its note) and prunes branches no word uses any more.
+export const trieFrames = ({ words = ['car', 'cat', 'cart', 'dog'], prefix, remove } = {}) => {
+    const counting = Array.isArray(remove);
+    const search = prefix ?? (counting ? null : 'ca');
+    const nodes = { 0: { value: '·', children: {}, isWord: false, ...(counting ? { note: 0 } : {}) } };
     let nextId = 1;
     const frames = [];
     const snapshot = (marks, line, message) => frames.push({ nodes: JSON.parse(JSON.stringify(nodes)), marks, line, message });
-    snapshot({}, 1, 'An empty trie: just the root. Each edge below a node is one character.');
+    const walk = (text) => {
+        let id = 0;
+        for (const character of text) {
+            id = nodes[id].children[character];
+            if (id === undefined) return null;
+        }
+        return id;
+    };
+    snapshot({}, counting ? undefined : 1, `An empty trie: just the root. Each edge below a node is one character.${counting ? ' The number beside each node counts the stored words that pass through it.' : ''}`);
     words.forEach((word) => {
+        const existing = walk(word);
+        if (counting && existing !== null && nodes[existing].isWord) {
+            snapshot({}, undefined, `"${word}" is already stored, so nothing changes (and no count goes up twice).`);
+            return;
+        }
         let id = 0;
         const path = [0];
         let created = 0;
+        if (counting) nodes[0].note += 1;
         for (const character of word) {
             if (nodes[id].children[character] === undefined) {
-                nodes[nextId] = { value: character, children: {}, isWord: false };
+                nodes[nextId] = { value: character, children: {}, isWord: false, ...(counting ? { note: 0 } : {}) };
                 nodes[id].children[character] = nextId;
                 nextId += 1;
                 created += 1;
             }
             id = nodes[id].children[character];
+            if (counting) nodes[id].note += 1;
             path.push(id);
         }
         nodes[id].isWord = true;
-        snapshot(Object.fromEntries(path.map((step) => [step, 'path'])), 9, `Insert "${word}": ${created ? `${created} new node${created === 1 ? '' : 's'}` : 'every node already existed'}${word.length - created > 0 && created ? `, sharing ${word.length - created} with earlier words` : ''}. The last node is marked as the end of a word.`);
+        snapshot(Object.fromEntries(path.map((step) => [step, 'path'])), counting ? undefined : 9, `Insert "${word}": ${created ? `${created} new node${created === 1 ? '' : 's'}` : 'every node already existed'}${word.length - created > 0 && created ? `, sharing ${word.length - created} with earlier words` : ''}. The last node is marked as the end of a word.`);
     });
+
+    if (counting) {
+        const subtree = (id) => [id, ...Object.values(nodes[id].children).flatMap(subtree)];
+        remove.forEach((word) => {
+            const end = walk(word);
+            if (end === null || !nodes[end].isWord) {
+                snapshot({}, 2, `remove("${word}"): "${word}" isn't a stored word, so return false before touching any count.`);
+                return;
+            }
+            nodes[0].note -= 1;
+            let id = 0;
+            const path = [0];
+            for (const character of word) {
+                const child = nodes[id].children[character];
+                nodes[child].note -= 1;
+                path.push(child);
+                if (nodes[child].note === 0) {
+                    const branch = subtree(child);
+                    snapshot({ ...Object.fromEntries(path.slice(0, -1).map((step) => [step, 'path'])), ...Object.fromEntries(branch.map((step) => [step, 'out'])) }, 9, `remove("${word}"): "${character}" drops to 0, so no other word passes through it. Cut it off, with everything below it.`);
+                    delete nodes[id].children[character];
+                    branch.forEach((step) => { delete nodes[step]; });
+                    snapshot(Object.fromEntries(path.slice(0, -1).map((step) => [step, 'path'])), 10, `"${word}" is gone, along with ${branch.length} node${branch.length === 1 ? '' : 's'} only it used.`);
+                    return;
+                }
+                id = child;
+            }
+            nodes[id].isWord = false;
+            snapshot({ ...Object.fromEntries(path.map((step) => [step, 'path'])), [id]: 'found' }, 14, `remove("${word}"): every node on its path is still used by a longer word, so only unmark the end of "${word}".`);
+        });
+        return frames;
+    }
+
     let id = 0;
     const path = [0];
-    for (const character of prefix) {
+    for (const character of search) {
         const next = nodes[id].children[character];
         if (next === undefined) {
-            snapshot(Object.fromEntries(path.map((step) => [step, 'path'])), 15, `No "${character}" edge here: no word starts with "${prefix}".`);
+            snapshot(Object.fromEntries(path.map((step) => [step, 'path'])), 15, `No "${character}" edge here: no word starts with "${search}".`);
             return frames;
         }
         id = next;
@@ -457,7 +637,7 @@ export const trieFrames = ({ words = ['car', 'cat', 'cart', 'dog'], prefix = 'ca
         if (nodes[nodeId].isWord) found.push(sofar);
         Object.entries(nodes[nodeId].children).sort(([a], [b]) => a.localeCompare(b)).forEach(([character, child]) => collect(child, sofar + character));
     };
-    collect(id, prefix);
-    snapshot({ ...Object.fromEntries(path.map((step) => [step, 'path'])), [id]: 'found' }, 18, `"${prefix}" is a prefix. Everything below this node completes it: ${found.join(', ')}. That's autocomplete, in O(length of the prefix) to get here.`);
+    collect(id, search);
+    snapshot({ ...Object.fromEntries(path.map((step) => [step, 'path'])), [id]: 'found' }, 18, `"${search}" is a prefix. Everything below this node completes it: ${found.join(', ')}. That's autocomplete, in O(length of the prefix) to get here.`);
     return frames;
 };

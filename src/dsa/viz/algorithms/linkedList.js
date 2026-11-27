@@ -98,6 +98,75 @@ const PROGRAMS = {
     },
 };
 
+// Merging two sorted lists with a dummy head and a tail pointer, matching the ll-merge-sorted lesson.
+// Frames add `positions` ({ id: { col, row } }): the first list on the top row, the second below, the dummy between.
+PROGRAMS.merge = {
+    title: 'Merging two sorted lists with a dummy and a tail',
+    defaults: { first: [1, 4, 6], second: [2, 3, 7, 8] },
+    code: `func merge(_ first: ListNode?, _ second: ListNode?) -> ListNode? {
+    let dummy = ListNode(0)
+    var tail = dummy
+    var a = first
+    var b = second
+    while let left = a, let right = b {
+        if left.value <= right.value {
+            tail.next = left
+            a = left.next
+        } else {
+            tail.next = right
+            b = right.next
+        }
+        tail = tail.next!
+    }
+    tail.next = a ?? b          // whatever is left is already sorted
+    return dummy.next
+}`,
+    * run({ first, second }) {
+        const nodes = [{ id: 0, value: 0 }, ...first.map((value, index) => ({ id: 1 + index, value })), ...second.map((value, index) => ({ id: 1 + first.length + index, value }))];
+        const positions = { 0: { col: 0, row: 0.5 } };
+        first.forEach((_, index) => { positions[1 + index] = { col: index + 1, row: 0 }; });
+        second.forEach((_, index) => { positions[1 + first.length + index] = { col: index + 1, row: 1 }; });
+        const next = { 0: null };
+        first.forEach((_, index) => { next[1 + index] = index + 1 < first.length ? 2 + index : null; });
+        second.forEach((_, index) => { next[1 + first.length + index] = index + 1 < second.length ? 2 + first.length + index : null; });
+        let tail = 0;
+        let a = first.length ? 1 : null;
+        let b = second.length ? 1 + first.length : null;
+        const merged = () => {
+            const ids = [];
+            for (let id = next[0]; id !== null && ids.length < nodes.length; id = next[id]) {
+                ids.push(id);
+                if (id === tail) break;
+            }
+            return Object.fromEntries(ids.map((id) => [id, 'found']));
+        };
+        const frame = (line, message, done = false) => ({ nodes, next: { ...next }, positions, pointers: done ? { dummy: 0 } : { dummy: 0, tail, a, b }, marks: merged(), line, message });
+        yield frame(5, 'The dummy node gives the merged list a place to start, so the first link is no special case. tail is the last node of the merged list so far.');
+        while (a !== null && b !== null) {
+            const left = nodes[a];
+            const right = nodes[b];
+            if (left.value <= right.value) {
+                next[tail] = a;
+                a = next[a];
+                yield frame(8, `${left.value} ≤ ${right.value}: link tail to ${left.value}, and a moves on${a === null ? ' to nil' : ` to ${nodes[a].value}`}.${left.value === right.value ? ' Taking the first list on ties keeps the merge stable.' : ''}`);
+            } else {
+                next[tail] = b;
+                b = next[b];
+                yield frame(11, `${right.value} < ${left.value}: link tail to ${right.value}, and b moves on${b === null ? ' to nil' : ` to ${nodes[b].value}`}.`);
+            }
+            tail = next[tail];
+            yield frame(14, `tail moves to ${nodes[tail].value}, the end of the merged list.`);
+        }
+        const rest = a ?? b;
+        next[tail] = rest;
+        tail = null;
+        yield frame(16, rest === null ? 'Both lists are used up.' : `One list is empty. The rest of the other, from ${nodes[rest].value}, is already sorted: link it on in one step.`);
+        const order = [];
+        for (let id = next[0]; id !== null; id = next[id]) order.push(nodes[id].value);
+        yield { ...frame(17, `Return dummy.next: ${order.join(' -> ')} -> nil. No new nodes were made, only links changed: O(m + n) time, O(1) extra space.`, true), marks: Object.fromEntries(nodes.filter((node) => node.id !== 0).map((node) => [node.id, 'found'])) };
+    },
+};
+
 export const LINKED_LIST_PROGRAMS = Object.keys(PROGRAMS);
 
 export const linkedListProgram = (name) => {

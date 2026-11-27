@@ -572,7 +572,7 @@ const rawModules = [
 
     // Part V: Trees ─────────────────────────────────────────────────────────────────────────
     {
-        id: 'tree-basics', code: 'M34', part: 5, title: 'Tree fundamentals', level: 'intermediate', tracks: ['core'], requires: ['intervals'],
+        id: 'tree-basics', code: 'M34', part: 5, title: 'Tree fundamentals', level: 'intermediate', tracks: ['core'], requires: ['intervals'], status: 'ready',
         summary: 'Tree vocabulary, tree types, building and printing trees in Swift.',
         lessons: [
             ['tree-terminology', 'Tree terminology', { minutes: 25 }],
@@ -585,7 +585,7 @@ const rawModules = [
         ],
     },
     {
-        id: 'tree-traversals', code: 'M35', part: 5, title: 'Tree traversals', level: 'intermediate', tracks: ['core'], requires: ['tree-basics'],
+        id: 'tree-traversals', code: 'M35', part: 5, title: 'Tree traversals', level: 'intermediate', tracks: ['core'], requires: ['tree-basics'], status: 'ready',
         summary: 'Every way to walk a tree, recursively and iteratively, depth-first and level by level.',
         lessons: [
             ['trav-dfs-recursive', 'Preorder, inorder and postorder', { minutes: 25 }],
@@ -598,7 +598,7 @@ const rawModules = [
         ],
     },
     {
-        id: 'binary-trees', code: 'M36', part: 5, title: 'Binary tree problems', level: 'intermediate', tracks: ['core'], requires: ['tree-traversals'],
+        id: 'binary-trees', code: 'M36', part: 5, title: 'Binary tree problems', level: 'intermediate', tracks: ['core'], requires: ['tree-traversals'], status: 'ready',
         summary: 'The classic binary tree problems, from depth to serialisation.',
         lessons: [
             ['bt-depth-diameter', 'Depth and diameter', { minutes: 25 }],
@@ -616,7 +616,7 @@ const rawModules = [
         ],
     },
     {
-        id: 'bst', code: 'M37', part: 5, title: 'Binary search trees', level: 'intermediate', tracks: ['core'], requires: ['binary-trees'],
+        id: 'bst', code: 'M37', part: 5, title: 'Binary search trees', level: 'intermediate', tracks: ['core'], requires: ['binary-trees'], status: 'ready',
         summary: 'BST operations, a generic BST in Swift, and the classic BST problems.',
         lessons: [
             ['bst-property-search-insert', 'The BST property, search and insert', { minutes: 25 }],
@@ -632,21 +632,21 @@ const rawModules = [
         ],
     },
     {
-        id: 'balanced-trees', code: 'M38', part: 5, title: 'Balanced trees', level: 'advanced', tracks: ['core'], requires: ['bst'],
+        id: 'balanced-trees', code: 'M38', part: 5, title: 'Balanced trees', level: 'advanced', tracks: ['core'], requires: ['bst'], status: 'ready',
         summary: 'Rotations, AVL and red-black trees, treaps, B-trees, and an ordered map for Swift.',
         lessons: [
             ['bal-why-rotations', 'Why balance matters, and rotations', { minutes: 25 }],
             ['bal-avl', 'AVL trees: insert and delete', { minutes: 45 }],
             ['bal-red-black', 'Red-black trees', { level: 'expert', minutes: 45, ...DEEP }],
             ['bal-treap', 'Treaps: split and merge', { level: 'expert', tracks: ['cp', 'deep'] }],
-            ['bal-splay', 'Splay trees', { level: 'expert', ...DEEP }],
+            ['bal-splay', 'Splay trees', { level: 'expert', minutes: 25, ...DEEP }],
             ['bal-b-trees', 'B-trees and B+ trees', { minutes: 25, tracks: ['core', 'ios'] }],
-            ['bal-234', '2-3-4 trees', DEEP],
+            ['bal-234', '2-3-4 trees', { minutes: 25, ...DEEP }],
             ['bal-ordered-map', 'Build an ordered set and map in Swift', { minutes: 40, tracks: ['core', 'cp'] }],
         ],
     },
     {
-        id: 'heaps', code: 'M39', part: 5, title: 'Heaps and priority queues', level: 'intermediate', tracks: ['core'], requires: ['balanced-trees'],
+        id: 'heaps', code: 'M39', part: 5, title: 'Heaps and priority queues', level: 'intermediate', tracks: ['core'], requires: ['balanced-trees'], status: 'ready',
         summary: 'Building a heap, priority queues, and the top-K, k-way merge and two-heap patterns.',
         lessons: [
             ['heap-array-index', 'A complete tree in an array', { minutes: 15 }],
@@ -664,7 +664,7 @@ const rawModules = [
         ],
     },
     {
-        id: 'tries', code: 'M40', part: 5, title: 'Tries', level: 'intermediate', tracks: ['core'], requires: ['heaps'],
+        id: 'tries', code: 'M40', part: 5, title: 'Tries', level: 'intermediate', tracks: ['core'], requires: ['heaps'], status: 'ready',
         summary: 'Prefix trees, autocomplete, word search and binary tries.',
         lessons: [
             ['trie-concept', 'The prefix tree', { minutes: 15 }],

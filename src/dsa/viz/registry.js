@@ -13,6 +13,7 @@ export const VISUALS = {
     intervals: () => import('./views/IntervalsView.jsx'),
     matrix: () => import('./views/MatrixView.jsx'),
     bst: () => import('./views/TreeViews.jsx').then((module) => ({ default: module.BstView })),
+    binaryTree: () => import('./views/TreeViews.jsx').then((module) => ({ default: module.BinaryTreeView })),
     avl: () => import('./views/TreeViews.jsx').then((module) => ({ default: module.AvlView })),
     heap: () => import('./views/TreeViews.jsx').then((module) => ({ default: module.HeapView })),
     trie: () => import('./views/TreeViews.jsx').then((module) => ({ default: module.TrieView })),

@@ -1,0 +1,429 @@
+## Why it matters
+
+Swift's `Set` and `Dictionary` answer "is this key here?" in O(1), but they keep no order. Ask a `Dictionary` of timestamps for "the latest reading at or before 10:15" and it has to check every key. A sorted array answers that with binary search, but inserting into the middle of it shifts everything after. Real apps need both at once all the time: a calendar that must find the bookings either side of a new one, a stock chart that shows the price in force at any moment, a leaderboard that keeps scores in order as they change. Java has `TreeMap` and C++ has `std::map` for this; **Swift's standard library has no sorted collection at all**. In this lesson you'll build one, `SortedMap`, on the AVL tree from earlier in this module, and meet the finished versions in DSAKit.
+
+## What Swift gives you
+
+| Need | `Dictionary` / `Set` | Sorted `Array` + binary search | Balanced tree |
+| --- | --- | --- | --- |
+| Look up a key | O(1) average | O(log n) | O(log n) |
+| Insert or remove a key | O(1) average | **O(n)**: shifts elements | O(log n) |
+| Smallest or largest key | O(n) | O(1) | O(log n) |
+| Floor or ceiling of x | O(n) | O(log n) | O(log n) |
+| All keys in a range | O(n) | O(log n + k) | O(log n + k) |
+| Visit keys in sorted order | O(n log n): sort first | O(n) | O(n) |
+
+Each has its place. If you only ever look keys up, use a `Dictionary`: nothing beats O(1), and [Inside Swift's Dictionary](/dsa/learn/hash-swift-dictionary) shows why it's so fast. If the data is built once and then only searched, a sorted array is simpler and faster than any tree, with the lower and upper bounds from [Lower bound, upper bound, first and last occurrence](/dsa/learn/bs-bounds). A balanced tree earns its place when **order queries and changes are mixed**.
+
+## A sorted array, until you insert
+
+How bad is a sorted array's O(n) insert? It depends on n, and Swift hides a lot of it. `insert(_:at:)` moves the tail of the array with one fast memory copy, so each shift is very cheap. But the number of shifts grows with n²:
+
+```swift run
+// Insert n values, in a scrambled order, into a sorted array. Binary search finds each place in
+// O(log n) steps, but insert(_:at:) then shifts every element after that place up by one.
+func lowerBound(_ items: [Int], _ value: Int, steps: inout Int) -> Int {
+    var low = 0
+    var high = items.count
+    while low < high {
+        steps += 1
+        let mid = low + (high - low) / 2
+        if items[mid] < value { low = mid + 1 } else { high = mid }
+    }
+    return low
+}
+
+for n in [1_000, 10_000, 100_000] {
+    var sorted: [Int] = []
+    var searchSteps = 0
+    var shifts = 0
+    for i in 0..<n {
+        let value = (i * 7_919) % n                  // 0..<n, scrambled
+        let index = lowerBound(sorted, value, steps: &searchSteps)
+        shifts += sorted.count - index
+        sorted.insert(value, at: index)
+    }
+    print("n = \(n): \(searchSteps) search steps, \(shifts) shifts")
+}
+```
+
+```output
+n = 1000: 8584 search steps, 250101 shifts
+n = 10000: 118995 search steps, 24998601 shifts
+n = 100000: 1522686 search steps, 2499443601 shifts
+```
+
+The binary searches grow like n log n: about 15 steps per insert at 100,000. The shifts grow like n² / 4: two and a half **billion** of them at 100,000 values. Memory copies are fast enough that this still finishes in a moment here, but every tenfold increase in n multiplies the shifting by a hundred. For a million values it's 250 billion. A balanced tree does about 20 steps per insert at a million values, and never shifts anything.
+
+## What about swift-collections?
+
+Apple's open-source **swift-collections** package (you'll meet it properly in M64) adds `Deque`, `Heap`, `OrderedSet` and more. Two of its names are easy to misread:
+
+- `OrderedSet` and `OrderedDictionary` keep **insertion order**, the order you added things, like an array with fast membership tests. They don't sort.
+- `TreeSet` and `TreeDictionary` are **hash-based**. The "tree" is how they store hash values internally, which makes copies share structure cheaply; their elements must be `Hashable`, and they iterate in no meaningful order. They're not sorted sets like Java's `TreeSet`.
+
+When this lesson was written, none of the package's stable releases included a sorted set or map, though work on sorted collections has appeared in the project's repository. Check the current release notes before assuming either way. For this course, you'll use your own, and DSAKit's.
+
+## Designing SortedMap
+
+The goal: something that feels like a `Dictionary`, but sorted.
+
+- **Generic** over `Key: Comparable` and any `Value`, as in [Generic types: Stack](/dsa/learn/swift-generic-types). The tree only ever compares keys with `<`.
+- **A subscript** for reading and writing: `map[key]` returns `Value?`, and assigning overwrites.
+- **Order queries**: `floor` (the largest key ≤ x) and `ceiling` (the smallest key ≥ x), returning the whole entry, and `elements(in:)` for a range of keys.
+- **Sorted iteration**, by conforming to `Sequence`, as in [Sequence and IteratorProtocol](/dsa/learn/swift-sequence-iterator).
+- **Value semantics.** It's a struct, so `var b = a; b[1] = "x"` must not change `a`. The nodes are class instances, shared by copies, so every change first checks `isKnownUniquelyReferenced` and copies the nodes if another copy can see them: the pattern from [Writing your own copy-on-write](/dsa/learn/swift-implementing-cow).
+
+Here it is, with the AVL insert from earlier in this module inside. Removal is left out to keep it short; it's the AVL delete, wrapped the same way.
+
+```swift run
+// A sorted map: an AVL tree of key-value nodes inside a struct, with copy-on-write
+struct SortedMap<Key: Comparable, Value> {
+    final class Node {
+        let key: Key
+        var value: Value
+        var left: Node?
+        var right: Node?
+        var height = 1
+
+        init(_ key: Key, _ value: Value) {
+            self.key = key
+            self.value = value
+        }
+
+        // A deep copy. The recursion is only as deep as the tree: O(log n).
+        func copy() -> Node {
+            let node = Node(key, value)
+            node.height = height
+            node.left = left?.copy()
+            node.right = right?.copy()
+            return node
+        }
+    }
+
+    private var root: Node?
+    private(set) var count = 0
+
+    // MARK: Lookups (no changes, so no copying)
+
+    subscript(key: Key) -> Value? {
+        get {
+            var current = root
+            while let node = current {
+                if key < node.key { current = node.left }
+                else if node.key < key { current = node.right }
+                else { return node.value }
+            }
+            return nil
+        }
+        set {
+            guard let newValue else { return }       // removal is left out to keep this short
+            if !isKnownUniquelyReferenced(&root) {
+                root = root?.copy()                  // another copy shares these nodes: copy first
+            }
+            var inserted = false
+            root = Self.insert(key, newValue, into: root, inserted: &inserted)
+            if inserted { count += 1 }
+        }
+    }
+
+    // The entry with the largest key ≤ key
+    func floor(_ key: Key) -> (key: Key, value: Value)? {
+        var best: Node?
+        var current = root
+        while let node = current {
+            if node.key <= key {
+                best = node                          // a candidate; anything better is to the right
+                current = node.right
+            } else {
+                current = node.left
+            }
+        }
+        return best.map { ($0.key, $0.value) }
+    }
+
+    // The entry with the smallest key ≥ key
+    func ceiling(_ key: Key) -> (key: Key, value: Value)? {
+        var best: Node?
+        var current = root
+        while let node = current {
+            if node.key >= key {
+                best = node                          // a candidate; anything better is to the left
+                current = node.left
+            } else {
+                current = node.right
+            }
+        }
+        return best.map { ($0.key, $0.value) }
+    }
+
+    // The entries with keys in range, in order: O(log n + k) for k results
+    func elements(in range: ClosedRange<Key>) -> [(key: Key, value: Value)] {
+        var result: [(key: Key, value: Value)] = []
+        func visit(_ node: Node?) {
+            guard let node else { return }
+            if range.lowerBound < node.key { visit(node.left) }      // smaller keys may be in range
+            if range.contains(node.key) { result.append((node.key, node.value)) }
+            if node.key < range.upperBound { visit(node.right) }     // larger keys may be in range
+        }
+        visit(root)
+        return result
+    }
+
+    // MARK: AVL insert, as in the AVL lesson
+
+    private static func height(_ node: Node?) -> Int { node?.height ?? 0 }
+
+    private static func update(_ node: Node) {
+        node.height = 1 + Swift.max(height(node.left), height(node.right))   // not the Sequence method
+    }
+
+    private static func rotateRight(_ y: Node) -> Node {
+        let x = y.left!
+        y.left = x.right
+        x.right = y
+        update(y)
+        update(x)
+        return x
+    }
+
+    private static func rotateLeft(_ x: Node) -> Node {
+        let y = x.right!
+        x.right = y.left
+        y.left = x
+        update(x)
+        update(y)
+        return y
+    }
+
+    private static func rebalance(_ node: Node) -> Node {
+        update(node)
+        let balance = height(node.left) - height(node.right)
+        if balance > 1 {
+            if height(node.left!.left) < height(node.left!.right) { node.left = rotateLeft(node.left!) }
+            return rotateRight(node)
+        }
+        if balance < -1 {
+            if height(node.right!.right) < height(node.right!.left) { node.right = rotateRight(node.right!) }
+            return rotateLeft(node)
+        }
+        return node
+    }
+
+    private static func insert(_ key: Key, _ value: Value, into node: Node?, inserted: inout Bool) -> Node {
+        guard let node else {
+            inserted = true
+            return Node(key, value)
+        }
+        if key < node.key {
+            node.left = insert(key, value, into: node.left, inserted: &inserted)
+        } else if node.key < key {
+            node.right = insert(key, value, into: node.right, inserted: &inserted)
+        } else {
+            node.value = value                       // an existing key: overwrite its value
+            return node
+        }
+        return rebalance(node)
+    }
+}
+
+// Iterating visits the entries in key order, with an explicit stack instead of recursion
+extension SortedMap: Sequence {
+    struct Iterator: IteratorProtocol {
+        let root: Node?                              // keeps the nodes shared, so changes copy them
+        var stack: [Node] = []
+
+        init(root: Node?) {
+            self.root = root
+            pushLeftEdge(root)
+        }
+
+        mutating func pushLeftEdge(_ start: Node?) {
+            var current = start
+            while let node = current {
+                stack.append(node)
+                current = node.left
+            }
+        }
+
+        mutating func next() -> (key: Key, value: Value)? {
+            guard let node = stack.popLast() else { return nil }
+            pushLeftEdge(node.right)                 // everything after node, smallest first
+            return (node.key, node.value)
+        }
+    }
+
+    func makeIterator() -> Iterator {
+        Iterator(root: root)
+    }
+}
+
+var prices = SortedMap<Int, Double>()            // minute of the day → share price
+for (minute, price) in [(540, 101.5), (600, 99.0), (570, 100.25), (660, 102.0), (630, 98.75)] {
+    prices[minute] = price
+}
+print("count:", prices.count, "keys:", prices.map { $0.key })
+print("price in force at 615:", prices.floor(615)!.value)
+print("first quote at or after 615:", prices.ceiling(615)!.key)
+print("between 560 and 640:", prices.elements(in: 560...640).map { $0.key })
+print("before 9:00?", prices.floor(539) == nil)
+
+var corrected = prices                           // a copy: shares the nodes for now
+corrected[600] = 99.5
+print("original 600:", prices[600]!, "corrected 600:", corrected[600]!)
+```
+
+```output
+count: 5 keys: [540, 570, 600, 630, 660]
+price in force at 615: 99.0
+first quote at or after 615: 630
+between 560 and 640: [570, 600, 630]
+before 9:00? true
+original 600: 99.0 corrected 600: 99.5
+```
+
+What to notice:
+
+- The quotes arrive out of order, but `map { $0.key }` lists them sorted: iteration is an inorder walk.
+- `floor(615)` finds the quote at 600, the price in force at 10:15. `ceiling(615)` finds the next quote, at 630.
+- `corrected` started as a copy sharing every node with `prices`. The write `corrected[600] = 99.5` found the root shared, copied the tree, and changed only the copy.
+- The getter and the order queries never copy anything: reading a shared tree is free.
+
+## How floor and ceiling work
+
+`floor(x)` walks down from the root, remembering the best candidate so far, like the BST version in [Floor, ceiling and a BST iterator](/dsa/learn/bst-floor-ceil-iterator):
+
+- If the node's key is ≤ x, it's a candidate, and better than any earlier one (each step right moves to larger keys). Anything even better must be larger, so go **right**.
+- If the node's key is greater than x, it's too big, and so is everything to its right. Go **left**.
+
+When the walk falls off the tree, the last candidate is the answer, or `nil` if there never was one. Take the quotes above and x = 615: from the root, the walk visits 570 (≤ 615, a candidate; go right), 630 (too big; go left) and 600 (a candidate; go right), then runs out of nodes, so the floor is 600. `ceiling` is the mirror image. Both walk one path: O(log n).
+
+## Iterating in order without recursion
+
+`for (minute, price) in prices` needs an iterator that produces one entry at a time. A recursive inorder walk can't pause between entries, so the iterator keeps an explicit **stack**, as in [Iterative traversals with a stack](/dsa/learn/trav-dfs-iterative):
+
+1. To start, push the root and every left child below it. The top of the stack is the smallest key.
+2. Each call to `next()` pops a node, pushes its right child and that child's whole left edge, and returns the popped entry.
+
+Each node is pushed and popped once, so a full iteration is O(n), and the stack never holds more than the tree's height: O(log n).
+
+There's one subtle line. The iterator stores `root`, even though it never reads it. That keeps the root's reference count above one for as long as the loop runs, so if the loop body changes the map, `isKnownUniquelyReferenced` says no and the map copies itself instead of rearranging nodes the iterator is about to visit. A loop over a map always sees the map as it was when the loop started, like a loop over an array.
+
+## DSAKit's SortedSet and SortedMap
+
+DSAKit has the finished versions, built on the same AVL core as `AVLTree`, with removal and a few extras. Both are value types and both iterate in sorted order.
+
+| Operation | `SortedSet` | `SortedMap` | Time |
+| --- | --- | --- | --- |
+| Insert | `insert(_:)`, returning whether it was new | `map[key] = value`, `updateValue(_:forKey:)` | O(log n) |
+| Remove | `remove(_:)` | `map[key] = nil`, `removeValue(forKey:)` | O(log n) |
+| Look up | `contains(_:)` | `map[key]`, `map[key, default: 0]` | O(log n) |
+| Smallest, largest | `first`, `last`, `popFirst()`, `popLast()` | the same, as entries | O(log n) |
+| At or below, at or above | `floor(_:)`, `ceiling(_:)` | the same, as entries | O(log n) |
+| Strictly below, above | `predecessor(of:)`, `successor(of:)` | the same, as entries | O(log n) |
+| A range of keys | `elements(in: a...b)`, `elements(in: a..<b)` | the same, as entries | O(log n + k) |
+
+```swift
+import DSAKit
+
+// Temperature readings by minute of the day, arriving out of order
+var readings: SortedMap = [600: 18.5, 540: 16.0, 660: 19.25]
+readings[570] = 17.0
+print(readings.floor(605)?.value ?? .nan)        // 18.5: the latest reading at or before 10:05
+print(readings.elements(in: 550...620).count)    // 2: 9:30 and 10:00
+
+// A sorted multiset: counts per value
+var counts = SortedMap<Int, Int>()
+for score in [70, 85, 70, 90] {
+    counts[score, default: 0] += 1
+}
+print(counts.keys, counts.last?.key ?? 0)        // [70, 85, 90] 90
+```
+
+The last pattern deserves a name. A `SortedMap` from value to count is a **sorted multiset**: it holds repeats, keeps them in order, and gives you the smallest and largest in O(log n). To remove one copy, decrement its count and remove the key when the count reaches zero.
+
+## Patterns that need an ordered map
+
+- **Neighbours of a new item.** Before accepting an interval, a booking or a price level, look at `floor` and `ceiling` of its key: in a set of non-overlapping intervals sorted by start, only those two can clash with it.
+- **The value in force at time t.** Readings, prices or configuration changes keyed by time: `floor(t)` gives the one that applied at t.
+- **Smallest and largest as things change.** A sorted multiset gives the current minimum and maximum even when values are removed or corrected, which a running maximum can't.
+- **A sliding window with order.** Keep the last k values in a `SortedSet`; when each new value arrives, `ceiling` and `floor` find its nearest neighbours in the window in O(log k).
+- **Sweep lines.** In [Sweep-line events](/dsa/learn/iv-sweep-line), an ordered map of the "active" items (say, the heights of buildings the sweep is currently over, as a sorted multiset) lets each event update the set and read off the maximum in O(log n).
+
+<Callout kind="gotcha" title="Keys need a real total order">
+A sorted tree assumes `<` is consistent: for any two different keys, exactly one is smaller, and if a < b and b < c then a < c. `Double.nan` breaks this, because every comparison with NaN is false: NaN is neither smaller than, larger than, nor equal to 5. Insert a NaN and lookups can wander off the wrong side of the tree, missing keys that are there. Filter NaNs out before they become keys. The same goes for a custom `Comparable` type whose `<` depends on something that can change after insertion.
+</Callout>
+
+<Callout kind="gotcha" title="Swift gotcha: Dictionary order is not sorted, and not stable">
+Printing a `Dictionary`, or looping over it, gives its keys in an order that depends on their hash values, and Swift seeds those randomly each time a program runs. Code that happens to work because the keys "came out sorted" will break on the next run. If you need order, sort the keys (`dict.keys.sorted()`, O(n log n) every time) or use a sorted map.
+</Callout>
+
+## Practice
+
+Three problems use an ordered map or set as their main tool. **Studio booking calendar** checks each new booking against its neighbours with floor and ceiling. **Nearby close values** slides a window of the last k values over an array, kept in a sorted set. **Price feed with corrections** keeps the highest and lowest current price of a stock while earlier prices are corrected, using a sorted multiset. Each one imports DSAKit, so you can use `SortedSet` and `SortedMap`, or build your own.
+
+```cards
+- id: swift-no-treemap
+  front: "What does Swift's standard library offer for a sorted map, like Java's TreeMap?"
+  back: "Nothing: Set and Dictionary are hash tables with no order. You use a sorted array (O(n) inserts), or a balanced tree such as DSAKit's SortedMap."
+- id: swift-collections-names
+  front: "Are swift-collections' OrderedSet and TreeSet sorted?"
+  back: "No. OrderedSet keeps insertion order, and TreeSet/TreeDictionary are hash-based persistent collections, iterating in no meaningful order."
+- id: floor-walk
+  front: "How does floor(x) walk a BST?"
+  back: "From the root: if the key is ≤ x, record it as the best so far and go right; otherwise go left. When you fall off the tree, the last recorded key is the floor. O(height)."
+- id: sorted-multiset
+  front: "How do you keep a sorted multiset with a SortedMap?"
+  back: "Map each value to its count. Insert by incrementing; remove one copy by decrementing and deleting the key at zero. first and last give the minimum and maximum in O(log n)."
+```
+
+```quiz
+- id: q1
+  type: mcq
+  prompt: "You need to insert values one at a time and, after each insert, find the largest value at or below some x. With 200,000 values, which is the best fit?"
+  options:
+    - "A Dictionary"
+    - "A sorted array, inserting with binary search"
+    - "A balanced search tree such as SortedSet"
+    - "A Set, sorting it after each insert"
+  answer: 2
+  explain: "A Dictionary or Set has no order, so each floor query is O(n), and sorting after each insert is O(n log n). A sorted array's inserts shift O(n) elements each. A balanced tree does both in O(log n)."
+- id: q2
+  type: truefalse
+  prompt: "Iterating over swift-collections' OrderedSet visits its elements in sorted order."
+  answer: false
+  explain: "OrderedSet keeps insertion order: the order elements were added. It's for when you need a set's fast membership test and an array's stable order, not sorting."
+- id: q3
+  type: trace
+  prompt: "A BST holds 50 at the root, 30 and 70 as its children, and 60 and 80 as 70's children. floor(65) visits which nodes, in order?"
+  answer: "50, 70, 60"
+  explain: "50 ≤ 65: a candidate, go right. 70 > 65: too big, go left. 60 ≤ 65: a better candidate, go right, and there's nothing there. The floor is 60."
+- id: q4
+  type: output
+  prompt: "What does this print? It uses a Dictionary from value to count as a multiset, then removes one copy of 7."
+  code: |
+    var counts: [Int: Int] = [:]
+    for value in [7, 3, 7, 9] {
+        counts[value, default: 0] += 1
+    }
+    let remaining = counts[7, default: 0] - 1
+    counts[7] = remaining == 0 ? nil : remaining
+    print(counts.keys.sorted(), counts[7] ?? 0, counts.count)
+  answer: "[3, 7, 9] 1 3"
+  explain: "7 appeared twice, so removing one copy leaves a count of 1 and keeps the key. The sorted keys are [3, 7, 9]. A SortedMap would give the same answers, and keep the keys sorted without the O(n log n) sort."
+- id: q5
+  type: bigo
+  prompt: "What does it cost to list the k entries of a SortedMap whose keys fall in a range, with n entries in total?"
+  options: ["O(1)", "O(log n)", "O(k)", "O(log n + k)", "O(n)", "O(n log n)"]
+  answer: "O(log n + k)"
+  explain: "One O(log n) descent finds the first key in the range, then an inorder walk visits the k results (plus a few nodes along the path), stopping at the first key past the range."
+- id: q6
+  type: multi
+  prompt: "Which keys could break a sorted map? Choose all that apply."
+  options:
+    - "Double.nan"
+    - "Negative integers"
+    - "A class whose < compares a property that changes after insertion"
+    - "Strings with accented letters"
+  answer: [0, 2]
+  explain: "NaN compares false with everything, and a key whose ordering changes after insertion ends up on the wrong side of the tree. Negative numbers and accented strings have perfectly consistent orders."
