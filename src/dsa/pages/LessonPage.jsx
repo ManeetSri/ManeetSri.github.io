@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useState } from 'react';
 import { Link, useParams } from 'react-router-dom';
-import { ArrowLeft, ArrowRight, Bookmark, CheckCircle2, Clock3, Code2, Flag, LoaderCircle, RotateCcw } from 'lucide-react';
+import { ArrowLeft, ArrowRight, Award, Bookmark, CheckCircle2, Clock3, Code2, Flag, LoaderCircle, RotateCcw } from 'lucide-react';
 import { lessonById, lessons as allLessons, LEVELS, TRACKS } from '../data/curriculum.js';
 import { DIFFICULTIES, problemById } from '../data/problems.js';
 import { useContent } from '../content/index.js';
@@ -151,6 +151,17 @@ const LessonView = ({ lesson }) => {
                 {content.status === 'ready' && (
                     <>
                         <Practice lesson={lesson} />
+
+                        {module.lessons.at(-1) === lesson && (
+                            <Card className="mt-12 flex flex-wrap items-center gap-4 border-amber/40 p-5">
+                                <Award size={26} aria-hidden="true" className="shrink-0 text-amber" />
+                                <div className="min-w-48 flex-1">
+                                    <p className="font-semibold">That’s the end of {module.code}, {module.title}</p>
+                                    <p className="text-sm text-muted">Take the checkpoint: 12 questions from the whole module. Score 80% to master it.</p>
+                                </div>
+                                <ButtonLink to={`/dsa/checkpoint/${module.id}`} size="sm" variant="primary">Take the checkpoint</ButtonLink>
+                            </Card>
+                        )}
 
                         <section aria-labelledby="lesson-notes" className="mt-12">
                             <h2 id="lesson-notes" className="mb-3 font-display text-[1.75rem] font-semibold tracking-tight">Your notes</h2>

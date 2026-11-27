@@ -1,8 +1,8 @@
-import { ArrowRight, CalendarClock, CheckCircle2, Circle, Code2, Compass, Flame, Hourglass, Layers, Sparkles, Target } from 'lucide-react';
+import { ArrowRight, Award, CalendarClock, CheckCircle2, Circle, Code2, Compass, Flame, Hourglass, Layers, Sparkles, Target } from 'lucide-react';
 import { Link } from 'react-router-dom';
-import { GOALS, moduleById, partByNumber } from '../data/curriculum.js';
+import { GOALS, moduleById, modules, partByNumber } from '../data/curriculum.js';
 import { DIFFICULTIES } from '../data/problems.js';
-import { completion, projection } from '../engine/path.js';
+import { completion, isDone, isOnPath, projection } from '../engine/path.js';
 import { planToday } from '../engine/today.js';
 import { useProfile, useStore } from '../store/store.js';
 import { formatDate, formatMinutes, greeting } from '../ui/format.js';
@@ -50,6 +50,11 @@ const TodayPage = () => {
     const itemsDone = plan.lessons.filter((item) => item.done).length + plan.practice.filter((item) => item.done).length + (plan.reviews.planned === 0 && plan.reviews.doneToday > 0 ? 1 : 0);
     const itemsTotal = plan.lessons.length + plan.practice.length + (plan.reviews.planned + plan.reviews.doneToday > 0 ? 1 : 0);
     const behind = profile.targetDate && pace.finish > new Date(profile.targetDate).getTime();
+    // The first module whose path lessons are all done but whose checkpoint isn't passed yet
+    const checkpointDue = modules.find((module) => {
+        const onPath = module.lessons.filter((lesson) => lesson.status === 'ready' && isOnPath(lesson, profile.goal));
+        return onPath.length > 0 && onPath.every((lesson) => isDone(lesson.id, state.lessons)) && !state.checkpoints[module.id]?.passedAt;
+    });
 
     return (
         <div className="mx-auto max-w-5xl">
@@ -120,6 +125,9 @@ const TodayPage = () => {
                             {plan.lessons.map(({ lesson, done }) => (
                                 <PlanRow key={lesson.id} done={done} icon={Target} to={`/dsa/learn/${lesson.id}`} title={lesson.title} detail={`${moduleById[lesson.module].code} · ${formatMinutes(lesson.minutes)}`} action="Learn" />
                             ))}
+                            {checkpointDue && (
+                                <PlanRow done={false} icon={Award} to={`/dsa/checkpoint/${checkpointDue.id}`} title={`Checkpoint: ${checkpointDue.title}`} detail={`${checkpointDue.code} · 12 questions · about 10 min`} action="Take it" />
+                            )}
                             {plan.practice.map(({ problem, done }) => (
                                 <PlanRow key={problem.id} done={done} icon={Code2} to={`/dsa/practice/${problem.id}`} title={problem.title} detail={`${DIFFICULTIES[problem.difficulty].label} · ${formatMinutes(problem.minutes)}`} action="Solve" />
                             ))}

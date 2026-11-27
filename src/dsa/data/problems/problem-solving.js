@@ -1,0 +1,43 @@
+// Problems for the problem-solving module. Fields are described in ../problems.js.
+export default [
+    {
+        id: 'kaprekar-trace',
+        title: 'Kaprekar trace',
+        difficulty: 'easy',
+        patterns: ['simulation', 'math'],
+        lessons: ['algo-pseudocode', 'algo-dry-runs', 'algo-what-is-an-algorithm'],
+        swiftTest: 'KaprekarTraceTests',
+        lists: [],
+        minutes: 20,
+    },
+    {
+        id: 'record-breakers',
+        title: 'Record breakers',
+        difficulty: 'easy',
+        patterns: ['traversal'],
+        lessons: ['algo-invariants', 'algo-dry-runs'],
+        swiftTest: 'RecordBreakersTests',
+        lists: [],
+        minutes: 15,
+    },
+    {
+        id: 'smallest-gap',
+        title: 'Smallest gap',
+        difficulty: 'easy',
+        patterns: ['traversal', 'sorting'],
+        lessons: ['algo-brute-force-first', 'algo-constraints-to-complexity'],
+        swiftTest: 'SmallestGapTests',
+        lists: [],
+        minutes: 20,
+    },
+    {
+        id: 'second-largest-distinct',
+        title: 'Second largest distinct value',
+        difficulty: 'medium',
+        patterns: ['traversal'],
+        lessons: ['algo-edge-cases', 'algo-invariants'],
+        swiftTest: 'SecondLargestDistinctTests',
+        lists: [],
+        minutes: 20,
+    },
+];

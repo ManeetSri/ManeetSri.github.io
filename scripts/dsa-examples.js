@@ -4,7 +4,8 @@
 // dsa-swift/Examples/<module>/<lesson>-<n>.swift, so the learner can run it with `swift <file>`.
 //
 // With --verify it also runs every example, and every quiz "output" question's code, and checks that
-// what Swift actually prints matches what the lesson says. Needs the Swift toolchain.
+// what Swift actually prints matches what the lesson says. Cheat-sheet templates (```swift check) are
+// type-checked. Needs the Swift toolchain.
 //   --check   only report generated files that are missing or out of date (used by dsa:check)
 import { execFile } from 'node:child_process';
 import { existsSync, mkdirSync, readdirSync, readFileSync, rmSync, writeFileSync, mkdtempSync } from 'node:fs';
@@ -12,10 +13,11 @@ import { tmpdir } from 'node:os';
 import { dirname, join, relative } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { parse } from 'yaml';
-import { fencedBlocks, runnableExamples } from './dsa-content-lib.js';
+import { fencedBlocks, parseMeta, runnableExamples } from './dsa-content-lib.js';
 
 const root = join(dirname(fileURLToPath(import.meta.url)), '..');
 const lessonsDir = join(root, 'src/dsa/content/lessons');
+const sheetsDir = join(root, 'src/dsa/content/sheets');
 const packageDir = join(root, 'dsa-swift');
 const RUN_TIMEOUT_MS = 30_000;
 const CONCURRENCY = 6;
@@ -75,6 +77,17 @@ for (const { module, lesson, path } of selected) {
     }
 }
 
+// Cheat-sheet templates are fragments, so they're type-checked rather than run
+const checks = [];
+if (!onlyModules.length && !onlyLessons.length && existsSync(sheetsDir)) {
+    readdirSync(sheetsDir).filter((name) => name.endsWith('.mdx')).forEach((name) => {
+        const path = join(sheetsDir, name);
+        fencedBlocks(readFileSync(path, 'utf8'))
+            .filter((block) => block.lang === 'swift' && parseMeta(block.meta).check)
+            .forEach((block) => checks.push({ label: `${relative(root, path)}:${block.line}`, code: block.body }));
+    });
+}
+
 // Generated files for lessons that no longer have them are removed
 if (!checkOnly) {
     const examplesDir = join(packageDir, 'Examples');
@@ -94,6 +107,12 @@ if (!checkOnly) {
 const runSwift = (file) => new Promise((resolve) => {
     execFile('swift', [file], { cwd: packageDir, timeout: RUN_TIMEOUT_MS, maxBuffer: 1 << 20 }, (error, stdout, stderr) => {
         resolve({ ok: !error, stdout, stderr: stderr || error?.message || '' });
+    });
+});
+
+const typecheck = (file) => new Promise((resolve) => {
+    execFile('swiftc', ['-typecheck', '-swift-version', '5', file], { timeout: RUN_TIMEOUT_MS }, (error, stdout, stderr) => {
+        resolve({ ok: !error, stderr: stderr || error?.message || '' });
     });
 });
 
@@ -119,6 +138,12 @@ const verifyAll = async () => {
         }
     };
     await Promise.all(Array.from({ length: CONCURRENCY }, worker));
+    for (const [index, check] of checks.entries()) {
+        const file = join(scratch, `sheet-${index}.swift`);
+        writeFileSync(file, check.code);
+        const result = await typecheck(file);
+        if (!result.ok) problems.push(`${check.label} doesn't compile:\n${result.stderr.split('\n').slice(0, 8).join('\n')}`);
+    }
     rmSync(scratch, { recursive: true, force: true });
 };
 
@@ -132,4 +157,4 @@ if (problems.length) {
 }
 const exampleCount = runs.filter((run) => run.file).length;
 const quizCount = runs.length - exampleCount;
-console.log(`✔ ${exampleCount} examples${verify ? ` and ${quizCount} quiz outputs verified` : checkOnly ? ' up to date' : ' written'}${scope}.`);
+console.log(`✔ ${exampleCount} examples${verify ? ` and ${quizCount} quiz outputs verified${checks.length ? `, ${checks.length} cheat-sheet templates type-checked` : ''}` : checkOnly ? ' up to date' : ' written'}${scope}.`);

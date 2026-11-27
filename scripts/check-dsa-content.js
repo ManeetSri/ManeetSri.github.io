@@ -110,6 +110,19 @@ problems.filter((problem) => problem.lessons.some((id) => inScope(moduleOfLesson
     if (!new RegExp(`enum\\s+${type}\\b`).test(solutions)) fail(`${name} expects "public enum ${type}" in dsa-swift/Sources/Solutions`);
 });
 
+// Links between pages must point at lessons and problems that exist
+const problemIdSet = new Set(problems.map((problem) => problem.id));
+filesIn(join(root, 'src/dsa/content'), '.mdx').forEach((path) => {
+    const where = relative(root, path);
+    const lessonModule = moduleOfLesson[basename(path, '.mdx')];
+    if (onlyModules.length && !(lessonModule && inScope(lessonModule))) return;
+    const text = readFileSync(path, 'utf8');
+    for (const [, kind, id] of text.matchAll(/\]\(\/dsa\/(learn|practice|checkpoint)\/([a-z0-9-]+)/g)) {
+        const known = kind === 'learn' ? lessonIds.has(id) : kind === 'practice' ? problemIdSet.has(id) : modules.some((module) => module.id === id);
+        if (!known) fail(`${where} links to /dsa/${kind}/${id}, which doesn't exist`);
+    }
+});
+
 // Generated example files must match the lessons they come from
 try {
     execFileSync('node', [join(root, 'scripts/dsa-examples.js'), '--check', ...onlyModules.flatMap((id) => ['--module', id])], { stdio: 'pipe' });

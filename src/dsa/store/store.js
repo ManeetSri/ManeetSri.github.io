@@ -4,7 +4,7 @@ import { createContext, useContext, useSyncExternalStore } from 'react';
 import { addDays, dayKey, startOfDay } from '../engine/dates.js';
 import { newCard, reviewCard } from '../engine/srs.js';
 
-export const COLLECTIONS = ['meta', 'lessons', 'problems', 'cards', 'notes', 'activity'];
+export const COLLECTIONS = ['meta', 'lessons', 'problems', 'cards', 'notes', 'activity', 'checkpoints'];
 
 export const DEFAULT_PROFILE = {
     goal: 'foundations',
@@ -129,6 +129,16 @@ export const createStore = (adapter) => {
         saveProblemText: (problemId, field, text) => put('problems', problemId, { [field]: text, updatedAt: now() }),
 
         review: (id, rating) => put('cards', id, reviewCard(state.cards[id], rating, now())),
+
+        // Every attempt is kept, keyed by time. The first pass marks the module mastered.
+        recordCheckpoint: (moduleId, { score, total, passed }) => {
+            const time = now();
+            const alreadyPassed = Boolean(state.checkpoints[moduleId]?.passedAt);
+            put('checkpoints', moduleId, {
+                attempts: { [time]: { at: time, score, total, passed } },
+                ...(passed && !alreadyPassed ? { passedAt: time } : {}),
+            });
+        },
 
         addMinutes: (minutes) => {
             const day = dayKey(now());

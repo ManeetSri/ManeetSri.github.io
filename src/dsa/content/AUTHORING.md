@@ -97,6 +97,31 @@ print(apples % people)
 
   When unsure, run it.
 
+## Visualisers (` ```visual <name> `)
+
+Interactive step-through or explorable diagrams. Use one where watching an idea unfold beats reading about it: at most one or two per lesson. The block body is optional YAML props:
+
+````mdx
+```visual recursionTree
+fn: fibonacci
+n: 4
+```
+````
+
+| name | props | shows |
+| --- | --- | --- |
+| `binarySearch` | `items` (sorted Int list), `target` | low/mid/high narrowing, with the Swift code traced line by line |
+| `recursionTree` | `fn`: `factorial`, `fibonacci`, `fibonacciMemo` (shows memo hits), `power` or `sumDigits`; `n`; `base` (for power) | the call tree growing and returning, and the call stack |
+| `traceTable` | `program`: `sum`, `largest`, `reverseDigits`, `gcd` or `fastPower`; `input`: `{ numbers: [...] }`, `{ number: 1234 }`, `{ first: 48, second: 18 }` or `{ base: 3, exponent: 13 }` | variables and a trace-table row per loop pass, with the code traced |
+| `growthChart` | `classes` (any of `O(1)`, `O(log n)`, `O(n)`, `O(n log n)`, `O(n²)`, `O(2ⁿ)`, `O(n!)`), `n`, `max` | growth curves with an n slider, a linear/log toggle and a table of counts |
+| `bitPlayground` | `value`, `operand` (0–255), `signed` (true for Int8), `operator` (`&`, `|`, `^`, `~`, `<<`, `>>`) | clickable 8-bit cells, an operator, and the result in binary, decimal and hex |
+| `arrayTrace` | `program` plus `input` (defaults shown): `reverse` `{items}`, `pairSum` `{items (sorted), target}`, `dedupe` `{items (sorted)}`, `dutchFlag` `{items of 0/1/2}`, `maxSumFixed` `{items, k}`, `shortestWindow` `{items (positive), target}`, `longestUnique` `{text}`, `prefixSum` `{items, query: [from, to]}`, `kadane` `{items}`, `dynamicAppend` `{count, capacity}`, `nextGreater` `{items}`, `bubbleSort` / `selectionSort` / `insertionSort` / `mergeSort` / `quickSort` `{items}`, `countingSort` `{items, max}`, `lowerBound` `{items (sorted), target}`, `sieve` `{n}` | array rows with named pointers, highlighted windows and swaps, variables, a stack for `nextGreater`, and the Swift code traced |
+| `linkedList` | `program`: `reverse`, `middle` or `cycle`; `input`: `{ values: [...], loopTo: index or null }` (loopTo is for cycle) | nodes and `next` arrows changing, with previous/current/next or slow/fast pointers |
+| `stackQueue` | `kind`: `stack`, `queue` or `deque`; `operations` such as `["push 3", "pop", "peek"]`, `["enqueue 3", "dequeue"]` or `["pushFront 1", "popBack"]` | the structure after each operation, and what each removal returns |
+| `hashTable` | `mode`: `chaining` or `probing`; `keys` (Ints or Strings); `size` | buckets with chains, or slots with probe sequences and clustering |
+
+Need a visualiser that doesn't exist? Say so in your report instead of improvising one.
+
 ## Takeaways (` ```cards `)
 
 ```yaml

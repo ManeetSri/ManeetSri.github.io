@@ -1,6 +1,6 @@
 import { useState } from 'react';
 import { Link } from 'react-router-dom';
-import { CheckCircle2, ChevronDown, Circle, CircleDot, Clock3, SkipForward } from 'lucide-react';
+import { Award, CheckCircle2, ChevronDown, Circle, CircleDot, Clock3, SkipForward } from 'lucide-react';
 import { GOALS, LEVELS, modulesInPart, parts, TRACKS } from '../data/curriculum.js';
 import { completion, isOnPath, lessonState, moduleCompletion, nextOnPath } from '../engine/path.js';
 import { useProfile, useStore } from '../store/store.js';
@@ -16,7 +16,7 @@ const STATE_ICONS = {
     stub: { icon: Clock3, className: 'text-white/20', label: 'Coming soon' },
 };
 
-const ModuleRow = ({ module, progress, goal, showAll, open, onToggle, nextId }) => {
+const ModuleRow = ({ module, progress, goal, showAll, open, onToggle, nextId, mastered }) => {
     const { done, total, ratio } = moduleCompletion(module, progress, goal);
     const visible = showAll ? module.lessons : module.lessons.filter((lesson) => isOnPath(lesson, goal));
     const minutes = visible.reduce((sum, lesson) => sum + lesson.minutes, 0);
@@ -29,7 +29,7 @@ const ModuleRow = ({ module, progress, goal, showAll, open, onToggle, nextId }) 
                     <span className="font-mono text-[10px]">{module.code.slice(1)}</span>
                 </ProgressRing>
                 <span className="min-w-0 flex-1">
-                    <span className="block font-semibold">{module.title}</span>
+                    <span className="flex items-center gap-2 font-semibold">{module.title}{mastered && <Chip tone="amber"><Award size={12} aria-hidden="true" /> Mastered</Chip>}</span>
                     <span className="block truncate text-sm text-muted">{module.summary}</span>
                 </span>
                 <span className="hidden shrink-0 text-right font-mono text-xs text-muted sm:block">
@@ -57,6 +57,15 @@ const ModuleRow = ({ module, progress, goal, showAll, open, onToggle, nextId }) 
                             </li>
                         );
                     })}
+                    {module.lessons.some((lesson) => lesson.status === 'ready') && (
+                        <li>
+                            <Link to={`/dsa/checkpoint/${module.id}`} className="mt-1 flex items-center gap-3 rounded-xl px-3 py-2.5 text-amber hover:bg-white/[0.04]">
+                                <Award size={18} aria-hidden="true" className="shrink-0" />
+                                <span className="flex-1">{mastered ? 'Retake the checkpoint' : 'Module checkpoint'}</span>
+                                <span className="font-mono text-xs text-muted">12 questions</span>
+                            </Link>
+                        </li>
+                    )}
                 </ol>
             )}
         </li>
@@ -65,7 +74,7 @@ const ModuleRow = ({ module, progress, goal, showAll, open, onToggle, nextId }) 
 
 const PathPage = () => {
     useConsoleMeta('Path', '/dsa/path');
-    const { lessons: progress } = useStore();
+    const { lessons: progress, checkpoints } = useStore();
     const { goal } = useProfile();
     const path = usePath();
     const next = nextOnPath(path, progress);
@@ -122,6 +131,7 @@ const PathPage = () => {
                                         open={openModules.has(module.id)}
                                         onToggle={() => toggle(module.id)}
                                         nextId={next?.id}
+                                        mastered={Boolean(checkpoints[module.id]?.passedAt)}
                                     />
                                 ))}
                             </ul>

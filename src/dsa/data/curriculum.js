@@ -246,7 +246,7 @@ const rawModules = [
 
     // Part II: Thinking algorithmically ─────────────────────────────────────────────────────
     {
-        id: 'problem-solving', code: 'M13', part: 2, title: 'Algorithms and problem solving', level: 'beginner', tracks: ['core'], requires: ['swift-tooling'],
+        id: 'problem-solving', code: 'M13', part: 2, title: 'Algorithms and problem solving', level: 'beginner', tracks: ['core'], requires: ['swift-tooling'], status: 'ready',
         summary: 'What makes an algorithm, and a repeatable way to go from a problem to working code.',
         lessons: [
             ['algo-what-is-an-algorithm', 'What an algorithm is', { minutes: 15 }],
@@ -259,7 +259,7 @@ const rawModules = [
         ],
     },
     {
-        id: 'complexity', code: 'M14', part: 2, title: 'Complexity analysis', level: 'beginner', tracks: ['core'], requires: ['problem-solving'],
+        id: 'complexity', code: 'M14', part: 2, title: 'Complexity analysis', level: 'beginner', tracks: ['core'], requires: ['problem-solving'], status: 'ready',
         summary: 'Big-O and friends, analysing loops and recursion, amortised costs and Swift\'s hidden costs.',
         lessons: [
             ['bigo-counting-operations', 'Counting operations'],
@@ -279,7 +279,7 @@ const rawModules = [
         ],
     },
     {
-        id: 'math-basics', code: 'M15', part: 2, title: 'Maths for DSA', level: 'beginner', tracks: ['core'], requires: ['complexity'],
+        id: 'math-basics', code: 'M15', part: 2, title: 'Maths for DSA', level: 'beginner', tracks: ['core'], requires: ['complexity'], status: 'ready',
         summary: 'Number systems, divisibility, primes, modular arithmetic, counting and the rest of the maths toolkit.',
         lessons: [
             ['math-number-systems', 'Number systems and conversion'],
@@ -299,7 +299,7 @@ const rawModules = [
         ],
     },
     {
-        id: 'bits', code: 'M16', part: 2, title: 'Bit manipulation', level: 'intermediate', tracks: ['core'], requires: ['math-basics'],
+        id: 'bits', code: 'M16', part: 2, title: 'Bit manipulation', level: 'intermediate', tracks: ['core'], requires: ['math-basics'], status: 'ready',
         summary: 'Binary, two\'s complement, the bitwise operators and the tricks built on them.',
         lessons: [
             ['bits-binary-twos-complement', 'Binary and two\'s complement', { minutes: 25 }],
@@ -313,7 +313,7 @@ const rawModules = [
         ],
     },
     {
-        id: 'recursion', code: 'M17', part: 2, title: 'Recursion', level: 'intermediate', tracks: ['core'], requires: ['bits'],
+        id: 'recursion', code: 'M17', part: 2, title: 'Recursion', level: 'intermediate', tracks: ['core'], requires: ['bits'], status: 'ready',
         summary: 'Thinking recursively, the call stack, recursion trees and turning recursion into loops.',
         lessons: [
             ['rec-what-is-recursion', 'Base case and recursive case'],

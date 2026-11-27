@@ -14,6 +14,8 @@ import NotesPage from './pages/NotesPage.jsx';
 import SettingsPage from './pages/SettingsPage.jsx';
 import ComingSoon from './pages/ComingSoon.jsx';
 import OnboardingPage from './pages/OnboardingPage.jsx';
+import CheckpointPage from './pages/CheckpointPage.jsx';
+import SheetsPage from './pages/SheetsPage.jsx';
 import ConsoleNotFound from './pages/ConsoleNotFound.jsx';
 
 // The private DSA-in-Swift learning console. Not linked from the portfolio, never indexed, and
@@ -33,9 +35,10 @@ const DsaApp = () => {
                     <Route path="progress" element={<ProgressPage />} />
                     <Route path="notes" element={<NotesPage />} />
                     <Route path="settings" element={<SettingsPage />} />
-                    <Route path="sheets" element={<ComingSoon screen="sheets" />} />
+                    <Route path="sheets" element={<SheetsPage />} />
+                    <Route path="sheets/:sheetId" element={<SheetsPage />} />
                     <Route path="mock" element={<ComingSoon screen="mock" />} />
-                    <Route path="checkpoint/:moduleId" element={<ComingSoon screen="checkpoint" />} />
+                    <Route path="checkpoint/:moduleId" element={<CheckpointPage />} />
                     <Route path="start" element={<OnboardingPage />} />
                     <Route path="*" element={<ConsoleNotFound />} />
                 </Routes>

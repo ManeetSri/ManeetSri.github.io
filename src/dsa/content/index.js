@@ -4,10 +4,11 @@ import { useEffect, useState } from 'react';
 
 const lessonFiles = import.meta.glob('./lessons/**/*.mdx');
 const problemFiles = import.meta.glob('./problems/*.mdx');
+const sheetFiles = import.meta.glob('./sheets/*.mdx');
 
 const byId = (files) => Object.fromEntries(Object.entries(files).map(([path, load]) => [path.split('/').pop().replace(/\.mdx$/, ''), load]));
 
-const loaders = { lesson: byId(lessonFiles), problem: byId(problemFiles) };
+const loaders = { lesson: byId(lessonFiles), problem: byId(problemFiles), sheet: byId(sheetFiles) };
 
 export const hasContent = (kind, id) => Boolean(loaders[kind][id]);
 

@@ -14,6 +14,10 @@ test('XP adds lessons, first-try answers, solved problems and reviews', () => {
     assert.equal(xp, 50 + 10 + 30 + 8 + 15);
 });
 
+test('a passed checkpoint is worth 200 XP, once', () => {
+    assert.equal(xpFrom({ checkpoints: { m: { passedAt: 1, attempts: { 1: { at: 1 }, 2: { at: 2 } } }, n: { attempts: { 3: { at: 3 } } } } }), 200);
+});
+
 test('testing out of a lesson earns no XP', () => {
     assert.equal(xpFrom({ lessons: { a: { testedOutAt: 1 } } }), 0);
 });

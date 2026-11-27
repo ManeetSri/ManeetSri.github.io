@@ -15,6 +15,11 @@ import swiftTypes from './problems/swift-types.js';
 import swiftGenerics from './problems/swift-generics.js';
 import swiftMemory from './problems/swift-memory.js';
 import swiftTooling from './problems/swift-tooling.js';
+import problemSolving from './problems/problem-solving.js';
+import complexity from './problems/complexity.js';
+import mathBasics from './problems/math-basics.js';
+import bits from './problems/bits.js';
+import recursion from './problems/recursion.js';
 
 export const DIFFICULTIES = {
     warmup: { label: 'Warm-up', xp: 15 },
@@ -81,6 +86,11 @@ export const problems = [
     ...swiftGenerics,
     ...swiftMemory,
     ...swiftTooling,
+    ...problemSolving,
+    ...complexity,
+    ...mathBasics,
+    ...bits,
+    ...recursion,
 ];
 
 export const problemById = Object.fromEntries(problems.map((problem) => [problem.id, problem]));
