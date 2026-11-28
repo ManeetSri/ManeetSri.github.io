@@ -1,0 +1,344 @@
+## Why it matters
+
+You favourite an article on its detail screen, go back, and the feed still shows it unfavourited. A badge says 3 while the list shows 2. These bugs all have the same cause: one fact stored in two places, and only one of them updated. A **single source of truth** is the rule that prevents them. It's also the first thing interviewers probe in any client design: "if the user edits this here, how does that screen find out?"
+
+## One owner per fact
+
+A source of truth is the one place that owns a piece of information. Owning means two things:
+
+- **It's the only place that changes it.** Everyone else asks the owner to change it.
+- **Everyone else reads from it,** or holds a copy that knows it's a copy: a cache that can be refreshed, or a draft that will be committed or thrown away.
+
+Notice that the rule is per *fact*, not per app. The article's favourite flag has one owner, the signed-in user has one owner, and they needn't be the same object. "Single source of truth" doesn't mean "one global store"; lesson 6 weighs that separately.
+
+## How a second source of truth sneaks in
+
+Nobody adds a second source of truth on purpose. It arrives as an innocent-looking line.
+
+### Handing a screen a value instead of an identity
+
+Swift structs are copied when you assign or pass them. That's usually what you want, and it's exactly what goes wrong when a detail screen is handed the article it shows:
+
+```swift run title="A copy that drifts"
+struct Article {
+    let id: Int
+    var title: String
+    var isFavourite = false
+}
+
+var feed = [
+    Article(id: 1, title: "Swift 6 in practice"),
+    Article(id: 2, title: "Observation, explained"),
+]
+
+// The detail screen is handed the article it shows: a struct, so a copy
+var detail = feed[0]
+detail.isFavourite = true
+
+print("Detail screen: favourite =", detail.isFavourite)
+print("Feed row:      favourite =", feed[0].isFavourite)
+```
+
+```output
+Detail screen: favourite = true
+Feed row:      favourite = false
+```
+
+In UIKit this is `detailVC.article = articles[indexPath.row]`; in SwiftUI it's `@State var article: Article` in the detail view. Either way, the detail screen now owns a second copy, and nothing connects it to the first.
+
+### The other usual suspects
+
+- **Storing something you could compute:** an `unreadCount` property next to the `messages` array it counts. The next lesson is about this one.
+- **Two services with opinions about one fact:** `FavouritesService.ids` and `Article.isFavourite`, each updated by different code paths.
+- **A persisted mirror:** the badge count written to UserDefaults "for the widget", updated in one place and forgotten in three.
+- **Screens that fetch for themselves:** the orders list and the order detail each call the API and keep their own array, so a refund shows on one and not the other.
+
+You can spot all of them by the code that tries to keep the copies in step: a `NotificationCenter` post after every save, a reload in `viewWillAppear` "just in case", a `didSet` that pushes a value into another object. Sync code is a symptom. The cure is to remove the copy, not to sync it harder.
+
+## Three ways to remove the copy
+
+### 1. Pass an identity, and read from the owner
+
+Hand the detail screen the article's **id**. It reads the current article from the owner every time it renders, and asks the owner to change it:
+
+```swift run title="One owner, and screens that hold ids"
+struct Article: Identifiable {
+    let id: Int
+    var title: String
+    var isFavourite = false
+}
+
+/// The one owner of articles. Screens hold ids and ask it; only it changes an article.
+final class ArticleStore {
+    private(set) var articles: [Article.ID: Article] = [:]
+    private(set) var feed: [Article.ID] = []
+
+    func load(_ incoming: [Article]) {
+        for article in incoming {
+            articles[article.id] = article
+        }
+        feed = incoming.map(\.id)
+    }
+
+    func toggleFavourite(_ id: Article.ID) {
+        articles[id]?.isFavourite.toggle()
+    }
+}
+
+let store = ArticleStore()
+store.load([
+    Article(id: 1, title: "Swift 6 in practice"),
+    Article(id: 2, title: "Observation, explained"),
+])
+
+let shownInDetail: Article.ID = 1   // the detail screen is handed an id, not a copy
+store.toggleFavourite(shownInDetail)
+
+for id in store.feed {
+    if let article = store.articles[id] {
+        print(article.title, article.isFavourite ? "★" : "☆")
+    }
+}
+```
+
+```output
+Swift 6 in practice ★
+Observation, explained ☆
+```
+
+`private(set)` is doing real work here: other code can read `articles` but can't assign to it, so every change goes through a method the owner controls. That's what makes it the owner rather than merely the first copy. Ids also pay off later: they're small, `Codable` and stable, which is what navigation, restoration and deep links need.
+
+### 2. Pass access to the owner's value
+
+When a child edits a value the parent owns, give it a `@Binding` (for one value) or the `@Observable` owner itself (use `@Bindable` to make bindings to its properties). The child edits the original, not a copy. This is the usual answer *within* a screen; ids are the usual answer *across* screens.
+
+### 3. Make the copy deliberate: drafts with a commit point
+
+Some copies are right. An edit sheet with Cancel and Save *should* work on a copy, so Cancel can throw it away. What makes a copy safe is a **commit point**: the copy is short-lived, the user can see it's an edit in progress, and Save hands it back to the owner, which decides.
+
+```swift check ios title="Read by id; edit a deliberate draft"
+import SwiftUI
+
+struct Article: Identifiable {
+    let id: Int
+    var title: String
+    var isFavourite = false
+}
+
+@MainActor @Observable
+final class ArticleStore {
+    private(set) var articles: [Article.ID: Article] = [:]
+
+    func toggleFavourite(_ id: Article.ID) {
+        articles[id]?.isFavourite.toggle()
+    }
+
+    func rename(_ id: Article.ID, to title: String) {
+        articles[id]?.title = title
+    }
+}
+
+struct ArticleDetail: View {
+    let store: ArticleStore
+    let id: Article.ID                  // identity, not a copy: always the current article
+    @State private var isEditing = false
+
+    var body: some View {
+        if let article = store.articles[id] {
+            Form {
+                Text(article.title).font(.headline)
+                Button(article.isFavourite ? "Unfavourite" : "Favourite") {
+                    store.toggleFavourite(id)
+                }
+                Button("Edit title") { isEditing = true }
+            }
+            .sheet(isPresented: $isEditing) {
+                EditTitleSheet(title: article.title) { store.rename(id, to: $0) }
+            }
+        } else {
+            // The owner deleted it, perhaps from another device: say so instead of showing a stale copy
+            ContentUnavailableView("Article removed", systemImage: "doc.questionmark")
+        }
+    }
+}
+
+struct EditTitleSheet: View {
+    @State private var draft: String    // a deliberate copy: Cancel throws it away
+    let onSave: (String) -> Void
+    @Environment(\.dismiss) private var dismiss
+
+    init(title: String, onSave: @escaping (String) -> Void) {
+        _draft = State(initialValue: title)
+        self.onSave = onSave
+    }
+
+    var body: some View {
+        NavigationStack {
+            Form {
+                TextField("Title", text: $draft)
+            }
+            .toolbar {
+                ToolbarItem(placement: .cancellationAction) {
+                    Button("Cancel") { dismiss() }
+                }
+                ToolbarItem(placement: .confirmationAction) {
+                    Button("Save") {
+                        onSave(draft)
+                        dismiss()
+                    }
+                }
+            }
+        }
+    }
+}
+```
+
+The detail screen never stores the article, so it can't go stale, and it notices when the article disappears. The sheet's `@State` is seeded once on purpose, and it's thrown away when the sheet closes.
+
+## On the device, the store is the source of truth
+
+For data the server owns, the server is the ultimate source of truth. But screens can't read the server directly, and they mustn't each keep their own fetched copy. So on the device you pick **one local owner**, usually a repository backed by a database or a store, and make a firm rule: screens read only from it, and the network writes only into it.
+
+```visual flow
+title: The local store as the device's source of truth
+nodes:
+  - { id: feed, label: Feed, kind: view, at: [0, 0] }
+  - { id: detail, label: Detail, kind: view, at: [0, 2] }
+  - { id: db, label: Local store, kind: store, at: [2, 0] }
+  - { id: repo, label: Repository, kind: service, at: [2, 2] }
+  - { id: api, label: Articles API, kind: external, at: [4, 2] }
+groups:
+  - { id: phone, label: iPhone, nodes: [feed, detail, db, repo] }
+edges:
+  - [db, feed, observe, { style: data }]
+  - [db, detail, observe, { style: data }]
+  - [detail, repo, favourite]
+  - [repo, db, write, { style: data }]
+  - [repo, api, sync, { style: async }]
+  - [api, repo, latest]
+steps:
+  - say: "Both screens **observe** the local store. Neither keeps its own copy of the article."
+    show: [feed, detail, db]
+    send: [db->feed, db->detail]
+  - say: "Tapping the star sends an **intent** to the repository. The detail screen doesn't flip a flag of its own."
+    show: [repo]
+    send: detail->repo
+  - say: "The repository writes the store first, so the change is saved even if the phone is offline."
+    send: repo->db
+    state: { db: active }
+    label: { db: saved }
+  - say: "Both screens update from the store at once. There's nothing to keep in step."
+    send: [db->feed, db->detail]
+    state: { db: null, feed: ok, detail: ok }
+    label: { db: null }
+  - say: "In the background the repository syncs the change to the server."
+    show: [api]
+    send: repo->api
+    state: { feed: null, detail: null, api: wait }
+  - say: "Newer data from the server goes **into the store**, never straight to a screen, so every screen sees it the same way."
+    send: [api->repo, repo->db]
+    state: { api: ok, db: active }
+```
+
+This is the architecture behind most offline-first apps, and Android's architecture guide calls it the same thing: a single source of truth. On iOS the local store might be SwiftData, observed with `@Query`; Core Data, observed with `NSFetchedResultsController`; or an `@Observable` store kept in memory and saved to disk. The rule matters more than the technology: **network → store → screens**, never network → screen.
+
+## Trade-offs
+
+| | Copies kept in step | One owner, screens hold ids | Local store as the source of truth |
+| --- | --- | --- | --- |
+| Consistency | drifts whenever one sync path is missed | consistent within the running app | consistent, and survives relaunch |
+| Code | sync code grows with every new screen | an owner type, plus id lookups | a persistence layer and its observation |
+| Offline | each copy is stale in its own way | in memory only | works offline by design |
+| Performance | no lookups, but redundant fetches | a dictionary lookup per read | disk reads, batched by the framework |
+| When it wins | never, on purpose; tolerable for read-only snapshots | most apps' in-memory state | apps that must work offline or share data with extensions |
+
+A read-only snapshot that's never edited (a receipt, a shared item preview) can be a plain copy, because there's nothing to drift. Anything the user can change, or the server can update, needs an owner.
+
+<Callout kind="interview">
+
+**What to say:** for each entity, name its owner: "The server owns orders; on the device the OrdersRepository owns the cached copy in SwiftData; screens observe it by id." Then show a change travelling through it: the user cancels an order on the detail screen, and the list updates because both read the same store.
+
+**What to ask:** can the same entity be edited in two places (a list's swipe action and a detail screen)? Can it change from outside: push, another device, a widget?
+
+**Red flags:** "we'll post a notification so the other screens reload"; passing full model structs between screens with no plan for updates; each screen fetching its own copy of the same data.
+
+</Callout>
+
+<Callout kind="gotcha" title="iOS gotcha: @State seeded from a parameter is a copy that never updates">
+
+`ArticleDetail(article: article)` with `@State var article: Article` inside takes the value once, when the view first gets its identity, and ignores every later one. If the article changes in the store, or the parent passes a different one into the same view identity, the screen doesn't notice. That's the right behaviour for a draft and the wrong one for anything else. Pass an id or a binding instead.
+
+</Callout>
+
+## Practice
+
+The architecture review **Duplicated sources of truth** is a shopping list screen that stores most of its facts two or three times, with the sync code that tries to hold them together. Find each copy, say what drifts and when, and plan the fix.
+
+```cards
+- id: owner-means
+  front: "What makes a place the source of truth for a fact?"
+  back: "It's the only place that changes the fact, and everything else reads from it or holds a copy that knows it's a copy (a cache or a draft)."
+- id: sync-symptom
+  front: "What's the tell-tale sign of a second source of truth?"
+  back: "Sync code: notifications after saves, reloads in viewWillAppear, didSet pushing values elsewhere. Remove the copy instead."
+- id: id-not-value
+  front: "Why hand a detail screen an id instead of the model?"
+  back: "The screen reads the current value from the owner on every render, so it can't drift, and it notices deletions. Ids are also Codable for navigation and restoration."
+- id: network-store-screen
+  front: "Which way does server data flow in a single-source-of-truth app?"
+  back: "Network → local store → screens. Screens never take data straight from the network; the store is the one copy they all observe."
+```
+
+```quiz
+- id: q1
+  type: bug
+  prompt: "The favourite button works on the detail screen, but the feed doesn't change. Which line creates the second source of truth?"
+  code: |
+    final class FeedViewController: UITableViewController {
+        var articles: [Article] = []
+        let store: ArticleStore
+
+        override func tableView(_ tableView: UITableView, didSelectRowAt indexPath: IndexPath) {
+            let detail = ArticleViewController(store: store)
+            detail.article = articles[indexPath.row]
+            navigationController?.pushViewController(detail, animated: true)
+        }
+    }
+  answer: 7
+  explain: "`Article` is a struct, so line 7 hands the detail screen a copy. Its favourite flag can change without the feed's copy (or the store) knowing. Pass the article's id and read it from `store`."
+- id: q2
+  type: mcq
+  prompt: "An edit-profile sheet has Cancel and Save. Where should the text the user is typing live?"
+  options:
+    - "Directly in the app-wide `Profile` model, through a binding, so every screen updates as they type"
+    - "In a draft owned by the sheet, handed to the profile owner on Save"
+    - "In UserDefaults, so it survives a crash"
+    - "In both the sheet and the profile model, kept in step with onChange"
+  answer: 1
+  explain: "A draft with a commit point is a deliberate, safe copy: Cancel discards it, Save gives it to the owner. Editing the real model live breaks Cancel and shows half-typed names elsewhere."
+- id: q3
+  type: multi
+  prompt: "Which of these are second sources of truth waiting to drift?"
+  options:
+    - "`var unreadCount: Int` stored next to `var messages: [Message]`"
+    - "A detail screen that holds an order id and reads the order from the store"
+    - "The cart count written to UserDefaults for the widget, from the add-to-cart button only"
+    - "`ProfileScreen` and `SettingsScreen` each fetching and keeping the user's profile"
+  answer: [0, 2, 3]
+  explain: "A stored count, a persisted mirror updated from one path, and two screens with their own fetched copies can all disagree with the real data. An id read from the store is the fix, not the problem."
+- id: q4
+  type: order
+  prompt: "Put the path of a favourite tap in order, in an app whose local store is the source of truth."
+  lines:
+    - "The detail screen sends a favourite intent to the repository"
+    - "The repository writes the change to the local store"
+    - "Every screen observing that article re-renders from the store"
+    - "The repository syncs the change to the server"
+    - "The server's answer is written into the store, never straight to a screen"
+  explain: "Writing locally first makes the change instant and offline-safe; screens only ever read from the store, so the server's later answer reaches them the same way."
+- id: q5
+  type: truefalse
+  prompt: "A single source of truth means the whole app should keep its state in one global store."
+  answer: false
+  explain: "The rule is one owner per fact. Different facts can have different owners: a session model, an articles repository, a screen's own filter. A global store is a separate decision with its own trade-offs."
+```

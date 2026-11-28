@@ -1,0 +1,317 @@
+## Why it matters
+
+iOS ends suspended apps whenever it needs the memory, without warning. Users neither know nor care: when they come back, they expect the tab, the search and the screen they left, and an app that relaunches on its home screen feels as if it crashed. Getting this right means deciding which state to save, where, and how to restore it safely. "What happens if the app is killed while the user is in the middle of this?" is a favourite interview follow-up, and the best answers separate the user's *data* from the screen's *state*.
+
+## Three kinds of state, three different answers
+
+[Termination and state restoration](/design/learn/sd-runtime-restoration) covered the lifecycle. The design question is what to keep:
+
+1. **User data:** a half-written message, a listing being created, a photo edit. This isn't UI state at all. Save it to the real store as the user works, as a draft. Restoration data can be discarded (see the gotcha below); a draft must not be.
+2. **UI state:** the selected tab, the navigation path, the search text, which item is selected in a split view, which sections are expanded, the scroll position of a long list. Save it **per window**, and restore it when that window comes back.
+3. **State not to restore:** alerts, toasts, spinners and errors (they described a moment that has passed); anything sensitive (a payment confirmation, a one-time code, a revealed password); and **content**, such as a page of search results. Restore the query and fetch the results again, rather than showing what was true hours ago.
+
+Most of the work is in that third list: an app that restores *everything* brings back stale results, old error alerts and screens that need a session that's since expired.
+
+## When the state is lost
+
+The only reliable moment to save is when the scene goes to the background. After that the app is suspended and runs no code, and if iOS ends it to reclaim memory, nothing in the app is told.
+
+```visual timeline
+title: Killed while suspended (not to scale)
+unit: s
+lanes:
+  - { id: user, label: User }
+  - { id: app, label: App }
+  - { id: system, label: iOS }
+spans:
+  - { lane: user, from: 0, to: 4, label: 'searching "invoice"', tone: active }
+  - { lane: app, from: 0, to: 4, label: foreground, tone: ok }
+  - { lane: app, from: 4, to: 5, label: save, tone: active }
+  - { lane: app, from: 5, to: 9, label: suspended, tone: wait }
+  - { lane: system, from: 9, to: 9.6, label: jetsam, tone: error }
+  - { lane: user, from: 12, to: 13, label: taps the icon }
+  - { lane: app, from: 12, to: 13.5, label: launch + restore, tone: active }
+  - { lane: app, from: 13.5, to: 16, label: 'back on "invoice"', tone: ok }
+markers:
+  - { at: 4, label: background }
+  - { at: 9, label: memory needed }
+steps:
+  - { at: 2, say: "The user is searching for \"invoice\" in the Search tab, two screens deep." }
+  - { at: 5, say: "They switch to another app. As the scene enters the background, the app saves its UI state. This is the **last moment it gets**." }
+  - { at: 8, say: "Suspended, the app runs no code at all, while the user carries on in other apps." }
+  - { at: 9.6, say: "iOS ends the app to reclaim memory. There's no callback: `applicationWillTerminate` isn't called for a suspended app." }
+  - { at: 13.5, say: "Later the user taps the icon. The app launches from scratch and reads the saved state." }
+  - { at: 16, say: "They're back on the search they left, as if the app had never stopped." }
+```
+
+So: save on the way into the background (or continuously, as the user changes things), never "on quit".
+
+## SwiftUI: @SceneStorage
+
+`@SceneStorage` is a property wrapper for **per-scene** UI state. It works like `@State`, but the system saves the value with the scene and puts it back when the scene is re-created after a relaunch. Each window has its own copy, which is exactly right for UI state: two iPad windows can each restore their own tab.
+
+It stores small values only: `Bool`, `Int`, `Double`, `String`, `URL`, `Data`, `Date` (from iOS 18), optionals of those, and enums whose raw value is an `Int` or `String`. Anything structured goes in as `Data`, encoded with `Codable`. Apple asks you to keep it small and to keep sensitive data out of it.
+
+```swift check ios title="A mail window that comes back where it was"
+import SwiftUI
+
+enum MailTab: String {
+    case inbox, search
+}
+
+struct MailWindow: View {
+    @SceneStorage("mail.tab") private var tab = MailTab.inbox
+    @SceneStorage("mail.search") private var searchText = ""
+    @SceneStorage("mail.openThread") private var openThreadID: String?   // an id, never the thread
+    let threadIDs: [String]
+
+    var body: some View {
+        TabView(selection: $tab) {
+            Tab("Inbox", systemImage: "tray", value: MailTab.inbox) {
+                NavigationStack {
+                    List(threadIDs, id: \.self) { id in
+                        Button(id) { openThreadID = id }
+                    }
+                    .navigationDestination(item: $openThreadID) { id in
+                        Text("Thread \(id)")
+                    }
+                }
+            }
+            Tab("Search", systemImage: "magnifyingglass", value: MailTab.search) {
+                NavigationStack {
+                    // The query is restored; the results are fetched again
+                    Text(searchText.isEmpty ? "Search your mail" : "Results for \(searchText)")
+                        .searchable(text: $searchText)
+                }
+            }
+        }
+        .onAppear {
+            // Restored ids can point at things deleted since: fall back instead of showing nothing
+            if let id = openThreadID, !threadIDs.contains(id) {
+                openThreadID = nil
+            }
+        }
+    }
+}
+```
+
+Two other tools are easy to confuse with it:
+
+- **`@AppStorage`** reads and writes UserDefaults. It's app-wide, not per window, and it survives everything, including the user force-quitting. It's for preferences ("show unread only"), not for where a window was. Two windows sharing one `@AppStorage("selectedTab")` fight over it.
+- **A `Codable` snapshot** in `@SceneStorage` (as `Data`) or in a file, for structured state such as a navigation path. `NavigationPath` has a `CodableRepresentation` for this; you'll use it in D20, Navigation & routing.
+
+## UIKit: a state restoration activity
+
+Scene-based UIKit apps describe each window's state as an `NSUserActivity`. The scene delegate returns one from `stateRestorationActivity(for:)` when the scene goes to the background, and the system hands it back as `session.stateRestorationActivity` when it reconnects the scene. Declare the activity type in the Info.plist's `NSUserActivityTypes`.
+
+```swift check ios title="Saving and restoring a window in UIKit"
+import UIKit
+
+final class InboxViewController: UITableViewController {
+    var searchText = ""
+    var openThreadID: String?
+
+    var restorationInfo: [String: Any] {
+        var info: [String: Any] = ["search": searchText]
+        info["thread"] = openThreadID
+        return info
+    }
+
+    func restore(from info: [AnyHashable: Any]) {
+        searchText = info["search"] as? String ?? ""
+        openThreadID = info["thread"] as? String
+    }
+}
+
+final class SceneDelegate: UIResponder, UIWindowSceneDelegate {
+    static let restorationType = "com.example.mail.window"
+    var window: UIWindow?
+    private let inbox = InboxViewController()
+
+    func scene(_ scene: UIScene, willConnectTo session: UISceneSession, options connectionOptions: UIScene.ConnectionOptions) {
+        guard let windowScene = scene as? UIWindowScene else { return }
+        if let activity = session.stateRestorationActivity, activity.activityType == Self.restorationType {
+            inbox.restore(from: activity.userInfo ?? [:])   // nil for a brand-new window
+        }
+        let window = UIWindow(windowScene: windowScene)
+        window.rootViewController = UINavigationController(rootViewController: inbox)
+        window.makeKeyAndVisible()
+        self.window = window
+    }
+
+    /// Called as the scene goes to the background: describe what to bring back
+    func stateRestorationActivity(for scene: UIScene) -> NSUserActivity? {
+        let activity = NSUserActivity(activityType: Self.restorationType)
+        activity.addUserInfoEntries(from: inbox.restorationInfo)
+        return activity
+    }
+}
+```
+
+Older apps use view-controller restoration (`restorationIdentifier` and `encodeRestorableState(with:)`). It still works, but the scene activity is the model that matches multiple windows.
+
+## Designing the snapshot
+
+Whichever tool you use, the saved state is a small, explicit **snapshot type**, designed like an API:
+
+- **Ids, not objects.** Save `openThreadID`, never the thread. The data may have changed, and the id is what the source of truth understands.
+- **Versioned.** The next release may rename a tab or restructure the path. Store a version and decide what an old snapshot means.
+- **Tolerant.** Restoring must never crash. A snapshot the app reads at every launch and can't decode crashes *every* launch: a crash loop users can only escape by deleting the app. Anything unreadable falls back to a fresh window.
+- **Validated against today's data.** The thread may have been deleted, the user signed out, the feature switched off. Restore what still makes sense, and fall back to the nearest screen that does.
+
+```swift run title="A restore that can't make things worse"
+import Foundation
+
+enum Tab: String, Codable {
+    case inbox, search, settings
+}
+
+/// What one window needs to look the same after a relaunch: small, and ids rather than objects
+struct WindowSnapshot: Codable {
+    static let currentVersion = 2
+
+    var version = WindowSnapshot.currentVersion
+    var tab = Tab.inbox
+    var searchText = ""
+    var openThreadID: String?
+
+    /// Never crash on restore: anything unreadable or from another version gives a fresh window
+    static func restore(from data: Data?, existingThreads: Set<String>) -> WindowSnapshot {
+        guard let data,
+              let snapshot = try? JSONDecoder().decode(WindowSnapshot.self, from: data),
+              snapshot.version == currentVersion
+        else { return WindowSnapshot() }
+
+        var restored = snapshot
+        if let id = restored.openThreadID, !existingThreads.contains(id) {
+            restored.openThreadID = nil   // deleted since it was saved: show the list instead
+        }
+        return restored
+    }
+}
+
+let threads: Set<String> = ["t1", "t2"]
+let saved = [
+    ("Saved normally", #"{"version":2,"tab":"search","searchText":"invoice","openThreadID":"t2"}"#),
+    ("Thread deleted since", #"{"version":2,"tab":"inbox","searchText":"","openThreadID":"t9"}"#),
+    ("Saved by an older version", #"{"version":1,"tab":"search","searchText":"invoice"}"#),
+    ("A tab this build doesn't have", #"{"version":2,"tab":"archive","searchText":""}"#),
+]
+for (label, json) in saved {
+    let window = WindowSnapshot.restore(from: Data(json.utf8), existingThreads: threads)
+    print("\(label): \(window.tab), \"\(window.searchText)\", thread \(window.openThreadID ?? "none")")
+}
+```
+
+```output
+Saved normally: search, "invoice", thread t2
+Thread deleted since: inbox, "", thread none
+Saved by an older version: inbox, "", thread none
+A tab this build doesn't have: inbox, "", thread none
+```
+
+Throwing away a whole snapshot because one field is unreadable is the simplest safe policy. A gentler one decodes field by field (`decodeIfPresent`, with a default for each) so an unknown tab costs only the tab. Either way, the restore is a pure function of the saved data and today's data, so it's easy to unit-test.
+
+## Testing restoration
+
+Restoration only runs after the *system* ends the app, so testing it needs a trick: run the app from Xcode, send it to the background (so it saves), then stop it with Xcode's Stop button, and launch it again. Force-quitting from the app switcher doesn't work for this, because that throws the saved state away. Add unit tests for the snapshot itself: round-tripping, an older version, a missing entity, and a corrupted value.
+
+## Trade-offs
+
+| | `@SceneStorage` | `@AppStorage` | `NSUserActivity` restoration | A `Codable` file |
+| --- | --- | --- | --- | --- |
+| Scope | one window | the whole app | one window | whatever you choose |
+| Survives force quit | no | yes | no | yes |
+| Values | small primitives, raw-value enums, `Data` | the same, in UserDefaults | property-list types in `userInfo` | anything `Codable` |
+| Effort | lowest: the system saves it | lowest | you build and read the activity | you choose when to write and how to recover |
+| Wins for | SwiftUI UI state | preferences | UIKit windows | drafts and other user data |
+
+<Callout kind="interview">
+
+**What to say:** "Drafts are user data, saved to the store as they're typed. UI state is per window: tab, path and query in scene storage, as ids, restored and validated at launch. I don't restore alerts, results or anything sensitive; results are refetched from the restored query."
+
+**What to ask:** must a draft survive a force quit? (Then it's data, not UI state.) Does the app support multiple windows? Which screens are sensitive enough to skip?
+
+**Red flags:** saving in `applicationWillTerminate`; restoring whole model objects; a restore path that can crash; drafts that exist only in restoration state.
+
+</Callout>
+
+<Callout kind="gotcha" title="iOS gotcha: force quit throws restoration away">
+
+When the user swipes the app away in the app switcher, or closes a window on iPad, the system discards that scene's restoration data, including its `@SceneStorage`. That's deliberate (it treats it as "start fresh"), and it's why anything the user would be upset to lose must be saved as data, in a store or a file, not as UI state.
+
+</Callout>
+
+## Practice
+
+The design exercise **App-wide state for a multi-tab app** includes restoring each window's tab and navigation after the app is ended in the background, and deciding what must not come back after sign-out.
+
+```cards
+- id: three-kinds
+  front: "What three kinds of state does restoration have to tell apart?"
+  back: "User data (save it to the store as it's made), UI state (save per window, restore at launch), and state not to restore (alerts, results, anything sensitive)."
+- id: when-save
+  front: "When must an app save its UI state?"
+  back: "As the scene goes to the background (or continuously). A suspended app that's ended for memory runs no code and gets no callback."
+- id: snapshot-rules
+  front: "What makes a restoration snapshot safe?"
+  back: "Ids instead of objects, a version, a restore that can't crash, and validation against today's data with a sensible fallback."
+- id: scene-vs-app-storage
+  front: "What's the difference between @SceneStorage and @AppStorage?"
+  back: "@SceneStorage is per window and discarded when the user closes it; @AppStorage is UserDefaults, app-wide, and survives everything. One is for where a window was, the other for preferences."
+```
+
+```quiz
+- id: q1
+  type: sort
+  prompt: "A marketplace app is ended in the background. What should come back when the user returns?"
+  buckets: [Save as data, Restore as UI state, Don't restore]
+  items:
+    - [The description of a listing they were writing, 0]
+    - [The selected tab, 1]
+    - [The search query in the Browse tab, 1]
+    - [The results that query returned, 2]
+    - [A "Couldn't connect" alert that was showing, 2]
+    - [The payment confirmation sheet, 2]
+  explain: "Work the user typed is data and must survive anything. Where they were is UI state. Results go stale, alerts describe a moment that's passed, and a payment sheet must never reappear on its own."
+- id: q2
+  type: mcq
+  prompt: "Two iPad windows of a notes app show different folders. Where should each window keep its selected folder?"
+  options:
+    - "`@AppStorage(\"selectedFolder\")`"
+    - "`@SceneStorage(\"selectedFolder\")`"
+    - "A static property on the app model"
+    - "The server, so it syncs to the Mac"
+  answer: 1
+  explain: "Scene storage is per window, so each window restores its own folder. `@AppStorage` and a static are shared by every window, so the two would overwrite each other."
+- id: q3
+  type: truefalse
+  prompt: "`applicationWillTerminate(_:)` is a reliable place to save UI state."
+  answer: false
+  explain: "When iOS ends a suspended app to reclaim memory, the app runs no code and that method isn't called. Save as the scene goes to the background, or continuously."
+- id: q4
+  type: bug
+  prompt: "Since the last release, some users crash on every launch. Which line is to blame?"
+  code: |
+    struct WindowState: Codable {
+        var tab: Tab
+        var openThreadID: String?
+    }
+
+    func restoreWindow(from data: Data) -> WindowState {
+        let state = try! JSONDecoder().decode(WindowState.self, from: data)
+        return state
+    }
+  answer: 7
+  explain: "`try!` turns an unreadable snapshot (a tab renamed in the new release, say) into a crash, and because the snapshot is restored on every launch, it crashes every launch. Use `try?` and fall back to a fresh window."
+- id: q5
+  type: multi
+  prompt: "How should a restored `openThreadID` be handled?"
+  options:
+    - "Check that the thread still exists before showing it"
+    - "Restore the whole thread object from the snapshot, so no fetch is needed"
+    - "Fall back to the thread list if it was deleted, or if the user has signed out"
+    - "Fetch the thread's latest messages, rather than showing saved ones"
+  answer: [0, 2, 3]
+  explain: "Restore ids and look them up in today's data. A saved copy of the thread would be stale and could resurrect something deleted or show another account's mail."
+```

@@ -1,0 +1,322 @@
+## Why it matters
+
+Which tab is selected, which screens are pushed and which sheet is showing are state too, and they're tied to the data they show. When the tie is careless you get a detail screen still open for an order deleted on another device, two sheets fighting to appear, a sign-out that leaves the previous user's messages one swipe away, and deep links that can't be expressed at all. "The item is deleted while the user is looking at it: what happens?" and "how does sign-out reset the app?" are classic interview probes, and both are questions about this coupling.
+
+## Navigation is state
+
+In SwiftUI this is literal. `NavigationStack(path:)` takes a binding to an array of routes, `.sheet(item:)` a binding to an optional, and `TabView(selection:)` a binding to the selected tab. Change the value and the screen changes. In UIKit, the state is held by UIKit itself (a navigation controller's `viewControllers`, a presented controller), and the design question is who decides what goes there; coordinators and routers answer it in D20, Navigation & routing.
+
+Because it's state, everything in this module applies to it: one source of truth, ids rather than copies, enums rather than booleans, and lifetimes that match the screens. Here are the five places it usually goes wrong.
+
+## 1. Destinations as booleans
+
+```swift
+@State private var showEditNote = false
+@State private var showShare = false
+@State private var showCancelConfirmation = false
+```
+
+Three booleans allow eight combinations for four real states (none, or one of three). Set two at once and you've asked for two presentations from one screen, which can't be shown together. It's the view-state lesson again: replace them with **one optional enum**, so at most one destination exists, and carry the id of what it's about.
+
+```swift
+enum Destination: Hashable, Identifiable {
+    case editNote(orderID: Int)
+    case share(orderID: Int)
+    case confirmCancel(orderID: Int)
+
+    var id: Self { self }
+}
+```
+
+## 2. Routes that hold copies
+
+`path: [Order]` or `.sheet(item: $editingOrder)` with a model struct puts **copies** into navigation state, and copies drift ([A single source of truth](/design/learn/sd-state-source-of-truth)). Routes should hold **ids**. The destination resolves the id from the store when it renders, so it always shows the current order, and notices if there isn't one. Ids also make routes small, `Hashable` and `Codable`, which is what restoration and deep links need: a deep link is a URL turned into a path of ids, and a restored window is a saved path of ids.
+
+## 3. Data changes that invalidate navigation
+
+Data changes underneath open screens all the time: a sync deletes an order, the server revokes access to a shared album, the user signs out. Navigation has to be checked against the data whenever the data changes:
+
+```visual sequence
+title: An order is deleted on another device while it's open
+participants:
+  - { id: sync, label: Sync }
+  - { id: store, label: Orders store }
+  - { id: model, label: OrdersModel }
+  - { id: nav, label: Navigation }
+messages:
+  - { note: "The user is on order 42's receipt, two screens deep.", over: nav }
+  - [sync, store, delete order 42, { say: "A sync brings a deletion made on the user's iPad." }]
+  - [store, model, orders changed, { async: true, say: "The store tells the model its orders changed. The model owns the path, so it can react." }]
+  - [model, model, prune the path, { say: "Routes for order 42, and anything pushed above them, no longer make sense." }]
+  - [model, nav, "path = []", { say: "The model sets the path, and the stack animates back to the list." }]
+  - { note: "No screen is left showing an order that doesn't exist.", over: [model, nav] }
+```
+
+The pruning is a pure function of the path and the data, so it's easy to get right and to test. A screen above a broken one goes too, because it was opened from it:
+
+```swift run title="Keeping only the routes that still make sense"
+enum Route: Hashable, Codable {
+    case order(id: Int)
+    case receipt(orderID: Int)
+    case help
+
+    var name: String {
+        switch self {
+        case .order(let id): "order \(id)"
+        case .receipt(let id): "receipt \(id)"
+        case .help: "help"
+        }
+    }
+}
+
+/// The routes that still make sense. A screen above a broken one goes too: it was opened from it.
+func pruned(_ path: [Route], existingOrders: Set<Int>) -> [Route] {
+    var kept: [Route] = []
+    for route in path {
+        switch route {
+        case .order(let id), .receipt(let id):
+            guard existingOrders.contains(id) else { return kept }
+        case .help:
+            break
+        }
+        kept.append(route)
+    }
+    return kept
+}
+
+let existing: Set<Int> = [7]   // order 42 was just deleted on another device
+let paths: [[Route]] = [
+    [.order(id: 7), .receipt(orderID: 7)],
+    [.order(id: 42), .receipt(orderID: 42)],
+    [.order(id: 7), .order(id: 42), .help],
+]
+for path in paths {
+    let before = path.map(\.name).joined(separator: " → ")
+    let after = pruned(path, existingOrders: existing).map(\.name).joined(separator: " → ")
+    print(before, "⇒", after.isEmpty ? "(the list)" : after)
+}
+```
+
+```output
+order 7 → receipt 7 ⇒ order 7 → receipt 7
+order 42 → receipt 42 ⇒ (the list)
+order 7 → order 42 → help ⇒ order 7
+```
+
+Popping isn't the only answer. A detail screen that resolves its id can show "This order was removed" with a button back, which is kinder when the user was in the middle of reading. Choose per screen; what matters is that no screen silently shows data that's gone.
+
+**Sign-out** is the extreme case: every path, sheet and piece of feature state from the old session must go. The most reliable reset is structural: give the signed-in part of the app an identity tied to the session, `MainTabs().id(session.userID)`. When the user changes, SwiftUI treats it as a new view, so every `@State`, every navigation path and every sheet underneath is thrown away, including ones nobody remembered to reset by hand.
+
+## 4. Who owns the navigation state
+
+While only a view decides where to go, its navigation state can be local: `@State private var path` in that view. As soon as **logic** needs to navigate (pop after saving, open a thread from a push notification, reset after sign-out, prune after a deletion), the state must move to something that logic can reach: the feature's model, or a router or coordinator (D20).
+
+Don't split it. A path that the view pushes onto *and* a model that also tracks "the current order" are two sources of truth, and they disagree the first time one of them changes without the other.
+
+Navigation is also **per window** ([Local, shared and app-wide state](/design/learn/sd-state-kinds)): each window has its own path and sheet, so navigation state lives in scene-level models, never in an app-wide one.
+
+```swift check ios title="A model that owns navigation and keeps it valid"
+import SwiftUI
+
+struct Order: Identifiable {
+    let id: Int
+    var title: String
+}
+
+enum Route: Hashable, Codable {
+    case order(id: Int)
+    case receipt(orderID: Int)
+}
+
+/// One sheet at a time, about one order, by id
+enum Destination: Hashable, Identifiable {
+    case editNote(orderID: Int)
+    case share(orderID: Int)
+
+    var id: Self { self }
+
+    var orderID: Int {
+        switch self {
+        case .editNote(let id), .share(let id): id
+        }
+    }
+}
+
+@MainActor @Observable
+final class OrdersModel {
+    private(set) var orders: [Int: Order] = [:] {
+        didSet { keepNavigationValid() }   // every data change re-checks navigation
+    }
+    var path: [Route] = []
+    var destination: Destination?
+
+    var sortedOrders: [Order] { orders.values.sorted { $0.id < $1.id } }
+
+    func ordersChanged(_ latest: [Order]) {
+        orders = Dictionary(uniqueKeysWithValues: latest.map { ($0.id, $0) })
+    }
+
+    func saved(noteFor orderID: Int) {
+        destination = nil   // logic decides where to go next, so the model owns the state
+    }
+
+    private func keepNavigationValid() {
+        if let broken = path.firstIndex(where: { !exists($0) }) {
+            path.removeSubrange(broken...)
+        }
+        if let destination, orders[destination.orderID] == nil {
+            self.destination = nil
+        }
+    }
+
+    private func exists(_ route: Route) -> Bool {
+        switch route {
+        case .order(let id), .receipt(let id): orders[id] != nil
+        }
+    }
+}
+
+struct OrdersScreen: View {
+    @Bindable var model: OrdersModel
+
+    var body: some View {
+        NavigationStack(path: $model.path) {
+            List(model.sortedOrders) { order in
+                NavigationLink(order.title, value: Route.order(id: order.id))
+            }
+            .navigationDestination(for: Route.self) { route in
+                switch route {
+                case .order(let id):
+                    OrderDetail(model: model, id: id)
+                case .receipt(let id):
+                    Text("Receipt for order \(id)")
+                }
+            }
+            .sheet(item: $model.destination) { destination in
+                switch destination {
+                case .editNote(let id):
+                    Button("Save note") { model.saved(noteFor: id) }
+                case .share(let id):
+                    Text("Share order \(id)")
+                }
+            }
+        }
+    }
+}
+
+struct OrderDetail: View {
+    let model: OrdersModel
+    let id: Int
+
+    var body: some View {
+        if let order = model.orders[id] {
+            List {
+                Text(order.title)
+                NavigationLink("Receipt", value: Route.receipt(orderID: id))
+                Button("Edit note") { model.destination = .editNote(orderID: id) }
+                Button("Share") { model.destination = .share(orderID: id) }
+            }
+        } else {
+            ContentUnavailableView("Order removed", systemImage: "shippingbox")
+        }
+    }
+}
+```
+
+## 5. Lifetimes follow navigation
+
+A pushed screen's state should live exactly as long as the screen. Create its model when the screen appears (`@State` in the destination view, or a model built for the route) and let it go when the screen is popped. Store per-screen state *above* navigation, say in a feature model's `currentOrderNote`, and it leaks between visits: open order 1, go back, open order 2, and for a moment order 2 shows order 1's note.
+
+The opposite mistake is tying something to a screen that should outlive it. A half-written review that disappears when the user pops back to check a detail is a bug, not tidiness. That's data: save it as a draft, keyed by the order's id, outside the screen ([Persisting and restoring UI state](/design/learn/sd-state-persist-restore)).
+
+## Trade-offs
+
+| | Navigation state in the view | In the feature's model | In a router or coordinator (D20) |
+| --- | --- | --- | --- |
+| Logic can navigate | no | yes, within the feature | yes, across features |
+| Reacting to data changes | awkward: `onChange` in the view | natural: the model sees both | the router must be told about data |
+| Restoration and deep links | per view, by hand | the model's path, encoded | one place for every entry point |
+| Testing | UI tests only | unit-test the path | unit-test routing |
+| Wins for | screens whose navigation is pure UI | most features | apps with many entry points and cross-feature flows |
+
+<Callout kind="interview">
+
+**What to say:** "Navigation is state, owned per window by the feature model: a path of routes holding ids, and one optional destination enum for sheets. Whenever the data changes, the model prunes routes whose ids no longer exist. Sign-out replaces the signed-in tree's identity, so every path, sheet and screen state from the old session is discarded."
+
+**What to ask:** can data change while it's on screen (sync, push, other devices)? What should a user see when it does: a pop, or a "removed" message? Which screens can be reached from outside (deep links, notifications)?
+
+**Red flags:** model structs in the path; several booleans for sheets; navigation that only views can trigger; sign-out that resets some screens by hand.
+
+</Callout>
+
+<Callout kind="gotcha" title="iOS gotcha: sheet(item:) re-presents when the item's identity changes">
+
+`.sheet(item:)` dismisses and presents again whenever the item's `id` changes. If the item is a model struct whose `id` is derived from fields the sheet edits, or `Destination` holds values that change while it's up, the sheet flickers closed and open mid-edit. Keep a destination's identity stable for as long as it's showing: ids of entities, not their contents.
+
+</Callout>
+
+## Practice
+
+The design exercise **App-wide state for a multi-tab app** asks you to own each tab's navigation path per window, keep it valid as the basket and catalogue change, restore it after relaunch, and wipe it on sign-out.
+
+```cards
+- id: nav-is-state
+  front: "Why treat navigation as state?"
+  back: "In SwiftUI it literally is (a path, an optional sheet, a selected tab), so the same rules apply: one owner, ids not copies, enums not booleans, lifetimes that match screens."
+- id: prune
+  front: "What should happen to navigation when the data it shows is deleted?"
+  back: "The owner checks the path against the data on every change and drops routes whose ids no longer exist (and everything above them), or the screen shows a \"removed\" state."
+- id: sign-out-id
+  front: "What's the most reliable way to reset every screen on sign-out in SwiftUI?"
+  back: "Give the signed-in tree an identity tied to the session, such as .id(session.userID). A new user means a new view, so all its state, paths and sheets are discarded."
+- id: who-owns
+  front: "When must navigation state move out of the view?"
+  back: "As soon as logic needs to navigate: after a save, from a notification, after a deletion or a sign-out. Then the feature model or a router owns it."
+```
+
+```quiz
+- id: q1
+  type: mcq
+  prompt: "An order detail screen has `@State var showEdit = false`, `@State var showShare = false` and `@State var showCancelAlert = false`. What's the best change?"
+  options:
+    - "Add a check that sets the other two to false before setting one"
+    - "Replace them with one optional `Destination` enum carrying the order's id"
+    - "Move all three booleans into an app-wide navigation store"
+    - "Use UIKit for the presentations instead"
+  answer: 1
+  explain: "One optional enum makes \"at most one destination\" impossible to break, and carrying the id means the sheet resolves the current order rather than a copy."
+- id: q2
+  type: multi
+  prompt: "Which are good things to put in a `NavigationStack` path?"
+  options:
+    - "`Route.order(id: 42)`"
+    - "The `Order` struct the list row was showing"
+    - "`Route.receipt(orderID: 42)`"
+    - "The order detail's view model"
+  answer: [0, 2]
+  explain: "Routes should be small, Hashable, Codable values holding ids. A struct copy goes stale, and a view model in the path ties lifetimes and identity to navigation in ways that break restoration and deep links."
+- id: q3
+  type: order
+  prompt: "Order 42 is deleted on another device while the user is on its receipt. Put what should happen in order."
+  lines:
+    - "A sync writes the deletion into the orders store"
+    - "The store's change reaches the model that owns the path"
+    - "The model drops routes for order 42 and everything above them"
+    - "The navigation stack pops back to the list"
+  explain: "Data first, then navigation derived from it. Because the model owns both, nothing has to notify the views directly."
+- id: q4
+  type: truefalse
+  prompt: "Applying `.id(session.userID)` to the root of the signed-in UI resets every navigation path and `@State` beneath it when a different user signs in."
+  answer: true
+  explain: "A new id gives the subtree a new identity, so SwiftUI discards the old views' state, paths and presentations, and builds fresh ones."
+- id: q5
+  type: mcq
+  prompt: "Opening order 2 briefly shows the note the user typed on order 1. Where is the note state most likely stored?"
+  options:
+    - "In `@State` inside the order detail view"
+    - "In a property of the feature model shared by every detail screen"
+    - "In the order itself, in the store"
+    - "In the route value"
+  answer: 1
+  explain: "State kept above navigation, shared across visits, outlives each screen. Give each detail its own state (or key it by order id), and save real drafts as data."
+```

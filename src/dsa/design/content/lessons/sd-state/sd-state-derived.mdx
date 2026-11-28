@@ -1,0 +1,266 @@
+## Why it matters
+
+A basket total that's a few pence off, a Checkout button that stays disabled after the last item is added, a badge that says 3 when the list shows 2. Each is a value that could have been computed, stored instead, and then not updated on one path. The fix is a habit: **store the facts, compute everything else.** In interviews it's the quickest way to show you design state deliberately: you list what's stored, and say what's derived from it.
+
+## Facts and derived values
+
+**Derived state** is any value you can compute from other state: a count, a total, whether a form is valid, the filtered and sorted list, the list grouped into sections, an "Updated 5 min ago" label, whether a button is enabled.
+
+The test is one question: **is this ever set on its own?** If it only ever changes because something else changed, it's derived. If the user or the server can set it independently, it's a fact, even if it usually matches a calculation. A delivery fee the server quotes is a fact; a subtotal of the lines is derived. A list sorted by the user's chosen order is derived from two facts: the items *and* the chosen order.
+
+Keep the stored facts to the smallest set that's independent, and compute the rest.
+
+## Stored derived state drifts
+
+Here are two baskets. The first stores its total and updates it as lines change; the second stores only the lines:
+
+```swift run title="Storing a total vs computing it"
+struct Line {
+    let name: String
+    let pence: Int
+    var quantity: Int
+}
+
+/// Stores a total as well as the lines it comes from
+struct DriftingBasket {
+    private(set) var lines: [Line] = []
+    private(set) var totalPence = 0
+
+    mutating func add(_ line: Line) {
+        lines.append(line)
+        totalPence += line.pence * line.quantity
+    }
+
+    mutating func setQuantity(_ quantity: Int, at index: Int) {
+        lines[index].quantity = quantity   // the total was forgotten here
+    }
+}
+
+/// Stores only the facts, and computes the rest when asked
+struct Basket {
+    private(set) var lines: [Line] = []
+
+    var totalPence: Int { lines.reduce(0) { $0 + $1.pence * $1.quantity } }
+    var itemCount: Int { lines.reduce(0) { $0 + $1.quantity } }
+    var canCheckOut: Bool { itemCount > 0 }
+
+    mutating func add(_ line: Line) { lines.append(line) }
+    mutating func setQuantity(_ quantity: Int, at index: Int) { lines[index].quantity = quantity }
+}
+
+var drifting = DriftingBasket()
+var basket = Basket()
+for line in [Line(name: "Coffee", pence: 450, quantity: 1), Line(name: "Bagel", pence: 300, quantity: 2)] {
+    drifting.add(line)
+    basket.add(line)
+}
+drifting.setQuantity(3, at: 0)
+basket.setQuantity(3, at: 0)
+
+print("Stored total:", drifting.totalPence)
+print("Computed total:", basket.totalPence, "for", basket.itemCount, "items")
+```
+
+```output
+Stored total: 1050
+Computed total: 1950 for 5 items
+```
+
+Every mutation of `DriftingBasket` has to remember the total, and the next developer to add `remove(at:)` or `applyPromo(_:)` must remember too. `Basket` has nothing to remember: its total can't be wrong unless its lines are.
+
+## Computed properties, and how SwiftUI sees them
+
+In Swift, derived state is a computed property. With `@Observable` there's nothing more to wire up: when a view's `body` reads `basket.totalPence`, Observation records which **stored** properties the getter touched (`lines`), and re-renders the view when any of them changes. A computed property is tracked through its inputs.
+
+```swift check ios title="Derived values in a SwiftUI basket"
+import SwiftUI
+
+struct Line: Identifiable {
+    let id: String
+    let name: String
+    let pence: Int
+    var quantity: Int
+}
+
+@Observable
+final class BasketModel {
+    var lines: [Line] = []
+    var updatedAt: Date?
+
+    var totalPence: Int { lines.reduce(0) { $0 + $1.pence * $1.quantity } }
+    var itemCount: Int { lines.reduce(0) { $0 + $1.quantity } }
+    var canCheckOut: Bool { itemCount > 0 }
+}
+
+struct BasketFooter: View {
+    let basket: BasketModel
+
+    var body: some View {
+        VStack {
+            Text(Decimal(basket.totalPence) / 100, format: .currency(code: "GBP"))
+            if let updatedAt = basket.updatedAt {
+                // Derived from a stored date and the clock; SwiftUI keeps it current
+                Text("Prices checked \(updatedAt, style: .relative) ago")
+            }
+            Button("Check out (\(basket.itemCount))") {}
+                .disabled(!basket.canCheckOut)
+        }
+    }
+}
+```
+
+The "checked 5 minutes ago" label is derived from a stored date *and the clock*. Store the date, never the string: `Text(date, style: .relative)` keeps the label current without a timer, and `TimelineView` does the same for anything more custom.
+
+## When computing it is too expensive
+
+Most derived values are cheap. Summing 100 basket lines takes microseconds; computing it on every render is fine, and caching it would only add a way to be wrong. Some are not cheap: filtering and sorting thousands of rows with locale-aware comparison, grouping a feed into sections, or building an attributed string per row. Do those in `body` and they run on every invalidation, including every keystroke in a search field.
+
+Estimate before you cache. Move the sliders to see when a filter-and-sort stops fitting in a frame:
+
+```visual estimator
+title: Can you afford to sort on every keystroke?
+inputs:
+  - { id: items, label: Items in the list, min: 10, max: 100000, value: 3000, scale: log, unit: items }
+  - { id: ns, label: Cost of one locale-aware comparison, min: 10, max: 2000, value: 300, scale: log, unit: ns }
+  - { id: hz, label: Display refresh rate, min: 60, max: 120, step: 60, value: 120, unit: Hz }
+outputs:
+  - { id: comparisons, label: Comparisons in one sort, formula: items * log2(items), format: si }
+  - { id: work, label: Time to filter and sort once, formula: (comparisons + items) * ns / 1e9, format: duration }
+  - { id: frame, label: One frame lasts, formula: 1 / hz, format: duration }
+  - { id: share, label: Share of the frame it uses, formula: work / frame * 100, unit: "%" }
+```
+
+When it doesn't fit, cache the result, but follow one rule: **the owner of the inputs maintains the cache, privately, in the same change.** Then the cached value can't drift, because nothing else can change the inputs without the owner noticing.
+
+```swift check ios title="A cached derived list, maintained by the owner of its inputs"
+import SwiftUI
+
+struct Product: Identifiable {
+    let id: Int
+    let name: String
+}
+
+@Observable
+final class CatalogueSearch {
+    var products: [Product] = [] { didSet { rebuild() } }
+    var query = "" { didSet { rebuild() } }
+
+    /// Derived from `products` and `query`; only `rebuild()` writes it
+    private(set) var results: [Product] = []
+
+    private func rebuild() {
+        results = products
+            .filter { query.isEmpty || $0.name.localizedStandardContains(query) }
+            .sorted { $0.name.localizedStandardCompare($1.name) == .orderedAscending }
+    }
+}
+
+struct CatalogueList: View {
+    @State private var search = CatalogueSearch()
+
+    var body: some View {
+        List(search.results) { product in
+            Text(product.name)
+        }
+        .searchable(text: $search.query)
+    }
+}
+```
+
+`results` is still derived state, just computed eagerly. What makes it safe is that it's `private(set)` and written in one function, triggered by the only two inputs. For work too slow even for that (a search over 100,000 messages), move it off the main actor and drop results that arrive for an old query, as the next lesson's view states do with numbered requests.
+
+## Trade-offs
+
+| | Compute on every read | Cache in the owner of the inputs | Store it separately |
+| --- | --- | --- | --- |
+| Can it drift? | no | no, if only the owner writes it | yes, on any missed path |
+| Cost | the work on every render | the work once per input change, plus memory | the work once, plus the sync code |
+| Code | a computed property | `didSet` (or a method) and a `private(set)` value | updates in every mutation |
+| Wins when | it's cheap: almost always | it's measurably expensive and read often | almost never; only for values the server sends as facts |
+
+<Callout kind="interview">
+
+**What to say:** list the stored state, then the derived state, out loud: "The basket stores lines and a promo code. The subtotal, discount, total, item count and whether you can check out are all computed from those." Interviewers hear that you've kept the stored state minimal.
+
+**What to ask:** is this number computed on the client or quoted by the server? A delivery fee or tax the server calculates is a fact to store and display, not a value to recompute.
+
+**Red flags:** an `isValid` flag updated by hand from three text fields; a stored `count` next to the array; "we'll recompute it in `viewWillAppear`".
+
+</Callout>
+
+<Callout kind="gotcha" title="iOS gotcha: onChange that copies one state into another">
+
+`.onChange(of: items) { count = items.count }` stores derived state in a second `@State` and keeps it in step by hand. It's a frame late (the view renders once with the old count, then again), and it's one more path that can be missed. Read `items.count` directly in `body`, or make it a computed property on the model.
+
+</Callout>
+
+## Practice
+
+The kata **Normalised playlist store** asks for totals and memberships that are computed from normalised data, never stored, so they stay right however the tracks change.
+
+```cards
+- id: derived-test
+  front: "How do you tell a fact from derived state?"
+  back: "Ask whether it's ever set on its own. If it only changes because something else changed, it's derived: compute it."
+- id: observable-computed
+  front: "Does SwiftUI update a view that reads a computed property of an @Observable model?"
+  back: "Yes. Observation tracks the stored properties the getter reads, so a change to any of them re-renders the view."
+- id: safe-cache
+  front: "When is caching a derived value safe?"
+  back: "When the owner of its inputs maintains it privately, in the same change that alters the inputs, so nothing else can make it stale."
+- id: relative-time
+  front: "How should a screen show \"Updated 5 min ago\"?"
+  back: "Store the date and derive the label with Text(date, style: .relative) or a TimelineView, never a stored string and a timer."
+```
+
+```quiz
+- id: q1
+  type: sort
+  prompt: "In a food-delivery basket, which values should be stored and which derived?"
+  buckets: [Store it, Derive it]
+  items:
+    - [The lines and their quantities, 0]
+    - [The promo code the user typed, 0]
+    - [The delivery fee the server quoted, 0]
+    - [The subtotal of the lines, 1]
+    - [The number shown on the basket badge, 1]
+    - [Whether the Place order button is enabled, 1]
+  explain: "The lines, the code and the server's quote are each set independently. The subtotal, badge and button state only ever change because those facts change, so computing them means they can't disagree."
+- id: q2
+  type: mcq
+  prompt: "A sign-up form has `email`, `password` and `isValid` stored in a view model. `isValid` is recalculated in each field's `didSet`. A new `acceptedTerms` field is added. What's the best change?"
+  options:
+    - "Add another `didSet` on `acceptedTerms` that recalculates `isValid`"
+    - "Make `isValid` a computed property over all the fields"
+    - "Recalculate `isValid` in the Submit button's action"
+    - "Use `onChange` in the view to update `isValid`"
+  answer: 1
+  explain: "`isValid` is derived. As a computed property it can't be forgotten when fields are added, and Observation re-renders the button whenever any field it reads changes."
+- id: q3
+  type: estimate
+  prompt: "A search screen filters and sorts 5,000 products on every keystroke. A sort makes about n × log₂ n comparisons, and each locale-aware comparison costs about 300 ns. Roughly how many milliseconds does one sort take?"
+  answer: 18
+  unit: ms
+  within: { factor: 2 }
+  explain: "log₂ 5,000 ≈ 12.3, so about 61,000 comparisons × 300 ns ≈ 18 ms. A 120 Hz frame lasts 8.3 ms, so this hitches on every keystroke: cache the result in the model and rebuild it only when the query or the products change."
+- id: q4
+  type: truefalse
+  prompt: "Caching a derived list in the model is fine, as long as it's `private(set)` and rebuilt by the model whenever one of its inputs changes."
+  answer: true
+  explain: "The danger of stored derived state is a missed update path. When the owner of the inputs is the only writer and rebuilds in the same change, there's no path to miss."
+- id: q5
+  type: bug
+  prompt: "The header shows \"0 unread\" when it first appears. Which line stores derived state that the view then has to keep in step by hand?"
+  code: |
+    struct InboxHeader: View {
+        let messages: [Message]
+        @State private var unread = 0
+
+        var body: some View {
+            Text("\(unread) unread")
+                .onChange(of: messages) { unread = messages.filter(\.isUnread).count }
+        }
+    }
+  answer: 3
+  explain: "Line 3 stores a count that's derived from `messages`, so `onChange` has to keep it in step, and it doesn't run when the view first appears. Delete the state and compute it in `body`: `messages.filter(\\.isUnread).count`."
+```

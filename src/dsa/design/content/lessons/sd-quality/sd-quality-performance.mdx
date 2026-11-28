@@ -1,0 +1,232 @@
+## Why it matters
+
+People judge an app by how it feels in the first second: does it open quickly, does the list scroll without stuttering, does the button respond? Slow apps get deleted, and on iOS the system itself steps in, killing an app whose launch takes too long or whose memory grows too large. Scalability is the same question asked about growth: what happens with ten times the users, or a user with ten times the data? Every mobile system design interview has a performance question hiding in it, and the strong answers come with numbers.
+
+## Three things "performance" means
+
+When someone says an app is "slow", they mean one of three things, and each has a different fix:
+
+- **Latency:** how long one operation takes. Cold launch, opening a screen, a request's round trip, the time from tapping "Pay" to seeing a result.
+- **Throughput:** how many operations happen per unit of time. Requests a server handles per second, images decoded per second, frames drawn per second while scrolling.
+- **Resource use:** what an operation costs. CPU time, memory, battery, network bytes, disk space, and app download size.
+
+The ISO 25010 model calls the whole family *performance efficiency* and splits it into time behaviour, resource utilisation and capacity. On a server you mostly worry about latency and throughput, because you can add machines. On a phone the resources are fixed, shared with every other app, and paid for in battery, so resource use matters as much as speed.
+
+## The main thread's budget
+
+On iOS, most of what people feel as performance happens on the **main thread**. It handles touches, runs your view code and prepares every frame. The display refreshes 60 times a second on most iPhones and up to 120 times on ProMotion displays, so the main thread has **16.7 ms per frame at 60 Hz and 8.3 ms at 120 Hz**. Miss that deadline and the screen shows the previous frame again: a **hitch**, which people feel as a stutter.
+
+Step through what happens when a feed decodes its JSON on the main thread, then when the same work moves off it:
+
+```visual timeline
+title: A 40 ms decode, on and off the main thread, at 120 Hz
+unit: ms
+lanes:
+  - { id: screen, label: Screen }
+  - { id: main, label: Main thread }
+  - { id: worker, label: Background task }
+spans:
+  - { lane: screen, from: 0, to: 8.3, label: frame, tone: ok }
+  - { lane: screen, from: 8.3, to: 16.7, label: frame, tone: ok }
+  - { lane: screen, from: 16.7, to: 58.3, label: "same frame, 4 dropped", tone: error }
+  - { lane: screen, from: 58.3, to: 66.7, label: frame, tone: ok }
+  - { lane: main, from: 0, to: 3, label: layout }
+  - { lane: main, from: 8.3, to: 11.3, label: layout }
+  - { lane: main, from: 16.7, to: 56.7, label: decode feed JSON, tone: error }
+  - { lane: main, from: 58.3, to: 61.3, label: layout }
+  - { lane: screen, from: 75, to: 83.3, label: frame, tone: ok }
+  - { lane: screen, from: 83.3, to: 91.7, label: frame, tone: ok }
+  - { lane: screen, from: 91.7, to: 100, label: frame, tone: ok }
+  - { lane: screen, from: 100, to: 108.3, label: frame, tone: ok }
+  - { lane: screen, from: 108.3, to: 116.7, label: frame, tone: ok }
+  - { lane: screen, from: 116.7, to: 125, label: frame, tone: ok }
+  - { lane: main, from: 75, to: 78, label: layout }
+  - { lane: main, from: 83.3, to: 86.3, label: layout }
+  - { lane: main, from: 91.7, to: 94.7, label: layout }
+  - { lane: main, from: 100, to: 103, label: layout }
+  - { lane: main, from: 108.3, to: 111.3, label: layout }
+  - { lane: main, from: 116.7, to: 121, label: show posts, tone: ok }
+  - { lane: worker, from: 76, to: 116, label: decode feed JSON, tone: wait }
+markers:
+  - { at: 0, label: decode on main }
+  - { at: 75, label: decode off main }
+steps:
+  - { at: 0, say: "At 120 Hz the main thread has **8.3 ms** to prepare each frame. A few milliseconds of layout fits easily." }
+  - { at: 16.7, say: "The feed's JSON arrives and is decoded **on the main thread**: 40 ms of work in one go." }
+  - { at: 58.3, say: "The screen showed the same frame for four refreshes: a **hitch**. Touches during it wait too." }
+  - { at: 76, say: "The same decode in a task off the main actor. The main thread keeps doing only short layout work." }
+  - { at: 121, say: "Every frame lands on time, and the decoded posts are applied in one short step. Same work, different thread." }
+```
+
+The fix didn't make the decode any faster; it moved it to where it doesn't block frames. That's the first rule of on-device performance: **keep the main thread for short, UI-only work**. In Swift concurrency that means doing heavy work in a function that isn't isolated to the main actor (a `@concurrent` function in Swift 6.2 and later, or a method on another actor) and hopping back to the main actor only to apply the result. D22 covers how.
+
+Apple's tools give you names and numbers for these failures:
+
+- **Hitches** while scrolling or animating, measured as a *hitch time ratio*: milliseconds of hitch per second of scrolling. Apple's guidance is that under 5 ms/s is good and over 10 ms/s is a problem people notice.
+- **Hangs:** the main thread unresponsive for 250 ms or more. Xcode Organizer reports a hang rate from users' devices, and MetricKit delivers hang diagnostics.
+- **Launch time:** Apple suggests drawing the first frame within about 400 ms. If launch takes far longer (around 20 seconds), the system's watchdog kills the app, which shows in crash reports with the code `0x8badf00d`.
+- **Memory:** there's no fixed limit you can design to; it depends on the device. When memory runs short, iOS terminates background apps first, and a foreground app that grows too large is killed too ("jetsam").
+
+### Battery is a performance budget too
+
+The cellular radio is one of the most power-hungry parts of a phone, and it stays in a high-power state for several seconds after each transfer. Ten small requests spread over a minute keep it awake far longer than one batched request, for the same bytes. So the cheapest network request, for the battery, is the one you combine with another or don't make. Location, background work and keeping the screen bright are the other big costs.
+
+## Percentiles, not averages
+
+Latency varies: the same request takes 120 ms on Wi-Fi and 3 s in a lift. A single average describes almost nobody. Teams describe latency with **percentiles**: p50 (the median: half are faster), p90, p95 and p99 (the slow tail).
+
+```swift run
+import Foundation
+
+func percentile(_ p: Double, of samples: [Int]) -> Int {
+    let sorted = samples.sorted()
+    let rank = Int((p * Double(sorted.count) / 100).rounded(.up))
+    return sorted[max(rank, 1) - 1]
+}
+
+// Twenty screen-load times in milliseconds: most are quick, two hit a slow network
+let loads = [120, 135, 110, 150, 2900, 140, 125, 160, 130, 115, 145, 1400, 155, 105, 138, 128, 142, 118, 133, 147]
+let mean = Double(loads.reduce(0, +)) / Double(loads.count)
+
+print("mean: \(String(format: "%.1f", mean)) ms")
+for p in [50.0, 90, 95, 99] {
+    print("p\(Int(p)): \(percentile(p, of: loads)) ms")
+}
+```
+
+```output
+mean: 334.8 ms
+p50: 135 ms
+p90: 160 ms
+p95: 1400 ms
+p99: 2900 ms
+```
+
+The mean, 335 ms, is slower than 90% of the loads and far faster than the slow ones: it describes nobody's experience. The percentiles tell the real story: most people wait about 135 ms, and one in twenty waits over a second. Those are the people who leave a one-star review, so budgets are written against the tail ("p95 under 1 s"), never the mean.
+
+The tail matters more as screens make more calls. If a screen waits for 10 requests in parallel, each with a 1% chance of being slow, the chance that *at least one* is slow is 1 − 0.99¹⁰, about 10%. A rare slow call becomes a common slow screen.
+
+## Scalability: growing without falling over
+
+A system is **scalable** if it can handle more load by adding resources, with the cost growing no faster than the load. There are two kinds of growth to design for, and mobile engineers need both.
+
+**More users, on the server.** More users means more requests per second. A server scales **vertically** (a bigger machine: simple, but there's a ceiling) or **horizontally** (more machines behind a load balancer: no ceiling, but the servers must be stateless, or share state carefully). You'll build this out in Part VI. The part that's yours as an app engineer: **the app is the server's biggest load generator**. A million active phones polling every 30 seconds is 33,000 requests a second for data that mostly hasn't changed. A push that makes every phone refresh at 9:00 sends them all at once. Client design choices are server capacity decisions.
+
+**More data, on the device.** A phone can't add CPUs, so on-device scalability is about algorithms and memory. The app that's fine with 100 photos must still work for the person with 50,000, the chat with 10,000 messages and the notes database five years old. What breaks first:
+
+- **Work that grows with the data on the main thread:** sorting, filtering or diffing a whole collection on every change. An O(n²) diff that takes 1 ms for 100 items takes 10 s for 10,000 ([Growth classes from O(1) to O(n!)](/dsa/learn/bigo-growth-classes) in the DSA course shows why).
+- **Loading everything into memory:** fetching all 50,000 records to show 20. Page from the database, and use lazy containers (`List`, `LazyVStack`) so views are built only as they scroll in.
+- **Unbounded caches and files:** an image cache with no size limit grows until the system starts killing your app.
+
+| Growth | Where it hurts | Typical designs |
+| --- | --- | --- |
+| 10× users | Server throughput, database, push fan-out | Stateless servers, caching, CDNs, pagination, push instead of polling |
+| 10× data per user | Device memory, main-thread work, launch time | Paged queries, lazy views, background processing, bounded caches |
+| 10× features | Build times, team coordination | Modules, clear ownership (Part IX) |
+
+## Trade-offs
+
+Almost every performance technique buys speed with something else:
+
+| Technique | Buys | Costs | When it wins |
+| --- | --- | --- | --- |
+| Cache the result | Latency, battery, server load | Memory or disk, staleness, invalidation logic | Data read far more often than it changes |
+| Precompute ahead of time | Latency when needed | Work (and battery) that may be wasted | Results that are very likely needed soon, such as the next page |
+| Do less (smaller payloads, fewer calls) | Everything | Product scope, sometimes more API endpoints | Almost always the first thing to try |
+| Defer the work | Launch time, responsiveness | Complexity; the work still happens later | Non-essential setup: analytics, prefetching, migrations |
+| Move it off the main thread | Responsiveness | Concurrency complexity, data-race risk | Anything over a millisecond or two that isn't UI |
+| Move it to the server | Device resources, battery | Latency, offline support, server cost | Heavy computation on shared data, such as search across all users |
+
+<Callout kind="interview">
+
+**Say numbers.** "Cold launch to first content under a second at p90 on a three-year-old phone; nothing heavier than layout on the main thread; the feed pages 20 posts at a time." Then say how you'd measure each: launch metrics, hitch rates, MetricKit in production.
+
+**Ask:** "How much data does a heavy user have?" and "How many daily users, and when's the peak?" One question sizes the device side, the other the server side.
+
+**Red flags:** "it'll be fast because Swift is fast"; describing latency with an average; polling when the server could push; loading a whole collection to show a screenful; treating the server's scalability as someone else's problem when the app's refresh policy creates the load.
+
+</Callout>
+
+<Callout kind="gotcha" title="iOS gotcha: measure Release builds on a real, older device">
+
+Debug builds turn off the optimiser, which can make Swift code with heavy generics many times slower than it will be in the App Store build. The simulator runs on your Mac's CPU, memory and storage, so it hides exactly the problems older phones have. Profile with Instruments on a Release build, on the oldest device you support, and keep a few performance tests in CI so a regression is caught before users find it.
+
+</Callout>
+
+## Practice
+
+The kata *Performance budget gate* turns this lesson's percentiles into a CI check: budgets such as "p90 cold launch under 1,000 ms", compared with each build's measurements and with the last good baseline. It's what keeps a fast app fast.
+
+```cards
+- id: frame-budget
+  front: "How long does the main thread have per frame at 60 Hz and at 120 Hz?"
+  back: "About 16.7 ms at 60 Hz and 8.3 ms at 120 Hz. Miss it and the previous frame is shown again: a hitch."
+- id: percentiles-not-mean
+  front: "Why are latency budgets written as percentiles rather than averages?"
+  back: "Latency is skewed by a slow tail. The mean describes nobody; p50 shows the typical experience and p95 or p99 shows the people about to give up."
+- id: app-generates-load
+  front: "How do client design choices affect server scalability?"
+  back: "The app generates the load. Polling intervals, refresh-on-push and retry policies multiply by every active phone: a million phones polling every 30 s is about 33,000 requests a second."
+- id: device-scalability
+  front: "What does scalability mean on the device, where you can't add hardware?"
+  back: "Coping with more data per user: paged queries, lazy views, bounded caches and no work that grows with the data on the main thread."
+```
+
+```quiz
+- id: q1
+  type: estimate
+  prompt: "A ProMotion display refreshes 120 times a second. How many milliseconds does the main thread have to prepare each frame?"
+  answer: 8.3
+  unit: ms
+  within: { percent: 10 }
+  explain: "1,000 ms ÷ 120 ≈ 8.3 ms. Anything longer on the main thread in one go, such as decoding a large JSON payload, drops at least one frame."
+- id: q2
+  type: estimate
+  prompt: "Your app polls for new messages every 30 seconds while it's open. At the evening peak, 2 million phones have it open. Roughly how many requests a second does that send?"
+  answer: 66667
+  unit: requests a second
+  within: { factor: 2 }
+  explain: "2,000,000 ÷ 30 ≈ 67,000 requests a second, almost all returning \"nothing new\". A push or a long-lived connection sends only real changes, which is why polling intervals are a server capacity decision."
+- id: q3
+  type: mcq
+  prompt: "Which is the best launch-time budget to put in a performance test?"
+  options:
+    - "Average launch time under 500 ms"
+    - "p90 time to first content under 1 s on an iPhone 12, Release build"
+    - "Launch should be as fast as possible"
+    - "The fastest of 10 launches under 300 ms"
+  answer: 1
+  explain: "It names the statistic (p90, which covers the slow tail), the metric (first content, what people see), the device and the build. Averages hide the tail; the fastest run hides everything."
+- id: q4
+  type: mcq
+  prompt: "A screen waits for 5 API calls in parallel. Each call is slow 2% of the time, independently. About how often is the screen slow?"
+  options:
+    - "2% of the time"
+    - "About 10% of the time"
+    - "About 40% of the time"
+    - "Never, because the calls run in parallel"
+  answer: 1
+  explain: "The screen is slow if any call is: 1 − 0.98⁵ ≈ 9.6%. Running in parallel saves time on the normal path, but the screen still waits for the slowest call, so tails add up."
+- id: q5
+  type: sort
+  prompt: "Which kind of performance does each measurement describe?"
+  buckets: [Latency, Throughput, Resource use]
+  items:
+    - ["Time from tapping a notification to the conversation appearing", 0]
+    - ["Photos the upload service accepts per second", 1]
+    - ["Megabytes the app downloads in a typical session", 2]
+    - ["Frames drawn per second while scrolling", 1]
+    - ["Battery used per hour of navigation", 2]
+    - ["Round trip of the sign-in request", 0]
+  explain: "Latency is the time for one operation; throughput is operations per unit of time; resource use is what the work costs in battery, memory, data or space."
+- id: q6
+  type: multi
+  prompt: "A photo app is smooth with 200 photos but stutters for users with 40,000. Which changes address the cause?"
+  options:
+    - "Fetch photos from the database in pages instead of all at once"
+    - "Use a lazy grid so cells are built only when they scroll into view"
+    - "Move grouping by date off the main thread, and update the grid incrementally"
+    - "Show a bigger loading spinner"
+  answer: [0, 1, 2]
+  explain: "The work grows with the data: fetching everything, building every cell, and regrouping on the main thread. Paging, lazy views and background processing make the cost depend on what's on screen. A spinner only hides the wait."
+```

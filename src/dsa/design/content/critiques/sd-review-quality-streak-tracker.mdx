@@ -1,0 +1,140 @@
+<Brief>
+
+This is the streak feature of a fitness app: finish a workout and your streak, points and tomorrow's reminder update. Users keep writing to support that their 40-day streak "reset to 1", the team is scared to touch the file, and there isn't a single test for it. Review it as you would a pull request: what's wrong, what matters most, and how you'd make it testable and safe to change.
+
+```swift check ios title="StreakModel.swift"
+import SwiftUI
+import UserNotifications
+
+@MainActor
+final class AnalyticsClient {
+    static let shared = AnalyticsClient()
+    func track(_ event: String, _ properties: [String: String] = [:]) {
+        // Sends the event to the analytics backend
+    }
+}
+
+@MainActor @Observable
+final class StreakModel {
+    static let shared = StreakModel()
+
+    var streak = 0
+    var points = 0
+    var banner: String?
+
+    func workoutFinished(kind: String, minutes: Int) {
+        let defaults = UserDefaults.standard
+        let now = Date()
+        if let last = defaults.object(forKey: "lastWorkout") as? Date {
+            if Calendar.current.isDateInYesterday(last) {
+                streak += 1
+            } else if !Calendar.current.isDateInToday(last) {
+                streak = 1
+            }
+        } else {
+            streak = 1
+        }
+        defaults.set(now, forKey: "lastWorkout")
+        defaults.set(streak, forKey: "streak")
+
+        if kind == "run" {
+            points += minutes * 2
+        } else if kind == "swim" {
+            points += minutes * 3
+        } else if kind == "yoga" {
+            points += minutes
+        }
+
+        if streak == 7 {
+            banner = "One week in a row!"
+        } else if streak == 30 {
+            banner = "30 days in a row!"
+        }
+
+        AnalyticsClient.shared.track("workout_finished", ["kind": kind, "streak": "\(streak)"])
+
+        let content = UNMutableNotificationContent()
+        content.title = "Keep your \(streak)-day streak going"
+        var tomorrow = Calendar.current.dateComponents([.year, .month, .day], from: now.addingTimeInterval(86_400))
+        tomorrow.hour = 18
+        let trigger = UNCalendarNotificationTrigger(dateMatching: tomorrow, repeats: false)
+        let request = UNNotificationRequest(identifier: UUID().uuidString, content: content, trigger: trigger)
+        UNUserNotificationCenter.current().add(request)
+    }
+}
+
+struct StreakBadge: View {
+    var body: some View {
+        Label("\(StreakModel.shared.streak) days", systemImage: "flame")
+    }
+}
+```
+
+</Brief>
+
+```workspace
+template: critique
+minutes: 25
+```
+
+```findings
+- id: streak-not-restored
+  title: The streak starts at zero on every launch, so it resets to 1
+  severity: high
+  lines: 16-17
+  detail: "`streak` and `points` begin at 0 and are never loaded. Line 33 saves the streak, but nothing reads it back, so after a relaunch a 40-day streak with yesterday's workout becomes 0 + 1 = 1 (line 25), and points are never saved at all. That's the support complaint: user data lost on an ordinary relaunch."
+- id: untestable-time
+  title: The streak rule reads the clock and calendar itself
+  severity: high
+  lines: 22-27
+  detail: "`Date()` and `Calendar.current` are read inside the rule, so the cases that matter (yesterday, two days ago, a workout at 23:59 and one at 00:01, a flight across time zones) can only be tested by changing the device's clock. Line 53 adds 86,400 seconds for \"tomorrow\", which is wrong on the days clocks change. Inject `now` and the `Calendar`, and use `calendar.date(byAdding: .day, value: 1, to:)`."
+- id: one-method-many-jobs
+  title: One method computes, saves, scores, writes copy, tracks and schedules
+  severity: high
+  lines: 20-58
+  detail: "The streak rule, persistence, points, banner copy, analytics and notifications all live in `workoutFinished`. Testing the rule fires analytics and schedules real notifications; changing the points table means editing the method that guards the streak. Low cohesion is why every change feels risky: split the pure decision from the side effects."
+- id: hidden-dependencies
+  title: Storage, analytics and notifications are reached through globals
+  severity: medium
+  lines: 49-57
+  detail: "`UserDefaults.standard` (line 21), `AnalyticsClient.shared` and `UNUserNotificationCenter.current()` are fetched from inside the method, so nothing in its signature says it has them and a test can't swap them. Tests that do run share the real defaults between runs, which makes them order-dependent, and send real analytics events."
+- id: global-model
+  title: The view reads a shared singleton model
+  severity: medium
+  lines: 61-65
+  detail: "`StreakBadge` reaches for `StreakModel.shared`, so previews and snapshot tests can only show whatever the shared instance holds, and every new view that does the same makes the singleton harder to remove. Pass the model in (an initialiser or the environment)."
+- id: stringly-kind
+  title: Workout kinds are strings matched in an if–else chain
+  severity: medium
+  lines: 35-41
+  detail: "A typo (\"Run\") or a new kind (\"cycling\") silently earns zero points, and the compiler can't point to the places that need updating. A `WorkoutKind` enum with a `pointsPerMinute` property makes adding a kind one change, checked by an exhaustive switch."
+- id: duplicate-reminders
+  title: Every workout adds another reminder
+  severity: medium
+  lines: 53-57
+  detail: "Each request gets a random identifier, so two workouts in a day schedule two reminders for tomorrow, and old ones are never replaced. A fixed identifier (\"streak-reminder\") makes each new request replace the last."
+- id: hard-coded-milestones
+  title: Milestones and their copy are hard-coded in the model
+  severity: low
+  lines: 43-47
+  detail: "The thresholds only fire on exact equality, the English strings can't be localised, and product can't add a 100-day milestone without changing this method and shipping a release. Move milestones to data and the copy to `String(localized:)` in the view layer."
+```
+
+<ReferenceReview>
+
+**Most important first.** There's a real bug shipping today: the streak is never loaded, so any relaunch turns a long streak into 1 (lines 16–17 and 25). Fix that first, and fix it with a test, because it's the kind of bug that comes back.
+
+**The design problem underneath** is that the rule users care about, "did you work out yesterday?", is buried in a method that also reads the clock, writes to disk, tracks analytics and schedules notifications. Every one of those is hidden behind a global, so the rule can't be tested on its own, and the code can't be changed without fear. Testability and maintainability are the qualities missing here, and both come from the same fix: separate the decision from the side effects, and pass dependencies in.
+
+**How I'd fix it, in small steps** (each one shippable):
+
+1. Extract the rule as a pure function: `StreakRule.next(current: Int, lastWorkout: Date?, now: Date, calendar: Calendar) -> Int`. Cover it with table-driven tests before changing anything else, including a workout at 23:59 followed by one at 00:01, and a gap of two days.
+2. Add a `StreakStore` protocol (load and save streak, points and last workout as one value). Back it with `UserDefaults` in the app and an in-memory store in tests, and load from it in `StreakModel.init`. This fixes the reset bug.
+3. Give `StreakModel` an initialiser that takes the store, a `now: () -> Date`, a `Calendar`, an `Analytics` protocol and a `ReminderScheduler` protocol. Build the real ones in the app's composition root, and keep `shared` only until the last caller is gone.
+4. Replace the kind string with a `WorkoutKind` enum and its `pointsPerMinute`.
+5. Make the reminder scheduler use a fixed identifier and `calendar.date(byAdding: .day, value: 1, to: now)`.
+6. Pass the model into `StreakBadge`, and move milestones into a small table with localised copy.
+
+**Tests to add:** the streak rule across today, yesterday, a gap, midnight and a time-zone change; the model restoring its streak from a store after a "relaunch" (a new model on the same store); two workouts in one day scheduling one reminder; points per kind. None of them need a simulator, the real clock or real notifications.
+
+</ReferenceReview>

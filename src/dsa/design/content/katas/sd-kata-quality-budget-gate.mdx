@@ -1,0 +1,112 @@
+A quality attribute you don't measure drifts. A **fitness function** stops the drift: an automated check, run on every build, that fails when a measurement crosses a line. Build the gate a CI job would run after its performance tests: it turns raw samples (launch times, frame rates, crash-free percentages) into one number per budget, compares it with an absolute limit and with the last good baseline, and keeps a baseline that only ever gets better.
+
+`QualityBudgetGate.value(of:in:) -> Double?`
+
+- `.mean` and `.maximum` are what they say. `.percentile(p)` uses the **nearest-rank** method: sort the samples, and take the one at rank ⌈p × n ÷ 100⌉, counting from 1 and never below 1.
+- No samples gives `nil`.
+
+`QualityBudgetGate.evaluate(_:samples:baseline:) -> [Outcome]`
+
+- One `Outcome` per budget, in the budgets' order, carrying the budget's id and the measured value.
+- `.noData` when the budget's metric has no samples (missing or empty). A gate that can't measure must not pass.
+- `.breached` when the value is on the wrong side of `limit`: above it for `.lowerIsBetter`, below it for `.higherIsBetter`. Exactly at the limit passes.
+- `.regressed` when the budget has a `maxRegression` and the baseline has an entry for its id, and the value is worse than `baseline × (1 + maxRegression)` (lower is better) or `baseline × (1 − maxRegression)` (higher is better). A breach is reported as a breach, never as a regression.
+- Otherwise `.pass`.
+
+`QualityBudgetGate.ratchet(_:budgets:outcomes:) -> [String: Double]`
+
+- Start from the old baseline. For each **passing** outcome, set its budget's entry to the better of the old entry and the new measurement (the lower one for `.lowerIsBetter`, the higher one for `.higherIsBetter`), or add it if there was none.
+- Outcomes that didn't pass change nothing, and entries for other budgets are kept.
+
+## Examples
+
+Cold launches in milliseconds: `[350, 1200, 310, 380, 330, 900, 320, 370, 340, 360]`.
+
+| Call | Result |
+| --- | --- |
+| `value(of: .percentile(50), in: launches)` | `350` (rank 5 of 10) |
+| `value(of: .percentile(90), in: launches)` | `900` (rank 9) |
+| `value(of: .mean, in: launches)` | `486`: two slow launches drag the mean far from what most people feel |
+| p90 launch budget, limit 1000 ms, no baseline | `.pass`, measured 900 |
+| the same budget, limit 800 ms | `.breached` |
+| limit 1000 ms, `maxRegression: 0.1`, baseline 800 ms | `.regressed`: 900 is 12.5% slower than 800 |
+| mean frame rate `[60, 58, 59, 57, 60]`, `.higherIsBetter`, limit 55 | `.pass`, measured 58.8 |
+| `ratchet(["cold-launch-p90": 800], …)` after a pass at 700 | `["cold-launch-p90": 700]` |
+| the same after a pass at 850 | `["cold-launch-p90": 800]`: a baseline never gets worse |
+
+## Constraints
+
+- Samples are finite numbers; percentiles are from 0 to 100; `maxRegression` is from 0 to 1.
+- Budget ids are unique. Several budgets may read the same metric (a p90 and a maximum of the same launches, say).
+- Don't sort in place or otherwise change the caller's samples.
+
+<Hints>
+<Hint>
+Write `value(of:in:)` first: everything else is built on it. `(p * Double(n) / 100).rounded(.up)` gives the rank; clamp it to `1...n` before subtracting one for the index.
+</Hint>
+<Hint>
+One helper, `isWorse(_ value: Double, than reference: Double, _ direction: Direction) -> Bool`, answers both the limit question and the baseline question, in both directions.
+</Hint>
+<Hint>
+In `ratchet`, look each outcome's budget up by id to find its direction, and skip anything whose verdict isn't `.pass`.
+</Hint>
+</Hints>
+
+## Solutions
+
+<Approach title="Reduce, compare with the limit, then the baseline" time="O(n log n) per budget, for the sort" space="O(n)">
+
+```swift
+public static func value(of statistic: Statistic, in samples: [Double]) -> Double? {
+    guard !samples.isEmpty else { return nil }
+    switch statistic {
+    case .mean:
+        return samples.reduce(0, +) / Double(samples.count)
+    case .maximum:
+        return samples.max()
+    case .percentile(let p):
+        let sorted = samples.sorted()
+        let rank = Int((p * Double(sorted.count) / 100).rounded(.up))
+        return sorted[min(max(rank, 1), sorted.count) - 1]
+    }
+}
+
+private static func isWorse(_ value: Double, than reference: Double, _ direction: Direction) -> Bool {
+    direction == .lowerIsBetter ? value > reference : value < reference
+}
+
+public static func evaluate(_ budgets: [Budget], samples: [String: [Double]], baseline: [String: Double] = [:]) -> [Outcome] {
+    budgets.map { budget in
+        guard let measured = value(of: budget.statistic, in: samples[budget.metric] ?? []) else {
+            return Outcome(budgetID: budget.id, measured: nil, verdict: .noData)
+        }
+        if isWorse(measured, than: budget.limit, budget.direction) {
+            return Outcome(budgetID: budget.id, measured: measured, verdict: .breached)
+        }
+        if let allowed = budget.maxRegression, let previous = baseline[budget.id] {
+            let threshold = budget.direction == .lowerIsBetter ? previous * (1 + allowed) : previous * (1 - allowed)
+            if isWorse(measured, than: threshold, budget.direction) {
+                return Outcome(budgetID: budget.id, measured: measured, verdict: .regressed)
+            }
+        }
+        return Outcome(budgetID: budget.id, measured: measured, verdict: .pass)
+    }
+}
+
+public static func ratchet(_ baseline: [String: Double], budgets: [Budget], outcomes: [Outcome]) -> [String: Double] {
+    let budgetByID = Dictionary(budgets.map { ($0.id, $0) }, uniquingKeysWith: { first, _ in first })
+    var next = baseline
+    for outcome in outcomes where outcome.verdict == .pass {
+        guard let measured = outcome.measured, let budget = budgetByID[outcome.budgetID] else { continue }
+        if let previous = next[outcome.budgetID], !isWorse(previous, than: measured, budget.direction) {
+            continue
+        }
+        next[outcome.budgetID] = measured
+    }
+    return next
+}
+```
+
+The two checks catch different failures. The **limit** is the promise to users ("p90 cold launch under a second") and never moves without a decision. The **regression** check catches the slow slide: ten pull requests that each add 3% stay inside the limit until, one day, they don't, and nobody can say which change did it. The ratchet has a cost worth naming: a lucky, unusually fast run becomes the new bar, and normal noise then fails builds. Real gates soften that with enough samples per run (percentiles of 10 launches, not one), an allowance above the noise you measure on your CI devices, and a baseline that's updated on the main branch only.
+
+</Approach>

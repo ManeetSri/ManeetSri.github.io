@@ -1,0 +1,316 @@
+## Why it matters
+
+Most "the screen shows the wrong thing" bugs are placement bugs. A value lives in the wrong place, so it gets copied, forgotten, or outlives the screen that needed it. Before you choose MVVM, a store or TCA, you have to say, for each piece of state, who reads it and how long it should live. Interviewers ask "where does this state live?" because the answer shows whether you've thought about ownership at all.
+
+## What counts as state
+
+State is any value that can change while the app runs and that something on screen depends on: whether a row is expanded, the text in a search field, the orders list, whether the user is signed in, which tab is selected.
+
+Two questions place almost every piece of it:
+
+- **Scope: who reads or writes it?** One view, a few views in one screen or flow, one window, or the whole app.
+- **Lifetime: how long must it live?** For a gesture, while a screen is open, for the session, across launches, or for ever on a server.
+
+| State | Who reads it | How long it lives | Typical home |
+| --- | --- | --- | --- |
+| Is this row expanded? | one view | while it's on screen | `@State` in that view |
+| Search text and filters | the list and the map of one screen | while the screen is open | a screen model |
+| The address picked in checkout step 1 | the three steps of checkout | the flow | a flow model handed to each step |
+| Selected tab, navigation path | one window | the scene, restored after relaunch | scene-level state |
+| Signed-in user, basket | every feature | the session (the basket across launches) | app-level models, injected |
+| Orders | many screens | owned by the server | a repository and its cache |
+
+The rest of this lesson walks up that table, from the cheapest kind of state to the most far-reaching.
+
+## Local state
+
+Local state belongs to one view, and nothing else needs to know about it: a toggle's position while the user decides, a text field's draft, whether a disclosure group is open, a sheet that only this view presents.
+
+Start every piece of state local and `private`. It's the cheapest kind there is: nothing else can change it, it's created and destroyed with the view, and changing it re-renders only that view. In SwiftUI that's `@State private var`; in UIKit, a private stored property on the view controller.
+
+Its one cost is that it has to move when a second view needs it. That move is one of the most common refactors in any app.
+
+## Shared state: lift it to the nearest common owner
+
+When two views need the same value, keep **one** copy in the lowest place both can reach, their nearest common ancestor in the view tree, and pass it down. React calls this *lifting state up*. In SwiftUI you pass a single value down as a `@Binding`, and several related values as an `@Observable` model, as in [@State and @Binding](/design/learn/sd-swiftui-state-binding) and [@Observable and @Bindable](/design/learn/sd-swiftui-observable).
+
+Here a places screen switches between a list and a map. The "open now" filter started inside the list; the moment the map needed it too, it moved up to the screen:
+
+```visual flow
+title: Lifting the filter as the map starts needing it
+layers:
+  - { label: App, rows: 0 }
+  - { label: Window, rows: 1 }
+  - { label: Screen, rows: 2 }
+  - { label: Views, rows: 3 }
+nodes:
+  - { id: session, label: Session, kind: service, at: [0, 0] }
+  - { id: basket, label: Basket, kind: service, at: [2, 0] }
+  - { id: tab, label: Selected tab, kind: view, at: [1, 1] }
+  - { id: search, label: PlaceSearch, kind: service, at: [1, 2] }
+  - { id: list, label: PlaceList, kind: view, at: [0, 3] }
+  - { id: map, label: PlaceMap, kind: view, at: [2, 3] }
+edges:
+  - [search, list, reads, { style: data }]
+  - [search, map, reads, { style: data }]
+  - [session, tab, user, { style: data }]
+  - [basket, tab, badge, { style: data }]
+steps:
+  - say: "The filter starts as **local** state: only the list reads it, so it's `@State` inside `PlaceList`."
+    show: [list]
+    label: { list: openNow }
+  - say: "Then the map needs it too. A second `@State` copy would drift: switch views and the filter seems to reset."
+    show: [map]
+    label: { map: openNow }
+    state: { list: error, map: error }
+  - say: "So the filter moves up to the lowest owner both views share, the screen's `PlaceSearch` model. Now it's **shared** state with one copy."
+    show: [search]
+    send: [search->list, search->map]
+    state: { list: ok, map: ok }
+    label: { list: null, map: null, search: openNow }
+  - say: "**Window** state belongs to one scene. Two iPad windows can sit on different tabs at the same time."
+    show: [tab]
+    state: { list: null, map: null }
+  - say: "**App-wide** state is the same in every window: who's signed in, and how many items the basket holds."
+    show: [session, basket]
+    send: [session->tab, basket->tab]
+```
+
+In code, the screen owns the model with `@State`, so it lives exactly as long as the screen, and hands it to both children. Each child keeps its own local state for things only it cares about:
+
+```swift check ios title="Local and shared state in one screen"
+import SwiftUI
+
+struct Place: Identifiable {
+    let id: Int
+    let name: String
+    let isOpen: Bool
+}
+
+/// Shared state: the list and the map both read it, so it lives in the screen that contains both
+@Observable
+final class PlaceSearch {
+    var query = ""
+    var openNowOnly = false
+    var places: [Place] = []
+
+    var results: [Place] {
+        places.filter { place in
+            (!openNowOnly || place.isOpen) && (query.isEmpty || place.name.localizedStandardContains(query))
+        }
+    }
+}
+
+struct PlaceSearchScreen: View {
+    @State private var search = PlaceSearch()   // owned here: lives as long as the screen
+    @State private var showsMap = false         // local: nothing else cares
+
+    var body: some View {
+        VStack {
+            Toggle("Open now", isOn: $search.openNowOnly)
+            if showsMap {
+                PlaceMap(search: search)
+            } else {
+                PlaceList(search: search)
+            }
+        }
+        .searchable(text: $search.query)
+        .toolbar {
+            Button(showsMap ? "List" : "Map") { showsMap.toggle() }
+        }
+    }
+}
+
+struct PlaceList: View {
+    let search: PlaceSearch
+    @State private var expanded: Set<Place.ID> = []   // local: which rows show their details
+
+    var body: some View {
+        List(search.results) { place in
+            DisclosureGroup(place.name, isExpanded: Binding(
+                get: { expanded.contains(place.id) },
+                set: { isOpen in
+                    if isOpen { expanded.insert(place.id) } else { expanded.remove(place.id) }
+                }
+            )) {
+                Text(place.isOpen ? "Open now" : "Closed")
+            }
+        }
+    }
+}
+
+struct PlaceMap: View {
+    let search: PlaceSearch
+
+    var body: some View {
+        // A real app draws a MapKit Map here; a count keeps the example short
+        Text("\(search.results.count) places on the map")
+    }
+}
+```
+
+The rule of thumb is **as low as possible, as little as possible**. The screen is the right owner for `openNowOnly`. Lifting it to the app would make the filter survive after the user leaves, and make every screen depend on a value only one screen uses.
+
+### Flow state
+
+A multi-step flow (checkout, onboarding, creating a listing) is shared state with a clear lifetime. Its steps share one flow model, created when the flow starts and discarded when it ends, so the next checkout starts clean. If the steps read and write a global object instead, the second checkout opens with the first one's half-filled address.
+
+## App-wide and window state
+
+**App-wide** state is the same wherever you look: the signed-in user, their entitlements (are they a subscriber?), the basket, settings, whether the network is reachable. It's created at launch, lives above every screen, and is handed to the screens that need it, through the environment in SwiftUI or initialisers in UIKit. You'll meet the ways to hand it over in D21, Dependency injection.
+
+On iPad, Mac and Vision Pro an app can have several windows, and each window is its own scene, as in [Multiple windows and scenes on iPad](/design/learn/sd-runtime-multi-window). Some state that *feels* global is really per window: the selected tab, the navigation path, a search in progress. Two windows side by side should be able to show different tabs, and must show the same signed-in user.
+
+```swift check ios title="App-wide state in the App, window state in each scene"
+import SwiftUI
+
+@Observable
+final class Session {
+    var userName: String?
+}
+
+enum Tab: String {
+    case explore, saved, profile
+}
+
+struct TravelApp: App {
+    @State private var session = Session()   // one per process: every window sees the same user
+
+    var body: some Scene {
+        WindowGroup {
+            RootView()
+                .environment(session)
+        }
+    }
+}
+
+struct RootView: View {
+    @Environment(Session.self) private var session
+    @SceneStorage("selectedTab") private var tab = Tab.explore   // one per window, restored after relaunch
+
+    var body: some View {
+        TabView(selection: $tab) {
+            Text("Explore").tag(Tab.explore)
+            Text("Saved").tag(Tab.saved)
+            Text(session.userName ?? "Signed out").tag(Tab.profile)
+        }
+    }
+}
+```
+
+Each new window creates its own `RootView`, with its own `@SceneStorage` and `@State`. The `Session` lives in the `App`, so there's one. (`@SceneStorage` saves the tab for that window, so it survives a relaunch; lesson 7 covers it.)
+
+## Server state is a different kind
+
+Some state isn't the app's at all: orders, messages, a product's price and stock. The server owns it, and the app holds a **cache**, a copy that can go stale. That changes what it needs: a freshness rule, a way to refetch, and one place on the device that holds the copy, so two screens never show two versions of the same order. The next lesson is about that one place, and Part V about caching it well.
+
+Mixing the two kinds is a classic mistake: an `orders` array stored in a view model's `@State`, fetched again by every screen that shows orders, each with its own idea of what's current.
+
+## A placement checklist
+
+Ask these in order for each piece of state:
+
+1. **Does anything outside this view read or change it?** If not, it's local and `private`. Stop.
+2. **Which owner do all its readers share?** Put it in the lowest one: the screen, the flow, the window or the app.
+3. **Should two windows see the same value?** Yes means app-wide; no means the window or lower.
+4. **Must it survive the screen closing, or the app being killed?** Then it also needs persisting (lesson 7).
+5. **Is it a copy of something the server owns?** Then it's a cache, and its source of truth is elsewhere.
+
+## Trade-offs
+
+| | Local | Lifted to a screen or flow | App-wide |
+| --- | --- | --- | --- |
+| Who can change it | one view | the owner, and views it hands a binding to | anything it's injected into |
+| What re-renders on a change | that view | views under the owner that read it | every reader, anywhere in the app |
+| Lifetime | the view's identity | the owner's | the process (or longer, if persisted) |
+| Typical bug | lost when the view is recreated | owner too high, so it outlives its screen | stale filters and drafts leaking between visits |
+| Testing | through the view, unless extracted | test the model directly | test the model, but every test shares its setup |
+| Coupling | none | the children depend on the owner | every feature depends on it |
+
+Local wins by default: it's free until a second reader appears. Lifting wins the moment one does, as long as the owner is the *lowest* shared one. App-wide wins only for state that's genuinely one per process and read across features. For a session or a basket it's right; for a filter or a draft it's a leak waiting to happen.
+
+<Callout kind="interview">
+
+**What to say:** classify state before drawing boxes. "The draft is local to the composer. The thread list and the unread badge share the inbox store. The signed-in account is app-wide. The selected tab is per window, because iPad supports two." Naming scope *and* lifetime for each piece is what interviewers listen for.
+
+**What to ask:** does the app support multiple windows? Must state survive being killed in the background? Which data does the server own?
+
+**Red flags:** one `AppState` singleton holding everything, with no reason given; every screen fetching its own copy of server data; treating per-window state as global.
+
+</Callout>
+
+<Callout kind="gotcha" title="iOS gotcha: @State only reads its initial value once">
+
+`@State var count: Int` in a child, set from a parent with `Child(count: total)`, takes `total` the first time the view appears and then ignores every later value, because state belongs to the view's identity, not to the struct the parent builds each time ([View lifetime vs state lifetime](/design/learn/sd-swiftui-lifetimes)). If a value comes from a parent, it isn't local: take it as a plain `let` or a `@Binding`.
+
+</Callout>
+
+## Practice
+
+The design exercise **App-wide state for a multi-tab app** asks you to place every piece of state in a four-tab grocery app: what's app-wide, what's per window, what's per screen, and how sign-out clears it. Do it after the global stores lesson; this lesson's checklist is the first half of the answer.
+
+```cards
+- id: two-questions
+  front: "Which two questions place a piece of state?"
+  back: "Who reads or writes it (its scope), and how long it must live (its lifetime)."
+- id: lift-lowest
+  front: "When two views need the same value, where does it go?"
+  back: "One copy in the lowest owner both share (their nearest common ancestor), passed down as a binding or an observable model."
+- id: tab-is-scene
+  front: "Why isn't the selected tab app-wide state?"
+  back: "Each window is its own scene with its own tab. Two iPad windows can show different tabs but must share the signed-in user."
+- id: server-state
+  front: "What makes server data different from UI state?"
+  back: "The server owns it; the app only caches a copy. It needs a freshness rule and one place on the device that holds the copy."
+```
+
+```quiz
+- id: q1
+  type: sort
+  prompt: "Where should each piece of state live in a travel app that supports several iPad windows?"
+  buckets: [Local to one view, Shared by a screen or flow, One per window, App-wide]
+  items:
+    - [Whether a disclosure group is expanded, 0]
+    - [A comment field's draft before it's posted, 0]
+    - [The filter both the list and the map apply, 1]
+    - [The traveller details entered in step 1 of booking and used in step 3, 1]
+    - [The selected tab, 2]
+    - [The signed-in user, 3]
+    - [Whether the user has an active subscription, 3]
+  explain: "Local state has one reader. Shared state goes to the lowest owner its readers share, and lives as long as that owner. Per-window state differs between two windows of the same app; app-wide state is the same in all of them."
+- id: q2
+  type: mcq
+  prompt: "`OrderList` keeps a `status` filter in `@State`. A new summary header, a sibling of the list in the same screen, must show the count for the same filter. What do you do?"
+  options:
+    - "Give the header its own `@State` filter and keep the two in step with `onChange`"
+    - "Move the filter to the screen that contains both, and pass it down"
+    - "Move the filter to an app-wide `AppState` so anything can read it"
+    - "Store it with `@AppStorage`, so both views read the same UserDefaults key"
+  answer: 1
+  explain: "Lift it to the lowest owner both views share. Two copies kept in step will drift; app-wide state outlives the screen and couples every feature to it; UserDefaults makes a filter persist and go global by accident."
+- id: q3
+  type: truefalse
+  prompt: "A model held in `@State` in the `App` struct is shared by every window of the app."
+  answer: true
+  explain: "There's one `App` value per process, so its state is app-wide. Each `WindowGroup` window builds its own root view, and state declared there (or below) is per window."
+- id: q4
+  type: mcq
+  prompt: "On iPad, a user searches for \"trainers\" in one window and \"boots\" in another. Each window should keep its search when the user switches tabs and comes back. Where does the query live?"
+  options:
+    - "In an app-wide search model shared by every window"
+    - "In state owned by each window's search tab, or by the window itself"
+    - "In UserDefaults, so it survives everything"
+    - "On the server, so it syncs across devices"
+  answer: 1
+  explain: "Two windows need two values, so it can't be app-wide. Owning it at the window's search tab (or the window's root) gives each scene its own query that outlives tab switches."
+- id: q5
+  type: multi
+  prompt: "Which are signs that a piece of state is placed too high?"
+  options:
+    - "It's still there when the user comes back to a screen they'd finished with"
+    - "Screens that never read it re-render or reload when it changes"
+    - "Two sibling views both need it"
+    - "Testing one feature means setting up state for unrelated ones"
+  answer: [0, 1, 3]
+  explain: "State placed too high outlives its screen, has a wide blast radius and couples features together. Two siblings needing it is the reason to lift it, to their parent and no further."
+```

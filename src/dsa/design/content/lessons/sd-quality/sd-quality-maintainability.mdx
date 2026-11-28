@@ -1,0 +1,278 @@
+## Why it matters
+
+Most of what an app costs comes after its first release. The code you write once is read, debugged and changed for years, often by people who weren't there when it was written. **Maintainability** decides how fast the team ships the fiftieth feature, **testability** decides whether you know it still works, and **evolvability** decides whether the app survives a change of direction nobody planned. Senior interviews probe all three with one question: "how would this design cope if…?"
+
+## Maintainability: how cheap the next change is
+
+Maintainability is how easily a system can be changed: to fix a bug, add a feature, or adapt to a new OS. The ISO 25010 quality model (you'll meet it in full later in this module) splits it into five parts, and each has an everyday iOS meaning:
+
+| Part | Question it asks | In an iOS app |
+| --- | --- | --- |
+| **Modularity** | Can I change one part without touching others? | The checkout package builds and tests on its own, and a change to it doesn't rebuild the feed |
+| **Reusability** | Can a part be used in more than one place? | The image loader serves the feed, the profile and the widget extension |
+| **Analysability** | How quickly can I find the cause of a bug, or the impact of a change? | Clear names, small types, logs with categories, one place that owns each piece of state |
+| **Modifiability** | Can I change it without breaking something else or making it slower? | Adding a payment method touches one enum and one view, not twelve files |
+| **Testability** | Can a test show me a fault quickly? | The streak rule runs in a unit test in milliseconds, without a simulator |
+
+You rarely measure maintainability directly. You notice its absence: a one-line change that edits eight files, a file everyone is scared to open, a regression in a screen nobody touched, a new engineer who needs a month to ship anything. When you see those signs, the cause is usually tangled dependencies or hidden state, which the complexity lesson later in this module picks apart.
+
+## Testability: control and observe
+
+A piece of code is **testable** when a test can do two things with it:
+
+- **Control** it: put it in the state you want and give it the inputs you want, including awkward ones such as midnight, an empty list, a network error or a full disk.
+- **Observe** it: see what it did, through a return value, a state change or a recorded call, without inspecting its private details.
+
+Code is hard to test when it has **hidden inputs** (things it reads that the caller didn't pass in) or **hidden outputs** (things it does that the caller can't see). iOS code has plenty of both:
+
+| Hidden inputs | Hidden outputs |
+| --- | --- |
+| `Date()`, `Calendar.current`, `Locale.current`, `TimeZone.current` | Writes to `UserDefaults.standard` or files |
+| `UserDefaults.standard`, `FileManager.default` | Analytics events |
+| `URLSession.shared` responses | Scheduled notifications, `UIApplication.shared.open(_:)` |
+| Random numbers, `UUID()` | Posts to `NotificationCenter.default` |
+
+Here's a trial banner with two hidden inputs, the clock and the stored start date:
+
+```swift check
+import Foundation
+
+struct TrialBannerBefore {
+    func text() -> String {
+        let start = UserDefaults.standard.object(forKey: "trialStart") as? Date ?? Date()
+        let used = Calendar.current.dateComponents([.day], from: start, to: Date()).day ?? 0
+        return used >= 14 ? "Your trial has ended" : "\(14 - used) days left in your trial"
+    }
+}
+```
+
+To test "last day of the trial" you'd have to write a date into the real defaults, and either wait thirteen days or change the Mac's clock. The fix is to keep the **rule** pure and push the reading of the world out to the edge: the caller reads the stored date and the current time once, and passes them in.
+
+```swift run
+import Foundation
+
+struct TrialBanner {
+    let trialLength = 14
+    let calendar: Calendar
+
+    func text(trialStart: Date, now: Date) -> String {
+        let used = calendar.dateComponents([.day], from: trialStart, to: now).day ?? 0
+        switch trialLength - used {
+        case ...0: return "Your trial has ended"
+        case 1: return "Last day of your trial"
+        case let left: return "\(left) days left in your trial"
+        }
+    }
+}
+
+var calendar = Calendar(identifier: .gregorian)
+calendar.timeZone = TimeZone(identifier: "Europe/London")!
+let banner = TrialBanner(calendar: calendar)
+let start = calendar.date(from: DateComponents(year: 2026, month: 3, day: 1, hour: 9))!
+
+for day in [1, 14, 15, 20] {
+    let now = calendar.date(from: DateComponents(year: 2026, month: 3, day: day, hour: 10))!
+    print("March \(day): \(banner.text(trialStart: start, now: now))")
+}
+```
+
+```output
+March 1: 14 days left in your trial
+March 14: Last day of your trial
+March 15: Your trial has ended
+March 20: Your trial has ended
+```
+
+Every interesting case now runs in a millisecond, in any time zone you pick. The view model that uses `TrialBanner` still reads `Date.now` and the stored start date, but in one place, where a test can replace them. The places where you can swap one implementation for another without editing the code are called **seams**. On iOS the common ones are a protocol passed to an initialiser, a closure such as `now: () -> Date`, or a plain value like `trialStart`. You'll build them properly in D21 (dependency injection) and D58 (designing for testability). What matters here is the habit: *every input a rule needs should arrive through its signature.*
+
+### Testability is a design property, not a testing one
+
+Notice that nothing in the fix involved writing tests. It changed the design. That's why testability counts as a quality attribute of the architecture rather than a job for QA: a design either lets you control and observe its parts, or it doesn't, and no amount of test-writing effort makes up for a design that hides its inputs.
+
+## Evolvability: surviving the change nobody planned
+
+Maintainability is about the *next* change, the kind you can see coming. **Evolvability** is about changes of direction: a subscription model replacing one-off purchases, a second country with different tax rules, SwiftUI replacing UIKit, an iPad or visionOS version, a company acquisition that swaps the backend. You can't predict which will come, so evolvable designs isolate the decisions most likely to change (which payment provider, which analytics vendor, which persistence framework) behind interfaces they own.
+
+Apps have an extra problem servers don't: **you can't redeploy the client.** A server team can ship a fix to every user in an hour. Every app version you ship stays installed somewhere for years, on phones that never update. So evolvability for an app also means old versions keep working while the server moves on:
+
+```visual sequence
+title: A new order status meets an old app
+participants:
+  - { id: old, label: App 1.0 }
+  - { id: new, label: App 2.0 }
+  - { id: api, label: Orders API }
+messages:
+  - [new, api, GET /orders, { say: "App 2.0 ships partial refunds, so the server adds a new order status." }]
+  - [api, new, "status: partially_refunded", { reply: true }]
+  - [old, api, GET /orders, { say: "Version 1.0 is still on hundreds of thousands of phones, and asks for the same list." }]
+  - [api, old, "status: partially_refunded", { reply: true }]
+  - [old, old, decode throws, { say: "1.0's `OrderStatus` enum has no such case. One bad element fails the whole array, so the orders screen goes blank." }]
+  - [old, old, "shows \"Unknown\"", { say: "Had 1.0 decoded unknown values to a fallback case, it would show one odd row instead of an empty screen." }]
+  - { note: "1.0 can't be patched now. The tolerance had to ship in 1.0.", over: [old, api] }
+fragments:
+  - { kind: alt, label: strict decoder, from: 4, to: 5, else: 5, elseLabel: tolerant decoder }
+```
+
+The defence has to be built in *before* you need it. A decoder that tolerates values it doesn't know is a few lines:
+
+```swift run
+import Foundation
+
+enum OrderStatus: Decodable, Equatable {
+    case placed, shipped, refunded
+    case unknown(String)
+
+    init(from decoder: any Decoder) throws {
+        let raw = try decoder.singleValueContainer().decode(String.self)
+        switch raw {
+        case "placed": self = .placed
+        case "shipped": self = .shipped
+        case "refunded": self = .refunded
+        default: self = .unknown(raw)
+        }
+    }
+
+    var label: String {
+        switch self {
+        case .placed: "Placed"
+        case .shipped: "On its way"
+        case .refunded: "Refunded"
+        case .unknown: "Update the app to see this status"
+        }
+    }
+}
+
+struct Order: Decodable {
+    let id: Int
+    let status: OrderStatus
+}
+
+let json = Data(#"[{"id": 1, "status": "shipped"}, {"id": 2, "status": "partially_refunded"}]"#.utf8)
+for order in try JSONDecoder().decode([Order].self, from: json) {
+    print("Order \(order.id): \(order.status.label)")
+}
+```
+
+```output
+Order 1: On its way
+Order 2: Update the app to see this status
+```
+
+The server side of the same habit is **additive change**: add fields and values, don't rename or remove them while any supported app version reads them, and version the API when you must break it. Feature flags and remote configuration (D54) let you change behaviour without a release, and a minimum-version check that asks people to update is the last resort, not the plan.
+
+## Trade-offs
+
+Investing in these qualities costs time now to save time later, so how much to invest depends on how long the code will live and how many people will change it.
+
+| Approach | Cost now | Cost of later changes | Testability | When it wins |
+| --- | --- | --- | --- | --- |
+| Quickest possible (globals, one big type) | Lowest | Rises fast | Poor | Prototypes and spikes you'll delete within weeks |
+| Seams at the edges (inject the clock, storage, network; pure rules) | Low | Low | Good | Most production features |
+| Abstraction everywhere (a protocol per class, layers for everything) | High | Medium: each change ripples through layers | Good, but tests mostly check mocks | Rarely; very large teams with strict boundaries |
+| Highly configurable (server-driven UI, rules in data) | Very high | Lowest for changes you anticipated | Hard: behaviour lives in data | Screens that change weekly without releases, such as a shop's home page |
+
+<Callout kind="interview">
+
+**Say:** "To make this testable I'd look for hidden inputs and outputs: the clock, defaults, the network, analytics. I'd keep the rule as a pure function and inject those at the edges." And for evolvability: "Old app versions stay in the wild for years, so the API changes additively and the client tolerates values it doesn't know."
+
+**Ask:** "How long will this code live, and how many teams will change it?" The answer tells you how much structure is worth paying for.
+
+**Red flags:** "we'll add tests later" (the design will already have decided whether you can); a protocol for every class with no second implementation in sight; changing a response shape without asking which app versions still read it.
+
+</Callout>
+
+<Callout kind="gotcha" title="iOS gotcha: UserDefaults.standard leaks between test runs">
+
+Unit tests hosted in your app read and write the app's real defaults domain, and on the simulator those values survive from one test run to the next. A test that passes alone fails after another test leaves a value behind, or the other way round. Inject a `UserDefaults(suiteName:)` created per test (and remove it with `removePersistentDomain(forName:)` afterwards), or better, inject a small storage protocol with an in-memory implementation for tests.
+
+</Callout>
+
+## Practice
+
+The architecture review *A workout streak that nobody can test* is this lesson in one file: a method that reads the clock, the disk and three singletons, and a streak that resets because nobody could test it. Find the hidden inputs and outputs, then plan the refactor in steps that each keep the app working.
+
+```cards
+- id: testability-control-observe
+  front: "What two things must a test be able to do for code to be testable?"
+  back: "Control it (set its state and inputs, including awkward ones like midnight or a network error) and observe it (see what it did, without peeking at private details)."
+- id: hidden-inputs
+  front: "Name four hidden inputs common in iOS code."
+  back: "`Date()` and `Calendar.current`, `UserDefaults.standard`, `URLSession.shared`, random numbers or `UUID()`. Each makes a test depend on the real world."
+- id: cant-redeploy-client
+  front: "Why does evolvability mean something extra for apps?"
+  back: "You can't redeploy the client: old versions stay installed for years. The API must change additively, and the app must tolerate values it doesn't know yet."
+- id: maintainability-parts
+  front: "What five parts does ISO 25010 split maintainability into?"
+  back: "Modularity, reusability, analysability, modifiability and testability."
+```
+
+```quiz
+- id: q1
+  type: multi
+  prompt: "Which of these does `isEligible` read without its caller passing them in?"
+  code: |
+    struct Promo {
+        func isEligible(userID: String) -> Bool {
+            let signUp = UserDefaults.standard.object(forKey: "signUp") as? Date ?? .now
+            let isNew = Date().timeIntervalSince(signUp) < 7 * 86_400
+            let inRegion = Locale.current.region == .unitedKingdom
+            return isNew && inRegion && userID.hasPrefix("u_")
+        }
+    }
+  options:
+    - "The sign-up date in `UserDefaults.standard`"
+    - "The current time"
+    - "The device's region"
+    - "`userID`"
+  answer: [0, 1, 2]
+  explain: "`userID` arrives through the signature. The stored date, the clock and the locale are hidden inputs: a test can't set them without changing the real defaults, the real time or the machine's region settings."
+- id: q2
+  type: mcq
+  prompt: "You need to test that a coupon expires exactly at midnight in the user's time zone. Which change helps most?"
+  options:
+    - "Mark the coupon type `@MainActor` so tests run in order"
+    - "Pass `now: Date` and a `Calendar` into the expiry check"
+    - "Add a protocol for the coupon type"
+    - "Run the test on a device set to that time zone"
+  answer: 1
+  explain: "The expiry rule needs the time and the calendar as inputs. Once they arrive through the signature, a test can try 23:59 and 00:01 in any time zone in milliseconds. A protocol for the coupon itself adds indirection without removing the hidden input."
+- id: q3
+  type: bug
+  prompt: "Click the line that makes this badge impossible to unit test reliably."
+  code: |
+    struct UnreadBadge {
+        let unread: Int
+        func text() -> String {
+            let hour = Calendar.current.component(.hour, from: Date())
+            if unread == 0 { return "" }
+            if hour < 6 { return "\(unread)" }
+            return unread > 99 ? "99+" : "\(unread) new"
+        }
+    }
+  answer: 4
+  explain: "Line 4 reads the real clock and calendar. The output depends on what time the test runs, so a test written in the afternoon fails at 5 am. Pass the hour (or `now` and a calendar) in."
+- id: q4
+  type: mcq
+  prompt: "The server team wants to add a new value, `\"on_hold\"`, to the `status` field of orders. Your shipped app decodes `status` into a strict enum. What's the safest plan?"
+  options:
+    - "Add the value now; users will update the app"
+    - "Ship an app version that decodes unknown statuses to a fallback, wait until old versions are rare, and only send `on_hold` to clients that understand it"
+    - "Rename the field to `status_v2` and remove the old one"
+    - "Ask the app to catch the decoding error and show an empty list"
+  answer: 1
+  explain: "Old versions can't be patched, and a strict enum fails the whole response. Ship tolerance first, then gate the new value by client version (or wait for adoption). Removing a field breaks every old version; an empty list hides real orders."
+- id: q5
+  type: match
+  prompt: "Match each maintainability part to the question it asks."
+  pairs:
+    - ["Modularity", "Can I change this part without touching the others?"]
+    - ["Analysability", "How quickly can I find the cause of a bug?"]
+    - ["Modifiability", "Can I change it without breaking or slowing something else?"]
+    - ["Testability", "Can a test show me a fault quickly?"]
+  explain: "They overlap, but each points at a different symptom: tangled parts, code nobody can read, changes that break things, and code tests can't reach."
+- id: q6
+  type: truefalse
+  prompt: "Maintainability matters less in an app than on a server, because you can always ship a new version."
+  answer: false
+  explain: "If anything it matters more: every release goes through review, many users update slowly, and old versions keep running for years. A bug you can't fix quickly, and an API you can't change freely, both raise the cost of change."
+```

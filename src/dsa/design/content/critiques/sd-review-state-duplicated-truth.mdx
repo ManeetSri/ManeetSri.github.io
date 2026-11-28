@@ -1,0 +1,148 @@
+<Brief>
+
+A shared shopping list app. Users report that the title says "3 of 2 bought", that hiding bought items makes delete remove the wrong thing, that renaming an item does nothing, and that the home-screen widget's "items left" count is often wrong. Review the screen as you would a pull request: find every place a fact is stored twice, say what drifts and when, and plan the fix.
+
+```swift check ios title="GroceryListView.swift"
+import SwiftUI
+
+struct GroceryItem: Identifiable, Hashable {
+    let id: UUID
+    var name: String
+    var isBought = false
+}
+
+@Observable final class GroceryList {
+    var items: [GroceryItem] = []
+    var boughtCount = 0
+
+    func toggle(_ item: GroceryItem) {
+        guard let index = items.firstIndex(where: { $0.id == item.id }) else { return }
+        items[index].isBought.toggle()
+        boughtCount += items[index].isBought ? 1 : -1
+    }
+
+    func delete(at offsets: IndexSet) { items.remove(atOffsets: offsets) }
+}
+
+struct GroceryListView: View {
+    @State private var list = GroceryList()
+    @State private var showBought = true
+    @State private var editing: GroceryItem?
+    @AppStorage("remainingCount") private var remaining = 0
+
+    private var visible: [GroceryItem] {
+        showBought ? list.items : list.items.filter { !$0.isBought }
+    }
+
+    var body: some View {
+        NavigationStack {
+            List {
+                FilterRow(showBought: showBought)
+                ForEach(visible, id: \.self) { item in
+                    Button(item.name) {
+                        list.toggle(item)
+                        remaining = list.items.count - list.boughtCount
+                    }
+                    .contextMenu { Button("Edit") { editing = item } }
+                }
+                .onDelete(perform: list.delete)
+            }
+            .navigationTitle("\(list.boughtCount) of \(list.items.count) bought")
+            .sheet(item: $editing) { EditItemView(item: $0) }
+        }
+    }
+}
+
+struct FilterRow: View {
+    @State var showBought: Bool
+
+    var body: some View { Toggle("Show bought items", isOn: $showBought) }
+}
+
+struct EditItemView: View {
+    @State var item: GroceryItem
+    @Environment(\.dismiss) private var dismiss
+
+    var body: some View {
+        Form {
+            TextField("Name", text: $item.name)
+            Button("Save") {
+                NotificationCenter.default.post(name: Notification.Name("groceryItemSaved"), object: nil)
+                dismiss()
+            }
+        }
+    }
+}
+```
+
+</Brief>
+
+```workspace
+template: critique
+minutes: 25
+```
+
+```findings
+- id: delete-wrong-item
+  title: Deleting with bought items hidden removes the wrong item
+  severity: high
+  lines: "43"
+  detail: "`onDelete` hands over offsets into `visible` (lines 28–30), the filtered list, but `delete(at:)` (line 19) removes those offsets from `list.items`. With bought items hidden, swiping away the second visible row deletes whatever is second in the full list. Two arrays share one set of indices; map the offsets to ids from `visible` and delete by id."
+- id: stored-count
+  title: The bought count is stored, and drifts on delete
+  severity: high
+  lines: "11-19"
+  detail: "`boughtCount` duplicates `items.filter(\\.isBought).count` and is only kept in step by `toggle`. Deleting a bought item leaves it too high, which is the \"3 of 2 bought\" title, and every future mutation (add, clear, sync) must remember it too. Make it a computed property."
+- id: edit-copy
+  title: Edits go to a copy that nothing applies
+  severity: high
+  lines: "57-67"
+  detail: "The sheet gets a copy of the item (lines 25 and 46), `EditItemView` copies it again into `@State`, and Save posts a notification with no data that nothing observes, then dismisses. The rename is lost every time. A draft is right here, but it needs a commit point: pass the item's id and an `onSave` closure that asks the list to rename it."
+- id: filter-copy
+  title: The filter toggle edits its own copy
+  severity: medium
+  lines: "52"
+  detail: "`FilterRow` declares `@State var showBought` and is created with the parent's value (line 35), so it takes that value once and then owns a second copy. Flipping the toggle changes only the row's copy; `visible` never filters. It should take a `@Binding`."
+- id: persisted-mirror
+  title: A third copy of the count lives in UserDefaults, updated from one path
+  severity: medium
+  lines: "39"
+  detail: "`remaining` (line 26) is written only when an item is toggled, never on delete, add, rename or sync, so the widget reading it is often wrong. A persisted mirror needs to be written by the owner of the items on every change (or the widget should read the list's own storage)."
+- id: view-owns-list
+  title: App data is owned by one view
+  severity: low
+  lines: "23"
+  detail: "The shopping list is created as `@State` inside the screen, so it lives and dies with this view and nothing else (the widget, another tab, a second window) can read the real list. That's why the UserDefaults mirror exists. The list belongs in an app-level store injected into the screen."
+- id: identity-by-value
+  title: Rows are identified by their whole value
+  severity: low
+  lines: "36"
+  detail: "`ForEach(visible, id: \\.self)` makes each row's identity its full `Hashable` value, so toggling `isBought` or renaming an item gives the row a new identity: SwiftUI removes and re-inserts it, animating the wrong thing and dropping row state. `GroceryItem` is already `Identifiable`; use its `id`."
+```
+
+<ReferenceReview>
+
+**Most important first.** Two bugs destroy or lose the user's data. Deleting while bought items are hidden **removes the wrong item**, because the filtered list's offsets are applied to the full list. And **every rename is thrown away**: the edit sheet works on a copy of a copy, and Save only posts a notification nobody handles. Fix these before anything else.
+
+**The design problem underneath** is that almost every fact on this screen is stored more than once:
+
+- whether items are bought: in `items`, in `boughtCount` and in UserDefaults' `remainingCount`;
+- the filter: in the screen and again in `FilterRow`;
+- the item being edited: in the list, in `editing` and in `EditItemView`'s state;
+- which row is which: by value (`id: \.self`) instead of by `id`.
+
+Each copy has its own update path, and each bug report is one of those paths being missed.
+
+**How I'd fix it, in small steps:**
+
+1. Write unit tests for `GroceryList` that describe what users expect: deleting by id, counts after deleting a bought item, renaming. Several will fail today, which is the point.
+2. Make `GroceryList` the single owner: `private(set) var items`, and intent methods that take ids: `toggle(id:)`, `delete(ids:)`, `rename(id:to:)`. Replace `boughtCount` with computed `boughtCount` and `remainingCount`.
+3. Delete by id: `.onDelete { offsets in list.delete(ids: offsets.map { visible[$0].id }) }`.
+4. Give `FilterRow` a `@Binding var showBought` and pass `$showBought`.
+5. Hold `editing` as `GroceryItem.ID?`, resolve the item from the list in the sheet, and turn `EditItemView` into a draft with a commit point: it's seeded with the current name and calls `onSave(newName)`, which the screen forwards to `list.rename(id:to:)`. Delete the notification.
+6. Use `ForEach(visible)` so rows are identified by `id`.
+7. Move the list out of the view into an app-level store injected through the environment. If the widget needs a count, the store writes it (to the App Group container the widget reads) inside the same methods that change `items`, and reloads the widget's timeline; remove `@AppStorage("remainingCount")`.
+
+**Tests to add:** `GroceryList` deletes the right item by id with bought items hidden; counts are right after toggling, deleting and renaming; a rename changes the item in `items`; the value written for the widget changes on every mutation. A UI test that hides bought items, swipes to delete, and checks which name disappeared.
+
+</ReferenceReview>

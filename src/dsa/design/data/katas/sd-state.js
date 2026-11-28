@@ -1,2 +1,36 @@
 // Katas for D19 · State management
-export default [];
+export default [
+    {
+        id: 'sd-kata-state-view-reducer',
+        kind: 'problem',
+        title: 'Reading list screen state',
+        difficulty: 'medium',
+        patterns: ['state', 'ui'],
+        lessons: ['sd-state-view-state'],
+        swiftTest: 'ReadingListScreenTests',
+        lists: [],
+        minutes: 30,
+    },
+    {
+        id: 'sd-kata-state-entity-store',
+        kind: 'problem',
+        title: 'Normalised playlist store',
+        difficulty: 'easy',
+        patterns: ['state'],
+        lessons: ['sd-state-normalisation', 'sd-state-derived'],
+        swiftTest: 'NormalisedPlaylistStoreTests',
+        lists: [],
+        minutes: 25,
+    },
+    {
+        id: 'sd-kata-state-undo-history',
+        kind: 'problem',
+        title: 'Undo and redo history',
+        difficulty: 'medium',
+        patterns: ['state', 'patterns'],
+        lessons: ['sd-state-undo-redo'],
+        swiftTest: 'DocumentEditHistoryTests',
+        lists: [],
+        minutes: 30,
+    },
+];
