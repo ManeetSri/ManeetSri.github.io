@@ -1,0 +1,122 @@
+A coffee chain's app lets people pay with a gift card. The card started life as a bag of properties, and every screen that touched it brought its own copy of the rules:
+
+```swift
+// Before: three screens ask the card for its data, decide, and change it
+// Checkout
+if !card.isFrozen && card.balance >= price {
+    card.balance -= price
+    card.receipts.append(Receipt(amount: price))
+}
+
+// Top-up (forgets the frozen check)
+if card.balance + amount <= 50_000 {
+    card.balance += amount
+}
+
+// Refunds (can refund the same receipt twice)
+card.balance += receipt.amount
+```
+
+The rules drifted, the top-up screen let frozen cards take money, and support found a refund paid out three times. Then the card became shared between the phone and a watch complication, and two quick taps on **Pay** both went through on one card's worth of money.
+
+Turn the card into an actor that owns its balance and its rules, and give it **commands**. Callers tell it what to do; nothing else changes the balance.
+
+`CouplingGiftCardWallet.GiftCard` with `pay(_:) throws -> Receipt`, `topUp(_:) throws -> Int`, `refund(_:) throws -> Int`, `freeze()` and `unfreeze()`
+
+All amounts are in pence. Throw `WalletError`, checking in exactly this order:
+
+- **`pay(amount)`**: the amount must be positive (`.invalidAmount`); the card must not be frozen (`.frozen`); the balance must cover it (`.insufficientFunds(balance:)`, carrying the balance at the time). Then take the amount and return a `Receipt` numbered 1, 2, 3… on this card, with the balance after the payment.
+- **`topUp(amount)`**: positive (`.invalidAmount`); not frozen (`.frozen`); the new balance must stay within `GiftCard.maximumBalance`, £500 (`.overLimit(maximum:)`). Then add it and return the new balance.
+- **`refund(receipt)`**: the receipt must be one this card issued, exactly as issued (`.unknownReceipt`); it must not have been refunded already (`.alreadyRefunded`). Then add its amount back and return the new balance. Refunds work while the card is frozen, and the limit doesn't apply: it's the customer's own money coming back.
+- A refused command changes nothing.
+
+`balance` and `isFrozen` stay readable: asking for data to *show* it is fine.
+
+## Examples
+
+| Card | Command | Result |
+| --- | --- | --- |
+| £20.00 | `pay(350)` | `Receipt(id: 1, amount: 350, remainingBalance: 1650)` |
+| £5.00 | `pay(501)` | throws `.insufficientFunds(balance: 500)`; still £5.00 |
+| frozen, £10.00 | `pay(0)` | throws `.invalidAmount`: the amount is checked first |
+| frozen, £10.00 | `topUp(100)` | throws `.frozen` |
+| £490.00 | `topUp(1_001)` | throws `.overLimit(maximum: 50000)` |
+| £6.00 after paying `receipt` (£4.00) | `refund(receipt)`, twice | `1000`, then throws `.alreadyRefunded` |
+| £50.00 | 100 simultaneous `pay(100)` | exactly 50 succeed; the balance ends at 0 |
+
+## Constraints
+
+- Every command checks and changes the balance inside one actor method with **no `await` in it**, so simultaneous calls can't interleave between the check and the change.
+- Receipt numbers are per card and never reused.
+- A receipt from another card is `.unknownReceipt`, even if it happens to have the same number.
+- The card starts unfrozen, with a balance between 0 and the maximum.
+
+<Hints>
+<Hint>
+Each command is a short run of `guard`s in the order given, then the change. Write `pay` first; `topUp` has the same shape.
+</Hint>
+<Hint>
+Keep every receipt you issue in `private var issued: [Int: Receipt]`, and the refunded numbers in a `Set<Int>`. "Issued, exactly as issued" is then `issued[receipt.id] == receipt`.
+</Hint>
+<Hint>
+Make `balance` and `isFrozen` `public private(set) var`: readable everywhere, changeable only inside the actor.
+</Hint>
+</Hints>
+
+## Solutions
+
+<Approach title="An actor whose commands check and change in one step" time="O(1) per command" space="O(r) for r receipts">
+
+```swift
+public actor GiftCard {
+    public static let maximumBalance = 50_000
+
+    public private(set) var balance: Int
+    public private(set) var isFrozen = false
+    private var nextReceiptID = 1
+    private var issued: [Int: Receipt] = [:]
+    private var refunded: Set<Int> = []
+
+    public init(balance: Int) {
+        self.balance = balance
+    }
+
+    public func pay(_ amount: Int) throws -> Receipt {
+        guard amount > 0 else { throw WalletError.invalidAmount }
+        guard !isFrozen else { throw WalletError.frozen }
+        guard amount <= balance else { throw WalletError.insufficientFunds(balance: balance) }
+        balance -= amount
+        let receipt = Receipt(id: nextReceiptID, amount: amount, remainingBalance: balance)
+        nextReceiptID += 1
+        issued[receipt.id] = receipt
+        return receipt
+    }
+
+    public func topUp(_ amount: Int) throws -> Int {
+        guard amount > 0 else { throw WalletError.invalidAmount }
+        guard !isFrozen else { throw WalletError.frozen }
+        guard balance + amount <= Self.maximumBalance else { throw WalletError.overLimit(maximum: Self.maximumBalance) }
+        balance += amount
+        return balance
+    }
+
+    public func refund(_ receipt: Receipt) throws -> Int {
+        guard issued[receipt.id] == receipt else { throw WalletError.unknownReceipt }
+        guard !refunded.contains(receipt.id) else { throw WalletError.alreadyRefunded }
+        refunded.insert(receipt.id)
+        balance += receipt.amount
+        return balance
+    }
+
+    public func freeze() { isFrozen = true }
+    public func unfreeze() { isFrozen = false }
+}
+```
+
+**What tell, don't ask bought.** The three screens now each make one call, and the rules exist once. The duplicated limit check (connascence of algorithm between screens) and the remembered-to-check-frozen convention are gone, because callers no longer decide. `private(set)` makes the old style impossible to write by accident.
+
+**Why the actor's shape matters.** An actor with `getBalance()` and `setBalance(_:)` would still have the double-spend bug: each `await` lets another call in between the check and the change. The test that fires a hundred payments at once passes only because every rule runs inside a single actor method with no suspension point. That's the general rule for actor APIs: offer whole operations, not getters and setters.
+
+**What's still outside.** A real card's balance lives on a server, which must enforce the same rules, because a phone and a watch each have their own copy of this actor. The app's actor then becomes a cache with optimistic updates, and the server's answer wins: you'll design that in D39 and D56.
+
+</Approach>

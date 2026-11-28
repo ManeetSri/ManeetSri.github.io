@@ -1,0 +1,254 @@
+## Why it matters
+
+The coupling ladder tells you how parts depend on each other. It doesn't tell you which dependency to fix first, or what to change it into. **Connascence** does both. It gives every dependency a strength, a distance and a count, and it tells you which way to refactor: towards weaker forms, and towards weaker forms the further apart the parts are. It's the vocabulary staff engineers use when they explain why a magic number in one function is fine but the same number shared by the app and the server is a release risk.
+
+## What connascence is
+
+Meilir Page-Jones introduced the term in the early 1990s, from the Latin for "born together". **Two parts are connascent if changing one would require changing the other for the system to stay correct.** That's the same idea as coupling, but Page-Jones went further: he listed the *forms* that agreement can take, ranked them, and said how distance and numbers change the cost.
+
+There are two families. **Static** connascence is visible in the source: you can find it by reading. **Dynamic** connascence only exists when the code runs: you find it by thinking about execution, or by a bug report.
+
+## Static connascence, weakest to strongest
+
+### Name
+
+Two parts agree on a **name**. Every method call is connascence of name: the caller and the method agree on `refreshOrders()`. It's the weakest form, and in Swift code the compiler checks it, and Xcode's Rename changes every use at once.
+
+The catch is names inside **strings**. A reuse identifier like `"OrderCell"`, a `UserDefaults` key, a notification name, a storyboard ID or a JSON key is still connascence of name, but the compiler can't see it. A typo compiles and fails at run time. Turning those strings into constants with one owner (`static let key = "…"`) brings the compiler back.
+
+### Type
+
+Two parts agree on a **type**. Swift checks this within your code. Across a boundary it can't: if the server sends IDs as numbers and later as strings, nothing tells the app until a `DecodingError` shows up in a crash log or an empty screen.
+
+### Meaning
+
+Two parts agree on what a **value means**, by convention. Status `2` means shipped. A price of `0` means free. `-1` means "not found". An empty string means "no user". Every part that reads the value has to know the convention, and nothing checks that they all agree.
+
+This is the form Swift is best at removing. Enums, optionals and domain types (you met them in [From primitive obsession to domain types](/design/learn/sd-modelling-domain-types)) turn a convention into a type. Then the knowledge "2 means shipped" lives in exactly one place.
+
+### Position
+
+Two parts agree on an **order**. A tuple `(String, Int, Int)`, an array where index 0 is the first name and index 1 the surname, a CSV with fixed columns, or a function with several unlabelled parameters of the same type. Swap two values and it still compiles.
+
+Swift's argument labels and structs convert connascence of position into connascence of name: `Order(id:status:totalPence:)` can't be filled in the wrong order by accident.
+
+### Algorithm
+
+Two parts must use the **same algorithm**. The image cache's `store` and `lookup` must build the cache key the same way. The app and its widget must agree on the rule for "the subscription is active". The app and the server must compute the same HMAC signature for a request. If one side changes the algorithm and the other doesn't, the system breaks with no compile error and often no crash: just cache misses, wrong badges or rejected requests.
+
+The fix is to have **one implementation**: a single `CacheKey` function both methods call, a shared framework both targets link, or moving the computation to one side so the other just receives the result.
+
+### Refactoring down the scale
+
+Here's an order list that had connascence of meaning (status codes as integers) and of position (a tuple). Moving to an enum and a struct leaves the meaning in one place and turns position into names:
+
+```swift run title="From magic numbers and tuples to an enum and a struct"
+import Foundation
+
+// The only place that knows what the server's numbers mean
+enum OrderStatus: Int, Decodable {
+    case placed = 0, packed = 1, shipped = 2, delivered = 3
+    case unknown = -1
+
+    // A newer server may send a status this build has never heard of
+    init(from decoder: any Decoder) throws {
+        let code = try decoder.singleValueContainer().decode(Int.self)
+        self = OrderStatus(rawValue: code) ?? .unknown
+    }
+}
+
+struct Order: Decodable {
+    let id: String
+    let status: OrderStatus
+}
+
+func badge(for order: Order) -> String {
+    switch order.status {
+    case .placed, .packed: "Preparing"
+    case .shipped: "On its way"
+    case .delivered: "Delivered"
+    case .unknown: "Updating…"
+    }
+}
+
+let json = Data(#"[{"id": "A1", "status": 2}, {"id": "B7", "status": 4}]"#.utf8)
+for order in try JSONDecoder().decode([Order].self, from: json) {
+    print("\(order.id): \(badge(for: order))")
+}
+```
+
+```output
+A1: On its way
+B7: Updating…
+```
+
+Two more things happened. The `switch` is exhaustive, so adding a status forces every `switch` over it to handle the new case: the compiler now checks the connascence for you. And the `unknown` case handles the server adding status `4` (say, "returned") before this build knows about it. Without it, one unfamiliar number would fail decoding for the **whole list**, on every installed copy of the app.
+
+## Dynamic connascence, weakest to strongest
+
+### Execution
+
+Parts must run in a particular **order**. This is the temporal coupling from [Temporal coupling and hidden ordering](/design/learn/sd-coupling-temporal): configure before use, restore the session before requesting the feed.
+
+### Timing
+
+Parts must agree on **when**. Races are connascence of timing, and so are mismatched timeouts: if the app gives up after 30 seconds but the server takes 45 to process a large upload, the user retries an upload that actually succeeded. Debounce intervals, animation completions and "refresh the token 60 seconds before it expires" all live here.
+
+### Value
+
+Several values must **change together**. A cart's `items` and its `itemCount`. A booking's `start` before its `end`. The unread badge and the list of unread messages. Every place that changes one must remember the others. The fix is to keep only one and derive the rest (`var itemCount: Int { items.count }`), or to keep them inside one type that maintains the invariant.
+
+### Identity
+
+Parts must refer to the **same instance**. The cart screen and the product screen must share one `Cart` object, or adding on one won't show on the other. Core Data objects must come from the same context to be related to each other. In SwiftUI, identity is easy to break by accident; see the gotcha below.
+
+## The three dials
+
+Every instance of connascence has three properties:
+
+- **Strength:** its rank above. Name is weakest; identity is strongest.
+- **Degree:** how many parts are involved. A convention shared by two functions is cheaper than one shared by forty.
+- **Locality:** how far apart the parts are. The further apart, the more a strong form costs.
+
+Locality is where mobile apps differ most from other software. Step through the same connascence of algorithm, building a cache key, at four distances:
+
+```visual flow
+title: The same agreement at four distances
+layers:
+  - { label: One type, rows: 0 }
+  - { label: One module, rows: 1 }
+  - { label: Targets, rows: 2 }
+  - { label: Network, rows: 3 }
+nodes:
+  - { id: store, label: "store(_:for:)", at: [0.5, 0] }
+  - { id: lookup, label: "lookup(_:)", at: [3.5, 0] }
+  - { id: cache, label: ImageCache, at: [0.5, 1] }
+  - { id: prefetch, label: Prefetcher, at: [3.5, 1] }
+  - { id: app, label: App, kind: client, at: [0.5, 2] }
+  - { id: widget, label: Widget, kind: client, at: [3.5, 2] }
+  - { id: phone, label: App 4.2, kind: client, at: [0.5, 3] }
+  - { id: cdn, label: Image CDN, kind: cdn, at: [3.5, 3] }
+edges:
+  - [store, lookup, same key]
+  - [cache, prefetch, same key]
+  - [app, widget, same key]
+  - [phone, cdn, same signature]
+steps:
+  - say: Two methods of one type build the cache key. Change one and the other is a few lines away, in the same review. **Cheap**, even though algorithm is a strong form.
+    show: [store, lookup]
+    state: { store: ok, lookup: ok }
+  - say: Two types in one module. Still one build and one review, but now someone has to *know* to look. Extract one `CacheKey` function and the risk disappears.
+    show: [cache, prefetch]
+    state: { cache: active, prefetch: active }
+  - say: The app and its widget are separate processes. During an update one can run the new build while the other still runs the old one. Share the code through one framework, and version anything they store.
+    show: [app, widget]
+    state: { app: wait, widget: wait }
+  - say: The app and the CDN must sign image URLs the same way. The server can change today; **app 4.2 stays installed for years**. Change it only with a versioned contract and a long overlap.
+    show: [phone, cdn]
+    state: { phone: error, cdn: error }
+```
+
+Page-Jones and, later, Jim Weirich, who did most to popularise the idea, boiled this down to two rules:
+
+1. **Rule of degree:** convert strong forms into weaker ones. Meaning into name, position into name, algorithm into one shared implementation.
+2. **Rule of locality:** as the distance between two parts grows, use weaker forms. Strong connascence is fine inside a function; between app and server, aim for name and type, with a version.
+
+## Trade-offs
+
+| Form | How you find it | Swift's tool to weaken it | When it's acceptable |
+| --- | --- | --- | --- |
+| Name (in code) | The compiler | Rename refactoring | Almost always |
+| Name (in strings) | Run time only | One constant with one owner, or a typed API | Never spread across files |
+| Type | The compiler; at the wire, decoding | Domain types; tolerant decoding | Always present; contain it at boundaries |
+| Meaning | Reading carefully | Enums, optionals, domain types | Inside one small type |
+| Position | Reading carefully | Labels, structs | Two or three values in a private helper |
+| Algorithm | Bugs: mismatches | One shared implementation, or compute on one side | Inside one type |
+| Execution, timing | Bugs: races, crashes | Initialisers, typestate, actors, `async` ordering | Inside one actor or function |
+| Value | Bugs: stale or inconsistent data | Derive with computed properties; one owner of the invariant | Inside one type |
+| Identity | Bugs: updates that don't show up | One owner of the instance, passed explicitly | Where it's deliberate, such as one shared store |
+
+<Callout kind="interview">
+
+**Say** the form, the distance and your fix in one breath: "The app and the server both compute the price with tax. That's connascence of algorithm across a release boundary, so I'd have the server send the final price and the app only display it." **Ask** how long old app versions stay supported, because that sets how expensive app–server connascence is. **Red flags:** business rules duplicated in the app and on the server, integer codes compared in several files, and decoding that fails the whole response on one unknown value.
+
+</Callout>
+
+<Callout kind="gotcha" title="iOS gotcha: SwiftUI can quietly break identity">
+
+`@ObservedObject var model = CartModel()` creates a **new** model every time SwiftUI recreates the view's struct, which can happen whenever its parent redraws, so state vanishes at random. A view that creates an object must own it: `@StateObject` for an `ObservableObject`, or `@State` for an `@Observable` class. A view that only *uses* an object someone else owns should receive it from outside.
+
+</Callout>
+
+## Practice
+
+The review **the AppManager** is full of connascence of meaning hidden in strings. The kata **gift card wallet** removes connascence of algorithm (a balance rule written twice) and of timing (a check-then-act race), by moving the rule inside the type that owns the balance.
+
+```cards
+- id: connascence-definition
+  front: "When are two parts connascent?"
+  back: "When changing one would require changing the other for the system to stay correct. Connascence adds forms, strength, degree and locality to the idea of coupling."
+- id: static-forms
+  front: "List the static forms of connascence, weakest to strongest."
+  back: "Name, type, meaning, position, algorithm."
+- id: dynamic-forms
+  front: "List the dynamic forms of connascence, weakest to strongest."
+  back: "Execution, timing, value, identity."
+- id: two-rules
+  front: "What are the rules of degree and locality?"
+  back: "Degree: convert strong forms into weaker ones. Locality: the further apart two parts are, the weaker their connascence should be."
+```
+
+```quiz
+- id: q1
+  type: match
+  prompt: "Match each example to its form of connascence."
+  pairs:
+    - ["`dequeueReusableCell(withIdentifier: \"OrderCell\")` and a storyboard ID", "Name (in a string)"]
+    - ["`if order.status == 2` in four files", "Meaning"]
+    - ["`let (first, last, age) = person`", "Position"]
+    - ["The app and the server both build the same HMAC for each request", "Algorithm"]
+    - ["`cart.items` and `cart.itemCount` updated separately", "Value"]
+    - ["Two screens must share the same `Cart` instance", "Identity"]
+  explain: "A string identifier is a name the compiler can't check. A status code is a convention. A tuple depends on order. A shared signature is an algorithm. Two stored values that must agree are connascence of value, and needing one instance is identity."
+- id: q2
+  type: sort
+  prompt: "Static or dynamic?"
+  buckets: [Static, Dynamic]
+  items:
+    - [A function with three unlabelled Int parameters, 0]
+    - [The app's 30 s timeout against the server's 45 s processing time, 1]
+    - [Two methods building the same cache key string, 0]
+    - [The feed request must wait for the session to restore, 1]
+    - [A badge count stored next to the list it counts, 1]
+  explain: "Static forms are visible by reading the source: parameter order and a duplicated algorithm. Timing, execution order and values that must stay in step only show up when the code runs."
+- id: q3
+  type: mcq
+  prompt: "Which change reduces connascence the most for the same behaviour?"
+  code: |
+    // Checkout screen
+    let total = items.reduce(0) { $0 + $1.pricePence } * 120 / 100
+    // Order summary screen
+    let total = items.reduce(0) { $0 + $1.pricePence } * 120 / 100
+  options:
+    - "Add a comment to both saying they must match"
+    - "Move the computation into one `Cart.totalIncludingVAT` that both screens use"
+    - "Replace `120 / 100` with a constant `vatMultiplier` in each file"
+    - "Write a test that compares the two screens' totals"
+  answer: 1
+  explain: "Two copies of an algorithm must change together. One implementation turns connascence of algorithm into connascence of name (both call `totalIncludingVAT`), the weakest form. A shared constant only removes part of the duplication, and a test detects drift rather than preventing it."
+- id: q4
+  type: mcq
+  prompt: "Your app and backend both decide whether a user may start a free trial, using the same rule. Product wants to change the rule next month. What's the most robust design?"
+  options:
+    - "Ship the new rule in the app and on the server on the same day"
+    - "Have the server decide and send `canStartTrial`, so the rule lives in one place and old app versions follow it"
+    - "Put the rule in remote config as a string the app parses"
+    - "Force every user to update the app before the change"
+  answer: 1
+  explain: "Connascence of algorithm across the app and server is the most expensive kind, because old app versions keep the old rule for years. Moving the rule to one side, and sending the result, leaves only connascence of name and type on a field."
+- id: q5
+  type: truefalse
+  prompt: "Connascence of algorithm inside one small type, such as two methods of an `ImageCache` building the same key, is a serious problem that must always be fixed."
+  answer: false
+  explain: "Locality matters: the two copies are a few lines apart and change in the same review. It's worth extracting a function if it's easy, but the same agreement between the app and the server is far more urgent."
+```

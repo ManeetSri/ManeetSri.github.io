@@ -1,0 +1,275 @@
+## Why it matters
+
+A sign-up form whose fields enable each other, a set of screens that push each other, a player whose controls all affect the queue: whenever several objects must react to each other, wiring them together directly turns into a web nobody can follow. A **mediator** puts those interactions in one object. On iOS its best-known form is the **coordinator**, and "how do your screens navigate without knowing about each other?" is one of the most common architecture questions in interviews.
+
+## Many objects, many connections
+
+Take a sign-up form: email, password, confirm password, a terms switch and a submit button. The rules connect them. Submit is enabled only when the email looks valid, the password is long enough, the confirmation matches and the terms are accepted; the confirmation shows an error when it differs from the password.
+
+If each control talks to the others directly, the password field must know about the confirmation field and the button, the switch must know about the button, and so on. Five objects can have up to ten pairwise links (n × (n − 1) / 2), and each link is a reason one of them changes when another does. Reusing the password field on a "change password" screen drags its neighbours along.
+
+The **Mediator** pattern, in the Gang of Four's words, defines an object that encapsulates how a set of objects interact, and keeps them from referring to each other explicitly. The objects, called **colleagues**, know only the mediator. The mediator knows the colleagues and holds the rules. Five colleagues means five links, all pointing at one place.
+
+<Callout kind="analogy">
+
+Planes approaching an airport don't negotiate landing order with each other. Each talks only to the control tower, which sees all of them and decides. Add a plane and nobody else's radio changes; change the landing rules and only the tower changes.
+
+</Callout>
+
+## You already use mediators
+
+### The view model between controls
+
+In SwiftUI the form's model is the mediator. Each control binds to one property and never sees the others; the rules that connect them are computed properties on the model:
+
+```swift check ios title="A form model as the mediator between its controls"
+import SwiftUI
+
+@MainActor @Observable
+final class SignUpForm {
+    var email = ""
+    var password = ""
+    var confirmation = ""
+    var acceptedTerms = false
+
+    // The rules that connect the fields live here, not in the fields
+    var confirmationError: String? {
+        !confirmation.isEmpty && confirmation != password ? "Passwords don't match" : nil
+    }
+
+    var canSubmit: Bool {
+        email.contains("@") && password.count >= 8 && confirmation == password && acceptedTerms
+    }
+}
+
+struct SignUpView: View {
+    @State private var form = SignUpForm()
+
+    var body: some View {
+        Form {
+            TextField("Email", text: $form.email)
+            SecureField("Password", text: $form.password)
+            SecureField("Confirm password", text: $form.confirmation)
+            if let error = form.confirmationError {
+                Text(error).foregroundStyle(.red)
+            }
+            Toggle("I accept the terms", isOn: $form.acceptedTerms)
+            Button("Create account") {}
+                .disabled(!form.canSubmit)
+        }
+    }
+}
+```
+
+The classic pattern has colleagues call `mediator.changed(self)` and the mediator push updates back. Observation makes the push automatic: SwiftUI tracks which properties `body` read (here, every field, through `canSubmit` and `confirmationError`) and re-evaluates the view when any of them changes. The structure is the same: every rule that spans controls has exactly one home, and it's testable without a view.
+
+In UIKit the **view controller** plays this role for its views. Each control sends its action to the controller (target–action), and the controller updates the others. Apple's MVC documentation calls the controller an intermediary between views and models, and mediating everything is also why view controllers bloat (D26 looks at that closely).
+
+### The coordinator between screens
+
+Screens are colleagues too. A welcome screen that creates and pushes the sign-up screen, which creates and pushes the permissions screen, has the same problem as the form: each screen knows what comes after it, so the flow can't change without editing three files, and the welcome screen can't be reused in a flow where something else comes next.
+
+A **coordinator** is a mediator for navigation. Each screen reports what *happened* ("the user chose to create an account", "an account was created") through a closure or a delegate. The coordinator decides what that means for the flow, and tells the navigation controller.
+
+```visual sequence
+title: An onboarding coordinator mediating between screens
+participants:
+  - { id: welcome, label: Welcome }
+  - { id: signup, label: Create account }
+  - { id: coord, label: Coordinator }
+  - { id: nav, label: Navigation }
+  - { id: app, label: App coordinator }
+messages:
+  - [welcome, coord, createAccount, { say: "Welcome reports what the user chose. It doesn't know which screen comes next, or that there's a flow at all." }]
+  - [coord, nav, push(CreateAccount), { say: "The coordinator owns the decision, and makes the screen and pushes it." }]
+  - [signup, coord, "created(userID)", { say: "The sign-up screen reports the result: an account exists now." }]
+  - { note: "Signed in: Back must not return to the form", over: coord }
+  - [coord, nav, "setViewControllers([Prompt])", { say: "So the coordinator **replaces** the stack instead of pushing. A rule about the whole flow lives in one place." }]
+  - [coord, app, "onFinish(userID)", { reply: true, say: "When the flow ends, the coordinator tells its parent, which swaps onboarding for the main app." }]
+```
+
+In code, each screen exposes its outputs and nothing else:
+
+```swift check ios title="Screens report outputs; the coordinator decides"
+import UIKit
+
+final class WelcomeViewController: UIViewController {
+    enum Output { case signIn, createAccount }
+    var onOutput: ((Output) -> Void)?
+
+    @objc private func createAccountTapped() { onOutput?(.createAccount) }
+    @objc private func signInTapped() { onOutput?(.signIn) }
+}
+
+final class CreateAccountViewController: UIViewController {
+    enum Output { case created(userID: String) }
+    var onOutput: ((Output) -> Void)?
+}
+
+final class NotificationsPromptViewController: UIViewController {
+    var onAnswered: (() -> Void)?
+}
+
+@MainActor
+final class OnboardingCoordinator {
+    private let navigation: UINavigationController
+    var onFinish: ((String) -> Void)?
+
+    init(navigation: UINavigationController) {
+        self.navigation = navigation
+    }
+
+    func start() {
+        let welcome = WelcomeViewController()
+        welcome.onOutput = { [weak self] output in
+            switch output {
+            case .createAccount: self?.showCreateAccount()
+            case .signIn: break   // showSignIn(), much the same
+            }
+        }
+        navigation.setViewControllers([welcome], animated: false)
+    }
+
+    private func showCreateAccount() {
+        let screen = CreateAccountViewController()
+        screen.onOutput = { [weak self] output in
+            switch output {
+            case .created(let userID): self?.showNotificationsPrompt(for: userID)
+            }
+        }
+        navigation.pushViewController(screen, animated: true)
+    }
+
+    private func showNotificationsPrompt(for userID: String) {
+        let prompt = NotificationsPromptViewController()
+        prompt.onAnswered = { [weak self] in self?.onFinish?(userID) }
+        // Signed in now: replace the stack, so Back can't return to the sign-up form
+        navigation.setViewControllers([prompt], animated: true)
+    }
+}
+```
+
+Look at what each part knows. `WelcomeViewController` knows its two buttons. `CreateAccountViewController` knows how to create an account. Neither imports, names or creates another screen. The coordinator knows the order, the branching and rules such as "after sign-in, no way back". Changing the flow (say, skipping the prompt when permission was already granted) is a change to one type.
+
+D20 builds coordinators properly: child coordinators for sub-flows, the back button, deep links and the SwiftUI version with a navigation path. Here the point is the pattern underneath: **colleagues report, the mediator decides.**
+
+## Designing a mediator that stays small
+
+The risk with a mediator is obvious once you've seen one fail: everything routes through it, so everything ends up *in* it. An `AppCoordinator` with forty methods and every business rule in the app is a god object with a nicer name. Four habits keep mediators healthy:
+
+- **Mediate interactions, not domain logic.** "Is this password strong enough?" belongs to a validator the form calls. "After sign-in, show the prompt" belongs to the coordinator. The mediator decides *who reacts*, not *what's true*.
+- **One mediator per flow.** Onboarding, checkout and settings each get their own coordinator; a parent coordinator starts and finishes children. The parent mediates between flows the way each child mediates between screens.
+- **Narrow channels.** Colleagues talk through a small output enum or one closure, not a reference to the whole mediator, so a screen can't call methods that aren't its business.
+- **Depend on an abstraction of the world.** A coordinator that drives a small `Navigator` protocol instead of `UINavigationController` can be tested by recording what it asked for. That's exactly the kata for this lesson.
+
+### Mediator, observer, facade
+
+These three get confused because all of them sit "in the middle".
+
+| | Who knows whom | Direction | Decides? |
+| --- | --- | --- | --- |
+| **Mediator** | Colleagues know the mediator; it knows them | Both ways | Yes: it holds the interaction rules |
+| **Observer** (NotificationCenter, Combine) | Publishers don't know subscribers | One to many | No: it broadcasts, each listener decides for itself |
+| **Facade** | Clients know the facade; the subsystem doesn't know either | One way, inwards | No: it simplifies access to a subsystem |
+
+Navigation by `NotificationCenter` ("post `.didSignIn` and let whoever's listening push something") is a common shortcut. It removes the coupling but also the owner: nobody can say what happens after sign-in without searching the codebase for observers, and two listeners can both push. A mediator keeps the decoupling and gives the decision a home.
+
+## Trade-offs
+
+| | Screens push each other | Delegate up to the presenting screen | Coordinator (mediator) | Event bus |
+| --- | --- | --- | --- | --- |
+| Coupling between screens | High: each names the next | Medium: each knows its parent's protocol | Low: screens know only their outputs | Low |
+| Where flow rules live | Spread across screens | Spread across parents | One type per flow | Wherever someone subscribed |
+| Reusing a screen in another flow | Hard | Possible | Easy | Easy, but unpredictable |
+| Testing the flow | UI tests only | Hard | Unit tests with a fake navigator | Hard |
+| Cost | None up front | Small | An extra type per flow, plus retention to manage | Debugging who reacted |
+
+**Screens pushing each other** is fine for a two-screen app or a prototype. **Coordinators** win once flows branch, are reused, or are entered from deep links, which is most production apps. An **event bus** suits broadcasts that many unrelated parts care about (the user signed out, so clear caches), not decisions with one right answer.
+
+<Callout kind="interview">
+
+When the interviewer asks how navigation works, say that screens expose outputs (an enum or closures), and a coordinator per flow turns outputs into navigation, so screens are reusable and flows are testable. Mention the parent coordinator that swaps onboarding for the main app. Questions worth asking: *Can users deep-link into the middle of this flow? Does the same screen appear in more than one flow?* Red flags: view controllers instantiating the next view controller, navigation through `NotificationCenter`, and one coordinator for the whole app.
+
+</Callout>
+
+<Callout kind="gotcha" title="iOS gotcha: the back swipe doesn't ask your coordinator">
+
+The system back button and the interactive swipe pop a screen without calling your code. A coordinator that tracks its own stack, or that must clean up a child coordinator when its flow is popped, drifts out of sync. Become the navigation controller's delegate and use `navigationController(_:didShow:animated:)` to notice pops. And keep a strong reference to every running coordinator: the screens' closures capture it weakly, so a coordinator nobody owns is deallocated at once and every button quietly does nothing.
+
+</Callout>
+
+## Practice
+
+**A mediated onboarding flow** has you write the coordinator behind a sign-in and sign-up flow, against a `Navigator` protocol: branch on what the user chose, skip the notifications prompt when it's already been answered, replace the stack once the user is signed in, ignore stale outputs from screens that are no longer on top, and tell the parent when the flow is done.
+
+```cards
+- id: mediator-intent
+  front: "What does the Mediator pattern do?"
+  back: "It puts the rules for how a set of objects interact into one object. The colleagues know only the mediator, so n objects need n links instead of up to n × (n − 1) / 2."
+- id: coordinator-as-mediator
+  front: "In what sense is a coordinator a mediator?"
+  back: "Screens are the colleagues: they report outputs and never name each other. The coordinator decides what each output means for the flow and drives navigation."
+- id: mediator-vs-observer
+  front: "Why is a mediator better than NotificationCenter for navigation?"
+  back: "Both decouple the screens, but a broadcast has no owner: nobody can tell what happens next, and several listeners may react. A mediator gives the decision one home."
+- id: god-mediator
+  front: "How do you stop a mediator becoming a god object?"
+  back: "Mediate interactions, not domain rules; one mediator per flow with parents for flows of flows; narrow output channels; and an abstraction of the world it drives."
+```
+
+```quiz
+- id: q1
+  type: mcq
+  prompt: "The product team wants the notifications prompt to come after the profile screen instead of before it. In a coordinator design, what changes?"
+  options:
+    - "The profile and prompt view controllers, which push each other"
+    - "Only the onboarding coordinator"
+    - "The app delegate and the coordinator"
+    - "Every screen's output enum"
+  answer: 1
+  explain: "The order of screens is the coordinator's knowledge. The screens report outputs and don't know what follows them, so reordering is a change to one type."
+- id: q2
+  type: sort
+  prompt: "Where does each belong?"
+  buckets: [The form or flow mediator, A domain type it calls, The colleague itself]
+  items:
+    - ["Enable Submit only when every field is valid", 0]
+    - ["Is this password at least 8 characters with a digit?", 1]
+    - ["After sign-in, replace the stack so Back can't return", 0]
+    - ["Show the keyboard's Next button on the email field", 2]
+    - ["Is this postcode valid for the chosen country?", 1]
+  explain: "The mediator owns rules that connect colleagues. Rules about what's true (validation) live in domain types it calls. A control's own presentation stays with the control."
+- id: q3
+  type: bug
+  prompt: "Users report the Create account button does nothing. Which line is the cause?"
+  code: |
+    final class SceneDelegate: UIResponder, UIWindowSceneDelegate {
+        var window: UIWindow?
+
+        func scene(_ scene: UIScene, willConnectTo session: UISceneSession, options: UIScene.ConnectionOptions) {
+            guard let windowScene = scene as? UIWindowScene else { return }
+            let navigation = UINavigationController()
+            let coordinator = OnboardingCoordinator(navigation: navigation)
+            coordinator.start()
+            window = UIWindow(windowScene: windowScene)
+            window?.rootViewController = navigation
+            window?.makeKeyAndVisible()
+        }
+    }
+  answer: 7
+  explain: "The coordinator is a local constant, so it's deallocated when the method returns. The screens capture it weakly, so `self?.showCreateAccount()` calls nothing. Store it in a property (or a parent's child list)."
+- id: q4
+  type: truefalse
+  prompt: "Replacing a coordinator with `NotificationCenter` posts removes the coupling between screens and keeps the flow as easy to follow."
+  answer: false
+  explain: "It removes the coupling, but the decision loses its owner: to know what happens after sign-in you must find every observer, and two may both react. A mediator keeps one place that decides."
+- id: q5
+  type: multi
+  prompt: "Which are mediators? Choose all that apply."
+  options:
+    - "A SwiftUI form model whose computed `canSubmit` reads every field"
+    - "A coordinator that turns screen outputs into navigation"
+    - "A facade that hides three persistence classes behind one `save(_:)`"
+    - "A UIKit view controller that enables a button when a switch changes"
+  answer: [0, 1, 3]
+  explain: "Each of those holds the rules connecting several peers that don't know each other. A facade simplifies one-way access to a subsystem; it doesn't coordinate peers."

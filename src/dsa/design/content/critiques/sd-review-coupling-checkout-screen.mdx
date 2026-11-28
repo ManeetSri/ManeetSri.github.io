@@ -1,0 +1,130 @@
+<Brief>
+
+This is the checkout screen of a shopping app, as it stands after two years and four teams. It works, but changes to the cart, the payment provider or analytics keep breaking it, and support has reports of items vanishing from carts and of a crash when checkout is opened from a notification. Review it for **coupling**: what each part depends on, how it finds out, and what would ripple when something changes.
+
+```swift check ios title="CheckoutViewController.swift"
+import UIKit
+
+// The vendors' SDKs, reduced to what this file calls
+enum AcmePay {
+    static func configure(apiKey: String) {}
+    static func charge(pence: Int, paymentMethod: String, completion: @escaping @Sendable (Bool) -> Void) {}
+}
+enum AcmeAnalytics {
+    static func logEvent(_ name: String, _ parameters: [String: Any]) {}
+}
+
+struct User { let id: String; var addresses: [String] }
+struct CartItem { let name: String; let pricePence: Int }
+
+@MainActor final class AppSession {
+    static let shared = AppSession()
+    var currentUser: User?
+    var cartItems: [CartItem] = []
+}
+
+final class CartViewController: UIViewController {
+    let badgeLabel = UILabel()
+    let tableView = UITableView()
+}
+
+final class CheckoutViewController: UIViewController {
+    var paymentMethodID: String!   // set by whoever pushes this screen, before it loads
+    private let totalLabel = UILabel()
+
+    override func viewDidLoad() {
+        super.viewDidLoad()
+        AcmePay.configure(apiKey: "pk_live_51Hx")
+        let total = AppSession.shared.cartItems.reduce(0) { $0 + $1.pricePence }
+        totalLabel.text = "£\(total / 100).\(total % 100)"
+        view.addSubview(totalLabel)
+    }
+
+    func submitOrder(isGuest: Bool, skipValidation: Bool, fromDeepLink: Bool) {
+        let user = AppSession.shared.currentUser
+        if !skipValidation && !isGuest && user?.addresses.first == nil { return }
+        let total = AppSession.shared.cartItems.reduce(0) { $0 + $1.pricePence }
+        AcmeAnalytics.logEvent(fromDeepLink ? "checkout_dl" : "checkout_tap", ["value": total, "user": user?.id ?? "guest"])
+        AcmePay.charge(pence: total, paymentMethod: paymentMethodID) { success in
+            Task { @MainActor in
+                guard success else { return }
+                AppSession.shared.cartItems = []
+                UserDefaults.standard.set(true, forKey: "has_ordered")
+                let cart = self.tabBarController?.viewControllers?[2] as? CartViewController
+                cart?.badgeLabel.text = "0"
+                cart?.tableView.reloadData()
+                self.navigationController?.popToRootViewController(animated: true)
+            }
+        }
+    }
+}
+```
+
+</Brief>
+
+```workspace
+template: critique
+minutes: 25
+```
+
+```findings
+- id: global-session
+  title: The screen's real inputs come from a global session that anyone can change
+  severity: high
+  lines: 39-46
+  detail: "`AppSession.shared` is common coupling. The user and the cart appear in no initialiser, any screen can change them during checkout, and tests share one instance. It causes a real bug: the total is read on line 41, the charge takes seconds, and line 46 then empties the whole cart, wiping anything added on another tab while the payment was in flight. Pass the cart and user in, and remove only the items that were paid for."
+- id: reach-into-cart
+  title: Reaches into the cart screen's labels and table view
+  severity: high
+  lines: 48-50
+  detail: "Content coupling: checkout knows the cart's tab index, its class and its subviews. Reorder the tabs or wrap the cart in a navigation controller and the cast fails silently, so the badge stays stale. It also bypasses whatever the cart screen does when its data changes. The cart screen should observe a shared cart model and update itself."
+- id: implicit-payment-method
+  title: A required dependency is an implicitly unwrapped property set from outside
+  severity: high
+  lines: 27
+  detail: "Temporal coupling: whoever creates the screen must remember to set `paymentMethodID` before `submitOrder` runs, and nothing enforces it. Opening checkout from a notification takes a path that doesn't, so line 43 unwraps `nil` and crashes. Take it in the initialiser."
+- id: sdk-configured-in-screen
+  title: The payment SDK is configured by this screen, with a live key
+  severity: medium
+  lines: 32
+  detail: "Configuration that must happen before any charge is hidden in one screen's `viewDidLoad`, so any other path that charges (one-tap reorder from a widget or an App Intent) runs before it and fails. It reconfigures on every visit, and a live key sits in a view controller. Configure once at launch, in the composition root, and hand screens something already configured."
+- id: control-flags
+  title: Three flags select behaviour, and one says who's calling
+  severity: medium
+  lines: 38-40
+  detail: "Control coupling: eight combinations, most never tested. `skipValidation` lets any caller bypass the address rule, and `fromDeepLink` tells checkout who called it only to pick an analytics name. Make guest and member checkout separate operations, always validate, and pass the entry point as data for analytics when the screen is created."
+- id: vendors-in-ui
+  title: Two vendors' SDKs and vocabularies are used directly in UI code
+  severity: medium
+  lines: 42-43
+  detail: "External coupling: string event names, an untyped `[String: Any]` payload and a callback charge API are written into the screen. Switching payment or analytics vendor means editing every screen like this one, and none of it can be tested without the real SDKs. Put each vendor behind a protocol the app owns (`PaymentProcessing`, typed `AnalyticsEvent`s), with one adapter each."
+- id: total-twice
+  title: The total is computed twice and formatted by hand
+  severity: low
+  lines: 33-34
+  detail: "Connascence of algorithm: lines 33 and 41 must agree on how a total is worked out, and the next change (a discount, delivery) will update one. The hand-made formatting is also wrong: 1205 pence shows as £12.5. Give the cart one `totalPence`, and format with `formatted(.currency(code: \"GBP\"))`."
+- id: string-flag
+  title: A UserDefaults flag shared by string
+  severity: low
+  lines: 47
+  detail: "`\"has_ordered\"` is a global variable shared with whoever reads it, such as a review prompt or onboarding, by a string the compiler can't check. Give the flag one owner type that both sides use."
+```
+
+<ReferenceReview>
+
+**Most important first.** Three problems cause bugs today, and none is visible from a single file. The global `AppSession` lets the cart change while a payment is in flight, and the success path then empties it, so customers lose items they added (that's the "items vanishing" report). Checkout reaches into the cart screen's subviews by tab index, so any change to the tab bar leaves the badge wrong without an error. And `paymentMethodID` is an implicitly unwrapped property that the notification path never sets, which is the crash.
+
+**The pattern underneath** is that the screen finds its dependencies instead of being given them: a singleton for state, a tab index for the cart, a hidden configuration call for payments, vendor SDKs called by name. Every one of those is coupling that no initialiser shows.
+
+**How I'd fix it, in small steps:**
+
+1. Give the screen an initialiser: `init(cart: Cart, user: User?, paymentMethodID: String, payments: any PaymentProcessing, analytics: any AnalyticsTracking, source: CheckoutSource)`. The crash goes away, and every dependency is visible.
+2. Make `Cart` a shared `@Observable` model, created once at launch and passed to both screens. Checkout tells it `cart.remove(paid: items)` with the items it charged for; the cart screen observes the model and updates its own badge and table. Delete the reach-in.
+3. Move the charge and its rules into a `CheckoutModel` that the view controller owns, with `placeOrder()` and `placeGuestOrder()` instead of three flags. Validation always runs.
+4. Configure the payment SDK once at launch, behind `PaymentProcessing` (`func charge(pence:paymentMethodID:) async throws`), with the key coming from build configuration rather than source. One adapter wraps the vendor's callback API.
+5. Replace string events with `AnalyticsEvent.checkoutStarted(valuePence:source:)`, mapped to the vendor's names in one adapter.
+6. Give the cart one `totalPence` and use currency formatting. Move `has_ordered` to an `OrderHistory` type that owns the key.
+
+**Tests to add:** `CheckoutModel` with fake payments and analytics: a successful charge removes exactly the paid items and keeps one added meanwhile; a failed charge keeps the cart; guest checkout skips the address check and member checkout doesn't; the analytics event carries the entry point. A test that builds the screen from a notification route and places an order without crashing.
+
+</ReferenceReview>

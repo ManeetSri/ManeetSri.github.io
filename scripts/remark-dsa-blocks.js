@@ -117,7 +117,7 @@ const checkFinding = (finding, seen) => {
     if (seen.has(finding.id)) return `duplicate finding id "${finding.id}"`;
     seen.add(finding.id);
     if (!SEVERITIES.includes(finding.severity)) return `finding "${finding.id}" needs a severity: ${SEVERITIES.join(', ')}`;
-    if (finding.lines !== undefined && !/^\d+(-\d+)?$/.test(String(finding.lines))) return `finding "${finding.id}" lines must look like 12 or 12-18`;
+    if (finding.lines !== undefined && !/^\d+(-\d+)?(, *\d+(-\d+)?)*$/.test(String(finding.lines))) return `finding "${finding.id}" lines must look like 12, 12-18 or 12-18, 40`;
     return null;
 };
 

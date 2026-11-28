@@ -1,0 +1,287 @@
+## Why it matters
+
+Every arrow in a design points one way: from the part that knows to the part that's known. Point the arrows the wrong way and your most important code, the rules about what a feed is or when a user may check out, ends up depending on whatever changes most: the JSON, the analytics vendor, the persistence framework. Point them the right way and those rules can be built, tested and reused on their own. Interviewers listen for this when you draw boxes: which way your arrows go, and why.
+
+## What an arrow means
+
+"A depends on B" means **A's source code names B**. A imports B's module, mentions B's type, or calls B's methods. Three things follow:
+
+- A can't compile without B.
+- A change to B can break A, but not the other way round.
+- To test A, you need B, or something that stands in for it.
+
+Dependency direction is about *who knows about whom*, not which way data flows. In `let posts = try await client.fetchFeed()`, data flows from the client to the caller, but the dependency points from the caller to the client. Keep the two apart in your head: much of good design is making them point in different directions on purpose.
+
+## Depend in the direction of stability
+
+The previous lesson defined stability as *how hard a part is to change*: a part many others depend on is stable, whether you like it or not. Robert C. Martin's **Stable Dependencies Principle** follows from that:
+
+**Depend in the direction of stability.** Every arrow should point from a less stable part to a more stable one, so instability falls along every path.
+
+The reason is inheritance of change. If a stable module imports a volatile one, every change to the volatile one can break the stable one, and through it everything that depends on it. The stable module becomes as volatile as the worst thing it imports. You'll meet the principle's formal version for packages, alongside its siblings, in D05.
+
+### What's stable in an iOS app
+
+Stability isn't only about arrows; it's also about how often each kind of code *needs* to change. Roughly, from most volatile to least:
+
+| Kind of code | How often it changes | Who changes it |
+| --- | --- | --- |
+| Screens, layout, copy | Every sprint | Designers and product |
+| Third-party SDKs (analytics, ads, payments) | When the vendor ships, or you switch vendor | Someone else |
+| The backend's API shape | Every few releases | Another team |
+| Persistence technology | Every few years (Core Data, then SwiftData) | You, reluctantly |
+| Your domain rules: pricing, eligibility, paging | When the business changes | You, deliberately |
+| Value types for the domain: `Money`, `OrderID` | Rarely | You |
+
+So the arrows should run from screens and adapters towards domain rules and models. The trouble is that the obvious first design points them the other way.
+
+## Flipping an arrow with a protocol
+
+Here's the obvious design: the feed's view model, which holds the paging rules, creates and calls a `RemoteFeedLoader` from the networking code. The feed's rules now depend on URLs, JSON and `URLSession`. Step through the fix:
+
+```visual flow
+title: Flipping the arrow between Feed and its loader
+nodes:
+  - { id: vm, label: FeedViewModel, at: [0, 0] }
+  - { id: proto, label: FeedLoading, at: [0, 1.5] }
+  - { id: loader, label: RemoteFeedLoader, at: [3, 0], w: 1.3 }
+  - { id: http, label: URLSession, kind: external, at: [3, 1.5] }
+groups:
+  - { id: feed, label: Feed module, nodes: [vm, proto] }
+  - { id: api, label: FeedAPI module, nodes: [loader] }
+edges:
+  - [vm, loader, imports]
+  - [vm, proto, calls]
+  - [loader, proto, conforms]
+  - [loader, http, calls]
+steps:
+  - say: The view model creates and calls `RemoteFeedLoader`. **Feed imports FeedAPI**, so the paging rules can't compile, run or be tested without HTTP code.
+    show: [vm, loader, http, "vm->loader", "loader->http"]
+  - say: Every change to URLs or JSON now reaches the feature that should care least about them. The stable part depends on the volatile part.
+    state: { loader: active, vm: error }
+  - say: Add a protocol **in the Feed module**, named in Feed's words. The view model only knows `FeedLoading`.
+    hide: ["vm->loader"]
+    show: [proto, "vm->proto"]
+    state: { loader: null, vm: null }
+  - say: "`RemoteFeedLoader` conforms to it, so now **FeedAPI imports Feed**. At run time the view model still calls the loader; in the source, the arrow between the modules has flipped."
+    show: ["loader->proto"]
+    active: ["loader->proto"]
+  - say: The volatile side (HTTP, JSON, URLs) depends on the stable side (what a page of posts is). Feed builds and tests on its own, with any loader.
+    state: { feed: ok }
+```
+
+The key detail is **where the protocol lives**. A `FeedLoading` protocol declared next to `RemoteFeedLoader` in the networking module changes nothing: Feed would still import that module to see it. The protocol has to belong to the side that uses it. That's the heart of the **dependency inversion principle**, which you'll study properly in D04.
+
+In code, the Feed module ends up owning everything it needs, and nothing it doesn't:
+
+```swift run title="Feed owns its abstraction"
+// Feed module: the policy, and the abstraction it owns, in its own words
+struct Post: Sendable {
+    let id: Int
+    let title: String
+}
+
+struct FeedPage: Sendable {
+    let posts: [Post]
+    let nextCursor: Int?   // nil on the last page
+}
+
+protocol FeedLoading: Sendable {
+    func page(after cursor: Int?) async throws -> FeedPage
+}
+
+@MainActor
+final class FeedViewModel {
+    private let loader: any FeedLoading
+    private var nextCursor: Int?
+    private(set) var posts: [Post] = []
+    private(set) var reachedEnd = false
+
+    init(loader: any FeedLoading) {
+        self.loader = loader
+    }
+
+    func loadMore() async {
+        guard !reachedEnd else { return }
+        do {
+            let page = try await loader.page(after: nextCursor)
+            posts += page.posts
+            nextCursor = page.nextCursor
+            reachedEnd = page.nextCursor == nil
+        } catch {
+            // A real view model would expose an error state here
+        }
+    }
+}
+
+// Tests, previews or a second app: anything that conforms will do
+struct CannedFeed: FeedLoading {
+    let pages: [[String]]
+
+    func page(after cursor: Int?) async throws -> FeedPage {
+        let index = cursor ?? 0
+        let posts = pages[index].enumerated().map { Post(id: index * 10 + $0.offset, title: $0.element) }
+        return FeedPage(posts: posts, nextCursor: index + 1 < pages.count ? index + 1 : nil)
+    }
+}
+
+let viewModel = FeedViewModel(loader: CannedFeed(pages: [["Hello", "Swift 6"], ["Coupling"]]))
+for _ in 1...3 {
+    await viewModel.loadMore()
+    print(viewModel.posts.map(\.title), viewModel.reachedEnd)
+}
+```
+
+```output
+["Hello", "Swift 6"] false
+["Hello", "Swift 6", "Coupling"] true
+["Hello", "Swift 6", "Coupling"] true
+```
+
+The paging rule (stop asking once there's no cursor) is tested here without a server, a URL or a JSON file. `RemoteFeedLoader`, in its own module, turns HTTP responses into `FeedPage`s, and the app target hands it to the view model.
+
+## Three ways to flip an arrow
+
+A protocol is one tool. Swift gives you two more, and they suit different sizes of dependency:
+
+```swift check title="A closure, a protocol and a generic"
+struct FeedPage: Sendable {
+    let titles: [String]
+    let nextCursor: Int?
+}
+
+protocol FeedLoading: Sendable {
+    func page(after cursor: Int?) async throws -> FeedPage
+}
+
+// A closure: the lightest seam, for one operation
+@MainActor final class ClosureFeedModel {
+    private let loadPage: @Sendable (Int?) async throws -> FeedPage
+    init(loadPage: @escaping @Sendable (Int?) async throws -> FeedPage) {
+        self.loadPage = loadPage
+    }
+}
+
+// A protocol: a named role, for several related operations
+@MainActor final class ProtocolFeedModel {
+    private let loader: any FeedLoading
+    init(loader: any FeedLoading) {
+        self.loader = loader
+    }
+}
+
+// A generic: the concrete type is known at compile time, but spreads into every use
+@MainActor final class GenericFeedModel<Loader: FeedLoading> {
+    private let loader: Loader
+    init(loader: Loader) {
+        self.loader = loader
+    }
+}
+```
+
+A **closure** is perfect for one function, and the caller can pass `remoteLoader.page(after:)` straight in. A **protocol** gives a role a name and groups related operations, such as `page(after:)` and `refresh()`. A **generic** avoids the small cost of an existential (`any`), but `GenericFeedModel<RemoteFeedLoader>` then appears in every type that holds one, which is noisy in SwiftUI views. You'll weigh `some` against `any` in D06.
+
+## Who creates the concrete types
+
+If Feed only knows `FeedLoading`, somebody has to create a `RemoteFeedLoader` and pass it in. That somebody is the **composition root**: one place, usually the app target or the `@main` app type, that knows every concrete type and wires them together. It's the most unstable part of the app (I = 1), which is exactly why it's allowed to know everything: nothing depends on it, so its knowledge doesn't spread. Dependency injection, D21, is the full story of how to do that wiring well.
+
+## Arrows that go round in circles
+
+When arrows form a loop (Feed imports Checkout, Checkout imports Feed), neither part can change, build or be tested without the other: they've become one part with two names. Swift Package Manager refuses to build it:
+
+```text title="What you'll see"
+error: cyclic dependency declaration found: Checkout -> Feed -> Checkout
+```
+
+Inside one module the compiler allows cycles between types, so you have to spot them yourself. A coordinator that holds its view controller strongly, while the view controller holds the coordinator strongly, is a dependency cycle *and* a retain cycle: one side should hold the other `weak`, or talk back through a closure. Break module cycles the same way you flip an arrow: find what one side needs from the other, and make it a protocol or closure owned by the side that needs it.
+
+## Trade-offs
+
+| Approach | Compile-time safety | Indirection | Test seam | Wins when |
+| --- | --- | --- | --- | --- |
+| Depend on the concrete type | Full | None | None | Stable, dependency-free code like `Money`, or code you'd never fake |
+| A closure | Full | Low | One function | A single operation: load a page, log an event |
+| A protocol owned by the user | Full | Medium: jump to definition lands on the protocol | Several operations | A role with a few methods, crossing a module boundary |
+| A generic constrained by the protocol | Full | Medium, plus type parameters everywhere | Same as protocol | Hot paths, or library code that must avoid existentials |
+
+Don't flip arrows that already point the right way. A view model depending on `Money` or `Date` is depending on something more stable than itself, and a protocol in front of it adds indirection and nothing else.
+
+<Callout kind="interview">
+
+**Say** which way arrows point and why, as you draw: "The feed module owns a `FeedLoading` protocol, and the networking adapter implements it, so the feed's rules don't depend on the API's shape." **Ask** what's likely to change: a vendor swap, a backend migration, a second app reusing a feature. Those are the arrows worth flipping. **Red flags:** domain code importing a vendor SDK, a protocol defined next to its only implementation "for testing", and modules that import each other.
+
+</Callout>
+
+<Callout kind="gotcha" title="Swift gotcha: protocols you call from the main actor">
+
+If `FeedLoading` isn't `Sendable`, a main-actor view model holding `any FeedLoading` won't compile in Swift 6 mode when it calls an `async` method on it: the compiler reports that sending `self.loader` risks causing data races, because the call runs off the main actor. Make the protocol `Sendable` (as above), or isolate it to `@MainActor` if every implementation lives there. Projects with Xcode's "Approachable Concurrency" setting run such calls on the caller's actor instead, which removes the error; this course's package uses plain Swift 6 mode, so you'll see it.
+
+</Callout>
+
+## Practice
+
+The kata **premium gate** is exactly this move with a vendor's purchases SDK: the gate owns a small `EntitlementSource` protocol, an adapter wraps the SDK, and the gate's rules are tested without the vendor at all.
+
+```cards
+- id: dependency-meaning
+  front: "What does \"A depends on B\" mean in source code?"
+  back: "A names B: imports its module, uses its type or calls it. A can't compile without B, and a change to B can break A, not the other way round."
+- id: sdp
+  front: "What does the Stable Dependencies Principle say?"
+  back: "Depend in the direction of stability: every arrow should point from a less stable part to a more stable one, so volatile code never drags stable code along with it."
+- id: protocol-owner
+  front: "When you flip a dependency with a protocol, where must the protocol live?"
+  back: "With the code that uses it. Declared next to the implementation, it changes nothing: the user would still import the implementation's module."
+- id: composition-root
+  front: "What is the composition root?"
+  back: "The one place, usually the app target, that knows every concrete type and wires them together. It's maximally unstable, so its knowledge doesn't spread."
+```
+
+```quiz
+- id: q1
+  type: mcq
+  prompt: "A `Checkout` module defines `protocol PaymentProcessing`. A `StripePayments` module implements it with the vendor's SDK. Which way do the module dependencies point?"
+  options:
+    - "Checkout → StripePayments"
+    - "StripePayments → Checkout"
+    - "Both ways, which is a cycle"
+    - "Neither: protocols don't create dependencies"
+  answer: 1
+  explain: "`StripePayments` names `PaymentProcessing`, so it imports Checkout. Checkout never mentions the vendor. At run time Checkout calls the Stripe code, but the source dependency points the other way: that's the inversion."
+- id: q2
+  type: truefalse
+  prompt: "Moving `protocol FeedLoading` into the Networking module, next to `RemoteFeedLoader`, keeps the Feed module independent of Networking."
+  answer: false
+  explain: "Feed would still have to import Networking to see the protocol, so the arrow hasn't flipped. The protocol must live in the module that uses it."
+- id: q3
+  type: sort
+  prompt: "Should this dependency be flipped behind a protocol or closure, or left pointing at the concrete type?"
+  buckets: [Flip it, Leave it concrete]
+  items:
+    - [A pricing rule calling an analytics vendor's SDK, 0]
+    - ["A view model using `Money`, your own dependency-free value type", 1]
+    - [Order history reading from Core Data while a SwiftData migration is planned, 0]
+    - ["A formatter using `Date` and `Calendar` from Foundation", 1]
+    - [The feed's paging rules calling the HTTP client, 0]
+  explain: "Flip arrows that point from stable rules to volatile details: vendors, persistence technology, transport. Arrows that already point at something more stable than you, like your own value types or Foundation, are fine as they are."
+- id: q4
+  type: mcq
+  prompt: "Swift Package Manager reports `cyclic dependency declaration found: Checkout -> Feed -> Checkout`. Feed imports Checkout to open the checkout flow; Checkout imports Feed to show recommended posts after paying. What's the best fix?"
+  options:
+    - "Merge the two modules"
+    - "Have each feature expose what it needs from the other as a closure or protocol it owns, and let the app target connect them"
+    - "Move both features into the app target"
+    - "Use `@_implementationOnly import` to hide the cycle"
+  answer: 1
+  explain: "Feed needs \"start checkout\" and Checkout needs \"show recommendations\". Each can own that need as a closure or small protocol, and the app target, which knows both, wires them. Neither imports the other, so the cycle disappears and both stay independent."
+- id: q5
+  type: mcq
+  prompt: "Why is the app target allowed to import every module?"
+  options:
+    - "Because Xcode requires it"
+    - "Because nothing depends on it (I = 1), so what it knows doesn't spread to any other module"
+    - "Because it's compiled last"
+    - "It isn't; the app target should only import one module"
+  answer: 1
+  explain: "The composition root is maximally unstable: no module imports it, so its dependencies don't drag anyone else along. That makes it the safe place to know every concrete type."
+```

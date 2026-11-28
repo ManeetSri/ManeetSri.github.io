@@ -1,0 +1,344 @@
+## Why it matters
+
+Every `for` loop you write uses the **Iterator** pattern, so it's easy to forget it's a design tool. Designing your own sequences lets a type hide how its data is stored or fetched: a folder tree, the view hierarchy, a paginated API, a stream of live updates. With `AsyncSequence`, "load the next page when the user scrolls" becomes a `for try await` loop. Interviewers reach for it in feed and pagination questions, where a clean iterator separates *how pages are fetched* from *what the screen does with items*.
+
+## The pattern
+
+The Gang of Four's intent: provide a way to access the elements of an aggregate object sequentially without exposing its underlying representation. Two roles:
+
+- The **aggregate** (a collection, a tree, a feed) knows how to make an iterator.
+- The **iterator** remembers a position and hands out the next element on request.
+
+The caller asks for "the next one" until there are none left, and never learns whether the elements came from an array, a tree, a file or the network. That's the whole point: the representation can change without touching any loop.
+
+Iteration comes in two styles. With **external iteration** the caller pulls: it asks for the next element and decides when to stop. With **internal iteration** the aggregate pushes each element into a closure you hand it, as `forEach` does. Swift's `for`–`in` is external, which is why `break` works in a loop and not in `forEach`.
+
+## Sequence and IteratorProtocol
+
+Swift splits the pattern across two protocols. An `IteratorProtocol` has one requirement, `mutating func next() -> Element?`; a `Sequence` has `makeIterator()`. The compiler turns a loop into exactly those calls:
+
+```swift
+for photo in album { show(photo) }
+
+// is compiled as
+var iterator = album.makeIterator()
+while let photo = iterator.next() { show(photo) }
+```
+
+Conform to `Sequence` and you inherit `map`, `filter`, `contains`, `first(where:)`, `reduce`, `zip`, `prefix` and the rest, all built on `next()`.
+
+### Hiding a tree behind a sequence
+
+A folder tree is a composite (you met it in [Composite: view hierarchies and menus](/design/learn/sd-structural-composite)). Callers want "every file", not the nested arrays. The iterator keeps its own stack of folders still to read, so the traversal needs no recursion and callers never see `subfolders`:
+
+```swift run title="A depth-first iterator over a folder tree"
+struct Folder {
+    let name: String
+    var files: [String] = []
+    var subfolders: [Folder] = []
+}
+
+// Every file path in the tree, depth first. Callers never see how folders store their contents.
+extension Folder: Sequence {
+    struct Iterator: IteratorProtocol {
+        var pendingFolders: [(path: String, folder: Folder)]
+        var pendingFiles: [String] = []
+
+        mutating func next() -> String? {
+            while pendingFiles.isEmpty {
+                guard let (path, folder) = pendingFolders.popLast() else { return nil }
+                pendingFiles = folder.files.reversed().map { "\(path)/\($0)" }
+                pendingFolders += folder.subfolders.reversed().map { ("\(path)/\($0.name)", $0) }
+            }
+            return pendingFiles.popLast()
+        }
+    }
+
+    func makeIterator() -> Iterator {
+        Iterator(pendingFolders: [(name, self)])
+    }
+}
+
+let photos = Folder(name: "Photos", files: ["cover.heic"], subfolders: [
+    Folder(name: "2024", files: ["beach.heic", "notes.txt"], subfolders: [
+        Folder(name: "Paris", files: ["eiffel.heic"]),
+    ]),
+    Folder(name: "2025", files: ["snow.heic"]),
+])
+
+for path in photos {
+    print(path)
+}
+
+// Sequence gives every algorithm for free, built on next()
+print(photos.filter { $0.hasSuffix(".heic") }.count, "photos")
+print(photos.first { $0.contains("Paris") } ?? "none")
+print(photos.contains("Photos/2025/snow.heic"))
+```
+
+```output
+Photos/cover.heic
+Photos/2024/beach.heic
+Photos/2024/notes.txt
+Photos/2024/Paris/eiffel.heic
+Photos/2025/snow.heic
+4 photos
+Photos/2024/Paris/eiffel.heic
+true
+```
+
+Swapping depth-first for breadth-first is a change to the iterator alone: pop from the front instead of the back. No caller changes. And `first(where:)` stops calling `next()` as soon as it finds a match, so folders after Paris are never opened. Iterators do work only when they're asked.
+
+### One-line iterators
+
+For simple walks you don't need a type at all. `sequence(first:next:)` builds an iterator from a starting value and a step function, which suits any "follow the pointer" structure in UIKit:
+
+```swift check ios title="Walking the view hierarchy and the responder chain"
+import UIKit
+
+extension UIView {
+    // The view and every superview up to the window: an iterator in one line
+    var ancestors: some Sequence<UIView> {
+        sequence(first: self, next: \.superview)
+    }
+
+    func enclosingScrollView() -> UIScrollView? {
+        ancestors.dropFirst().lazy.compactMap { $0 as? UIScrollView }.first
+    }
+}
+
+extension UIResponder {
+    // The responder chain from D12, walked the same way
+    var responderChain: some Sequence<UIResponder> {
+        sequence(first: self, next: \.next)
+    }
+}
+```
+
+`some Sequence<UIView>` is the design choice worth copying: callers get a sequence of views and every algorithm on it, and you stay free to change how it's produced. `lazy` makes `compactMap` produce values on demand instead of building an array, so `first` stops at the nearest scroll view.
+
+## Promises: Sequence or Collection?
+
+The protocol you return is a promise, and the two promise different things.
+
+- A **`Sequence`** may be **single-pass** (iterating twice might give different results, or nothing the second time) and may even be infinite. It doesn't promise a `count`.
+- A **`Collection`** is multi-pass and finite, with indices, `count`, and subscripting. `Array`, `Set`, `Dictionary` and `String` are all collections.
+
+Return `[Element]` when callers need `count`, indices or several passes, and the data fits in memory. Return `some Sequence<Element>` when the elements are computed, streamed or potentially huge, and you want to keep the freedom to change how. Returning a mutable array property (`var subfolders: [Folder]` that anyone can change) is the anti-pattern: it exposes the representation the iterator was meant to hide.
+
+## AsyncSequence: elements that arrive later
+
+Some elements don't exist yet when you ask: the next page of a feed, the next line of a download, the next location update. `AsyncSequence` is the same pattern with an `async` `next()`, and `for try await` is its loop. Apple's frameworks are full of them: `URLSession.bytes(for:)` and its `.lines`, `URL.lines`, `FileHandle.bytes`, `NotificationCenter.notifications(named:)`, and `AsyncStream` for building your own.
+
+A feed is the classic case. The server returns pages with a cursor to the next one. The screen wants items. An async iterator turns one into the other, and fetches a page **only when the loop asks for an element it doesn't have**:
+
+```visual sequence
+title: A paging iterator fetches on demand
+participants:
+  - { id: screen, label: Feed screen }
+  - { id: iter, label: Page iterator }
+  - { id: api, label: Feed API }
+messages:
+  - [screen, iter, "next()", { say: "The loop asks for an item. The buffer is empty, so the iterator must fetch." }]
+  - [iter, api, GET first page]
+  - [api, iter, "[a, b] + cursor p2", { reply: true, say: "The page arrives with a cursor. The iterator keeps both; the screen sees neither." }]
+  - [iter, screen, a, { reply: true }]
+  - [screen, iter, "next()", { say: "The next item, `b`, is already buffered: no request." }]
+  - [iter, screen, b, { reply: true }]
+  - [screen, iter, "next()"]
+  - [iter, api, "GET ?cursor=p2", { say: "Only when the buffer runs dry does it fetch the next page." }]
+  - [api, iter, "[c, d] + cursor p3", { reply: true }]
+  - [iter, screen, c, { reply: true }]
+  - { note: "The user stops scrolling: the loop breaks, and page 3 is never fetched", over: [screen, api] }
+```
+
+```swift run title="A paginated feed as an AsyncSequence"
+struct Page: Sendable {
+    let items: [String]
+    let nextCursor: String?
+}
+
+struct PageNotFound: Error {}
+
+// A stand-in for the feed API: three pages, and a log of the requests it served
+actor FakeFeedAPI {
+    private(set) var requests: [String] = []
+    private let pages = [
+        "first": Page(items: ["a", "b"], nextCursor: "p2"),
+        "p2": Page(items: ["c", "d"], nextCursor: "p3"),
+        "p3": Page(items: ["e"], nextCursor: nil),
+    ]
+
+    func page(after cursor: String?) throws -> Page {
+        let key = cursor ?? "first"
+        requests.append(key)
+        guard let page = pages[key] else { throw PageNotFound() }
+        return page
+    }
+}
+
+// Every item in the feed, one at a time. Callers never see pages or cursors.
+struct FeedItems: AsyncSequence {
+    typealias Element = String
+    let api: FakeFeedAPI
+
+    struct AsyncIterator: AsyncIteratorProtocol {
+        let api: FakeFeedAPI
+        var buffer: [String] = []
+        var cursor: String?
+        var isLastPage = false
+
+        mutating func next() async throws -> String? {
+            while buffer.isEmpty {
+                if isLastPage { return nil }
+                try Task.checkCancellation()
+                let page = try await api.page(after: cursor)   // fetch only when asked
+                buffer = page.items.reversed()
+                cursor = page.nextCursor
+                isLastPage = page.nextCursor == nil
+            }
+            return buffer.popLast()
+        }
+    }
+
+    func makeAsyncIterator() -> AsyncIterator {
+        AsyncIterator(api: api)
+    }
+}
+
+let api = FakeFeedAPI()
+for try await item in FeedItems(api: api) {
+    print("show", item)
+    if item == "c" { break }   // the user stopped scrolling
+}
+print("requests:", await api.requests)
+
+let fresh = FakeFeedAPI()
+var everything: [String] = []
+for try await item in FeedItems(api: fresh) {
+    everything.append(item)
+}
+print("all:", everything, "requests:", await fresh.requests)
+```
+
+```output
+show a
+show b
+show c
+requests: ["first", "p2"]
+all: ["a", "b", "c", "d", "e"] requests: ["first", "p2", "p3"]
+```
+
+Three properties make this a good design rather than a clever one:
+
+- **Pull means backpressure for free.** The iterator fetches only when the consumer asks. A slow consumer never gets a flood of pages, and a loop that breaks early stops the requests.
+- **Cancellation is checked.** `Task.checkCancellation()` before each fetch means cancelling the task that runs the loop (leaving the screen, for instance) stops paging at the next request. SwiftUI's `.task` modifier cancels its task when the view disappears.
+- **The paging policy has one home.** Cursors, page sizes, retries and "is this the last page?" live in the iterator. The screen's code is a loop over items.
+
+In a real app the iterator would depend on a protocol rather than a concrete API, so tests can feed it canned pages, and the screen would load a page's worth of items at a time rather than one per scroll event. From Swift 6, `AsyncSequence` also has a `Failure` type, so on iOS 18 a function can return `some AsyncSequence<Post, any Error>` and hide the iterator type as `some Sequence` does.
+
+Not every async source is pull-based. Location updates, button taps and socket messages arrive whether or not anyone is asking; `AsyncStream` buffers them for a consumer that may be slower. Choosing what to keep when the buffer fills is the subject of D14's async streams lesson.
+
+## Trade-offs
+
+| | Return an array | `some Sequence` / custom iterator | Custom `Collection` | `AsyncSequence` | Callbacks or Combine |
+| --- | --- | --- | --- | --- | --- |
+| Hides representation | Partly: it's a copy, in memory | Yes | Yes | Yes | Yes |
+| Laziness and early stop | No: everything is built first | Yes | Yes (via `lazy`) | Yes, per element | Push-based: needs cancellation |
+| Multi-pass, `count`, indices | Yes | Not promised | Yes | No | No |
+| Asynchronous elements | No | No | No | Yes | Yes |
+| Backpressure | Not needed | Not needed | Not needed | Built in (pull) | Needs demand management |
+| Cost to write | None | Small | Larger: indices and their rules | Small to medium | Medium |
+
+**Arrays** are right whenever the data is small, finite and already in memory. **A custom sequence** wins for computed or nested data you don't want to flatten up front. **A custom collection** earns its extra code when callers need indices and random access over a representation that isn't an array, such as a ring buffer. **`AsyncSequence`** wins for paging, streaming bytes or lines, and anything consumed in a loop that may stop early.
+
+<Callout kind="interview">
+
+In a feed design, describe pagination as an iterator: the repository exposes items (or pages) as an `AsyncSequence`, owns the cursor, fetches the next page only when the list nears its end, and stops when the task is cancelled. Then say what changes for offline: the iterator reads cached pages first. Questions to ask: *Can items be inserted while I'm paging? Is the cursor stable for hours or minutes?* Red flags: fetching every page up front, exposing cursors to the view, and paging loops that ignore cancellation and keep downloading after the user has left.
+
+</Callout>
+
+<Callout kind="gotcha" title="Swift gotcha: copying an iterator may or may not copy its position">
+
+`var a = array.makeIterator(); var b = a` gives two independent positions, because `IndexingIterator` is a struct. An iterator that wraps a reference, such as `AnyIterator`, a file handle or a network stream, shares its position between copies, so advancing one advances both. Never rely on copying an iterator to "save your place"; ask the sequence for a new one, and don't share one async iterator between tasks.
+
+</Callout>
+
+```cards
+- id: iterator-intent
+  front: "What does the Iterator pattern hide?"
+  back: "The aggregate's representation. Callers ask for the next element until there are none, without knowing whether elements come from an array, a tree, a file or the network."
+- id: for-in-desugar
+  front: "What does Swift turn `for x in s` into?"
+  back: "`var it = s.makeIterator()` followed by `while let x = it.next()`. Conforming to Sequence gives every algorithm built on that `next()`."
+- id: sequence-vs-collection
+  front: "What does Collection promise that Sequence doesn't?"
+  back: "Multiple passes, finiteness, indices and an efficient `count`. A Sequence may be single-pass or infinite."
+- id: async-paging
+  front: "Why is an AsyncSequence a good fit for a paginated feed?"
+  back: "It's pull-based: pages are fetched only when the loop needs more items, so breaking early stops requests, cancellation stops paging, and cursors stay hidden."
+```
+
+```quiz
+- id: q1
+  type: mcq
+  prompt: "A search screen shows the first 20 results, but the API can stream thousands. Which return type for `results(for:)` fits best?"
+  options:
+    - "`[SearchResult]`, loading every page first"
+    - "`some AsyncSequence<SearchResult, any Error>`, fetching pages as the loop asks"
+    - "A `Collection` with indices into every possible result"
+    - "A completion handler called once with all results"
+  answer: 1
+  explain: "The screen needs a few results and may stop at any time. A pull-based async sequence fetches only what's consumed; the other options load everything before showing anything."
+- id: q2
+  type: output
+  prompt: "What does this print?"
+  code: |
+    struct Countdown: Sequence, IteratorProtocol {
+        var current: Int
+        mutating func next() -> Int? {
+            guard current > 0 else { return nil }
+            defer { current -= 1 }
+            return current
+        }
+    }
+
+    let numbers = Countdown(current: 5)
+    print(numbers.prefix(3).map { $0 * 10 })
+    print(Array(numbers))
+  answer: |
+    [50, 40, 30]
+    [5, 4, 3, 2, 1]
+  explain: "`Countdown` is a struct that is its own iterator, so each use copies it and starts again from 5. A class-based iterator would have continued from 2 on the second line: whether a sequence is multi-pass depends on the type."
+- id: q3
+  type: bug
+  prompt: "This paging iterator keeps downloading after the user leaves the screen and SwiftUI cancels the task. Which line should check for cancellation first?"
+  code: |
+    mutating func next() async throws -> Post? {
+        while buffer.isEmpty {
+            if isLastPage { return nil }
+            let page = try await loader.page(after: cursor)
+            buffer = page.posts.reversed()
+            cursor = page.nextCursor
+            isLastPage = page.nextCursor == nil
+        }
+        return buffer.popLast()
+    }
+  answer: 4
+  explain: "Before each fetch, `try Task.checkCancellation()` stops paging once the task is cancelled. Without it, a loader that ignores cancellation keeps fetching every page the loop asks for."
+- id: q4
+  type: truefalse
+  prompt: "`first(where:)` on a custom Sequence visits every element before returning."
+  answer: false
+  explain: "It calls `next()` until the predicate matches, then stops. An iterator that computes elements on demand does no work for the elements after the match."
+- id: q5
+  type: sort
+  prompt: "What should each API return?"
+  buckets: ["[Element]", "some Sequence", "AsyncSequence"]
+  items:
+    - ["The five most recent searches, shown in a list with a count", 0]
+    - ["Every file under a folder tree, for a search that stops at the first match", 1]
+    - ["Lines of a large log file being downloaded", 2]
+    - ["Every ancestor of a view, up to the window", 1]
+    - ["Pages of a social feed, fetched as the user scrolls", 2]
+  explain: "Small, finite, in-memory data with a count is an array. Computed or nested data you may stop early is a sequence. Elements that arrive over time are an async sequence."

@@ -1,0 +1,244 @@
+## Why it matters
+
+"Can this order be cancelled?" gets answered in the orders list (show the swipe action?), on the detail screen (enable the button?), in the help text, in a Core Data fetch for the "Cancellable" filter, and on the server. Written five times, the answers drift: the list lets you swipe, the button is disabled, and support gets the call. The **Specification** pattern makes a business rule a named value you can reuse and combine with *and*, *or* and *not*. Interviewers like it because it shows you know where rules belong: in the domain, once.
+
+## The pattern
+
+A specification answers one yes-or-no question about a candidate: `isSatisfied(by:)`. Its power is composition: small specifications combine into bigger ones, which are specifications too. Eric Evans and Martin Fowler described the pattern, and it's part of domain-driven design. They list three uses, and apps meet the first two constantly:
+
+- **Validation**: does this object meet the rule? (Enable the button, show the error.)
+- **Selection**: which of these objects meet it? (Filter a list, or query a store.)
+- **Building to order**: make an object that meets it. (Rarer in apps.)
+
+The point isn't the boolean logic, which `&&` already does. It's that the rule gets a **name** and a **home**, so the list, the button and the query all ask the same question.
+
+## A specification in Swift
+
+A specification can be a struct holding a name and a test, with the boolean operators defined on it. Each small rule says one thing; the business rule is built from them:
+
+```swift run title="Composable specifications for cancelling an order"
+struct Specification<Candidate> {
+    let name: String
+    private let test: (Candidate) -> Bool
+
+    init(_ name: String, _ test: @escaping (Candidate) -> Bool) {
+        self.name = name
+        self.test = test
+    }
+
+    func isSatisfied(by candidate: Candidate) -> Bool { test(candidate) }
+
+    static func && (lhs: Self, rhs: Self) -> Self {
+        Self("\(lhs.name) and \(rhs.name)") { lhs.test($0) && rhs.test($0) }
+    }
+
+    static func || (lhs: Self, rhs: Self) -> Self {
+        Self("(\(lhs.name) or \(rhs.name))") { lhs.test($0) || rhs.test($0) }
+    }
+
+    static prefix func ! (spec: Self) -> Self {
+        Self("not \(spec.name)") { !spec.test($0) }
+    }
+}
+
+enum Status { case placed, packing, dispatched, delivered }
+
+struct Order {
+    let id: String
+    let status: Status
+    let minutesSincePlaced: Int
+    let soldByMarketplaceSeller: Bool
+}
+
+// Small rules with names, then the business rule built from them
+let notDispatched = Specification<Order>("not dispatched") { [.placed, .packing].contains($0.status) }
+let placedRecently = Specification<Order>("placed within an hour") { $0.minutesSincePlaced <= 60 }
+let soldByUs = !Specification<Order>("sold by a marketplace seller") { $0.soldByMarketplaceSeller }
+
+let canCancelInApp = notDispatched && placedRecently && soldByUs
+let needsSupport = notDispatched && !canCancelInApp
+
+print("Rule:", canCancelInApp.name)
+
+let orders = [
+    Order(id: "A1", status: .placed, minutesSincePlaced: 12, soldByMarketplaceSeller: false),
+    Order(id: "B2", status: .packing, minutesSincePlaced: 95, soldByMarketplaceSeller: false),
+    Order(id: "C3", status: .placed, minutesSincePlaced: 5, soldByMarketplaceSeller: true),
+    Order(id: "D4", status: .dispatched, minutesSincePlaced: 30, soldByMarketplaceSeller: false),
+]
+
+// The same rule drives the list filter, the button and the help text
+print("Cancellable:", orders.filter(canCancelInApp.isSatisfied).map(\.id))
+for order in orders {
+    let action = canCancelInApp.isSatisfied(by: order) ? "Cancel order"
+        : needsSupport.isSatisfied(by: order) ? "Contact support to cancel" : "Return it after delivery"
+    print(order.id, "→", action)
+}
+```
+
+```output
+Rule: not dispatched and placed within an hour and not sold by a marketplace seller
+Cancellable: ["A1"]
+A1 → Cancel order
+B2 → Contact support to cancel
+C3 → Contact support to cancel
+D4 → Return it after delivery
+```
+
+Read the definition of `canCancelInApp` aloud and it's the sentence the product manager wrote. `needsSupport` reuses it rather than restating it, so when the hour becomes ninety minutes, one line changes and every screen agrees. The rules are pure functions of an order, so their tests are a table of orders and expected answers, with no UI involved.
+
+## When the rule must also be a query
+
+The closure version has a limit: a closure can only be *called*. The "Cancellable" filter over 20,000 stored orders shouldn't load every order into memory to test it. You want the store to filter, which means turning the rule into a query.
+
+That needs the rule as a **tree** rather than a closure: an enum, as in [Interpreter: mini DSLs and route grammars](/design/learn/sd-behavioural-interpreter). Then the same rule can be interpreted twice, once in memory and once as a Core Data predicate:
+
+```swift check title="One rule, interpreted in memory and as a query"
+import Foundation
+
+struct StoredOrder {
+    var status: String
+    var placedAt: Date
+    var sellerID: String?
+}
+
+indirect enum OrderRule {
+    case notDispatched
+    case placedAfter(Date)
+    case soldByUs
+    case and([OrderRule])
+    case not(OrderRule)
+
+    // Interpretation 1: test one order in memory
+    func isSatisfied(by order: StoredOrder) -> Bool {
+        switch self {
+        case .notDispatched: ["placed", "packing"].contains(order.status)
+        case .placedAfter(let date): order.placedAt > date
+        case .soldByUs: order.sellerID == nil
+        case .and(let rules): rules.allSatisfy { $0.isSatisfied(by: order) }
+        case .not(let rule): !rule.isSatisfied(by: order)
+        }
+    }
+
+    // Interpretation 2: the same rule as a Core Data query, so the store does the filtering
+    var predicate: NSPredicate {
+        switch self {
+        case .notDispatched: NSPredicate(format: "status IN %@", ["placed", "packing"])
+        case .placedAfter(let date): NSPredicate(format: "placedAt > %@", date as NSDate)
+        case .soldByUs: NSPredicate(format: "sellerID == nil")
+        case .and(let rules): NSCompoundPredicate(andPredicateWithSubpredicates: rules.map(\.predicate))
+        case .not(let rule): NSCompoundPredicate(notPredicateWithSubpredicate: rule.predicate)
+        }
+    }
+
+    static func cancellableInApp(now: Date) -> OrderRule {
+        .and([.notDispatched, .placedAfter(now.addingTimeInterval(-3600)), .soldByUs])
+    }
+}
+```
+
+Two details are worth copying. `.and([])` is satisfied by every order (`allSatisfy` on an empty list is true), so "no rules" is the null object of specifications, from the previous lesson. And `cancellableInApp(now:)` takes the current time as a parameter instead of calling `Date()` inside, so tests can pin it. Keep the two interpretations side by side, and test that they agree on a table of orders, or they'll drift exactly as the five copies did.
+
+A tree has one more payoff: it can **explain itself**. Walk it and collect the leaves that failed, and the detail screen can say "Can't cancel: it was placed more than an hour ago" instead of greying out a button. That's the second half of this lesson's kata.
+
+## Where specifications live
+
+- **In the domain layer, pure.** A specification takes a candidate (and any context, such as the time) and returns a Bool. No view models, no networking.
+- **Named after the business, not the code.** `canCancelInApp`, `qualifiesForFreeDelivery`, `isStrongPassword`. Those names appear in conversations with product, which is the point.
+- **Never the final authority.** The app's copy of "can cancel" decides what to *show*. The server must check again when the request arrives, because a client can be old, wrong or tampered with. A specification that's also sent as a rule tree, or generated from a shared definition, keeps the two in step.
+
+## Trade-offs
+
+| | Inline conditions | Closure specification | Enum (tree) specification |
+| --- | --- | --- | --- |
+| One home for the rule | No: copied per screen | Yes | Yes |
+| Readable composition | `&&` chains, unnamed | Named rules with operators | Named cases and combinators |
+| Open to new kinds of rule | Yes | Yes: any closure | No: a new case each time |
+| Explain why it failed | No | Hard | Yes: walk the tree |
+| Translate to a query or send over the wire | No | No | Yes |
+| Cost | None | A small generic type | An enum plus each interpreter |
+
+**Inline conditions** are fine for a rule used once. **Closure specifications** win when rules are many, varied and only evaluated in memory: form validation, list filters over loaded data. **Enum specifications** win when a rule must also become a query, be explained to the user, or come from the server.
+
+<Callout kind="interview">
+
+When a design has eligibility rules (free delivery, refunds, promotions, who can edit), say you'd model each as a named specification in the domain layer, composed from small rules, and reused for validation, filtering and UI state. Then add the two senior points: the server re-checks, and if the rule must filter a large store or be explained to users, it's a tree you can translate and walk. Red flags: the same condition copied into a view model, a cell and a fetch request, and client-only enforcement of a rule that affects money.
+
+</Callout>
+
+<Callout kind="gotcha" title="Swift gotcha: `Date()` inside a rule makes it untestable">
+
+A specification that reads the clock itself (`order.placedAt > Date().addingTimeInterval(-3600)`) gives different answers each time the test runs, and fails near the boundary at random. Pass `now` in, as `cancellableInApp(now:)` does, or inject a clock. The rule stays pure, and a test can stand one second either side of the hour.
+
+</Callout>
+
+## Practice
+
+**Promo eligibility rules** asks you to evaluate a basket against a tree of rules (minimum subtotal, a category in the basket, loyalty tier, first order, combined with `all`, `any` and `not`), and to report the rules a basket fails, so the checkout can say "add £4.50 to qualify" instead of nothing.
+
+```cards
+- id: spec-intent
+  front: "What does the Specification pattern give a business rule?"
+  back: "A name and a single home. The rule becomes a value with `isSatisfied(by:)` that composes with and, or and not, so every screen asks the same question."
+- id: spec-uses
+  front: "What are the main uses of a specification in an app?"
+  back: "Validation (does this one qualify?) and selection (which of these qualify, in memory or as a store query)."
+- id: closure-vs-tree
+  front: "When does a specification need to be a tree rather than a closure?"
+  back: "When it must be translated (into a predicate or server query), explained to the user, or sent over the wire. A closure can only be called."
+- id: server-authority
+  front: "Why must the server re-check a rule the app already evaluates?"
+  back: "The client's answer decides what to show. Clients can be old, wrong or tampered with, so anything involving money or permissions is enforced on the server."
+```
+
+```quiz
+- id: q1
+  type: mcq
+  prompt: "The \"Ending soon\" filter must run over 50,000 stored listings, and the same rule decides whether a listing's detail screen shows a countdown. Which design fits best?"
+  options:
+    - "A closure specification, used to filter every listing loaded from the store"
+    - "A rule tree interpreted twice: as a store predicate for the filter, and in memory for the detail screen"
+    - "Two separate conditions, one in the fetch request and one in the view model"
+    - "Ask the server for the filter and compute the countdown rule in the view"
+  answer: 1
+  explain: "The store should do the filtering, which needs a rule you can translate; the detail screen needs the same rule in memory. A tree gives both from one definition, and a test can check they agree."
+- id: q2
+  type: output
+  prompt: "Using the lesson's `Specification`, what does this print?"
+  code: |
+    struct Specification<Candidate> {
+        let name: String
+        let test: (Candidate) -> Bool
+        static func && (lhs: Self, rhs: Self) -> Self {
+            Self(name: "\(lhs.name) and \(rhs.name)") { lhs.test($0) && rhs.test($0) }
+        }
+        static prefix func ! (spec: Self) -> Self {
+            Self(name: "not \(spec.name)") { !spec.test($0) }
+        }
+    }
+
+    let long = Specification<String>(name: "long") { $0.count >= 8 }
+    let hasDigit = Specification<String>(name: "has a digit") { $0.contains(where: \.isNumber) }
+    let strong = long && hasDigit && !Specification(name: "is 'password1'") { $0 == "password1" }
+
+    print(strong.name)
+    print(["sunshine", "sunshine7", "password1"].map(strong.test))
+  answer: |
+    long and has a digit and not is 'password1'
+    [false, true, false]
+  explain: "Names compose the same way the tests do. \"sunshine\" has no digit, \"sunshine7\" passes all three, and \"password1\" is long with a digit but fails the last rule."
+- id: q3
+  type: truefalse
+  prompt: "Once the app checks `canCancelInApp` before sending the cancel request, the server doesn't need to check it again."
+  answer: false
+  explain: "The app's check is for the interface. A request can come from an old build with an outdated rule, or a modified client, so the server enforces the rule itself."
+- id: q4
+  type: multi
+  prompt: "Which make a specification easier to test? Choose all that apply."
+  options:
+    - "Passing the current time in as a parameter"
+    - "Keeping it free of view models and networking"
+    - "Reading the signed-in user from a singleton inside the rule"
+    - "Testing it with a table of candidates and expected answers"
+  answer: [0, 1, 3]
+  explain: "A pure rule with its context passed in is a function you can test with a table. A singleton read inside the rule hides an input, so tests must set up global state."

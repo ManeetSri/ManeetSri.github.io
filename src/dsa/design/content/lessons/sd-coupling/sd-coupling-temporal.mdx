@@ -1,0 +1,268 @@
+## Why it matters
+
+"You must call `configure()` before anything else." "Set `viewModel` before the view loads." "Always call `end` after `begin`." Each of those sentences describes a coupling that lives only in documentation, and each is a crash or a flaky bug waiting for a new teammate. Temporal coupling is behind launch crashes, intermittent `401`s and SDKs that are easy to misuse. Interviewers who ask you to design a component or an SDK listen for whether you make the wrong order impossible, rather than writing it in a README.
+
+## What temporal coupling is
+
+Two operations are **temporally coupled** when they only work if they happen in a particular order, or together, and nothing in the code enforces it. It comes in two shapes:
+
+- **Order:** B only works after A. `FirebaseApp.configure()` before any other Firebase call. `register(_:forCellReuseIdentifier:)` before `dequeueReusableCell(withIdentifier:for:)`, or UIKit throws an exception saying it's unable to dequeue a cell with that identifier.
+- **Pairing:** every A needs a matching B. Each `beginBackgroundTask` needs an `endBackgroundTask`, or iOS terminates the app when the time runs out. A `CheckedContinuation` must be resumed exactly once: twice is a crash, and never leaves the waiting task suspended forever, with a "leaked its continuation" warning in the console.
+
+The coupling itself is often unavoidable: you can't capture a payment you haven't authorised. The design problem is when the order is **hidden**: the types allow the wrong order, so the compiler accepts it and only a user finds out.
+
+A very common iOS version is the two-phase view controller:
+
+```swift check ios title="Two-phase set-up"
+import UIKit
+
+final class OrderViewModel {
+    let title = "Order 42"
+}
+
+final class OrderViewController: UIViewController {
+    // Must be set by whoever creates the screen, before viewDidLoad
+    var viewModel: OrderViewModel!
+
+    override func viewDidLoad() {
+        super.viewDidLoad()
+        title = viewModel.title
+    }
+}
+```
+
+The implicitly unwrapped optional is a comment that crashes. Forget the assignment, or set it after `view` has been touched (accessing `view` loads it, which runs `viewDidLoad` straight away), and the app stops.
+
+## Making the wrong order impossible
+
+There are four standard moves. Each turns an order that lives in people's heads into one the compiler checks.
+
+### 1. Ask for it in the initialiser
+
+If an object can't work without something, its initialiser takes it. Then there's no "created but not ready" state to misuse.
+
+```swift check ios title="One-phase set-up"
+import UIKit
+
+final class OrderViewModel {
+    let title = "Order 42"
+}
+
+final class OrderViewController: UIViewController {
+    private let viewModel: OrderViewModel
+
+    init(viewModel: OrderViewModel) {
+        self.viewModel = viewModel
+        super.init(nibName: nil, bundle: nil)
+    }
+
+    @available(*, unavailable)
+    required init?(coder: NSCoder) {
+        fatalError("Created in code, with a view model")
+    }
+
+    override func viewDidLoad() {
+        super.viewDidLoad()
+        title = viewModel.title
+    }
+}
+```
+
+Storyboards used to force two-phase set-up, because UIKit created the controller for you. Since iOS 13, `instantiateViewController(identifier:creator:)` lets you call your own `init?(coder:viewModel:)`, so even storyboard screens can take their dependencies up front.
+
+### 2. Pass the result along
+
+When B needs something A produces, make A *return* it and B *take* it. "Sign in, then fetch" with a shared token in between is hidden order. `let token = try await session.token()` followed by `api.orders(token: token)` is the same order, but now B can't be called without A's output.
+
+### 3. A type for each stage
+
+When a process has stages, give each stage its own type, and offer each operation only on the type where it's valid. This is called **typestate**. Placing an order with prices the user hasn't seen is a real bug in shopping apps; here it can't be written:
+
+```swift run title="Typestate: you can't order an unpriced basket"
+struct Basket {
+    var items: [String: Int]   // product ID → quantity
+}
+
+// Only the pricing service makes these, so holding one proves the basket was priced
+struct PricedBasket {
+    let basket: Basket
+    let totalPence: Int
+    let quoteID: String
+    fileprivate init(basket: Basket, totalPence: Int, quoteID: String) {
+        self.basket = basket
+        self.totalPence = totalPence
+        self.quoteID = quoteID
+    }
+}
+
+struct Checkout {
+    let prices: [String: Int]
+
+    func price(_ basket: Basket) -> PricedBasket {
+        let total = basket.items.reduce(0) { sum, item in sum + (prices[item.key] ?? 0) * item.value }
+        return PricedBasket(basket: basket, totalPence: total, quoteID: "Q-\(total)")
+    }
+
+    // There's no placeOrder(_ basket: Basket): an unpriced basket has no way in
+    func placeOrder(_ priced: PricedBasket) -> String {
+        "Ordered for \(priced.totalPence)p under quote \(priced.quoteID)"
+    }
+}
+
+let checkout = Checkout(prices: ["tea": 350, "mug": 900])
+let priced = checkout.price(Basket(items: ["tea": 2, "mug": 1]))
+print(checkout.placeOrder(priced))
+```
+
+```output
+Ordered for 1600p under quote Q-1600
+```
+
+In a real app, `PricedBasket`'s initialiser would be `private` to the checkout module, so no other code could forge one. The order "price, then place" is now a fact about the types, not a line in the docs. Swift's `~Copyable` types can go one step further and make a value usable only once, so a quote can't be placed twice; you'll meet them in D06.
+
+### 4. Scope the pair with a closure
+
+When two calls must bracket some work, replace them with one call that takes the work as a closure. The API runs the closing half for you, even if the work throws.
+
+```swift check ios title="The pair becomes one call"
+import UIKit
+
+func thumbnail(of image: UIImage, side: CGFloat) -> UIImage {
+    let size = CGSize(width: side, height: side)
+    // Replaces UIGraphicsBeginImageContextWithOptions … UIGraphicsEndImageContext, deprecated in iOS 17
+    return UIGraphicsImageRenderer(size: size).image { _ in
+        image.draw(in: CGRect(origin: .zero, size: size))
+    }
+}
+```
+
+Apple has moved a whole family of APIs this way: `Mutex.withLock` instead of lock and unlock, `withTaskGroup` instead of tracking child tasks yourself, `performBatchUpdates` for collection view changes. When you design an API with a "begin" and an "end", consider whether it should be a `with…` function instead.
+
+## Hidden order in async code
+
+With `async` code, temporal coupling turns into races. Here's a launch sequence that works on the developer's phone and fails for users with a slower Keychain or network. The session restores a saved token and refreshes it; meanwhile the root view's `.task` loads the feed:
+
+```visual timeline
+title: The feed asks before the session is ready
+unit: ms
+lanes:
+  - { id: session, label: Session }
+  - { id: before, label: Feed (as written) }
+  - { id: after, label: Feed (awaits token) }
+spans:
+  - { lane: session, from: 0, to: 300, label: Keychain + refresh, tone: wait }
+  - { lane: before, from: 20, to: 140, label: GET /feed → 401, tone: error }
+  - { lane: after, from: 20, to: 300, label: waiting for token, tone: wait }
+  - { lane: after, from: 300, to: 420, label: GET /feed → 200, tone: ok }
+markers:
+  - { at: 300, label: token ready }
+steps:
+  - { at: 0, say: "Launch. The session starts reading the saved token from the Keychain and refreshing it." }
+  - { at: 20, say: "The root view's `.task` starts loading the feed straight away. Nothing in the code says it has to wait." }
+  - { at: 140, say: "The request went out without a token, so the server answers `401` and the feed shows an error." }
+  - { at: 300, say: "The token arrives 160 ms too late. On a fast phone it might have won the race, which is how this bug gets past testing." }
+  - { at: 420, say: "When `token()` **awaits** the restore, the same request starts at 300 ms and succeeds. The order is now in the code." }
+```
+
+The fix is to make "wait for the session" part of asking for a token. The session starts restoring as soon as it's created, and anyone who asks for a token waits for that restore, however early they ask:
+
+```swift check title="SessionStore.swift"
+actor SessionStore {
+    private let restored: Task<String?, Never>
+
+    // Restoring starts at creation, so there's no start() to forget to call
+    init(restore: @escaping @Sendable () async -> String?) {
+        restored = Task { await restore() }
+    }
+
+    /// The signed-in user's token, once the saved session has loaded
+    func token() async -> String? {
+        await restored.value
+    }
+}
+```
+
+Notice that the initialiser *starts* the work. A separate `start()` method would have been one more hidden order.
+
+## Trade-offs
+
+| Technique | Who catches a mistake | Cost | Wins when |
+| --- | --- | --- | --- |
+| A comment or a README | A user, in production | Nothing up front | Never, on its own |
+| A `precondition` at run time | A developer, if that path runs in testing | A line per rule | Internal code where a type change isn't worth it |
+| Ask for it in the initialiser | The compiler | Larger initialisers | An object that can't work without the dependency |
+| Pass the result along | The compiler | Values threaded through calls | B needs A's output |
+| A type per stage | The compiler | A type per stage, more to read | Multi-step flows: payments, uploads, onboarding |
+| A closure-scoped API | The compiler | Work must fit in a closure | Pairs: lock and unlock, begin and end |
+
+Prefer the compiler. A precondition is a reasonable fallback inside one module, where you control every caller. Typestate is powerful but heavy: use it for the flows where the wrong order costs money or data.
+
+<Callout kind="interview">
+
+**Say** how your component prevents misuse: "The client is created by `configure(apiKey:)`, so there's no unconfigured client to call," or "Upload stages are types, so you can't send before compressing." **Ask** what happens if the app calls the component early, during launch, before the user has signed in. **Red flags:** set-up methods that must be called in order, implicitly unwrapped dependencies, and "it works because the network is usually slower than the Keychain".
+
+</Callout>
+
+<Callout kind="gotcha" title="iOS gotcha: create cell registrations once">
+
+`UICollectionView.CellRegistration` (iOS 14) removes the register-then-dequeue ordering, because you dequeue *with* the registration rather than with a string identifier. But it adds an ordering of its own: create the registration once, outside the diffable data source's cell provider. Creating it inside the provider prevents reuse, and from iOS 15 UIKit throws an exception.
+
+</Callout>
+
+## Practice
+
+The review **the checkout screen** has a view controller that must be configured before it loads, and a payment SDK with a set-up call that has to come first. Find both, and say which of the four moves you'd use for each.
+
+```cards
+- id: temporal-definition
+  front: "What is temporal coupling?"
+  back: "Operations that only work in a particular order, or as a pair, when nothing in the code enforces it. The order lives in documentation, so the compiler accepts the wrong one."
+- id: temporal-fixes
+  front: "What are the four ways to make a required order impossible to get wrong?"
+  back: "Ask for the dependency in the initialiser, pass A's result into B, give each stage its own type (typestate), or scope a pair of calls with a closure."
+- id: start-method
+  front: "Why should a session object start restoring in its initialiser rather than in a `start()` method?"
+  back: "A separate `start()` is another hidden order that a caller can forget. Starting in `init` and making `token()` await the restore puts the order in the code."
+```
+
+```quiz
+- id: q1
+  type: mcq
+  prompt: "An analytics SDK's README says: \"Call `Analytics.setup(key:)` before calling `Analytics.track(_:)`.\" How would you redesign the API so the wrong order can't compile?"
+  options:
+    - "Make `track` log a warning when called before `setup`"
+    - "Make `setup(key:)` return an `AnalyticsClient`, and put `track` only on that client"
+    - "Call `setup` automatically from `track` with a default key"
+    - "Add a `isSetUp` property callers can check"
+  answer: 1
+  explain: "If the only way to get something with `track` is to call `setup`, there's no unconfigured state to misuse. A warning or an `isSetUp` flag still lets the wrong order compile, and a default key hides a configuration bug."
+- id: q2
+  type: sort
+  prompt: "Which technique fits each problem best?"
+  buckets: [Initialiser parameter, Pass the result along, A type per stage, Closure-scoped API]
+  items:
+    - [A view controller that crashes if `viewModel` isn't set before it loads, 0]
+    - ["Every `beginUpdates()` on a custom chart must be matched by `endUpdates()`", 3]
+    - [An upload must be compressed then encrypted then sent, 2]
+    - [Fetching orders needs the token that signing in produces, 1]
+  explain: "A dependency the object can't live without belongs in `init`. A begin and end pair becomes one call taking a closure. A multi-step flow gets a type per stage. When B needs A's output, return it from A and take it in B."
+- id: q3
+  type: truefalse
+  prompt: "Accessing a view controller's `view` property before setting its dependencies is safe, because `viewDidLoad` only runs when the screen appears."
+  answer: false
+  explain: "Accessing `view` loads it if it isn't loaded, and `viewDidLoad` runs immediately, so a dependency set afterwards is too late. That's one reason two-phase set-up is fragile."
+- id: q4
+  type: mcq
+  prompt: "In the timeline above, why did the bug pass testing on the developer's phone?"
+  options:
+    - "The Simulator doesn't have a Keychain"
+    - "On a fast device the session's restore usually finished before the feed's request went out, so the hidden order happened to hold"
+    - "`.task` runs after the session restores on debug builds"
+    - "The server accepted requests without a token in staging"
+  answer: 1
+  explain: "Hidden order in async code becomes a race. When the restore usually wins, everything works until a slower Keychain, network or device changes who wins. Awaiting the restore removes the race."
+- id: q5
+  type: recall
+  prompt: "Your `PhotoUploader` has `prepare()`, `upload()` and `cleanUp()`, which must be called in that order, with `cleanUp()` always called even if `upload()` throws. Sketch an API that enforces this."
+  model: "One call that owns the order: `func upload(_ photo: Photo) async throws -> UploadReceipt`, which prepares, uploads and cleans up inside, using `defer` for the clean-up so it runs even when the upload throws. If callers need control between stages, use a type per stage: `prepare()` returns a `PreparedUpload`, and only that type has `upload()`, which returns a receipt and cleans up before returning or throwing."
+```

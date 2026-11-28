@@ -1,0 +1,534 @@
+## Why it matters
+
+A media player, an upload, a phone call, a checkout and a sign-in screen all behave differently depending on what mode they're in: "pause" means one thing while playing and nothing at all while loading. Code that tracks the mode with a handful of booleans ends up with `if` statements in every method and states that should be impossible. The **State** pattern gives each mode its own place, and interviewers use it to see whether you can model behaviour, not only data.
+
+## The problem: behaviour that depends on a mode
+
+Here's a podcast player as it often starts life:
+
+```swift check title="Boolean soup"
+final class PlayerController {
+    var isLoading = false
+    var isPlaying = false
+    var hasFailed = false
+    var position = 0
+
+    func playPauseTapped() {
+        if isLoading || hasFailed { return }
+        if isPlaying {
+            isPlaying = false
+            // pause, save position
+        } else {
+            isPlaying = true
+            // play from position
+        }
+    }
+
+    func loadFailed() {
+        isLoading = false
+        hasFailed = true
+        // forgot isPlaying = false? Then the UI shows "playing" and "failed" at once
+    }
+}
+```
+
+Three booleans give eight combinations, and only four of them mean anything. Every method has to re-derive "which mode am I in?" from the flags, and every new method is another chance to forget one. When a bug report says "the spinner and the error showed together", this is why.
+
+The fix has two parts, and they're worth keeping apart in your head:
+
+1. **Name the modes.** The player is *idle*, *loading*, *playing*, *paused* or *failed*: exactly one at a time.
+2. **Put each mode's behaviour in one place.** What "play/pause" does depends on the mode, so the mode should decide.
+
+You did the first part in [Making illegal states unrepresentable with enums](/design/learn/sd-modelling-illegal-states), and wrote transition functions in [Enum state machines](/design/learn/sd-functional-state-machines). This lesson is about the second part: the Gang of Four's **State** pattern, the object-oriented version it describes, and why Swift code usually ends up with an enum instead.
+
+## The classic pattern: one object per state
+
+The Gang of Four describe State as letting an object change its behaviour when its internal state changes, so that it *appears to change its class*. The design has three parts:
+
+- A **context**: the object the rest of the app talks to (the `Player`).
+- A **state protocol** with one method per event the context receives.
+- One **concrete state** type per mode. Each implements the events it cares about and decides which state comes next.
+
+```swift check title="State objects in Swift"
+protocol AudioEngine {
+    func play()
+    func pause()
+}
+
+protocol PlaybackState {
+    func loaded(_ player: Player) -> any PlaybackState
+    func togglePlayPause(_ player: Player) -> any PlaybackState
+}
+
+// By default a state ignores an event: it stays as it is
+extension PlaybackState {
+    func loaded(_ player: Player) -> any PlaybackState { self }
+    func togglePlayPause(_ player: Player) -> any PlaybackState { self }
+}
+
+struct Loading: PlaybackState {
+    func loaded(_ player: Player) -> any PlaybackState {
+        player.engine.play()
+        return Playing()
+    }
+}
+
+struct Playing: PlaybackState {
+    func togglePlayPause(_ player: Player) -> any PlaybackState {
+        player.engine.pause()
+        return Paused()
+    }
+}
+
+struct Paused: PlaybackState {
+    func togglePlayPause(_ player: Player) -> any PlaybackState {
+        player.engine.play()
+        return Playing()
+    }
+}
+
+final class Player {
+    let engine: any AudioEngine
+    private var state: any PlaybackState = Loading()
+
+    init(engine: any AudioEngine) {
+        self.engine = engine
+    }
+
+    // The context forwards every event to whichever state it's in
+    func loaded() { state = state.loaded(self) }
+    func togglePlayPause() { state = state.togglePlayPause(self) }
+}
+```
+
+The `if` statements have gone. `Player` never asks what mode it's in: it hands the event to the current state, and the state's type *is* the answer. Adding a "buffering" mode means adding a `Buffering` type, without touching the others, which is the open–closed principle at work.
+
+### Apple ships this one: GKStateMachine
+
+GameplayKit (iOS and macOS) has the object version built in. Each state is a `GKState` subclass, `isValidNextState(_:)` lists where it may go, and `didEnter(from:)` and `willExit(to:)` are **entry and exit actions**: code that runs whenever you arrive in or leave a state, whichever transition got you there.
+
+```swift check title="GameplayKit's state machine"
+import GameplayKit
+
+final class IdleState: GKState {
+    override func isValidNextState(_ stateClass: AnyClass) -> Bool {
+        stateClass is LoadingState.Type
+    }
+}
+
+final class LoadingState: GKState {
+    override func didEnter(from previousState: GKState?) {
+        // Entry action: start fetching the episode
+    }
+
+    override func isValidNextState(_ stateClass: AnyClass) -> Bool {
+        stateClass is PlayingState.Type || stateClass is FailedState.Type
+    }
+}
+
+final class PlayingState: GKState {
+    override func willExit(to nextState: GKState) {
+        // Exit action: remember the position, whatever comes next
+    }
+}
+
+final class FailedState: GKState {
+    override func isValidNextState(_ stateClass: AnyClass) -> Bool {
+        stateClass is LoadingState.Type
+    }
+}
+
+let machine = GKStateMachine(states: [IdleState(), LoadingState(), PlayingState(), FailedState()])
+machine.enter(IdleState.self)
+let started = machine.enter(LoadingState.self)     // true
+let skipped = machine.enter(IdleState.self)        // false: Loading doesn't allow it
+```
+
+It's built for games (states also get `update(deltaTime:)` every frame), but it shows the shape clearly. Notice what it *doesn't* give you. The states are long-lived instances created up front, so data that belongs to one visit (this episode, this error) can't travel with the transition; it has to be set on a state or on the context first. And `enter(_:)` takes a class and can be called by anyone holding the machine, so nothing keeps the decisions about what comes next in one place.
+
+### What the object version costs
+
+- **Transitions are scattered.** To answer "how do we get to Paused?" you read every state type. There's no single table to review.
+- **Per-state data leaks into the context.** The position, the episode and the error all end up as optional properties on `Player`, because the state objects are recreated on each transition. That's the boolean soup coming back as optionals.
+- **Adding an event touches every state.** A new `seek` event is a new protocol requirement; the protocol-extension default quietly ignores it in every state you forget, and the compiler can't tell you which.
+
+## The Swift version: an enum that owns its data
+
+Swift enums with associated values fix the last two problems at once. Each case carries exactly the data that exists in that mode: there's an error only in `.failed`, and a position only while playing or paused. One `switch` over the pair *(state, event)* is the whole transition table.
+
+The machine also **returns effects** instead of performing them: values that say "start loading this", "pause the engine". Something else carries them out. That keeps the machine a pure function you can test with plain values, as in [Functional core, imperative shell](/design/learn/sd-functional-core-shell).
+
+```swift run title="A podcast player as an enum state machine"
+struct Episode: Equatable, CustomStringConvertible {
+    let id: String
+    let title: String
+    var description: String { id }
+}
+
+enum Playback: Equatable {
+    case idle
+    case loading(Episode)
+    case playing(Episode, at: Int)
+    case paused(Episode, at: Int)
+    case failed(Episode, reason: String)
+
+    enum Event {
+        case select(Episode)
+        case loaded
+        case loadFailed(String)
+        case tick
+        case togglePlayPause
+        case retry
+    }
+
+    enum Effect: Equatable {
+        case startLoading(Episode)
+        case play(from: Int)
+        case pause
+        case savePosition(Int)
+        case showError(String)
+    }
+
+    mutating func handle(_ event: Event) -> [Effect] {
+        switch (self, event) {
+        case (_, .select(let episode)):
+            self = .loading(episode)
+            return [.startLoading(episode)]
+        case (.loading(let episode), .loaded):
+            self = .playing(episode, at: 0)
+            return [.play(from: 0)]
+        case (.loading(let episode), .loadFailed(let reason)):
+            self = .failed(episode, reason: reason)
+            return [.showError(reason)]
+        case (.playing(let episode, let seconds), .tick):
+            self = .playing(episode, at: seconds + 1)
+            return []
+        case (.playing(let episode, let seconds), .togglePlayPause):
+            self = .paused(episode, at: seconds)
+            return [.pause, .savePosition(seconds)]
+        case (.paused(let episode, let seconds), .togglePlayPause):
+            self = .playing(episode, at: seconds)
+            return [.play(from: seconds)]
+        case (.failed(let episode, _), .retry):
+            self = .loading(episode)
+            return [.startLoading(episode)]
+        case (.idle, _), (.loading, _), (.playing, _), (.paused, _), (.failed, _):
+            return []   // any other pair: this state ignores this event
+        }
+    }
+}
+
+let episode = Episode(id: "ep42", title: "Designing for offline")
+var playback = Playback.idle
+let events: [Playback.Event] = [.togglePlayPause, .select(episode), .loadFailed("timed out"), .retry, .loaded, .tick, .tick, .togglePlayPause, .tick, .togglePlayPause]
+
+for event in events {
+    let effects = playback.handle(event).map { "\($0)" }.joined(separator: ", ")
+    let line = "\(event) → \(playback)"
+    print(effects.isEmpty ? line : "\(line) · \(effects)")
+}
+```
+
+```output
+togglePlayPause → idle
+select(ep42) → loading(ep42) · startLoading(ep42)
+loadFailed("timed out") → failed(ep42, reason: "timed out") · showError("timed out")
+retry → loading(ep42) · startLoading(ep42)
+loaded → playing(ep42, at: 0) · play(from: 0)
+tick → playing(ep42, at: 1)
+tick → playing(ep42, at: 2)
+togglePlayPause → paused(ep42, at: 2) · pause, savePosition(2)
+tick → paused(ep42, at: 2)
+togglePlayPause → playing(ep42, at: 2) · play(from: 2)
+```
+
+Read the output as a test log. Play/pause while idle does nothing. A tick while paused doesn't move the position. Every interesting rule is one `case` line, and you can review the whole behaviour of the player on one screen.
+
+Walk the same events through the diagram:
+
+```visual states
+title: The player's states, walked event by event
+states:
+  - { id: idle, label: Idle, at: [0, 0] }
+  - { id: loading, label: Loading, at: [1, 0] }
+  - { id: playing, label: Playing, at: [2, 0] }
+  - { id: failed, label: Failed, at: [1, 1] }
+  - { id: paused, label: Paused, at: [2, 1] }
+initial: idle
+transitions:
+  - [idle, loading, select]
+  - [loading, playing, loaded]
+  - [loading, failed, loadFailed]
+  - [failed, loading, retry]
+  - [playing, playing, tick]
+  - [playing, paused, togglePlayPause]
+  - [paused, playing, togglePlayPause]
+  - [playing, loading, select]
+events:
+  - { event: select, say: "Choosing an episode starts loading it. The episode travels **inside** the `.loading` case, not in a separate optional property." }
+  - { event: loadFailed, say: "The load times out. Only `.failed` has a reason, so the UI can't show an error in any other state." }
+  - { event: retry, say: "Retry goes back to **Loading** with the same episode, which `.failed` kept for exactly this." }
+  - { event: loaded, say: "Loaded: playback starts from 0, and the machine returns a `play` effect for the engine to perform." }
+  - { event: tick, say: "Each tick moves the position. A tick in any other state is ignored by the catch-all line." }
+  - { event: togglePlayPause, say: "Pause returns **two** effects, pause the engine and save the position, so resuming on another device can pick up there." }
+  - { event: togglePlayPause, say: "Play again resumes from the saved position: the data the next state needs came with the transition." }
+```
+
+### The catch-all line is a design decision
+
+The last case lists every state with `_` instead of writing `default:`. It's the middle way between `default` and spelling out all thirty pairs, and today it does the same as `default`. The difference shows up next month, when someone adds `.buffering`: with `default`, the new state silently ignores every event; with the explicit list, the compiler stops and makes you decide what `.buffering` does with each one. Exhaustiveness is the main reason to prefer an enum, so don't switch it off with `default` in the one place it matters most.
+
+## Effects: the machine decides, the shell does
+
+As with the shell you wrote in D07, the view model that owns the machine is thin. It sends events in and performs whatever comes out:
+
+```swift
+@MainActor @Observable
+final class PlayerModel {
+    private(set) var playback = Playback.idle
+    private let engine = AVPlayer()
+
+    func send(_ event: Playback.Event) {
+        for effect in playback.handle(event) {
+            switch effect {
+            case .startLoading(let episode): load(episode)   // async work sends .loaded or .loadFailed back
+            case .play(let seconds): engine.seek(to: CMTime(seconds: Double(seconds), preferredTimescale: 1)); engine.play()
+            case .pause: engine.pause()
+            case .savePosition(let seconds): saveProgress(seconds)
+            case .showError: break   // the view reads the error from playback itself
+            }
+        }
+    }
+}
+```
+
+The SwiftUI view switches over `model.playback` to decide what to draw, and calls `model.send(.togglePlayPause)` from its button. Tests never touch AVPlayer: they feed events to `Playback` and compare states and effects, as the output above did.
+
+Apple's own APIs report state the same way: `AVPlayer.timeControlStatus`, `URLSessionTask.state`, `UIGestureRecognizer.state` and the Network framework's `NWConnection.State` (whose `.waiting(NWError)` case carries the reason it's waiting, exactly like `.failed` above). Translating them into *your* events at the edge keeps the machine yours:
+
+```swift check title="Turning Apple's state into your events"
+import AVFoundation
+
+enum EngineSignal {
+    case paused, buffering, playing
+}
+
+func signal(for status: AVPlayer.TimeControlStatus) -> EngineSignal {
+    switch status {
+    case .paused: .paused
+    case .waitingToPlayAtSpecifiedRate: .buffering
+    case .playing: .playing
+    @unknown default: .paused
+    }
+}
+```
+
+The `@unknown default` isn't optional. Apple's enums aren't frozen, so a future iOS may add cases, and in Swift 6 language mode a switch without it is a compile error rather than the warning it was in Swift 5 mode. Mapping to your own enum here keeps that one awkward branch at the edge, and every switch inside the app stays exhaustive over cases you control.
+
+## Machines inside machines
+
+As a machine grows, some events apply to a whole group of states. A call can be hung up whether it's dialling, ringing, connected or on hold. Rather than repeating that rule four times, **nest** the states: an outer enum for the big phases, and an inner one for the details of the active phase.
+
+```swift check title="Hierarchical states"
+enum Call: Equatable {
+    case idle
+    case active(Phase)
+    case ended(reason: String)
+
+    enum Phase: Equatable {
+        case dialling
+        case ringing
+        case connected(muted: Bool)
+        case onHold
+    }
+
+    enum Event {
+        case dial, remoteRang, answered, toggleMute, hold, resume, hangUp
+    }
+
+    mutating func handle(_ event: Event) {
+        switch (self, event) {
+        case (.idle, .dial):
+            self = .active(.dialling)
+        case (.active, .hangUp):                  // one rule for every active phase
+            self = .ended(reason: "hung up")
+        case (.active(let phase), _):
+            self = .active(phase.handle(event))   // everything else is the phase's business
+        case (.idle, _), (.ended, _):
+            break
+        }
+    }
+}
+
+extension Call.Phase {
+    func handle(_ event: Call.Event) -> Call.Phase {
+        switch (self, event) {
+        case (.dialling, .remoteRang): .ringing
+        case (.ringing, .answered): .connected(muted: false)
+        case (.connected(let muted), .toggleMute): .connected(muted: !muted)
+        case (.connected, .hold): .onHold
+        case (.onHold, .resume): .connected(muted: false)
+        case (.dialling, _), (.ringing, _), (.connected, _), (.onHold, _): self
+        }
+    }
+}
+```
+
+The outer machine handles what all active phases share; the inner one handles what differs. This is the core idea of David Harel's **statecharts**, the notation behind UML state diagrams (you drew them in D09). Nesting keeps each switch small, and it's how large flows like a checkout stay readable.
+
+## State machines meet Swift concurrency
+
+A state machine inside an actor or a `@MainActor` model has one trap: **every `await` is a point where other code can run**. If you read the state, await a download, and then write the next state, the user may have tapped cancel in between, and your write undoes their cancel. Two rules keep it safe:
+
+- **Claim the transition before you suspend.** Move to `.downloading` *before* the first `await`, so a second tap sees it and does nothing.
+- **Re-check after you resume.** When the `await` returns, confirm you're still in the state you left, and drop the result if you're not.
+
+```swift check title="Transitions around an await"
+import Foundation
+
+@MainActor
+final class EpisodeDownload {
+    enum State {
+        case idle
+        case downloading(Task<Data, any Error>)
+        case downloaded(Data)
+        case failed(String)
+    }
+
+    private(set) var state = State.idle
+
+    func start(from url: URL) async {
+        guard case .idle = state else { return }   // already started: ignore a double tap
+        let task = Task { try await URLSession.shared.data(from: url).0 }
+        state = .downloading(task)                 // claim the transition before any await
+        do {
+            let data = try await task.value
+            guard case .downloading = state else { return }   // cancelled while we waited
+            state = .downloaded(data)
+        } catch {
+            guard case .downloading = state else { return }
+            state = .failed(error.localizedDescription)
+        }
+    }
+
+    func cancel() {
+        guard case .downloading(let task) = state else { return }
+        task.cancel()
+        state = .idle
+    }
+}
+```
+
+This is **actor reentrancy**: actors stop data races, but not interleavings like this one. A synchronous `handle(_:)` that returns effects, as in the podcast player, avoids the problem entirely, because nothing can interleave inside a function that never suspends.
+
+## Trade-offs
+
+| | Booleans and optionals | Enum state machine | State objects (GoF, GKStateMachine) |
+| --- | --- | --- | --- |
+| Impossible states | Easy to create | Can't be represented | Prevented for the mode; per-state data still leaks into the context |
+| Adding a state | Another flag, every method rechecks | Compiler lists every switch to update | Add one type; others untouched |
+| Adding an event | One more method full of `if`s | Add a case; the compiler finds the gaps | A new requirement on every state; defaults hide gaps |
+| Seeing every transition | Nowhere | One switch | Spread across types |
+| Per-state data | Optionals that must agree | Associated values | Usually on the context |
+| Testing | Set flags, hope | Pure values in, values out | Needs the context and fakes |
+| Persisting or restoring | Field by field | `Codable` comes almost free | Hand-written |
+
+**Booleans** are fine for one independent flag (`isFavourite`). **An enum** wins for almost every app-level machine: screens, uploads, players, flows, where the set of states is known and reviewing transitions matters. **State objects** win when states are added by other teams or plug-ins (an open set), or when each state is big enough to deserve its own file, as in a game's AI.
+
+<Callout kind="interview">
+
+When a design has a "status" field, say the states out loud and draw the transitions, including failure and recovery: "an upload is queued, uploading, paused, waiting to retry, failed or done; cancel works from every active state." Then say where the effects run. Good questions to ask: *Which states survive the app being killed? What can the user do in each one?* Red flags interviewers listen for: parallel booleans (`isLoading` and `error` both set), a `default:` that swallows new states, and async code that writes state after an `await` without checking it's still current.
+
+</Callout>
+
+<Callout kind="gotcha" title="iOS gotcha: don't restore a state whose work died with the process">
+
+Enums with associated values get `Codable` almost for free, so it's tempting to save the machine's state and restore it at launch. But some states describe work in flight: `.loading`, `.uploading(attempt:sent:)`, `.waitingToRetry`. When iOS terminates a suspended app, its requests and timers die with it, and restoring `.uploading` shows progress that will never move. Map in-flight states to resting ones when you save (`.uploading` becomes `.paused`), or send the machine an event at launch (`.relaunched`) and let it decide. Background `URLSession` transfers are the exception: they keep running in a system process, and the app reconnects to them by the session's identifier.
+
+</Callout>
+
+<Callout kind="gotcha" title="iOS gotcha: gesture recognisers are state machines too">
+
+`UIGestureRecognizer.state` moves through `.possible`, `.began`, `.changed`, `.ended`, `.cancelled` and `.failed`. A discrete gesture such as a tap goes straight to `.recognized`, which is the same value as `.ended`. Handle `.cancelled` as well as `.ended` in a pan handler, or a phone call interrupting a drag leaves your view half-moved.
+
+</Callout>
+
+## Practice
+
+**An upload state machine** asks you to write the machine behind a resumable photo upload: pause and resume from the bytes already sent, retries with a growing delay and an attempt limit, cancel from every active state, and effects for the shell to perform. The tests walk it event by event, the way the output above did.
+
+```cards
+- id: state-pattern-intent
+  front: "What problem does the State pattern solve?"
+  back: "Behaviour that depends on a mode. Each mode's behaviour lives in one place, so methods stop re-deriving the mode from flags and the object seems to change its class."
+- id: enum-vs-objects
+  front: "When do state objects beat an enum state machine?"
+  back: "When the set of states is open (added by plug-ins or other teams) or each state is large. For a known set of app states, an enum gives exhaustive checks, per-state data and one place to read every transition."
+- id: catch-all
+  front: "Why list every state with `_` instead of writing `default:` in a transition switch?"
+  back: "So adding a state is a compile error until you decide how it handles each event. `default` silently makes the new state ignore everything."
+- id: reentrancy
+  front: "What are the two rules for state transitions around an `await`?"
+  back: "Claim the transition before suspending, and re-check the state after resuming, because other code can run on the actor while you wait."
+```
+
+```quiz
+- id: q1
+  type: mcq
+  prompt: "A sign-in screen has `isLoading: Bool`, `error: String?` and `user: User?`. Which change removes the bug where the spinner and an error show together?"
+  options:
+    - "Set `isLoading = false` at the top of every method"
+    - "An enum: `.idle`, `.signingIn`, `.failed(String)`, `.signedIn(User)`"
+    - "A `didSet` on `error` that clears `isLoading`"
+    - "Wrap the three properties in a struct"
+  answer: 1
+  explain: "Only the enum makes the bad combination unrepresentable. The other fixes patch one path and leave the eight combinations in place for the next method to get wrong."
+- id: q2
+  type: bug
+  prompt: "A teammate added a `.buffering` state to `Playback` yesterday. Which line means it silently ignores every event, with no compiler warning?"
+  code: |
+    mutating func handle(_ event: Event) -> [Effect] {
+        switch (self, event) {
+        case (.loading(let episode), .loaded):
+            self = .playing(episode, at: 0)
+            return [.play(from: 0)]
+        case (.playing(let episode, let seconds), .togglePlayPause):
+            self = .paused(episode, at: seconds)
+            return [.pause]
+        default:
+            return []
+        }
+    }
+  answer: 9
+  explain: "`default` matches every pair the cases above don't, including any state added later. Listing each state with `_` keeps the switch exhaustive, so the new state fails to compile until someone decides what it does."
+- id: q3
+  type: sort
+  prompt: "Which design fits each?"
+  buckets: [Enum state machine, State objects, A plain Bool]
+  items:
+    - ["An upload: queued, uploading, paused, retrying, failed, done", 0]
+    - ["A game enemy whose behaviours are added by level designers as plug-ins", 1]
+    - ["Whether a recipe is marked as a favourite", 2]
+    - ["A checkout flow whose transitions the team reviews together", 0]
+    - ["A drawing app's tools, each a large class added by a different team", 1]
+  explain: "Known, reviewable sets of states suit an enum. Open sets of large states suit objects. A single independent yes/no is a Bool, not a state machine."
+- id: q4
+  type: multi
+  prompt: "An `@MainActor` model downloads an episode. Which of these keep its state machine correct? Choose all that apply."
+  options:
+    - "Move to `.downloading` before the first `await`"
+    - "After the `await` returns, check you're still `.downloading` before storing the result"
+    - "Mark the class `@unchecked Sendable`"
+    - "Have the transition function return effects instead of awaiting inside it"
+  answer: [0, 1, 3]
+  explain: "Claiming the state first stops a double start; re-checking after resuming respects a cancel that happened meanwhile; a synchronous transition can't interleave at all. `@unchecked Sendable` only silences the compiler."
+- id: q5
+  type: mcq
+  prompt: "The app saves the podcast player's `Playback` state with `Codable` when it goes to the background. iOS terminates it while the state is `.loading(episode)`. What should the next launch show?"
+  options:
+    - "`.loading(episode)`, exactly as saved"
+    - "`.idle`, discarding the episode"
+    - "A resting state built from the saved one, such as the episode paused at its saved position, or `.idle` with the episode selected"
+    - "`.failed(episode, reason: \"terminated\")`"
+  answer: 2
+  explain: "The load that `.loading` describes died with the process, so restoring it shows a spinner that never stops. Save (or restore) in-flight states as resting ones, so the user sees where they were and can carry on with one tap."

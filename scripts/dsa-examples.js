@@ -11,7 +11,7 @@
 //   --check      only report generated files that are missing or out of date (used by the content check)
 //   --repeat <n> run each example n times: output that varies between runs (a concurrency bug) fails
 //   --skip-ios   leave out `check ios` blocks (on a machine without Xcode)
-import { execFile } from 'node:child_process';
+import { execFile, execFileSync } from 'node:child_process';
 import { existsSync, mkdirSync, readdirSync, readFileSync, rmSync, writeFileSync, mkdtempSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join, relative } from 'node:path';
@@ -138,10 +138,29 @@ const runSwift = (file) => new Promise((resolve) => {
 // In Swift 6 mode a fragment is lowered to SIL as well: data-race (region isolation) errors, missing returns and
 // use-before-initialisation are only diagnosed there, and -typecheck alone would let them through.
 const checkMode = course.swiftVersion === '6' ? ['-emit-sil', '-o', '/dev/null'] : ['-typecheck'];
+// Test code (XCTest, Swift Testing) needs the platform's developer frameworks and the testing macros
+const testPaths = (() => {
+    const lookup = (args) => {
+        try {
+            return execFileSync('xcrun', args, { encoding: 'utf8' }).trim();
+        } catch {
+            return null;
+        }
+    };
+    const swiftc = lookup(['--sdk', 'iphonesimulator', '--find', 'swiftc']);
+    const plugins = swiftc ? ['-plugin-path', join(dirname(dirname(swiftc)), 'lib/swift/host/plugins/testing')] : [];
+    const forPlatform = (sdk) => {
+        const platform = lookup(['--sdk', sdk, '--show-sdk-platform-path']);
+        return platform ? ['-F', join(platform, 'Developer/Library/Frameworks'), '-I', join(platform, 'Developer/usr/lib'), ...plugins] : [];
+    };
+    return { mac: forPlatform('macosx'), ios: forPlatform('iphonesimulator') };
+})();
+const importsTesting = (file) => /^\s*(@testable\s+)?import\s+(XCTest|Testing)\b/m.test(readFileSync(file, 'utf8'));
 const typecheck = (file, ios) => new Promise((resolve) => {
+    const extra = importsTesting(file) ? testPaths[ios ? 'ios' : 'mac'] : [];
     const [command, commandArgs] = ios
-        ? ['xcrun', ['--sdk', 'iphonesimulator', 'swiftc', ...checkMode, '-target', IOS_TARGET, '-swift-version', course.swiftVersion, file]]
-        : ['swiftc', [...checkMode, '-swift-version', course.swiftVersion, file]];
+        ? ['xcrun', ['--sdk', 'iphonesimulator', 'swiftc', ...checkMode, ...extra, '-target', IOS_TARGET, '-swift-version', course.swiftVersion, file]]
+        : ['swiftc', [...checkMode, ...extra, '-swift-version', course.swiftVersion, file]];
     execFile(command, commandArgs, { timeout: RUN_TIMEOUT_MS * 2 }, (error, stdout, stderr) => {
         resolve({ ok: !error, stderr: stderr || error?.message || '' });
     });

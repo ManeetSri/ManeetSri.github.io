@@ -1,0 +1,392 @@
+## Why it matters
+
+Apps are full of tiny languages. Deep-link routes like `/users/:id/posts/:post`, the path patterns in an `apple-app-site-association` file, `NSPredicate` format strings and `#Predicate`, regular expressions, search syntax like `from:alex has:photo`, and the feature-flag targeting rules a server sends down. The **Interpreter** pattern is how you build one: turn the grammar into types, parse sentences into a tree, and evaluate the tree. Interviewers meet it in "design a deep-link router" and "how does the app decide who sees this feature?", where the strong answer treats routes and rules as **data the app interprets**, not `if` statements scattered through the code.
+
+## The pattern
+
+The Gang of Four's intent: given a language, define a representation for its grammar along with an interpreter that uses the representation to interpret sentences in the language. In practice that's three steps:
+
+1. **A grammar**: the rules for what a sentence looks like.
+2. **An abstract syntax tree (AST)**: one type per grammar rule, so a parsed sentence is a tree of values. Leaves are *terminal* expressions (a literal word, a number); inner nodes are *nonterminal* ones (an `and` of two conditions).
+3. **An interpreter**: a function that walks the tree against some context (a URL, a user) and produces a result.
+
+In Swift the AST is almost always an enum, often `indirect`, and the interpreter is a recursive switch over it: the enum-and-switch form of a visitor from [the previous lesson](/design/learn/sd-behavioural-visitor). The pattern's real lesson is the pipeline around it: **parse once, early, into a checked tree; interpret many times.**
+
+```visual flow
+title: Parse once, interpret many times
+layers:
+  - { label: At launch, rows: [0, 0] }
+  - { label: Every link, rows: [2, 2] }
+nodes:
+  - { id: text, label: Route patterns, kind: store, at: [0, 0] }
+  - { id: parser, label: Parser, kind: service, at: [2, 0] }
+  - { id: ast, label: Segments, kind: cache, at: [4, 0] }
+  - { id: url, label: Incoming URL, kind: external, at: [0, 2] }
+  - { id: interp, label: Interpreter, kind: service, at: [2, 2] }
+  - { id: route, label: Route enum, kind: client, at: [4, 2] }
+edges:
+  - [text, parser, parse]
+  - [parser, ast, build]
+  - [url, interp, path]
+  - [ast, interp, match]
+  - [interp, route, result]
+steps:
+  - say: "At launch, or in a unit test, each pattern string such as `/users/:id` is **parsed once**."
+    send: text->parser
+  - say: "Parsing builds segments: `.literal(\"users\")`, `.parameter(\"id\")`. A malformed pattern fails here, long before a user taps a link."
+    send: parser->ast
+  - say: "A link arrives from Safari, a notification or another app. Only its path components reach the interpreter."
+    send: url->interp
+  - say: "The interpreter walks the prepared segments against the path: no string parsing on this path at all."
+    send: ast->interp
+  - say: "The result is a typed `Route`, so the rest of the app never handles raw strings or dictionaries."
+    send: interp->route
+    state: { route: ok }
+```
+
+## A route grammar
+
+Here's the grammar for deep-link paths. A pattern is a list of segments separated by `/`, and each segment is a literal word, a named parameter (`:id`), or a `*` that captures everything left:
+
+```text
+pattern = segment ("/" segment)*
+segment = literal | ":" name | "*"
+```
+
+The parser checks the rules a string can't express: no empty segments, no parameter named twice, and `*` only at the end. It throws a typed error (Swift 6's `throws(PatternError)`), so a bad pattern is caught where it's written. The interpreter then matches paths against the segments, and a small router maps each match to a typed `Route`:
+
+```swift run title="A route pattern parser, interpreter and router"
+import Foundation
+
+// The grammar:  pattern = segment ("/" segment)*   segment = literal | ":" name | "*"
+enum Segment: Equatable {
+    case literal(String)
+    case parameter(String)
+    case rest          // "*": everything that's left, and only allowed last
+}
+
+enum PatternError: Error {
+    case empty, emptySegment, duplicate(String), restNotLast
+}
+
+struct RoutePattern {
+    let segments: [Segment]
+
+    // Parsing: text in, a checked tree (here, a list) out. Done once, at launch or in a test.
+    init(_ text: String) throws(PatternError) {
+        let parts = text.split(separator: "/", omittingEmptySubsequences: false).dropFirst()
+        guard !parts.isEmpty else { throw .empty }
+        var names: Set<String> = []
+        segments = try parts.map { (part) throws(PatternError) -> Segment in
+            if part.isEmpty { throw .emptySegment }
+            if part == "*" { return .rest }
+            guard part.hasPrefix(":") else { return .literal(String(part)) }
+            let name = String(part.dropFirst())
+            guard names.insert(name).inserted else { throw .duplicate(name) }
+            return .parameter(name)
+        }
+        if let index = segments.firstIndex(of: .rest), index != segments.count - 1 { throw .restNotLast }
+    }
+
+    // Interpreting: walk the segments against a path, collecting parameters
+    func match(_ path: [String]) -> [String: String]? {
+        var captured: [String: String] = [:]
+        for (index, segment) in segments.enumerated() {
+            switch segment {
+            case .rest:
+                captured["*"] = path.dropFirst(index).joined(separator: "/")
+                return captured
+            case .literal(let word):
+                guard index < path.count, path[index] == word else { return nil }
+            case .parameter(let name):
+                guard index < path.count else { return nil }
+                captured[name] = path[index]
+            }
+        }
+        return path.count == segments.count ? captured : nil
+    }
+}
+
+enum Route {
+    case profile(userID: Int)
+    case post(userID: Int, postID: Int)
+    case settings
+    case help(topic: String)
+}
+
+struct Router {
+    private var table: [(RoutePattern, ([String: String]) -> Route?)] = []
+
+    mutating func add(_ pattern: String, _ build: @escaping ([String: String]) -> Route?) throws(PatternError) {
+        table.append((try RoutePattern(pattern), build))
+    }
+
+    // First match wins, so order the table from specific to general
+    func route(for url: URL) -> Route? {
+        let path = Array(url.pathComponents.dropFirst())   // drop the leading "/"
+        for (pattern, build) in table {
+            if let parameters = pattern.match(path), let route = build(parameters) { return route }
+        }
+        return nil
+    }
+}
+
+var router = Router()
+try router.add("/settings") { _ in .settings }
+try router.add("/users/:id") { p in
+    p["id"].flatMap(Int.init).map { .profile(userID: $0) }
+}
+try router.add("/users/:id/posts/:post") { p in
+    guard let user = p["id"].flatMap(Int.init), let post = p["post"].flatMap(Int.init) else { return nil }
+    return .post(userID: user, postID: post)
+}
+try router.add("/help/*") { p in
+    p["*"].map { .help(topic: $0) }
+}
+
+for path in ["/users/42", "/users/42/posts/7", "/users/alex", "/help/billing/refunds", "/settings/advanced"] {
+    let route = URL(string: "https://example.com" + path).flatMap(router.route(for:))
+    print(path, "→", route.map { "\($0)" } ?? "no match")
+}
+
+for bad in ["/users/:id/friends/:id", "/files/*/edit", "/users//posts"] {
+    do throws(PatternError) {
+        _ = try RoutePattern(bad)
+    } catch {
+        print(bad, "is rejected:", error)
+    }
+}
+```
+
+```output
+/users/42 → profile(userID: 42)
+/users/42/posts/7 → post(userID: 42, postID: 7)
+/users/alex → no match
+/help/billing/refunds → help(topic: "billing/refunds")
+/settings/advanced → no match
+/users/:id/friends/:id is rejected: duplicate("id")
+/files/*/edit is rejected: restNotLast
+/users//posts is rejected: emptySegment
+```
+
+The design choices are the lesson:
+
+- **Two stages.** Patterns are parsed when the router is built, so `/files/*/edit` fails in a unit test, not when a user taps a link. Matching never parses anything.
+- **Typed output.** `/users/alex` matches the pattern's *shape* but its builder rejects a non-numeric id, so the router moves on. Everything after the router sees `Route.profile(userID: 42)`, never `["id": "42"]`.
+- **Order is part of the language.** First match wins, so the table runs from specific to general. Universal links on iOS work the same way, which is worth knowing when you write the file Apple's system interprets for you.
+
+### A language you configure but don't write
+
+Universal links are decided by iOS before your app runs, using the `components` patterns in your site's `apple-app-site-association` file. `*` matches any run of characters and `?` exactly one; components are checked in order and the first match decides, including `exclude` rules:
+
+```json
+{
+  "applinks": {
+    "details": [
+      {
+        "appIDs": ["ABCDE12345.com.example.travel"],
+        "components": [
+          { "/": "/help/website/*", "exclude": true },
+          { "/": "/help/*" },
+          { "/": "/trips/*", "?": { "ref": "?*" } }
+        ]
+      }
+    ]
+  }
+}
+```
+
+Swap the first two entries and `/help/website/cookies` opens the app instead of Safari. Knowing it's an ordered interpreter makes that bug obvious. D20 covers universal links end to end.
+
+## Apple's interpreters: strings vs trees
+
+`NSPredicate` and `#Predicate` express the same idea, and the difference between them is a lesson in interpreter design.
+
+```swift check title="One rule, two ways"
+import Foundation
+
+struct Trip {
+    var city: String
+    var nights: Int
+    var isBooked: Bool
+}
+
+// The macro checks this at compile time and builds an expression tree, not a closure
+let longUnbookedBreaks = #Predicate<Trip> { trip in
+    trip.nights >= 3 && !trip.isBooked
+}
+
+let lisbon = Trip(city: "Lisbon", nights: 4, isBooked: false)
+let matches = try longUnbookedBreaks.evaluate(lisbon)   // interpreted in memory
+
+// The string version is parsed at run time: a typo here is a crash, not a compile error
+let sameRule = NSPredicate(format: "nights >= %d AND isBooked == NO", 3)
+```
+
+- `NSPredicate(format:)` parses a string **at run time** into a tree of comparison and compound predicates. Core Data translates that tree to SQL. A misspelt key path or a stray quote is found by a crash, in front of a user.
+- `#Predicate` (iOS 17) is a macro: the compiler type-checks the closure and builds a tree of `PredicateExpressions` values. SwiftData **translates** the tree into a database query; `evaluate(_:)` **interprets** it in memory. One tree, two interpreters.
+
+That second point generalises. Once a rule is a tree, you can do more with it than evaluate it: translate it to SQL or a server query, print it for a debug screen, check it for contradictions. A closure can only be called.
+
+## Rules as data: interpreting what the server sends
+
+Feature-flag targeting is a language the server writes and the app interprets. A rule like "app version 8.2 or later, and either in the UK or Ireland, or a beta tester" arrives as JSON and decodes into a tree:
+
+```swift check title="A targeting rule, decoded and interpreted"
+import Foundation
+
+struct UserContext: Sendable {
+    var appVersion: [Int]       // [8, 2, 0]
+    var country: String
+    var isBetaTester: Bool
+}
+
+// A targeting rule as the server sends it, decoded into a tree
+indirect enum Condition: Decodable, Sendable {
+    case all([Condition])
+    case any([Condition])
+    case not(Condition)
+    case versionAtLeast([Int])
+    case countryIn([String])
+    case betaTester
+    case unknown                 // an operator this build doesn't understand
+
+    func evaluate(in user: UserContext) -> Bool {
+        switch self {
+        case .all(let conditions): conditions.allSatisfy { $0.evaluate(in: user) }
+        case .any(let conditions): conditions.contains { $0.evaluate(in: user) }
+        case .not(let condition): !condition.evaluate(in: user)
+        case .versionAtLeast(let minimum): !user.appVersion.lexicographicallyPrecedes(minimum)
+        case .countryIn(let countries): countries.contains(user.country)
+        case .betaTester: user.isBetaTester
+        case .unknown: false     // fail closed: never switch a feature on by accident
+        }
+    }
+
+    private enum Key: String, CodingKey { case all, any, not, versionAtLeast, countryIn, betaTester }
+
+    init(from decoder: any Decoder) throws {
+        let json = try decoder.container(keyedBy: Key.self)
+        if let list = try json.decodeIfPresent([Condition].self, forKey: .all) { self = .all(list) }
+        else if let list = try json.decodeIfPresent([Condition].self, forKey: .any) { self = .any(list) }
+        else if let inner = try json.decodeIfPresent(Condition.self, forKey: .not) { self = .not(inner) }
+        else if let version = try json.decodeIfPresent([Int].self, forKey: .versionAtLeast) { self = .versionAtLeast(version) }
+        else if let countries = try json.decodeIfPresent([String].self, forKey: .countryIn) { self = .countryIn(countries) }
+        else if json.contains(.betaTester) { self = .betaTester }
+        else { self = .unknown }
+    }
+}
+```
+
+```json
+{ "all": [
+    { "versionAtLeast": [8, 2] },
+    { "any": [{ "countryIn": ["GB", "IE"] }, { "betaTester": true }] }
+] }
+```
+
+Two decisions here matter more than the code. **Unknown operators fail closed**: an app from last year that receives a newer operator treats it as false, so it never shows a feature it can't support. And the language has **no loops, variables or functions**: it selects among behaviours the app already ships. That keeps evaluation fast and predictable, and it's the line App Review guideline 2.5.2 draws: apps may not download code that adds or changes features, but configuration that chooses between existing ones is everyday practice.
+
+D54 builds a whole flag client on top of rules like these.
+
+## Designing a mini-language that stays mini
+
+- **Parse early, interpret often.** Parse built-in patterns at launch and in tests; parse server-sent rules once when they arrive, not on every evaluation.
+- **Return typed results.** A router returns `Route`, a rule returns `Bool`, a query returns a typed filter. Raw dictionaries stop at the interpreter's edge.
+- **Make failure safe and visible.** Unknown operators fail closed, unknown components render nothing, and both are logged so you know which app versions are behind.
+- **Bound the input.** A server-sent tree 10,000 levels deep will overflow the stack of a recursive interpreter. Cap the depth and size when decoding.
+- **Know when to stop.** Once the language wants precedence rules, variables or user-defined functions, it isn't mini any more. Use an existing one (regex, `#Predicate`, a parsing library) rather than growing your own.
+
+## Trade-offs
+
+| | `if` statements in code | Mini-language you interpret | Runtime string DSL (`NSPredicate(format:)`) | Compile-time DSL (`#Predicate`, `Regex` builder) |
+| --- | --- | --- | --- | --- |
+| Change without an app release | No | Yes, if the server sends it | Yes | No |
+| Errors found | At compile time | At parse time: tests, or when rules arrive | At run time, often as a crash | At compile time |
+| Can be inspected, translated, logged | No | Yes: it's a tree | Partly | Yes |
+| Cost to build | None | Parser, AST, interpreter, tests | None: it's Apple's | None: it's Apple's |
+| Risk | Rules scattered across the app | A language that keeps growing | Typos and injection | Limited to what the macro supports |
+
+**Plain code** wins for rules that change only with releases. **Your own mini-language** wins for routes, targeting and anything ops or product teams change without a release, provided it stays declarative and small. **Apple's DSLs** win whenever they cover the job: prefer the compile-checked forms to their string ancestors.
+
+<Callout kind="interview">
+
+In a deep-link router design, say: patterns are parsed once into segments at launch and covered by table-driven tests; matching walks segments against path components; the result is a typed route enum handed to the coordinator; order runs from specific to general; unknown links fall back to a safe default screen. For server-driven rules, say you decode into a tree, evaluate locally, fail closed on unknown operators and cap depth. Questions to ask: *Who writes these rules, and how often do they change? What should an old app do with a rule it doesn't understand?* Red flags: parsing URL strings with `components(separatedBy:)` in five places, routes returning `[String: Any]`, and rules evaluated by building format strings at run time.
+
+</Callout>
+
+<Callout kind="gotcha" title="iOS gotcha: never build a predicate format string from user input">
+
+`NSPredicate(format: "name == '\(query)'")` breaks on the first apostrophe ("O'Brien") and lets input change the predicate's meaning: injection, Core Data style. Pass values as arguments, `NSPredicate(format: "name == %@", query)`, so the parser treats them as values, or use `#Predicate`, where the compiler does it for you.
+
+</Callout>
+
+## Practice
+
+**Promo eligibility rules** is a small interpreter: a rule tree with `all`, `any` and `not` over a few leaf rules, evaluated against a basket. It also asks for a second interpretation of the same tree, explaining *why* a basket doesn't qualify, which is the payoff of having rules as data.
+
+```cards
+- id: interpreter-steps
+  front: "What are the three parts of the Interpreter pattern?"
+  back: "A grammar, an abstract syntax tree with a type per grammar rule, and an interpreter that walks the tree against a context to produce a result."
+- id: parse-once
+  front: "Why parse route patterns at launch rather than on each link?"
+  back: "Malformed patterns fail in tests instead of in front of users, and matching becomes a cheap walk over prepared segments with no string parsing."
+- id: tree-vs-closure
+  front: "What can you do with a rule that's a tree that you can't do with a closure?"
+  back: "Interpret it more than one way: translate it to SQL or a server query, explain it, log it, check it. A closure can only be called."
+- id: fail-closed
+  front: "What should an app do with a server rule that uses an operator it doesn't know?"
+  back: "Fail closed: treat that part as false (and log it), so an old app never enables a feature it can't support."
+```
+
+```quiz
+- id: q1
+  type: mcq
+  prompt: "Your router table is `[\"/users/:id\", \"/users/me\"]`, first match wins. What happens to `/users/me`?"
+  options:
+    - "It matches `/users/me`, because literals beat parameters"
+    - "It matches `/users/:id` with `id = \"me\"`, and the builder may reject it or route to the wrong screen"
+    - "It matches neither"
+    - "The parser rejects the table as ambiguous"
+  answer: 1
+  explain: "First match wins, and `:id` matches any segment. Order the table from specific to general (`/users/me` first), or have the parser rank literals above parameters."
+- id: q2
+  type: sort
+  prompt: "Which stage is responsible for each?"
+  buckets: [Parsing, Interpreting]
+  items:
+    - ["Rejecting `/files/*/edit` because `*` must come last", 0]
+    - ["Capturing `42` from `/users/42` as the `id` parameter", 1]
+    - ["Noticing a parameter name is used twice", 0]
+    - ["Returning no match for `/settings/advanced`", 1]
+    - ["Turning `\":id\"` into `.parameter(\"id\")`", 0]
+  explain: "Parsing checks a pattern and builds its tree, once. Interpreting walks that tree against each incoming path."
+- id: q3
+  type: multi
+  prompt: "A server sends feature-flag rules that your app interprets. Which are good design? Choose all that apply."
+  options:
+    - "Treat operators this build doesn't know as false"
+    - "Cap the depth of the rule tree when decoding"
+    - "Add loops and variables so product can express anything"
+    - "Parse each rule once when it arrives, not on every evaluation"
+    - "Throw away every rule if one fails to decode"
+  answer: [0, 1, 3]
+  explain: "Failing closed keeps old apps safe, a depth cap protects a recursive interpreter, and parsing once keeps evaluation cheap. Loops turn configuration into code, and one bad rule shouldn't disable the rest."
+- id: q4
+  type: bug
+  prompt: "A user named O'Brien crashes search. Which line is the bug?"
+  code: |
+    func contactsMatching(_ name: String, in context: NSManagedObjectContext) throws -> [Contact] {
+        let request = Contact.fetchRequest()
+        request.predicate = NSPredicate(format: "lastName BEGINSWITH[cd] '\(name)'")
+        request.fetchLimit = 50
+        return try context.fetch(request)
+    }
+  answer: 3
+  explain: "Interpolating input into a format string means the apostrophe ends the string literal early, and the predicate parser fails at run time. Use `NSPredicate(format: \"lastName BEGINSWITH[cd] %@\", name)`."
+- id: q5
+  type: truefalse
+  prompt: "`#Predicate` builds an expression tree, which is why SwiftData can translate it into a database query instead of calling it on every object."
+  answer: true
+  explain: "The macro turns the closure into a tree of `PredicateExpressions` values. SwiftData translates that tree for the store, and `evaluate(_:)` interprets the same tree in memory."

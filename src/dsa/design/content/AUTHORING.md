@@ -60,7 +60,7 @@ Use `##` for sections (they become "On this page") and `###` inside them.
 | ` ```swift ` (no meta) | Deliberately partial or pseudo code. Use sparingly. | not checked |
 | ` ```json `, ` ```http `, ` ```graphql `, ` ```yaml `, ` ```sql `, ` ```bash ` | Payloads, requests, schemas, commands | not checked |
 
-Rules for `run` blocks: deterministic output (no dates, randomness, timing or unordered collections), no crashes, no input, quick. Swift 6 mode means top-level code runs on the main actor; concurrency examples must be data-race free or they won't compile, which is exactly the lesson. Show code that's *meant* to fail (a data race, a retain cycle) without `run`/`check`, and show the compiler's message in a ` ```text title="What you'll see" ` block. `check` blocks are compiled as far as SIL, so data-race (region isolation) errors, missing returns and use-before-initialisation fail the check just as they would in Xcode: a fragment with an elided body (`// …`) must still return something.
+Rules for `run` blocks: deterministic output (no dates, randomness, timing or unordered collections), no crashes, no input, quick. Swift 6 mode means top-level code runs on the main actor; concurrency examples must be data-race free or they won't compile, which is exactly the lesson. Show code that's *meant* to fail (a data race, a retain cycle) without `run`/`check`, and show the compiler's message in a ` ```text title="What you'll see" ` block. `check` blocks may `import XCTest` or `import Testing` (test code is checked against the platform's test frameworks). They are compiled as far as SIL, so data-race (region isolation) errors, missing returns and use-before-initialisation fail the check just as they would in Xcode: a fragment with an elided body (`// …`) must still return something.
 
 ## Diagrams and simulators (` ```visual <name> `)
 
@@ -123,7 +123,7 @@ steps:
     label: { client: null }
 ```
 
-- **`kind`** (default `service`) sets a node's accent, a small shape change and its tag: `client`, `view`, `service`, `store` (on-device: Keychain, files, Core Data), `db`, `cache`, `queue`, `cdn`, `external` (dashed: someone else's system) and `actor` (a person).
+- **`kind`** (default `service`) sets a node's accent, a small shape change and its tag: `client`, `view`, `service`, `store` (on-device: Keychain, files, Core Data), `db`, `cache`, `queue`, `cdn`, `external` (dashed: someone else's system), `actor` (a person) and `plain` (no tag: a concept, fact or step rather than a part of the system).
 - **`w`** makes a node span several columns. Positions can be fractions (`at: [1.5, 0]`) to centre a node under two others.
 - **Edge styles:** `sync` (solid, the default), `async` (dashed), `data` (dotted: reads and writes rather than calls). An edge in each direction between the same two nodes is drawn as two parallel lines.
 - **A step** lists only what changes:
@@ -373,7 +373,7 @@ Registry: also a one-sentence `summary`. The MDX:
 
 1. `<Brief>`: one or two sentences of context, then the code under review in a ` ```swift check ios title="File.swift" ` block (it must compile; realistic, 30–70 lines) or a written design.
 2. ` ```workspace ` with `template: critique`.
-3. A ` ```findings ` block: 4–9 findings, each `{ id, title, severity: high | medium | low, lines?: "12-18", detail }`. Line numbers count from the first line of the code block. Order by severity. A finding is a real problem with a consequence, not a style preference.
+3. A ` ```findings ` block: 4–9 findings, each `{ id, title, severity: high | medium | low, lines?: "12-18" (or several places: "12-18, 40"), detail }`. Line numbers count from the first line of the code block. Order by severity. A finding is a real problem with a consequence, not a style preference.
 4. `<ReferenceReview>`: how an experienced reviewer would write it up: what matters most, the plan to fix it in small steps, and the tests to add.
 
 ### Katas (`kind: 'problem'`)

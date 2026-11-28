@@ -1,2 +1,36 @@
 // Katas for D13 · Behavioural patterns II
-export default [];
+export default [
+    {
+        id: 'sd-kata-behavioural-2-upload-machine',
+        kind: 'problem',
+        title: 'An upload state machine',
+        difficulty: 'medium',
+        patterns: ['patterns', 'state'],
+        lessons: ['sd-behavioural-state'],
+        swiftTest: 'ResumableUploadMachineTests',
+        lists: [],
+        minutes: 30,
+    },
+    {
+        id: 'sd-kata-behavioural-2-onboarding-flow',
+        kind: 'problem',
+        title: 'A mediated onboarding flow',
+        difficulty: 'medium',
+        patterns: ['patterns', 'navigation'],
+        lessons: ['sd-behavioural-mediator'],
+        swiftTest: 'OnboardingFlowMediatorTests',
+        lists: [],
+        minutes: 30,
+    },
+    {
+        id: 'sd-kata-behavioural-2-promo-rules',
+        kind: 'problem',
+        title: 'Promo eligibility rules',
+        difficulty: 'easy',
+        patterns: ['patterns', 'swift'],
+        lessons: ['sd-behavioural-specification', 'sd-behavioural-interpreter', 'sd-behavioural-visitor'],
+        swiftTest: 'PromoEligibilityRulesTests',
+        lists: [],
+        minutes: 25,
+    },
+];

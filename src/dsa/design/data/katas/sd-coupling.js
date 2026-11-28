@@ -1,2 +1,36 @@
 // Katas for D03 · Coupling & cohesion
-export default [];
+export default [
+    {
+        id: 'sd-kata-coupling-premium-gate',
+        kind: 'problem',
+        title: 'Premium gate',
+        difficulty: 'medium',
+        patterns: ['principles', 'payments'],
+        lessons: ['sd-coupling-stable-dependencies', 'sd-coupling-instability'],
+        swiftTest: 'CouplingPremiumGateTests',
+        lists: [],
+        minutes: 30,
+    },
+    {
+        id: 'sd-kata-coupling-gift-card-wallet',
+        kind: 'problem',
+        title: 'Gift card wallet',
+        difficulty: 'easy',
+        patterns: ['principles', 'concurrency'],
+        lessons: ['sd-coupling-demeter', 'sd-coupling-connascence'],
+        swiftTest: 'CouplingGiftCardWalletTests',
+        lists: [],
+        minutes: 25,
+    },
+    {
+        id: 'sd-kata-coupling-delivery-tracker',
+        kind: 'problem',
+        title: 'Delivery tracker',
+        difficulty: 'easy',
+        patterns: ['principles'],
+        lessons: ['sd-coupling-demeter'],
+        swiftTest: 'CouplingDeliveryTrackerTests',
+        lists: [],
+        minutes: 20,
+    },
+];

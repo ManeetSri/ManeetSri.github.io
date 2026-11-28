@@ -1,0 +1,302 @@
+## Why it matters
+
+Every app reaches the point where a small change takes a week. The server renames one field, and the profile screen, the widget and the share card all break. That's **coupling**. Its partner, **cohesion**, explains why a file called `Helpers.swift` becomes the place nobody wants to touch. They're the oldest words in software design, and interviewers use them to test whether you can say *why* one design is better than another, not only that it is.
+
+## Coupling: how far a change travels
+
+Two pieces of code are **coupled** when changing one forces you to change the other. Larry Constantine described the idea in the late 1960s, and it reached most programmers through *Structured Design* (Yourdon and Constantine, 1979). Kent Beck's modern phrasing adds the part that makes it useful: coupling is always *with respect to a particular change*.
+
+A view and its view model may be tightly coupled with respect to "show a new field", because both must change. The same pair can be completely uncoupled with respect to "switch from `URLSession` to a WebSocket", because neither knows how the data arrives. So "is this coupled?" is the wrong question. "Which changes would ripple from here, and how far?" is the right one.
+
+Here's a common first version of a profile header. It decodes the server's JSON straight into a type and hands that type to the view:
+
+```swift check ios title="ProfileHeader.swift"
+import SwiftUI
+
+// The JSON's shape, field for field
+struct ProfileResponse: Decodable {
+    let user_name: String
+    let followers: Int
+}
+
+struct ProfileHeader: View {
+    let profile: ProfileResponse
+
+    var body: some View {
+        VStack {
+            Text(profile.user_name).font(.title)
+            Text("\(profile.followers) followers")
+        }
+    }
+}
+```
+
+It works, and it's short. The trouble is that the home-screen widget and the share card were written the same way, so three parts of the app know the server's field names. Step through what happens when the API team ships version 2:
+
+```visual flow
+title: How far one rename travels
+nodes:
+  - { id: api, label: Profile API, kind: external, at: [0, 1] }
+  - { id: response, label: ProfileResponse, at: [1.5, 1], w: 1.25 }
+  - { id: profile, label: Profile, at: [3, 0] }
+  - { id: header, label: Profile header, kind: view, at: [4.5, 0] }
+  - { id: widget, label: Widget, kind: view, at: [4.5, 1] }
+  - { id: share, label: Share card, kind: view, at: [4.5, 2] }
+edges:
+  - [api, response, JSON]
+  - [response, header]
+  - [response, widget]
+  - [response, share]
+  - [response, profile, mapped once, { style: data }]
+  - [profile, header]
+  - [profile, widget]
+  - [profile, share]
+steps:
+  - say: Three parts of the app read `ProfileResponse`, the type that mirrors the server's JSON.
+    show: [api, response, header, widget, share, "api->response", "response->header", "response->widget", "response->share"]
+  - say: API v2 renames `user_name` to `display_name`. The response type has to follow.
+    send: api->response
+    state: { api: active, response: error }
+    label: { api->response: display_name }
+  - say: Every reader of `user_name` breaks with it. **Four files** change for one rename, and each is a chance to miss one.
+    state: { header: error, widget: error, share: error }
+  - say: Now add one boundary. The app's own `Profile` type is built from the response in exactly one place.
+    reset: true
+    show: [api, response, profile, header, widget, share, "api->response", "response->profile", "profile->header", "profile->widget", "profile->share"]
+  - say: The same rename arrives.
+    send: api->response
+    state: { api: active, response: active }
+    label: { api->response: display_name }
+  - say: Only the mapping changes. The views read `Profile.name`, which didn't move, so **the change stops at the boundary**.
+    send: response->profile
+    state: { response: ok, profile: ok, header: ok, widget: ok, share: ok }
+    label: { profile: 1 line }
+```
+
+In code, the boundary is a few lines. The server's names live in one `CodingKeys` enum, and the rest of the app speaks its own language:
+
+```swift run title="Mapping at the boundary"
+import Foundation
+
+// What the server sends. Only this type knows the server's field names.
+struct ProfileResponse: Decodable {
+    let displayName: String
+    let followerCount: Int
+
+    enum CodingKeys: String, CodingKey {
+        case displayName = "display_name"   // "user_name" until API v2: the only line that changed
+        case followerCount = "followers"
+    }
+}
+
+// What the app uses everywhere, named in the app's words
+struct Profile {
+    let name: String
+    let followers: Int
+
+    init(_ response: ProfileResponse) {
+        name = response.displayName
+        followers = response.followerCount
+    }
+}
+
+let json = Data(#"{"display_name": "Ada", "followers": 1200}"#.utf8)
+let profile = Profile(try JSONDecoder().decode(ProfileResponse.self, from: json))
+print("\(profile.name) has \(profile.followers) followers")
+```
+
+```output
+Ada has 1200 followers
+```
+
+The mapping costs one type and one initialiser. In return, a server change is a one-line edit, and the views can be previewed and tested with a `Profile` built by hand, without any JSON.
+
+## Cohesion: what belongs together
+
+**Cohesion** looks inside one part instead of between parts. It asks how strongly the contents of a type, file or module belong together. A cohesive part has one job, and everything in it serves that job.
+
+Most codebases have a file like this one:
+
+```swift check title="Helpers.swift"
+import Foundation
+
+enum Helpers {
+    static func formatPrice(pence: Int) -> String {
+        "£" + String(format: "%.2f", Double(pence) / 100)
+    }
+
+    static func isValidEmail(_ text: String) -> Bool {
+        text.contains("@") && text.contains(".")
+    }
+
+    static func cachesDirectory() -> URL {
+        URL.cachesDirectory.appending(path: "images")
+    }
+
+    static func searchQuery(from text: String) -> String {
+        text.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+    }
+}
+```
+
+Nothing in it is wrong on its own. But the four functions change for four unrelated reasons: finance wants prices in the user's currency, the sign-up team tightens the email rule, the image cache moves into an App Group so a widget can share it, and search gets diacritic folding. Every one of those edits lands in the same file, owned by nobody, imported by everything. Split it into `PriceFormatter`, `EmailRule`, `ImageCacheLocation` and `SearchQuery`, and each change has one obvious home.
+
+<Callout kind="analogy">
+
+A kitchen drawer that holds only cutlery is cohesive: you know what's in it and where a new fork goes. The drawer that holds batteries, takeaway menus, a tape measure and a single chopstick is not. Nothing in it is useless, but you have to open it and rummage every time, and nobody agrees what belongs there.
+
+</Callout>
+
+### Two smells that point at the same problem
+
+Martin Fowler's *Refactoring* names the two ways poor cohesion shows up when you change code:
+
+- **Shotgun surgery:** one change forces small edits in many files. The date format on orders is spread across the list, the cell, the detail screen and the receipt PDF. The *concern* has no home.
+- **Divergent change:** one file changes for many unrelated reasons. `Helpers.swift` above, or a view controller that's edited for layout, networking and analytics alike. The *file* has too many jobs.
+
+Shotgun surgery tells you to gather something together. Divergent change tells you to pull something apart.
+
+## One rule, seen from two sides
+
+"Low coupling, high cohesion" sounds like two rules, but it's one: **keep together what changes together, and keep apart what changes separately.** Moving code usually improves both at once. Pulling price formatting out of three views into a `PriceFormatter` raises cohesion (prices have one home) and lowers coupling (the views no longer each know the rounding rule).
+
+Coupling isn't the enemy, though. A system with no coupling does nothing: the profile header has to depend on *something* that gives it a name to show. What you want is coupling that is:
+
+- **Few:** each part knows about a small number of others.
+- **Narrow:** each connection carries only what's needed.
+- **Visible:** it appears in an initialiser or a signature, not buried in a method body.
+- **Stable:** it points at things that change less often than the code that depends on them. You'll work this out properly later in this module.
+
+### Visible and hidden coupling
+
+Compare two versions of the same check:
+
+```swift check title="Hidden and visible dependencies"
+import Foundation
+
+// Hidden: nothing in the type's signature says it reads UserDefaults, or which key
+final class OnboardingGate {
+    func shouldShowOnboarding() -> Bool {
+        !UserDefaults.standard.bool(forKey: "hasSeenOnboarding")
+    }
+}
+
+// Visible: whoever creates it decides where the answer comes from
+final class VisibleOnboardingGate {
+    private let hasSeenOnboarding: () -> Bool
+
+    init(hasSeenOnboarding: @escaping () -> Bool) {
+        self.hasSeenOnboarding = hasSeenOnboarding
+    }
+
+    func shouldShowOnboarding() -> Bool {
+        !hasSeenOnboarding()
+    }
+}
+```
+
+Both are coupled to the stored flag. The first hides it: a test that calls it reads and writes the real defaults on the simulator, and a reader has to open the method to discover the dependency. The second puts it in the initialiser, where anyone can see it and anyone can replace it.
+
+## The change test
+
+You can't measure coupling by staring at code. Instead, list the changes you expect, and for each one count the places that must change:
+
+| A likely change | Where it should land |
+| --- | --- |
+| The API renames a field | The response type's `CodingKeys` |
+| Designers restyle the profile header | The header view |
+| Prices show in the user's own currency | `PriceFormatter` |
+| Onboarding state moves from `UserDefaults` to iCloud | Whatever supplies `hasSeenOnboarding` |
+
+If a likely change touches many places, coupling is too high or cohesion too low *along that axis*. If your boundaries only protect against changes nobody expects, that's over-engineering, and it has costs of its own: you'll meet them in D04.
+
+## Trade-offs
+
+| Approach | Cost of a server change | Testability | Indirection | Wins when |
+| --- | --- | --- | --- | --- |
+| Use the server's types everywhere | High: every reader changes | Needs JSON fixtures | None | A prototype, or one screen over an API that ships with the app |
+| Map to app types at one boundary | One mapping | Build app values by hand | One type and one mapping per resource | Any API you don't control, or one that outlives app versions |
+| A protocol or wrapper around everything | Low along every axis, including ones that never change | High | High: "jump to definition" lands on protocols | Rarely; only where a change or a test seam is real |
+
+The middle row is the default for real apps. Move to the first row only when you can say why the boundary isn't worth it, and to the last only for a change you can name.
+
+<Callout kind="interview">
+
+**Say** which change a boundary protects against when you draw it: "The API is owned by another team and versions independently, so I map responses to app models in the repository." **Ask** what's likely to change: the backend, the storage, the design, the team structure. **Red flags:** "loosely coupled" used as a slogan with no change in mind, a protocol in front of every type "for testability", and shared global state that any screen can write.
+
+</Callout>
+
+<Callout kind="gotcha" title="iOS gotcha: shared instances hide coupling">
+
+`URLSession.shared`, `UserDefaults.standard`, `NotificationCenter.default` and `FileManager.default` are all real dependencies that appear in no signature. Using them in the app's start-up code is fine. Inside a view model they mean tests hit the real network and the real defaults, and the next reader can't see what the type depends on without reading every line. Pass them in instead: you'll see the options in D21.
+
+</Callout>
+
+## Practice
+
+The review **the checkout screen** is full of the coupling this module names, starting with hidden dependencies like the ones above. Read it once now and list what would ripple when the API or the analytics vendor changes; come back to it after the next two lessons and you'll find more.
+
+```cards
+- id: coupling-definition
+  front: "What does it mean for two pieces of code to be coupled?"
+  back: "Changing one forces a change in the other. Coupling is always with respect to a particular change, so ask which changes ripple and how far."
+- id: cohesion-definition
+  front: "What is cohesion?"
+  back: "How strongly the contents of one part belong together. A cohesive type has one job, so it changes for one kind of reason."
+- id: two-smells
+  front: "What's the difference between shotgun surgery and divergent change?"
+  back: "Shotgun surgery: one change touches many files, so gather the concern into one place. Divergent change: one file changes for many reasons, so pull it apart."
+- id: good-coupling
+  front: "What kind of coupling are you aiming for?"
+  back: "Few, narrow, visible and stable connections. Zero coupling means nothing works together."
+```
+
+```quiz
+- id: q1
+  type: mcq
+  prompt: "A designer changes how dates look on orders, and you edit the order list, the order cell, the detail screen and the receipt PDF. Which smell is this, and what's the fix?"
+  options:
+    - "Divergent change: split the order cell into smaller views"
+    - "Shotgun surgery: give order date formatting one home that all four use"
+    - "Neither: four views showing dates must each format them"
+    - "Tight coupling to the server: map the API response to an app model"
+  answer: 1
+  explain: "One change touching many files is shotgun surgery. The concern (how an order date reads) has no home, so every view re-implements it. One formatter, used by all four, makes it a one-place change."
+- id: q2
+  type: multi
+  prompt: "Which of these are dependencies that a type's initialiser and method signatures don't reveal? Choose all that apply."
+  options:
+    - "Calling `UserDefaults.standard.bool(forKey:)` inside a method"
+    - "An `init(store: OnboardingStore)` parameter"
+    - "Posting to `NotificationCenter.default` from a method"
+    - "Reading `Date.now` to decide whether a token has expired"
+    - "A `func load(using client: HTTPClient)` parameter"
+  answer: [0, 2, 3]
+  explain: "Shared instances and the current time are real dependencies that hide inside method bodies, so a reader can't see them and a test can't replace them. Parameters make the same dependencies visible and replaceable."
+- id: q3
+  type: truefalse
+  prompt: "A well-designed app aims for zero coupling between its parts."
+  answer: false
+  explain: "Parts that know nothing about each other can't work together. The aim is coupling that's few, narrow, visible and pointed at stable things, so likely changes stay local."
+- id: q4
+  type: sort
+  prompt: "The profile header reads either `ProfileResponse` directly or the app's own `Profile`. For each change, when does the header itself have to change?"
+  buckets: [Only without the mapping, Even with the mapping, In neither design]
+  items:
+    - [The server renames `user_name` to `display_name`, 0]
+    - [The server starts sending followers as a string, 0]
+    - [The design adds the user's pronouns under the name, 1]
+    - [The API moves the profile to a new URL, 2]
+    - [The server adds a `last_seen` field the app doesn't use, 2]
+  explain: "A mapping absorbs changes to the server's representation, such as names and types. A new line on screen changes what the view shows, so the view changes however the data arrives. A new URL is the API client's business, and `Decodable` ignores keys it doesn't declare, so neither touches the header."
+- id: q5
+  type: mcq
+  prompt: "Your team proposes putting a protocol in front of every service \"to reduce coupling\". What's the best first question?"
+  options:
+    - "Which naming convention should the protocols follow?"
+    - "Which change, or which test, does each protocol make easier?"
+    - "Should the protocols be in a separate module?"
+    - "Can we generate the protocols automatically?"
+  answer: 1
+  explain: "Coupling is always with respect to a change. A boundary that protects against a change nobody expects adds indirection and buys nothing. Naming the change, or the test seam, is what justifies each one."
+```

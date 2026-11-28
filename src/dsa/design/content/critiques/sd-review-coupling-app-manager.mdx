@@ -1,0 +1,139 @@
+<Brief>
+
+Every feature in this social app calls `AppManager.shared`. Four teams edit the file, most pull requests that touch it conflict, and two bugs are open against it: dates sometimes show up blank, and people who sign out are signed in again after relaunching. Review it for **cohesion**: what belongs together, what doesn't, and how you'd take it apart without stopping feature work.
+
+```swift check ios title="AppManager.swift"
+import UIKit
+
+@MainActor
+final class AppManager {
+    static let shared = AppManager()
+
+    var currentUserID: String?
+    var imageCache: [URL: UIImage] = [:]
+    private let haptics = UIImpactFeedbackGenerator(style: .medium)
+    private let dateFormatter = DateFormatter()
+
+    // Call first, from application(_:didFinishLaunchingWithOptions:)
+    func bootstrap() {
+        currentUserID = UserDefaults.standard.string(forKey: "uid")
+        dateFormatter.dateFormat = "d MMM yyyy"
+        UINavigationBar.appearance().tintColor = .systemPink
+        if currentUserID != nil {
+            UIApplication.shared.registerForRemoteNotifications()
+        }
+        track("app_open")
+    }
+
+    func perform(_ action: String, payload: [String: Any] = [:]) async throws {
+        switch action {
+        case "login":
+            var request = URLRequest(url: URL(string: "https://api.example.com/login")!)
+            request.httpMethod = "POST"
+            request.httpBody = try JSONEncoder().encode(["email": payload["email"] as! String])
+            let (data, _) = try await URLSession.shared.data(for: request)
+            currentUserID = String(decoding: data, as: UTF8.self)
+            UserDefaults.standard.set(currentUserID, forKey: "uid")
+            track("login")
+        case "logout":
+            currentUserID = nil
+            imageCache.removeAll()
+            UserDefaults.standard.removeObject(forKey: "userID")
+            track("logout")
+        case "like":
+            haptics.impactOccurred()
+            let postID = payload["postID"] as! String
+            var request = URLRequest(url: URL(string: "https://api.example.com/posts/\(postID)/like")!)
+            request.httpMethod = "POST"
+            _ = try await URLSession.shared.data(for: request)
+            track("like_post")
+        default:
+            break
+        }
+    }
+
+    func image(at url: URL) async throws -> UIImage? {
+        if let cached = imageCache[url] { return cached }
+        let (data, _) = try await URLSession.shared.data(from: url)
+        imageCache[url] = UIImage(data: data)
+        return imageCache[url]
+    }
+
+    func displayDate(_ date: Date) -> String {
+        dateFormatter.string(from: date)
+    }
+
+    func track(_ event: String) {
+        print("analytics", event, currentUserID ?? "anonymous")
+    }
+}
+```
+
+</Brief>
+
+```workspace
+template: critique
+minutes: 25
+```
+
+```findings
+- id: god-object
+  title: One singleton holds four unrelated jobs
+  severity: high
+  lines: 4-10
+  detail: "Coincidental cohesion: the session, an image cache, date formatting and haptics share a type only because they're all \"app\" things. Joining each method to the state it uses gives separate islands (the user ID with sign-in and analytics, the cache with `image(at:)`, the formatter with `displayDate`), so it's several types sharing a name. Every team's change lands here (divergent change), and nothing can be tested or reused alone."
+- id: stringly-perform
+  title: Unrelated operations hide behind one string-keyed perform
+  severity: high
+  lines: 23-47
+  detail: "Logical cohesion: sign-in, sign-out and liking a post share a method because they're all \"actions\". Callers can't see what each one needs, a mistyped action falls through to `default` and silently does nothing, and the `as!` casts on lines 28 and 40 crash on a missing or misspelled payload key. Each operation should be a typed method on the type that owns it."
+- id: key-mismatch
+  title: Sign-out clears a different key from the one sign-in writes
+  severity: high
+  lines: 31-36
+  detail: "Sign-in stores the user ID under `\"uid\"` (line 31), `bootstrap` restores it from `\"uid\"` (line 14), but sign-out removes `\"userID\"` (line 36). The stored ID survives sign-out, so the next launch signs the user back in: the open bug, and a privacy problem on a shared device. It's connascence of name hidden in strings; one owner with one key constant (and, for anything tied to auth, the Keychain) removes it."
+- id: launch-order
+  title: Launch work grouped by time, with an order nobody enforces
+  severity: medium
+  lines: 13-21
+  detail: "Temporal cohesion: session restore, date formatting, appearance and push registration share a method only because they run at launch. The order is load-bearing and hidden. A view that calls `displayDate` before `bootstrap` gets an unconfigured `DateFormatter`, which returns an empty string: the blank dates. Configure the formatter where it's created, and make each launch step its own named type run in an explicit order."
+- id: tangled-analytics
+  title: Analytics is tangled into every operation
+  severity: medium
+  lines: 61-63
+  detail: "`track` is called from bootstrap and every action (lines 20, 32, 37 and 44) with free-text event names, and it reads session state to attach the user. Changing vendor or event names means editing the session code, and the session can't move without dragging analytics with it. Operations should report what happened in typed events, and one analytics layer should translate them."
+- id: unbounded-cache
+  title: An unbounded image cache on a singleton that never dies
+  severity: medium
+  lines: 50-55
+  detail: "Every image scrolled past stays in the dictionary until sign-out, so memory grows until iOS terminates the app. And because the method suspends at the download, two cells asking for the same URL download it twice. An image pipeline of its own, with `NSCache` (which evicts under memory pressure) and one in-flight task per URL, fixes both."
+- id: haptics-in-data
+  title: A network operation triggers haptic feedback
+  severity: low
+  lines: 38-39
+  detail: "Liking a post buzzes the phone from inside the data operation, so a like sent from a notification action, a widget or a retry queue either buzzes at the wrong moment or can't reuse this code. Feedback belongs to the button that was tapped, such as SwiftUI's `.sensoryFeedback(_:trigger:)` (iOS 17)."
+- id: inline-networking
+  title: Requests are built inline against URLSession.shared
+  severity: low
+  lines: 26-29
+  detail: "URLs, methods and bodies are written into each action, against the shared session. There's no single place to add auth headers, timeouts or retries, and no seam for tests. Requests belong to an API client injected into the types that need it."
+```
+
+<ReferenceReview>
+
+**Most important first.** Fix the sign-out bug today, on its own: it's one constant shared by the three places that use the key, plus a test, and it stops signed-out users being signed back in. The blank dates come from the same root cause as everything else here, hidden order inside a grab-bag type, and they're fixed by configuring the formatter when it's created.
+
+**The design problem underneath** is that `AppManager` has no single job. Its parts are related only by convenience (coincidental), by being "actions" (logical) or by running at launch (temporal), which are the three weakest kinds of cohesion. That's why every team edits it, why its bugs come from strings and ordering, and why nothing in it can be tested alone.
+
+**How I'd take it apart, without a big-bang rewrite:**
+
+1. Write the new types one island at a time: `SessionStore` (`signIn(email:)`, `signOut()`, `restore()`, owning the key), `ImagePipeline` (`NSCache` plus one task per URL), `DateLabels` (a formatter configured at creation, or `Date.formatted`), `LikesService` (`like(postID:)`) and an `AnalyticsTracking` protocol that takes typed events.
+2. Keep `AppManager` for now as a thin facade that forwards to them, so existing call sites keep compiling while teams migrate. Each migration is a small pull request in one team's code.
+3. Replace each `perform("…", payload:)` call with the typed method, then delete `perform`. The `as!` crashes go with it.
+4. Move haptics to the like button, and appearance to a theme step.
+5. Turn `bootstrap` into a list of named launch steps run in order by the app delegate, with session restore first.
+6. Once nothing calls `AppManager`, create the new types in the composition root and inject them; delete the singleton.
+
+**Tests to add:** `SessionStore` against an isolated `UserDefaults(suiteName:)` and a stub HTTP client: sign in, sign out, relaunch, and check the user is signed out. `DateLabels` formats correctly with no launch code run. `ImagePipeline` returns cached images and downloads a URL once when two callers ask together. A mapping test from each typed analytics event to the vendor's event name.
+
+</ReferenceReview>

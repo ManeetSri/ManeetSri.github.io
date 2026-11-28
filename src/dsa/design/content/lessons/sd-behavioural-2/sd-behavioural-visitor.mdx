@@ -1,0 +1,298 @@
+## Why it matters
+
+Trees made of a fixed set of node types are everywhere in apps: server-driven screens built from components, Markdown and rich-text documents, the syntax trees behind Swift macros, a rules language sent from a server. You need many operations over them: render, prefetch images, build accessibility labels, validate, log impressions. The **Visitor** pattern lets you add operations without touching the node types. In Swift, an enum and a `switch` usually does the same job with less ceremony, and knowing *why* (double dispatch, and which way your code is likely to grow) is a favourite senior interview topic.
+
+## The problem: many operations over fixed types
+
+Picture a server-driven home screen. The server sends a tree of components: text, images, buttons and stacks that contain more components. The app needs to:
+
+- render it in SwiftUI,
+- collect the image URLs to prefetch before the screen appears,
+- build a spoken summary for VoiceOver,
+- check that every button's deep link is one the app can handle.
+
+The object-oriented reflex is a method per operation on every component type: `render()`, `imageURLs()`, `accessibilitySummary()`, `validate()`. Four operations later, every component type knows about SwiftUI, prefetching, accessibility and routing. Each type is now coupled to every concern in the app, and adding an operation means editing every type.
+
+The **Visitor** pattern turns this around. The Gang of Four describe it as representing an operation to be performed on the elements of an object structure, so you can define a new operation without changing the classes of the elements. Each operation becomes one type, a *visitor*, with one method per kind of node.
+
+## Why overloading isn't enough
+
+The obvious attempt is one overloaded function per node type. It compiles, and it's wrong:
+
+```swift run title="The overloading trap, and the visitor that fixes it"
+protocol Component {
+    func accept<V: ComponentVisitor>(_ visitor: V) -> V.Result
+}
+
+struct TextBlock: Component {
+    let text: String
+    func accept<V: ComponentVisitor>(_ visitor: V) -> V.Result { visitor.visitText(self) }
+}
+
+struct ImageBlock: Component {
+    let url: String
+    let alt: String
+    func accept<V: ComponentVisitor>(_ visitor: V) -> V.Result { visitor.visitImage(self) }
+}
+
+struct Stack: Component {
+    let children: [any Component]
+    func accept<V: ComponentVisitor>(_ visitor: V) -> V.Result { visitor.visitStack(self) }
+}
+
+// One operation over every kind of component, in one type
+protocol ComponentVisitor {
+    associatedtype Result
+    func visitText(_ text: TextBlock) -> Result
+    func visitImage(_ image: ImageBlock) -> Result
+    func visitStack(_ stack: Stack) -> Result
+}
+
+// The trap: overloads are chosen at compile time, from the static type
+func describe(_ text: TextBlock) -> String { "text" }
+func describe(_ image: ImageBlock) -> String { "image" }
+func describe(_ component: any Component) -> String { "some component" }
+
+let screen = Stack(children: [
+    TextBlock(text: "Weekend in Lisbon"),
+    ImageBlock(url: "https://cdn.example.com/tram.jpg", alt: "A yellow tram"),
+    Stack(children: [ImageBlock(url: "https://cdn.example.com/view.jpg", alt: "The view from a hill")]),
+])
+
+print(screen.children.map { describe($0) })
+
+// The fix: two dynamic dispatches, first on the component, then on the visitor
+struct Describer: ComponentVisitor {
+    func visitText(_ text: TextBlock) -> String { "text" }
+    func visitImage(_ image: ImageBlock) -> String { "image" }
+    func visitStack(_ stack: Stack) -> String { "stack of \(stack.children.count)" }
+}
+
+print(screen.children.map { $0.accept(Describer()) })
+
+// A second operation is a second visitor; no component changes
+struct ImagesToPrefetch: ComponentVisitor {
+    func visitText(_ text: TextBlock) -> [String] { [] }
+    func visitImage(_ image: ImageBlock) -> [String] { [image.url] }
+    func visitStack(_ stack: Stack) -> [String] { stack.children.flatMap { $0.accept(self) } }
+}
+
+print(screen.accept(ImagesToPrefetch()))
+```
+
+```output
+["some component", "some component", "some component"]
+["text", "image", "stack of 1"]
+["https://cdn.example.com/tram.jpg", "https://cdn.example.com/view.jpg"]
+```
+
+The first line is the trap. Each child's static type is `any Component`, and Swift picks among overloads **at compile time** using static types, so every call goes to the general version. Swift (like Java and C#) has **single dispatch**: the only thing chosen at run time is which implementation of a method runs, based on the *receiver*.
+
+The visitor gets a second dispatch out of that one mechanism. Calling `$0.accept(visitor)` dispatches on the component, so `ImageBlock.accept` runs. Inside it, `self` is statically an `ImageBlock`, so the call to `visitor.visitImage(self)` is resolved correctly, and it dispatches on the visitor's type. Two dispatches, one on each object: **double dispatch**.
+
+```visual sequence
+title: Double dispatch, one call at a time
+participants:
+  - { id: caller, label: Caller }
+  - { id: stack, label: Stack }
+  - { id: visitor, label: ImagesToPrefetch }
+  - { id: image, label: ImageBlock }
+messages:
+  - [caller, stack, "accept(visitor)", { say: "The caller holds an `any Component`. Calling `accept` is the first dynamic dispatch: Swift runs **Stack's** implementation." }]
+  - [stack, visitor, "visitStack(self)", { say: "Inside `Stack.accept`, `self` is statically a `Stack`, so the right visit method is chosen. That's the second dispatch, on the visitor." }]
+  - [visitor, image, "accept(self)", { say: "To visit the children, the visitor asks each one to accept it, starting the same two-step dance again." }]
+  - [image, visitor, "visitImage(self)", { say: "`ImageBlock.accept` calls `visitImage`, the only method that knows about image URLs." }]
+  - [visitor, caller, "[tram.jpg, view.jpg]", { reply: true, say: "Results flow back up: each `accept` returns whatever its visitor returned, so the whole tree folds into one array." }]
+```
+
+### What the classic visitor buys and costs
+
+- **New operations are cheap.** `ImagesToPrefetch` was added without touching any component. Rendering, accessibility and validation would be three more visitors, each with all its logic in one place.
+- **New node types are expensive.** Adding a `VideoBlock` means a new requirement on `ComponentVisitor`, and every visitor must implement it. The compiler finds them all, which is a feature: no operation silently ignores videos.
+- **Ceremony.** Every node needs an `accept`; every visitor needs a method per node type; generic `Result` types make visitors that return different things possible but noisy.
+
+You'll meet real visitors in Apple's open-source tools. SwiftSyntax, which Swift macros use to read your code, has a `SyntaxVisitor` class with a `visit(_:)` overload for each of its hundreds of node types; you override only the ones you care about and return `.visitChildren` or `.skipChildren`. Apple's swift-markdown package has `MarkupVisitor`, plus `MarkupWalker` and `MarkupRewriter` for walking and transforming a document.
+
+## The Swift way: an enum and a switch
+
+Look at what the visitor protocol really is: a list of "one case per node type", where the compiler insists every operation handles every case. Swift has that built in. An enum with associated values is a **sum type**, and `switch` is exhaustive pattern matching over it. Each operation becomes a function containing one switch:
+
+```swift run title="Server-driven UI as an enum, with operations as switches"
+import Foundation
+
+indirect enum Component {
+    case text(String)
+    case image(url: String, alt: String)
+    case button(title: String, deepLink: String)
+    case stack([Component])
+    case unsupported(type: String)   // a component this version of the app doesn't know
+}
+
+// Each operation is one function with one exhaustive switch
+extension Component {
+    var imagesToPrefetch: [String] {
+        switch self {
+        case .image(let url, _): [url]
+        case .stack(let children): children.flatMap(\.imagesToPrefetch)
+        case .text, .button, .unsupported: []
+        }
+    }
+
+    var accessibilitySummary: String {
+        switch self {
+        case .text(let text): text
+        case .image(_, let alt): "Image: \(alt)"
+        case .button(let title, _): "Button: \(title)"
+        case .stack(let children): children.map(\.accessibilitySummary).filter { !$0.isEmpty }.joined(separator: ". ")
+        case .unsupported: ""
+        }
+    }
+}
+
+// Decoding is an operation too: the server names the type, the app picks the case
+extension Component: Decodable {
+    private enum Key: String, CodingKey {
+        case type, text, url, alt, title, deepLink, children
+    }
+
+    init(from decoder: any Decoder) throws {
+        let json = try decoder.container(keyedBy: Key.self)
+        let type = try json.decode(String.self, forKey: .type)
+        switch type {
+        case "text": self = .text(try json.decode(String.self, forKey: .text))
+        case "image": self = .image(url: try json.decode(String.self, forKey: .url), alt: try json.decode(String.self, forKey: .alt))
+        case "button": self = .button(title: try json.decode(String.self, forKey: .title), deepLink: try json.decode(String.self, forKey: .deepLink))
+        case "stack": self = .stack(try json.decode([Component].self, forKey: .children))
+        default: self = .unsupported(type: type)   // newer server, older app: skip it, don't fail the screen
+        }
+    }
+}
+
+let payload = """
+{ "type": "stack", "children": [
+    { "type": "text", "text": "Weekend in Lisbon" },
+    { "type": "image", "url": "https://cdn.example.com/tram.jpg", "alt": "A yellow tram" },
+    { "type": "carousel3d", "items": [] },
+    { "type": "button", "title": "Book a table", "deepLink": "myapp://restaurants/42" }
+] }
+"""
+
+let screen = try JSONDecoder().decode(Component.self, from: Data(payload.utf8))
+print(screen.imagesToPrefetch)
+print(screen.accessibilitySummary)
+```
+
+```output
+["https://cdn.example.com/tram.jpg"]
+Weekend in Lisbon. Image: A yellow tram. Button: Book a table
+```
+
+The trade-off is the same as the visitor's, with none of the scaffolding:
+
+- **A new operation is a new function.** No case changes, as with a new visitor.
+- **A new case breaks every switch** that doesn't handle it, as a new visit method breaks every visitor. That's the safety you want.
+- **Pattern matching goes deeper than a visitor can.** `case .stack(let children) where children.isEmpty` or `case .image(let url, _) where url.hasPrefix("http:")` match on structure and contents in one line.
+
+Notice `.unsupported`. A server-driven screen is decoded by apps that are weeks or months old, so the server *will* send components an installed app has never heard of. Decoding them as a case of their own keeps the rest of the screen working, and each operation decides what an unknown component means (prefetch nothing, say nothing, render `EmptyView`). Throwing on an unknown type would blank the whole screen for everyone who hasn't updated.
+
+When an operation only cares about one or two cases, write the traversal once and reuse it: an `allComponents` property that flattens the tree lets a "find every button" operation filter instead of switching over every case. You give up exhaustiveness for that operation, on purpose.
+
+## Trade-offs
+
+This is the expression problem from [The expression problem: protocols vs enums](/design/learn/sd-solid-expression-problem), seen from the operations' side.
+
+| | Methods on each node type | Classic visitor | Enum and switch |
+| --- | --- | --- | --- |
+| Add an operation | Edit every node type | Add one visitor type | Add one function |
+| Add a node type | Add one type | Edit every visitor | Edit every switch |
+| Compiler finds the gaps | For new types | Yes | Yes |
+| Boilerplate | Low | High: `accept` everywhere, one method per type | Low |
+| Matching on structure | No | No | Yes: nested patterns and `where` |
+| Default behaviour ("visit children, ignore the rest") | No | Easy: a base walker | A traversal helper you write once |
+| Node types from other modules | Yes, via protocols | Only if they adopt `accept` | No: one enum, one module |
+
+**Methods on the node types** win when new kinds of node appear often and operations are few: a plug-in system. **An enum and switch** wins for almost every app-level tree: server-driven UI, rules, document blocks, where node kinds are known and operations keep coming. **A classic visitor** still earns its keep when the node types are separate classes you can't fold into one enum (an existing class hierarchy, generated code), or when there are so many node types that walkers with "visit children by default" are the only sane way to write an operation, as in SwiftSyntax.
+
+<Callout kind="interview">
+
+For "design a server-driven UI", say the payload decodes into a component enum, each concern (rendering, prefetch, accessibility, impression logging) is a function or renderer over that enum, and unknown component types decode to a fallback case so old app versions degrade gracefully. If asked about the Visitor pattern, explain double dispatch and why Swift's switch over an enum makes it mostly unnecessary. Red flags: one giant `render()` method per component class that also does networking and analytics, `as?` casting chains instead of a switch, and decoding that throws away the whole screen on one unknown type.
+
+</Callout>
+
+<Callout kind="gotcha" title="Swift gotcha: overloads don't look at the runtime type">
+
+`describe(component)` with an `any Component` argument always calls the `any Component` overload, even when the value inside is an `ImageBlock`. Overload resolution uses static types; only method calls on the receiver dispatch dynamically. If you find yourself writing overloads per subtype and calling them with existentials, you want a protocol method, a visitor, or an enum.
+
+</Callout>
+
+## Practice
+
+**Promo eligibility rules** gives you a small rules tree as an indirect enum, and asks for two operations over it: deciding whether a basket qualifies, and explaining which rules it failed. Each is one recursive switch, which is the enum form of a visitor.
+
+```cards
+- id: visitor-intent
+  front: "What does the Visitor pattern make cheap, and what does it make expensive?"
+  back: "Adding an operation over a fixed set of node types is cheap: one new visitor. Adding a node type is expensive: every visitor needs a new method."
+- id: double-dispatch
+  front: "What is double dispatch, and why does a visitor need it?"
+  back: "Choosing code by the runtime types of two objects. Swift dispatches only on the receiver, so `node.accept(visitor)` picks the node's method, which calls the visitor's method for its own static type."
+- id: enum-as-visitor
+  front: "Why does an enum with a switch usually replace a visitor in Swift?"
+  back: "The enum is the fixed set of node types and the exhaustive switch is the operation, so you get cheap operations and compiler-checked gaps without `accept` boilerplate, plus nested pattern matching."
+- id: unknown-components
+  front: "Why should a server-driven UI enum have an `unsupported` case?"
+  back: "Old app versions will receive component types they don't know. Decoding them to a fallback case keeps the rest of the screen working instead of failing to decode it all."
+```
+
+```quiz
+- id: q1
+  type: output
+  prompt: "What does this print?"
+  code: |
+    protocol Shape {}
+    struct Circle: Shape {}
+    struct Square: Shape {}
+
+    func name(_ shape: Circle) -> String { "circle" }
+    func name(_ shape: Square) -> String { "square" }
+    func name(_ shape: any Shape) -> String { "shape" }
+
+    let shapes: [any Shape] = [Circle(), Square()]
+    print(shapes.map { name($0) }, name(Circle()))
+  answer: "[\"shape\", \"shape\"] circle"
+  explain: "Inside the closure, `$0` is statically `any Shape`, so the general overload wins for both. `name(Circle())` has the static type `Circle`, so it gets the specific one. Overloads never look at the runtime type."
+- id: q2
+  type: mcq
+  prompt: "Your rich-text editor's block types (paragraph, heading, list, quote, image) are stable, but the team adds a new operation most sprints: export to Markdown, word count, spell-check ranges, PDF layout. Which design fits?"
+  options:
+    - "A method per operation on each block class"
+    - "An enum of blocks, with each operation a function that switches over it"
+    - "A dictionary from block type names to closures"
+    - "Subclass each block type once per operation"
+  answer: 1
+  explain: "Fixed kinds and growing operations is exactly where an enum and switch (or a visitor) wins: each new operation is one new function, and the compiler checks it handles every block."
+- id: q3
+  type: truefalse
+  prompt: "In a classic visitor design, adding a new operation means changing every node type."
+  answer: false
+  explain: "A new operation is a new visitor, and the nodes' `accept` methods stay as they are. It's adding a node type that touches every visitor, and the compiler lists each one so no operation silently ignores it."
+- id: q4
+  type: multi
+  prompt: "Your app decodes a server-driven screen into a component enum. Which choices make it robust to the server shipping new components? Choose all that apply."
+  options:
+    - "Decode unknown `type` values to an `.unsupported` case"
+    - "Throw a decoding error on any unknown type so bugs surface quickly"
+    - "Have each operation decide what unsupported components mean, such as rendering nothing"
+    - "Log unknown component types, so the team sees which app versions need them"
+  answer: [0, 2, 3]
+  explain: "Old app versions will meet new components. A fallback case keeps the screen working, each operation handles it explicitly, and logging tells you how often it happens. Throwing blanks the screen for every user who hasn't updated."
+- id: q5
+  type: sort
+  prompt: "Which design fits each situation best?"
+  buckets: [Enum and switch, Classic visitor, Methods on each type]
+  items:
+    - ["A feature-flag rule tree with and, or, not and a few comparisons", 0]
+    - ["Analysing Swift source with hundreds of syntax node types, caring about two of them", 1]
+    - ["A plug-in system where third parties add new widget types with their own rendering", 2]
+    - ["Server-driven UI components that need rendering, prefetch and accessibility", 0]
+  explain: "Known kinds with growing operations suit an enum. Huge type sets where most operations care about a few nodes suit visitors with default walking. Open sets of types added by others suit methods on a protocol."
