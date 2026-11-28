@@ -1,0 +1,224 @@
+<Brief>
+
+You're the iOS lead for a home-goods shop's app. It has four tabs, **Home** (editorial and categories), **Search**, **Basket** and **Account** (orders, returns, settings), runs on iPhone and iPad, targets iOS 18, and is SwiftUI apart from a few older UIKit screens hosted inside it. Navigation grew feature by feature, and the product team now wants it designed properly, because most of the app's traffic doesn't come through its icon.
+
+How people arrive today:
+
+- **Marketing emails**: up to three campaigns a week, about 2 million emails each, sent through a provider that rewrites every link for click tracking.
+- **Shared links**: product and category pages shared from the website or the app, in Messages, WhatsApp and social apps.
+- **Notifications**: order shipped, out for delivery, delivered, a price drop on a saved item, and a basket reminder.
+- **Widgets**: an order-tracking widget (small and medium) and a Live Activity on delivery day.
+- **Spotlight** results for recently viewed products, and two Home Screen **quick actions**: Search, and Track my latest order.
+- And people expect to come back to where they were after iOS ends the app in the background.
+
+What you know: 4 million monthly users, 1.2 million a day. About 30% of sessions start from a notification, a link or a widget. The website has about 60 link patterns, of which the app handles 25 today, inconsistently. Emails from the past two years are still in inboxes and their links must keep working. Checkout and everything in Account need sign-in. Six feature teams own Home, Search, Product, Basket and checkout, Account, and Growth (marketing and notifications). Analytics wants to know which entry point started each visit.
+
+Design the routing: how every entry point reaches the right screen, cold or warm, signed in or not, on iPhone and iPad, and how navigation is restored. Spend about 45 minutes.
+
+</Brief>
+
+```workspace
+template: feature
+minutes: 45
+```
+
+<ModelAnswer section="requirements">
+
+Questions that change the design:
+
+- **Which old link formats exist?** Two years of emails means `/p/{id}` and `/products/{id}` from an earlier website, not only today's paths. They must be aliases, never dead.
+- **What should a link do when the app can't show it?** A web page the app doesn't know yet, or an old app version: fall back to the website, inside the app.
+- **Can a link act, or only navigate?** Promo links ("20% off with SPRING20") and "add to basket" links are common asks; I'd allow them to *prefill and ask*, never to act.
+- **What happens to a link during checkout?** If a payment is in progress, tearing the flow down is worse than a delay.
+- **Is iPad a priority, and multi-window?** Assume yes for iPad layout, yes for multiple windows (each window navigates on its own).
+
+Functional:
+
+- Every entry point (universal links, the custom scheme, notification taps and actions, widget and Live Activity taps, Spotlight, quick actions, Handoff) opens the right screen, cold or warm.
+- Routes that need sign-in ask for it, then continue to the destination; cancelling drops the destination.
+- Each window restores its tab and stacks after being ended in the background.
+- Every entry is attributed to its source for analytics.
+
+Non-functional:
+
+- A link opens its destination screen within about a second of a cold launch, showing cached or placeholder content while data loads; launch never waits on the network to route.
+- No link, payload or restored snapshot can crash the app or perform an action without the user confirming.
+- Adding a route is one change in one place per team, tested automatically against the website's association file.
+
+Out of scope: deferred deep links for people who install from a link (a later phase), App Clips, Android (but share the link table with it).
+
+</ModelAnswer>
+
+<ModelAnswer section="estimates">
+
+The numbers say where the difficulty is, and it isn't load:
+
+- **Entry-point launches:** 1.2M daily users × ~2.5 sessions = 3M sessions a day; 30% of those = **~900,000 a day** start from a link, notification or widget. Routing is on the critical path for a third of all visits, so a broken route is a visible regression, and worth monitoring per route.
+- **Campaign peaks:** 2M emails with a ~5% click rate in the first hour is ~100,000 opens an hour, **under 30 a second**. No routing backend is involved (iOS resolves universal links on the device), but the click-tracking redirector and the web fallback pages see that load, and Apple's CDN serves the association file.
+- **Routes:** ~60 web patterns plus aliases, perhaps **40 app routes**. Parsing is microseconds; the cost is keeping 40 routes consistent across app, website and association file.
+- **The association file:** 60 patterns is a few KB, far under the 128 KB limit, so excludes and aliases are cheap.
+- **Restoration snapshot:** a tab plus four stacks of at most ~10 routes, ~40 bytes each: **under 2 KB per window**, small enough to rewrite on every navigation change.
+
+</ModelAnswer>
+
+<ModelAnswer section="architecture">
+
+On the device, every door does one thing, hand its payload to an adapter, and everything after that is shared:
+
+1. **Adapters** at each door: `onOpenURL` (universal links, the scheme, widgets, Live Activities), `onContinueUserActivity` (Spotlight, Handoff), the notification centre delegate (set in `didFinishLaunching`), a scene delegate for quick actions, and App Intents that open the app.
+2. **`LinkParser`**, one per app, in a small `Routing` module: raw URL or payload in, typed `AppRoute` (plus `EntrySource`) out, or `nil`. It also generates URLs from routes.
+3. **`EntryHandler`**, one per window: holds the latest pending route until the window is restored and the session is known, applies the sign-in gate, and logs the source.
+4. **`AppRouter`**, one per window: plans a route against the current UI (what's presented, which tab, iPhone or iPad) and applies it to the navigation model.
+5. **`AppFlow` and feature flows**: the window's tab selection and each tab's path and presented flow, owned by observable flow objects per feature.
+
+Server side, three supporting pieces:
+
+- The **association file** on `shop.example.com`, `www.shop.example.com` and a tracking subdomain `click.shop.example.com`, generated from the same **route table** the app's parser is tested against.
+- **Web pages for every route**, which are both the fallback when the app isn't installed and the answer for links the app doesn't support yet.
+- The **notification service** (Growth's) puts a `link` field in every payload, built from the same route table.
+
+</ModelAnswer>
+
+<ModelAnswer section="client">
+
+- **Routes.** A central `AppRoute` enum in the `Routing` module, with each team's routes nested: `case catalogue(CatalogueRoute)`, `case account(AccountRoute)`… Teams own their nested enum and its URL patterns; the `Routing` module is small and stable, and the compiler checks exhaustiveness. Features navigate to other features by reporting outputs, which the app turns into routes.
+- **Navigation state, per window:** `WindowNavigation { tab, paths: [Tab: [AppRoute]], presented: Presented? }`. Each tab's `NavigationStack` binds to its path. `Presented` is one optional enum (sign-in, checkout, share), so two presentations can't be requested at once.
+- **Flows.** One `@Observable` flow per tab, owning its path and child flows (checkout lives in Basket's presentation state and is released when dismissed). Flows build screens with their dependencies through a `@ViewBuilder` destination method; screens get closures, never the flow or a global router.
+- **iPad.** `TabView` with `.sidebarAdaptable`, departments as a `TabSection`. The Search tab is a `NavigationSplitView` (results beside the product); a product route on iPad sets the split view's selection instead of pushing. One state, any width.
+- **Hosted UIKit screens** report outputs; they never push or present themselves, so there's one navigation system per stack.
+- **The router's plan** is a pure function of `(route, current state, isSignedIn, idiom)` returning commands; unit tests cover it per route.
+
+</ModelAnswer>
+
+<ModelAnswer section="api">
+
+**Link formats** (one table, shared by the app, the website, the association file and Android):
+
+| Path | Route | Notes |
+| --- | --- | --- |
+| `/product/{id}`, aliases `/p/{id}`, `/products/{id}` | product | aliases from 2024–25 emails; never removed |
+| `/category/{slug}` | category | |
+| `/search?q=` | search | `+` means a space |
+| `/basket` | basket | |
+| `/orders`, `/orders/{id}`, `/orders/{id}/tracking` | orders | need sign-in |
+| `/returns/{orderID}` | start a return | needs sign-in |
+| `/promo/{code}` | basket with the code *offered* | never applied without a tap |
+
+Rules: patterns are only ever **added**; a removed feature's path keeps parsing and maps to the nearest sensible route. Every link may carry `utm_*` and `source` parameters, which the parser ignores for routing and the entry handler logs.
+
+**Association file:** `applinks` components in order: excludes first (`/help/*`, `/account/delete`, `/legal/*`, anything that must stay on the web), then the route patterns. Served on all three hosts, generated in CI from the route table.
+
+**Notification payload:**
+
+```json
+{
+  "aps": { "alert": { "title": "Out for delivery" }, "category": "DELIVERY", "target-content-id": "order-A1B2C3" },
+  "link": "https://shop.example.com/orders/A1B2C3/tracking",
+  "orderID": "A1B2C3"
+}
+```
+
+`link` decides the destination; typed ids are for the app's own logic; `target-content-id` picks the window on iPad. Older payloads without `link` are still parsed by `type` for a year.
+
+**Widgets and Live Activities** use the same universal links with `source=widget`. **Quick actions** have types `shop.search` and `shop.trackLatest` (with the order id in `userInfo`, refreshed when orders change). **Spotlight** items use the route's URL as their identifier.
+
+</ModelAnswer>
+
+<ModelAnswer section="data">
+
+- **Routes** are values: `Hashable`, `Codable`, `Sendable`, ids only.
+- **Window snapshot** in `@SceneStorage` as `Data`: `{ version, userID, savedAt, tab, paths, searchSelection }`. Rewritten on every navigation change (under 2 KB). Restored leniently: route by route, the valid prefix of each stack; discarded for another user or an unknown version; after 8 hours only the tab is kept.
+- **Not in the snapshot:** presented flows, alerts, search results. An open checkout restores as the Basket tab; the address form's draft is saved as data in the basket store, keyed by basket, so it survives even a force quit.
+- **Pending route**: in memory in the entry handler. If the app is ended during sign-in, the destination is lost; that's acceptable (the user can tap again), and persisting it would risk replaying stale intents.
+- **Spotlight index** of recently viewed products, ids as route URLs, removed on sign-out.
+- **Route table**: a JSON file in the repo (path pattern, route name, needs sign-in, owner team), the single source for the parser tests, the association file and the website's link builder.
+
+</ModelAnswer>
+
+<ModelAnswer section="deepdive">
+
+**1. A cold start from "Out for delivery".** The app isn't running. iOS launches it; `didFinishLaunching` sets the notification delegate; the scene connects with its restoration snapshot. The window restores tabs and stacks from the snapshot (validated, no animation) while the session loads from the Keychain. The delegate delivers the tap; its adapter parses `link` into `.account(.tracking("A1B2C3"))`, source `.notification`, and the entry handler holds it until both "restored" and "session known" are true. If the token is valid, the router dismisses nothing (nothing is presented after a restore), selects Account and sets its path to `[orders, order A1B2C3, tracking]`; Home and Search keep their restored stacks. If the session has expired, sign-in is presented over the restored UI with the route pending; success applies it, cancel drops it. The tracking screen shows its last cached state at once and refreshes, so the user sees something within the second even on a slow network.
+
+**2. Email click tracking.** The provider rewrites `https://shop.example.com/product/42` to `https://click.mailer.example/...`, which isn't in our entitlement, so today every email link opens Safari. Fix: a tracking subdomain we control, `click.shop.example.com`, pointed at the provider, serving our association file (the provider hosts it), and `applinks:click.shop.example.com` in the entitlement. The app then receives the *tracking* URL. The entry handler resolves it with a `HEAD` request that follows redirects, with a 2-second timeout, then parses the final URL. During that, the app shows its normal launch UI; on timeout or failure it opens the tracking URL in an in-app Safari view, which still registers the click and lands on the web page. The click is counted once, by the provider, either way.
+
+**3. A link while the user is paying.** The planner checks what's presented before tearing it down. Sheets for short tasks (share, filters, an address form with no edits) are dismissed. A checkout whose payment is in flight is never torn down by a link: the route waits in the entry handler, and a small banner says "Finish checkout to open this"; when checkout ends, the pending route is applied. That one rule is a few lines in the planner and a test, instead of a bug report about lost payments.
+
+</ModelAnswer>
+
+<ModelAnswer section="failure">
+
+- **Malformed or unknown links on our domain:** the parser returns `nil`; the app opens the URL in an in-app Safari view, so newer web pages work in older app versions and nothing crashes. Links to other hosts are never loaded (no open redirects).
+- **Destination gone** (a deleted product, a cancelled order): the screen resolves its id and shows a "no longer available" state with a way back; restored stacks drop routes whose data the device knows is gone.
+- **Signed out, or another account:** account routes ask for sign-in and continue; snapshots carry the user id and are ignored for anyone else; sign-out clears scene storage and the Spotlight index.
+- **Offline:** routing never waits on the network; screens show cached content or placeholders; the click-tracking resolution falls back after its timeout.
+- **Two entry points at once** (a notification tap during a cold launch from a quick action): the newest wins; the older is logged and dropped.
+- **Multiple windows:** each window has its own entry handler, router and snapshot; `target-content-id` and activity identifiers let the window already showing an order claim its notifications.
+- **Security:** links navigate, they never act: promo codes and "add to basket" links prefill a screen with a confirm button; every parameter is validated; magic sign-in links are single-use and expire in minutes; payment screens are never restored and never opened by a link.
+- **Monitoring:** log `route_opened` and `route_failed` with source and route name; alert when a route's failure rate jumps after a release or a campaign send.
+
+</ModelAnswer>
+
+<ModelAnswer section="tradeoffs">
+
+- **Universal links everywhere, the scheme only as a fallback and for tooling.** Costs the association file, the tracking subdomain and web pages for every route; buys links that work for everyone and can't be hijacked.
+- **A central route enum with nested feature routes** over string registration: the compiler checks every switch and teams own their part; the price is that the `Routing` module changes with each new route family, and cross-feature navigation goes through outputs. At 20+ teams I'd revisit registration with generated, tested tables.
+- **Flow objects per feature** over one app-wide store: fits six teams working independently; the planner stays pure so the rules are still unit-tested.
+- **Restore tabs and stacks, never presentations,** with an 8-hour limit: users find their place without stale checkouts; a few will wish the form had come back (the draft covers that).
+- **Outside links open on a canonical tab; in-app links push on the current one:** predictable for support and analytics, contextual inside the app.
+- **Evolution:** generate Android's and the website's link builders from the same table; add deferred deep links through sign-in ("continue where you left off" after install); route-level feature flags so Growth can launch a campaign page in the app and on the web at once; App Clips for QR codes in shops.
+
+</ModelAnswer>
+
+```rubric
+- id: entry-coverage
+  label: Covered every way into the app, cold and warm
+  skill: requirements
+  look_for:
+    - Lists links, the scheme, notifications and their actions, widgets and Live Activities, Spotlight, quick actions and restoration
+    - Separates cold-start delivery from warm delivery, and says where each arrives
+    - Asks about old link formats, sign-in, iPad and multiple windows
+- id: one-route
+  label: One typed route, one parser, one router
+  skill: client
+  look_for:
+    - Every entry point adapts its payload into the same typed route, with ids only
+    - A single parser validates every parameter and also generates URLs, with a round-trip test
+    - Navigation state is per window and owned by flows or a model; screens report outputs and never navigate directly
+- id: link-contract
+  label: A link contract that keeps working
+  skill: api
+  look_for:
+    - Universal links with an association file generated from the same route table, and web fallbacks
+    - Handles email click tracking with a tracking subdomain of its own, or an equivalent
+    - Notification payloads carry a link; old patterns are kept as aliases, never removed
+- id: cold-start
+  label: Cold starts, sign-in and timing handled deliberately
+  skill: offline
+  look_for:
+    - The notification delegate is set before launch finishes
+    - A pending route waits until the window is restored and the session known, then is applied on top
+    - Sign-in gating holds the route and resumes or drops it; routing never waits on the network
+- id: restoration
+  label: Restoration that can't make things worse
+  skill: data
+  look_for:
+    - A small versioned snapshot of routes per window, decoded leniently and validated
+    - Tied to the user, with an age limit; presentations and alerts aren't restored, drafts are data
+- id: safety
+  label: Links treated as untrusted input
+  skill: security
+  look_for:
+    - No action without confirmation (promo codes, add to basket), no open redirects, every id validated
+    - A link never tears down a payment in progress
+```
+
+<Pitfalls>
+
+- Parsing links separately in the scene delegate, `onOpenURL` and the notification handler, so each entry point has its own idea of a route.
+- Handling only warm-start callbacks, so every link tapped while the app is closed opens Home.
+- Forgetting that email click tracking redirects through another domain, which sends every campaign link to Safari.
+- Letting a link apply a promo code, add to the basket or open a payment screen without the user confirming.
+- Restoring a half-finished checkout, or restoring one account's screens for another.
+- Removing old link patterns when the website changes, breaking two years of emails.
+
+</Pitfalls>

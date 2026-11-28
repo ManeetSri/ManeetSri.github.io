@@ -1,0 +1,439 @@
+## Why it matters
+
+"Do we still need coordinators in SwiftUI?" is a question every team moving off UIKit argues about, and interviewers like it because both "yes" and "no" can be right. SwiftUI navigation is state, so the part of a coordinator that pushed view controllers disappears. The rest of its job doesn't: something still has to own a flow's navigation state, build its screens with their dependencies, turn their outputs into navigation, start and finish child flows, and accept routes from outside. This lesson shows where each of those jobs goes, as small observable **flow** objects, and when you don't need them at all.
+
+## What a coordinator did, and where it goes
+
+Take the UIKit coordinator from earlier in this module apart, job by job:
+
+| Job | UIKit coordinator | SwiftUI |
+| --- | --- | --- |
+| Hold the flow's navigation | a `UINavigationController` it drives | a path and an optional destination it **owns as state** |
+| Create screens with their dependencies | builds view controllers | a `@ViewBuilder` method from route to view |
+| Turn screen outputs into navigation | closures that push and present | closures that change its state |
+| Start and finish child flows | a `children` array, released on finish | the child **stored in the parent's state**, released by clearing it |
+| Accept routes from outside | `handle(route)` down the tree | the same, as a method that sets state |
+| Notice the back swipe | the navigation controller's delegate | nothing: the stack writes the shorter path back through the binding |
+
+The last row is the big simplification. A SwiftUI stack bound to a path tells its owner about every pop, because popping *is* writing the path. The other rows remain, and an object that does them is a coordinator in everything but name. Call it a **flow**.
+
+## A flow object
+
+Here's the Basket tab's flow. It owns the tab's path, knows which screen each route becomes and what that screen needs, and starts checkout as a child.
+
+```swift check ios group=flows title="BasketFlow.swift"
+import SwiftUI
+
+// What the flows hand to screens. Screens never reach for singletons.
+protocol ProductCatalogue: Sendable {
+    func name(of productID: Int) async -> String
+}
+
+struct ShopDependencies: Sendable {
+    let catalogue: any ProductCatalogue
+}
+
+enum BasketRoute: Hashable, Codable {
+    case product(id: Int)
+    case reviews(productID: Int)
+}
+
+enum CheckoutOutcome: Equatable {
+    case placed(orderID: String)
+    case cancelled
+}
+
+/// The Basket tab's flow: owns its navigation, builds its screens, and starts checkout as a child
+@MainActor @Observable
+final class BasketFlow {
+    var path: [BasketRoute] = []
+    /// The presented child flow. Setting it presents the sheet; clearing it dismisses and frees it.
+    var checkout: CheckoutFlow?
+    /// Told when an order is placed; the parent decides what happens next
+    var onOrderPlaced: ((String) -> Void)?
+    private let dependencies: ShopDependencies
+
+    init(dependencies: ShopDependencies) {
+        self.dependencies = dependencies
+    }
+
+    func checkOutTapped() {
+        guard checkout == nil else { return }
+        let child = CheckoutFlow()
+        // Weak: self owns the child through `checkout`, and the child owns this closure
+        child.onFinish = { [weak self] outcome in
+            guard let self else { return }
+            checkout = nil
+            if case .placed(let orderID) = outcome { onOrderPlaced?(orderID) }
+        }
+        checkout = child
+    }
+
+    /// The only place that knows which screen each route becomes, and what it needs
+    @ViewBuilder
+    func destination(for route: BasketRoute) -> some View {
+        switch route {
+        case .product(let id):
+            ProductScreen(id: id, catalogue: dependencies.catalogue) {
+                self.path.append(.reviews(productID: id))
+            }
+        case .reviews(let productID):
+            Text("Reviews for product \(productID)")
+        }
+    }
+}
+```
+
+Three choices in there carry the design:
+
+- **`destination(for:)` returns `some View`**, not `AnyView`. The `@ViewBuilder` switch produces one concrete type, so SwiftUI keeps each destination's identity and doesn't pay for type erasure. Destination builders written as `-> AnyView` lose that, and get slower as the switch grows.
+- **Screens get closures, not the flow.** `ProductScreen` receives `onShowReviews`, which it can call and nothing else. Handing every screen the flow object, or putting a router in the environment for any view to call, recreates the "anyone can navigate anywhere" problem coordinators were meant to solve.
+- **The closures given to screens capture the flow strongly**, and that's fine: a view holding a closure doesn't own anything long-lived, so there's no cycle. The closure the *child* holds, `onFinish`, is different: the parent owns the child, so that one captures the parent weakly.
+
+## Child flows live in the parent's state
+
+In UIKit a child coordinator lives in a `children` array, and keeping that array in step with the screen was the hard part. In SwiftUI the child lives in the state that presents it. `checkout` being non-`nil` *is* the sheet being up, and clearing it both dismisses the sheet and releases the child. There's no separate bookkeeping to forget.
+
+```swift check ios group=flows title="CheckoutFlow.swift"
+enum CheckoutStep: Hashable {
+    case delivery, payment
+}
+
+/// A child flow with its own stack. It reports how it ended and never decides what follows.
+@MainActor @Observable
+final class CheckoutFlow: Identifiable {
+    var steps: [CheckoutStep] = []
+    var onFinish: ((CheckoutOutcome) -> Void)?
+
+    func addressChosen() { steps.append(.delivery) }
+    func deliveryChosen() { steps.append(.payment) }
+    func placed(orderID: String) { finish(.placed(orderID: orderID)) }
+    func cancel() { finish(.cancelled) }
+
+    private func finish(_ outcome: CheckoutOutcome) {
+        guard let onFinish else { return }   // once, however it ends
+        self.onFinish = nil
+        onFinish(outcome)
+    }
+}
+```
+
+`Identifiable` comes free for a class: its `id` is the object's identity, which is stable for the whole life of the sheet however much the checkout's own state changes. That's exactly the identity `.sheet(item:)` needs.
+
+Follow one checkout from start to finish:
+
+```visual sequence
+title: A child flow, from start to release
+participants:
+  - { id: screen, label: Basket screen }
+  - { id: basket, label: BasketFlow }
+  - { id: checkout, label: CheckoutFlow }
+  - { id: ui, label: SwiftUI }
+  - { id: app, label: AppFlow }
+messages:
+  - [screen, basket, checkOutTapped, { say: "The basket screen reports a tap. It doesn't know a checkout flow exists." }]
+  - [basket, checkout, "init, onFinish", { say: "The parent creates the child and gives it a way to report back, capturing itself weakly." }]
+  - [basket, ui, "checkout = child", { say: "Storing the child **is** presenting it: the sheet's item is now non-nil, so SwiftUI presents the checkout's view bound to that object." }]
+  - [checkout, checkout, steps.append, { say: "Inside the sheet, the child owns its own stack of steps. The parent never sees them." }]
+  - [checkout, basket, "onFinish(.placed)", { reply: true, say: "An order is placed. The child reports the outcome and clears its own `onFinish`, so it can't report twice." }]
+  - [basket, ui, "checkout = nil", { say: "Clearing the state dismisses the sheet. Nothing else holds the child, so it's freed: no `children` array to keep in step." }]
+  - [basket, app, "onOrderPlaced(id)", { reply: true, say: "Showing the order spans two tabs, so the basket passes it up to the flow that owns both." }]
+```
+
+## Drawing flows
+
+Views bind to flows and draw them. Two details matter: the stack's destinations come from the flow's builder, and the sheet's binding turns a swipe-down into the child's own cancel, so the parent always hears how the flow ended.
+
+```swift check ios group=flows title="FlowViews.swift"
+struct ProductScreen: View {
+    let id: Int
+    let catalogue: any ProductCatalogue
+    let onShowReviews: () -> Void
+    @State private var name = ""
+
+    var body: some View {
+        VStack {
+            Text(name)
+            Button("Reviews", action: onShowReviews)
+        }
+        .task(id: id) { name = await catalogue.name(of: id) }
+    }
+}
+
+struct BasketFlowView: View {
+    @Bindable var flow: BasketFlow
+
+    var body: some View {
+        NavigationStack(path: $flow.path) {
+            List {
+                NavigationLink("Trail runners", value: BasketRoute.product(id: 7))
+                Button("Check out") { flow.checkOutTapped() }
+            }
+            .navigationDestination(for: BasketRoute.self) { route in
+                flow.destination(for: route)
+            }
+        }
+        // A swipe-down writes nil: turn it into the child's own cancel, so the parent always hears
+        .sheet(item: Binding(get: { flow.checkout }, set: { if $0 == nil { flow.checkout?.cancel() } })) { checkout in
+            CheckoutFlowView(flow: checkout)
+        }
+    }
+}
+
+struct CheckoutFlowView: View {
+    @Bindable var flow: CheckoutFlow
+
+    var body: some View {
+        NavigationStack(path: $flow.steps) {
+            Button("Use this address") { flow.addressChosen() }
+                .navigationDestination(for: CheckoutStep.self) { step in
+                    switch step {
+                    case .delivery: Button("Standard delivery") { flow.deliveryChosen() }
+                    case .payment: Button("Pay") { flow.placed(orderID: "A1B2C3") }
+                    }
+                }
+                .toolbar {
+                    Button("Cancel") { flow.cancel() }
+                }
+        }
+    }
+}
+```
+
+Without that custom binding, a swipe-down would set `checkout` to `nil` directly. The sheet would close and the child would be freed, but `onFinish` would never run, so the parent would never learn the checkout was abandoned. For a basket that's a missing analytics event; for a flow that holds a seat or a payment intent, it's a resource nobody releases.
+
+## The root flow, one per window
+
+Every tree needs a root, and in SwiftUI the question is *where it lives*. Two rules:
+
+- **One per window.** Navigation is per scene: two iPad windows each have their own tab and paths. So the root flow belongs to a view inside `WindowGroup`, not to the `App`, whose `@State` is shared by every window.
+- **Created once, never in `body`.** A flow made in `body`, or in a view's `init` without `@State`, is rebuilt on every update and loses its state. `@State` keeps the first instance for the view's lifetime.
+
+```swift check ios group=flows title="AppFlow.swift"
+struct LiveCatalogue: ProductCatalogue {
+    func name(of productID: Int) async -> String { "Product \(productID)" }
+}
+
+enum AppTab: Hashable {
+    case shop, basket, account
+}
+
+/// The root flow: it owns the tabs' flows and connects them
+@MainActor @Observable
+final class AppFlow {
+    var tab = AppTab.shop
+    var accountPath: [String] = []
+    let basket: BasketFlow
+
+    init(dependencies: ShopDependencies) {
+        basket = BasketFlow(dependencies: dependencies)
+        basket.onOrderPlaced = { [weak self] orderID in
+            // A decision that spans tabs belongs to the flow that owns both
+            self?.tab = .account
+            self?.accountPath = ["orders", orderID]
+        }
+    }
+}
+
+/// Used as `WindowGroup { WindowRoot() }`, so every window gets its own flow
+struct WindowRoot: View {
+    @State private var flow = AppFlow(dependencies: ShopDependencies(catalogue: LiveCatalogue()))
+
+    var body: some View {
+        TabView(selection: $flow.tab) {
+            Tab("Shop", systemImage: "house", value: AppTab.shop) {
+                Text("Shop")
+            }
+            Tab("Basket", systemImage: "bag", value: AppTab.basket) {
+                BasketFlowView(flow: flow.basket)
+            }
+            Tab("Account", systemImage: "person", value: AppTab.account) {
+                Text("Account: \(flow.accountPath.joined(separator: " › "))")
+            }
+        }
+    }
+}
+```
+
+Deep links enter here too. An `open(_ route:)` on `AppFlow` selects the tab and hands the rest of the route to that tab's flow, which sets its path or presents its child. Because everything is state, "dismiss whatever is presented first" is `basket.checkout?.cancel()`, and it runs synchronously in the same update.
+
+## Flows or one navigation value?
+
+The previous lesson kept a window's whole navigation as one value; this one splits it into objects. They're two answers to the same question, and each wins somewhere.
+
+| | One navigation value | Flow objects |
+| --- | --- | --- |
+| What a flow is | a nested struct or enum case | an `@Observable` class |
+| Per-flow dependencies and async work | passed in from outside | owned by the flow |
+| Saving and restoring | encode the value | each flow encodes its own part |
+| Equality in tests | the whole tree at once | per flow |
+| Releasing a child | it's removed with its enclosing value | clear the reference |
+| Wins for | apps built around a single store or reducer | most SwiftUI apps with distinct features |
+
+Many apps combine them: flow objects per feature, each holding plain-value navigation state (`[Route]` and an optional destination) that's easy to test and encode.
+
+## UIKit coordinators with SwiftUI screens
+
+Most large apps don't switch in one go. A common middle stage keeps UIKit coordinators and navigation controllers, and writes new screens in SwiftUI, hosted in `UIHostingController`:
+
+```swift check ios title="A UIKit coordinator showing a SwiftUI screen"
+import SwiftUI
+import UIKit
+
+struct ReviewsScreen: View {
+    let productID: Int
+    let onWriteReview: () -> Void
+
+    var body: some View {
+        Button("Write a review", action: onWriteReview)
+            .navigationTitle("Reviews")
+    }
+}
+
+final class ProductCoordinator {
+    private let navigation: UINavigationController
+
+    init(navigation: UINavigationController) {
+        self.navigation = navigation
+    }
+
+    @MainActor
+    func showReviews(for productID: Int) {
+        let screen = ReviewsScreen(productID: productID) { [weak self] in
+            self?.showReviewComposer(for: productID)
+        }
+        let host = UIHostingController(rootView: screen)
+        host.title = "Reviews"   // the UIKit bar reads the host's title and navigationItem
+        navigation.pushViewController(host, animated: true)
+    }
+
+    @MainActor
+    func showReviewComposer(for productID: Int) {}
+}
+```
+
+The rule that keeps this sane: **one navigation system per stack.** A hosted SwiftUI screen reports outputs and the UIKit coordinator navigates; the screen doesn't contain `NavigationStack` or `NavigationLink`, which would try to manage a stack UIKit already owns. When a whole tab is SwiftUI, flip it: the tab's root becomes one `UIHostingController` holding a `NavigationStack` and its flow, and UIKit stops at the tab bar.
+
+## Testing a flow
+
+A flow is a plain observable object, so its rules test without a simulator:
+
+```swift
+@Test @MainActor func placingAnOrderClosesCheckoutAndReportsTheOrder() {
+    let basket = BasketFlow(dependencies: .preview)
+    var reported: [String] = []
+    basket.onOrderPlaced = { reported.append($0) }
+
+    basket.checkOutTapped()
+    weak var checkout = basket.checkout
+    checkout?.placed(orderID: "A1B2C3")
+
+    #expect(basket.checkout == nil)     // the sheet is dismissed
+    #expect(checkout == nil)            // and the child is freed
+    #expect(reported == ["A1B2C3"])     // and the parent heard, once
+}
+```
+
+The `weak` reference is the lifetime test: if anything still held the child (a strong capture in `onFinish`, a stray array), it would survive the line that cleared it.
+
+## Trade-offs
+
+| | Navigation in views | Flow objects (SwiftUI coordinators) | UIKit coordinators hosting SwiftUI | One app-wide router or store |
+| --- | --- | --- | --- | --- |
+| Screens reusable in other flows | only if they never navigate | yes | yes | yes |
+| Child flow lifetimes | the view's | the parent's state | a `children` array plus delegates | the store's |
+| Deep links | hard | down the tree of flows | down the tree of coordinators | one place |
+| Migration from UIKit | a rewrite | a rewrite per feature | gradual | a big change at once |
+| Cost | none | a class per flow | two navigation systems for a while | everything goes through one type |
+| Wins for | small apps, leaf screens | most SwiftUI apps with real flows | UIKit apps adopting SwiftUI | apps already built on a store |
+
+You don't need flows everywhere. A settings screen whose links only push static detail can navigate in its views. Introduce a flow when a feature has logic that navigates, a child flow to start and finish, or routes arriving from outside.
+
+<Callout kind="interview">
+
+**What to say:** "A flow object per feature owns its navigation state, builds its screens with their dependencies through a `@ViewBuilder` destination method, and turns screen outputs into state changes. Child flows live in the parent's presentation state, so clearing it dismisses and frees them; swipe-downs are routed through the child's cancel so the parent always hears. One root flow per window." For a migration: "UIKit coordinators hosting SwiftUI screens, one navigation system per stack."
+
+**What to ask:** is the app all SwiftUI, or mid-migration? Do flows need their own dependencies or long-running work? Is there already a store-based architecture?
+
+**Red flags:** a router in the environment that any view calls; destination builders returning `AnyView`; flows created in `body`; a child's `onFinish` capturing its parent strongly; hosted SwiftUI screens with their own `NavigationStack` inside a UIKit stack.
+
+</Callout>
+
+<Callout kind="gotcha" title="iOS gotcha: the App's @State is shared by every window">
+
+On iPad, and on the Mac, a `WindowGroup` can open several windows, but `@State` declared on the `App` struct exists once for the whole app. Put the root flow there and every window shares one tab selection and one set of paths: switching tabs in one window switches them in all. Declare it in the view the `WindowGroup` creates, so each window gets its own.
+
+</Callout>
+
+## Practice
+
+[A coordinator tree that lets go](/design/practice/sd-kata-navigation-coordinator-tree) is written with plain classes rather than SwiftUI, because the lifetime rules are the same in both: a parent holds its running children, results arrive exactly once, finishing a parent finishes its children first, and nothing keeps a finished flow alive. Its tests check that with weak references, as the test above does.
+
+```cards
+- id: flow-jobs
+  front: "Which jobs of a UIKit coordinator remain in SwiftUI?"
+  back: "Owning the flow's navigation state, building screens with their dependencies, turning outputs into navigation, starting and finishing child flows, and accepting routes. Pushing and noticing the back swipe go away: the path is state."
+- id: child-in-state
+  front: "Where does a child flow live in SwiftUI?"
+  back: "In the parent's presentation state, such as `var checkout: CheckoutFlow?`. Non-nil presents it; clearing it dismisses the sheet and frees the child, with no children array to keep in step."
+- id: swipe-cancel
+  front: "How does a parent flow hear that the user swiped a sheet away?"
+  back: "Give `.sheet(item:)` a binding whose setter, on nil, calls the child's own cancel. Otherwise SwiftUI clears the state directly and the child's completion never runs."
+- id: root-per-window
+  front: "Where should a SwiftUI app's root flow be created?"
+  back: "In `@State` on the view inside `WindowGroup`, so each window has its own, and never in `body` or in the App struct, whose state every window shares."
+```
+
+```quiz
+- id: q1
+  type: mcq
+  prompt: "In UIKit, a coordinator had to watch the navigation controller's delegate to notice the back swipe. Why doesn't a SwiftUI flow need that?"
+  options:
+    - "SwiftUI disables the back swipe in programmatic stacks"
+    - "The stack writes the shortened path back through the binding, so the flow's state already reflects the pop"
+    - "SwiftUI calls `onDisappear` on the flow"
+    - "Flows observe `NotificationCenter` for pops"
+  answer: 1
+  explain: "Popping is writing the path. The flow owns the path, so it sees every pop, whoever caused it. Only presentations dismissed by a swipe need care, because the child's own completion wouldn't run."
+- id: q2
+  type: bug
+  prompt: "A deep link sets `checkout = nil` while a checkout is open, without finishing it. Memory shows that CheckoutFlow is never freed. Which line is the cause?"
+  code: |
+    func checkOutTapped() {
+        let child = CheckoutFlow()
+        child.onFinish = { outcome in
+            self.checkout = nil
+            if case .placed(let id) = outcome { self.onOrderPlaced?(id) }
+            print("finished", child.steps)
+        }
+        checkout = child
+    }
+  answer: 6
+  explain: "The child stores this closure, and the closure captures `child` strongly, so the child holds itself. Finishing would break the cycle by clearing `onFinish`, but a child released without finishing keeps it forever (and, through `self`, keeps a reference to its parent too). Capture weakly and don't reference the child inside its own completion."
+- id: q3
+  type: multi
+  prompt: "Which are good reasons to introduce a flow object for a feature? Choose all that apply."
+  options:
+    - "It starts a child flow and must react to how it ended"
+    - "Logic, not only taps, decides where to go next"
+    - "Routes from notifications must land inside it"
+    - "It has two static screens linked by a NavigationLink"
+    - "Its screens need dependencies the feature owns"
+  answer: [0, 1, 2, 4]
+  explain: "Flows earn their keep when navigation has logic, children, outside entry points or dependencies to hand out. Two static screens can navigate in their views."
+- id: q4
+  type: truefalse
+  prompt: "A root flow stored in `@State` on the `App` struct gives each iPad window its own navigation state."
+  answer: false
+  explain: "State on the App exists once for the whole app, so every window would share it. Create the root flow in the view inside `WindowGroup`."
+- id: q5
+  type: mcq
+  prompt: "A UIKit app pushes a hosted SwiftUI screen, and that screen contains `NavigationStack { … }` with links of its own. What's the likely result?"
+  options:
+    - "It works: the two stacks merge"
+    - "Two navigation systems fight over one stack: doubled bars, links that push into the wrong place"
+    - "UIKit converts the links into pushes automatically"
+    - "The app crashes at launch"
+  answer: 1
+  explain: "One navigation system per stack. A hosted screen should report outputs and let the UIKit coordinator push; or the whole tab becomes SwiftUI with its own stack at the root."
+```

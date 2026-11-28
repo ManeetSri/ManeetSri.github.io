@@ -167,7 +167,9 @@ const checkCourse = async (course) => {
     // Links between pages, in either course, must point at something that exists
     filesIn(at(course.contentDir), '.mdx').forEach((path) => {
         const where = relative(root, path);
-        const lessonModule = moduleOfLesson[basename(path, '.mdx')];
+        // A practice statement belongs to the module of the lessons it practises
+        const fileId = basename(path, '.mdx');
+        const lessonModule = moduleOfLesson[fileId] ?? moduleOfLesson[practice.find((item) => item.id === fileId)?.lessons?.[0]];
         if (onlyModules.length && !(lessonModule && inScope(lessonModule))) return;
         const text = readFileSync(path, 'utf8');
         for (const [, base, kind, id] of text.matchAll(/\]\(\/(dsa|design)\/(learn|practice|checkpoint)\/([a-z0-9-]+)/g)) {

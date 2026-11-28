@@ -1,0 +1,445 @@
+## Why it matters
+
+iOS ends suspended apps to reclaim memory, and users come back hours later expecting the tab, the product and the order they left. [Persisting and restoring UI state](/design/learn/sd-state-persist-restore) covered the tools (`@SceneStorage`, the scene's restoration activity, snapshot types) and [Termination and state restoration](/design/learn/sd-runtime-restoration) the lifecycle. Navigation is the hardest state to restore well, because it points at data that may have changed, at screens that may need a session the user no longer has, and at flows that were half finished. And on a cold start it collides with the notification or link that launched the app. "The app was killed in the background while the user was three screens deep; what do they see when they come back?" is a senior-level interview question, and the answer is a set of decisions, not an API.
+
+## Restoring is a deep link with history
+
+A window's navigation, as this module has built it, is a small value: the selected tab, a typed path per tab, a split view's selection, and perhaps a presented flow. Restoring navigation means saving that value when the window goes to the background and rebuilding the UI from it at the next launch.
+
+Rebuilding from a value is exactly what a deep link does. So the strongest designs don't write restoration code at all; they **restore through the router**. The saved snapshot is a set of routes, and restoring applies them through the same validation and the same plan-and-perform steps as a link, without animation. Every rule the router already knows (orders need sign-in, a deleted product has no screen, a sheet can't sit behind a push) applies to restored state for free.
+
+That rules out one tempting shortcut: saving `NavigationPath.CodableRepresentation` and handing it back to the stack. [NavigationStack and NavigationPath](/design/learn/sd-nav-stack) showed what it contains: type names that break when you rename or move a type, and no validation when it's decoded. Save typed routes you can check.
+
+## What to bring back
+
+Not everything that was on screen should return. Decide per kind of state:
+
+| State | Restore? | Why |
+| --- | --- | --- |
+| Selected tab, split view selection | yes | cheap, and the strongest sign of "where I was" |
+| Browsing paths: category, product, reviews | yes, validated | each id may have been deleted since |
+| Search query | yes; refetch the results | results are content, and content goes stale |
+| A presented task: checkout, compose, an address form | no; restore its *start*, and its draft as data | a half-finished payment step out of context is confusing or unsafe |
+| Alerts, toasts, spinners | never | they described a moment that has passed |
+| Sensitive screens: payment details, a one-time code | no, or behind re-authentication | the device may have changed hands |
+| Anything from another account | never | the snapshot must name its user |
+| A snapshot from days ago | the tab only | after long enough, "where I was" is a guess |
+
+The last row is a product decision with a real trade-off. Restoring a week-old stack puts the user on a product they've forgotten; discarding everything feels like a crash. A time limit (a few hours, or one working day) with the tab kept beyond it is a common middle ground.
+
+## Restoring without trusting the snapshot
+
+The snapshot was written by an earlier run of the app, possibly an earlier *version* of it, for a user who may have signed out since, pointing at data that may be gone. Restore defensively, and never crash: a snapshot the app reads at every launch and can't handle is a crash on every launch.
+
+```swift run title="A restore that keeps what's still true"
+import Foundation
+
+enum Tab: String, Codable, CaseIterable {
+    case home, search, basket, account
+}
+
+enum Route: Codable, Equatable {
+    case category(slug: String)
+    case product(id: Int)
+    case orders
+    case order(id: String)
+}
+
+/// What a window saves: small, ids only, versioned, and tied to the user it belongs to
+struct Snapshot: Codable {
+    static let version = 2
+    var version = Snapshot.version
+    var userID: String
+    var savedAt: Double   // seconds since 1970
+    var tab: Tab
+    var paths: [String: [Route]]
+}
+
+/// Decodes one value, or nil if this build can't read it, so one bad route doesn't cost the rest
+struct Lenient<Value: Decodable>: Decodable {
+    let value: Value?
+    init(from decoder: any Decoder) throws {
+        value = try? Value(from: decoder)
+    }
+}
+
+/// The same snapshot, read without trusting it
+struct SavedSnapshot: Decodable {
+    var version: Int
+    var userID: String
+    var savedAt: Double
+    var tab: Lenient<Tab>
+    var paths: [String: [Lenient<Route>]]
+}
+
+struct Navigation {
+    var tab = Tab.home
+    var paths: [Tab: [Route]] = [:]
+
+    /// An entry point's route lands on its own tab and replaces that tab's stack; other tabs keep theirs
+    mutating func open(_ route: Route) {
+        switch route {
+        case .category, .product: tab = .home; paths[.home] = [route]
+        case .orders: tab = .account; paths[.account] = [.orders]
+        case .order: tab = .account; paths[.account] = [.orders, route]
+        }
+    }
+
+    var summary: String {
+        let stacks = Tab.allCases.compactMap { tab -> String? in
+            guard let path = paths[tab], !path.isEmpty else { return nil }
+            return "\(tab.rawValue) [" + path.map(\.name).joined(separator: ", ") + "]"
+        }
+        return (["on \(tab.rawValue)"] + stacks).joined(separator: " | ")
+    }
+}
+
+extension Route {
+    var name: String {
+        switch self {
+        case .category(let slug): "category \(slug)"
+        case .product(let id): "product \(id)"
+        case .orders: "orders"
+        case .order(let id): "order \(id)"
+        }
+    }
+}
+
+/// Restoring never crashes and never shows what shouldn't come back
+func restore(_ data: Data, user: String, now: Double, existingOrders: Set<String>) -> Navigation {
+    guard let saved = try? JSONDecoder().decode(SavedSnapshot.self, from: data),
+          saved.version == Snapshot.version,
+          saved.userID == user                  // never restore another account's screens
+    else { return Navigation() }
+
+    var navigation = Navigation(tab: saved.tab.value ?? .home)
+    guard now - saved.savedAt < 8 * 3600 else { return navigation }   // old: keep the tab, start stacks at their roots
+
+    for (key, routes) in saved.paths {
+        guard let tab = Tab(rawValue: key) else { continue }
+        var kept: [Route] = []
+        for item in routes {
+            // A route this build can't read, or whose data has gone, ends the stack there
+            guard let route = item.value else { break }
+            if case .order(let id) = route, !existingOrders.contains(id) { break }
+            kept.append(route)
+        }
+        navigation.paths[tab] = kept
+    }
+    return navigation
+}
+
+let now = 1_800_000_000.0
+let orders: Set<String> = ["A1B2C3"]
+func encoded(_ snapshot: Snapshot) throws -> Data { try JSONEncoder().encode(snapshot) }
+let usual = Snapshot(userID: "u1", savedAt: now - 600, tab: .basket, paths: [
+    "home": [.category(slug: "shoes"), .product(id: 7)],
+    "account": [.orders, .order(id: "A1B2C3")],
+])
+
+var orderGone = usual
+orderGone.paths["account"] = [.orders, .order(id: "Z9Y8X7")]
+var weekOld = usual
+weekOld.savedAt = now - 7 * 86_400
+// Saved before gift cards were removed from the app
+let fromOldBuild = #"{"version":2,"userID":"u1","savedAt":1799999400,"tab":"home","paths":{"home":[{"category":{"slug":"shoes"}},{"giftCard":{"code":"XMAS"}},{"product":{"id":7}}]}}"#
+
+let cases: [(String, Data, String)] = [
+    ("Saved ten minutes ago", try encoded(usual), "u1"),
+    ("Order deleted since", try encoded(orderGone), "u1"),
+    ("A route this build no longer has", Data(fromOldBuild.utf8), "u1"),
+    ("Saved a week ago", try encoded(weekOld), "u1"),
+    ("Another user signed in", try encoded(usual), "u2"),
+    ("Not JSON at all", Data("garbage".utf8), "u1"),
+]
+for (label, data, user) in cases {
+    print("\(label): \(restore(data, user: user, now: now, existingOrders: orders).summary)")
+}
+
+// Cold start from a link: restore first, then the link's route wins its own tab
+var launched = restore(try encoded(usual), user: "u1", now: now, existingOrders: orders)
+launched.open(.product(id: 42))
+print("Restored, then a link to product 42: \(launched.summary)")
+```
+
+```output
+Saved ten minutes ago: on basket | home [category shoes, product 7] | account [orders, order A1B2C3]
+Order deleted since: on basket | home [category shoes, product 7] | account [orders]
+A route this build no longer has: on home | home [category shoes]
+Saved a week ago: on basket
+Another user signed in: on home
+Not JSON at all: on home
+Restored, then a link to product 42: on home | home [product 42] | account [orders, order A1B2C3]
+```
+
+Each case is a rule worth stating in a design review:
+
+- **Element by element.** `Lenient` decodes each route on its own, so a route a later release removed (gift cards, here) costs that route and everything above it, not the whole window. A screen above an unreadable or deleted one goes too, because it was opened from it.
+- **Validated against today's data.** The deleted order's screen isn't restored; its list is.
+- **Tied to the user.** A snapshot written for one account is never applied for another. Clearing snapshots at sign-out is good hygiene, but the check at restore is what's guaranteed to run.
+- **Aged.** A week-old snapshot keeps its tab and nothing else.
+- **Versioned, and failing closed.** Anything unreadable gives a fresh window, never a crash.
+- **Entry points win their own tab.** The link to product 42 replaced the Home stack and left Account's restored stack alone.
+
+## Launch order: restoration meets an entry point
+
+On a cold start, a restoration snapshot and a launching notification or link can arrive together. Which wins? The user has only now tapped something, so the entry point expresses what they want *now*; the snapshot expresses where they were. Apply them in that order: restore the snapshot as the base, then apply the entry route on top.
+
+```visual sequence
+title: A cold start with both a snapshot and a notification
+participants:
+  - { id: ios, label: iOS }
+  - { id: scene, label: Scene }
+  - { id: restore, label: Restorer }
+  - { id: entry, label: Entry handler }
+  - { id: router, label: Router }
+messages:
+  - [ios, scene, "connect (restoration activity)", { say: "The scene connects. Its session carries the snapshot saved when the app last went to the background." }]
+  - [scene, restore, restore(snapshot), { say: "The restorer decodes it leniently and checks the user, the version, the age and today's data." }]
+  - [restore, router, "apply: tabs and stacks", { say: "What survives is applied through the router, without animation: every tab's stack is set in one step. No presented flow comes back." }]
+  - [ios, entry, notification response, { say: "Meanwhile the notification delegate receives the tap that launched the app. Its route is held, because restoring isn't finished." }]
+  - [restore, entry, restored, { reply: true, say: "Restoration done: the entry handler may release what it's holding." }]
+  - [entry, router, "open(.order(A1B2C3))", { say: "The notification's route is applied **on top**: it selects Account and replaces that tab's stack." }]
+  - { note: "Home and Search keep their restored stacks; the user lands on the order", over: [entry, router] }
+```
+
+The entry handler from the deep-links lesson already holds routes until the UI is ready. "Ready" now means *restored*: release pending routes only after the snapshot has been applied, or the restore overwrites the stack the notification has built.
+
+## Data that isn't there yet
+
+A restored product screen has an id, not a product. Don't block launch on the network to find out whether it still exists. Restore the routes immediately; each destination resolves its id from the cache or the network and shows a loading state meanwhile, exactly as it would for a deep link. If the data comes back "not found", the screen either shows a "no longer available" state or asks its owner to prune the path ([Coupling between state and navigation](/design/learn/sd-state-navigation-coupling) weighed the two). The check against `existingOrders` in the example above is the cheap version of that, possible when the data is already on the device.
+
+## SwiftUI: a snapshot in scene storage
+
+`@SceneStorage` holds `Data`, is saved per window by the system, and is discarded when the user closes the window or force-quits, which is the behaviour you want for UI state. Encode the window's navigation into it whenever it changes (it's a few hundred bytes), and restore once when the window appears:
+
+```swift check ios group=restore title="ShopWindow.swift"
+import SwiftUI
+import UIKit
+
+enum ShopTab: String, Codable, Hashable {
+    case home, account
+}
+
+enum Route: Codable, Hashable {
+    case product(id: Int)
+    case orders
+    case order(id: String)
+}
+
+/// One window's navigation as a value: what gets saved and restored
+struct NavigationState: Codable, Equatable {
+    var tab = ShopTab.home
+    var home: [Route] = []
+    var account: [Route] = []
+}
+
+struct SavedNavigation: Codable {
+    static let version = 2
+    var version = SavedNavigation.version
+    var userID: String
+    var state: NavigationState
+}
+
+@MainActor @Observable
+final class WindowNavigation {
+    var state = NavigationState()
+
+    func snapshot(for userID: String) -> Data? {
+        try? JSONEncoder().encode(SavedNavigation(userID: userID, state: state))
+    }
+
+    func restore(from data: Data?, for userID: String) {
+        guard let data,
+              let saved = try? JSONDecoder().decode(SavedNavigation.self, from: data),
+              saved.version == SavedNavigation.version,
+              saved.userID == userID
+        else { return }   // anything doubtful: a fresh window
+        state = saved.state   // validated again as each screen resolves its ids
+    }
+}
+
+struct ShopWindow: View {
+    let userID: String
+    // Per window, saved by the system with the scene, discarded when the user closes the window
+    @SceneStorage("navigation") private var saved: Data?
+    @State private var navigation = WindowNavigation()
+    @State private var restored = false
+
+    var body: some View {
+        TabView(selection: $navigation.state.tab) {
+            Tab("Home", systemImage: "house", value: ShopTab.home) {
+                NavigationStack(path: $navigation.state.home) {
+                    Text("Home").navigationDestination(for: Route.self) { route in Text(String(describing: route)) }
+                }
+            }
+            Tab("Account", systemImage: "person", value: ShopTab.account) {
+                NavigationStack(path: $navigation.state.account) {
+                    Text("Account").navigationDestination(for: Route.self) { route in Text(String(describing: route)) }
+                }
+            }
+        }
+        .task {
+            guard !restored else { return }
+            navigation.restore(from: saved, for: userID)
+            restored = true   // now the entry handler may release a pending route on top
+        }
+        .onChange(of: navigation.state) { _, _ in
+            saved = navigation.snapshot(for: userID)   // small, so cheap to keep current
+        }
+    }
+}
+```
+
+Because the snapshot carries the user id and a version, the same defensive rules apply as in the example above. Keeping `NavigationState` a plain `Codable` value also means the restoration test is a unit test: encode, decode, compare.
+
+## UIKit: a snapshot in the restoration activity
+
+In UIKit the scene delegate returns an `NSUserActivity` from `stateRestorationActivity(for:)` as the scene goes to the background, and finds it again in `session.stateRestorationActivity` when the scene reconnects. The activity's `userInfo` takes property-list types, so the snapshot goes in as `Data`. Coordinators then rebuild each tab's stack in one `setViewControllers(_:animated: false)` call, the same call a deep link uses:
+
+```swift check ios group=restore title="SceneDelegate.swift"
+@MainActor
+final class AccountCoordinator {
+    let navigation = UINavigationController(rootViewController: UIViewController())
+    func show(_ routes: [Route]) {
+        guard let root = navigation.viewControllers.first else { return }
+        navigation.setViewControllers([root] + routes.map(makeScreen), animated: false)
+    }
+    private func makeScreen(for route: Route) -> UIViewController { UIViewController() }
+}
+
+final class SceneDelegate: UIResponder, UIWindowSceneDelegate {
+    static let restorationType = "com.example.shop.window"
+    var window: UIWindow?
+    private let navigation = WindowNavigation()
+    private let account = AccountCoordinator()
+    private let userID = "u1"
+
+    func scene(_ scene: UIScene, willConnectTo session: UISceneSession, options connectionOptions: UIScene.ConnectionOptions) {
+        guard let windowScene = scene as? UIWindowScene else { return }
+        if let activity = session.stateRestorationActivity, activity.activityType == Self.restorationType {
+            navigation.restore(from: activity.userInfo?["navigation"] as? Data, for: userID)
+        }
+        account.show(navigation.state.account)   // the whole stack at once, without animation
+        let window = UIWindow(windowScene: windowScene)
+        window.rootViewController = account.navigation
+        window.makeKeyAndVisible()
+        self.window = window
+    }
+
+    func stateRestorationActivity(for scene: UIScene) -> NSUserActivity? {
+        guard let data = navigation.snapshot(for: userID) else { return nil }
+        let activity = NSUserActivity(activityType: Self.restorationType)
+        activity.addUserInfoEntries(from: ["navigation": data])
+        return activity
+    }
+}
+```
+
+## Several windows
+
+On iPad and Mac each window is its own scene with its own session, so each saves and restores its own snapshot; that falls out of keeping navigation per scene. The new question is which window an entry point should land in. A notification's `target-content-id`, and `targetContentIdentifier` on activities, name the content it's about, and scene activation conditions let the window already showing that content claim it, instead of a random window or a new one. You met windows and scenes in [Multiple windows and scenes on iPad](/design/learn/sd-runtime-multi-window).
+
+## Testing restoration
+
+- **Unit-test the restore function** with the cases in the example: a normal snapshot, a deleted entity, an unknown route, an old version, another user, garbage. It's pure, so these run in milliseconds.
+- **Keep fixtures from every release.** Save a real snapshot from each shipped version in the test bundle. When the route enum changes, the old fixtures tell you what users upgrading today will see.
+- **Exercise the real thing.** Run from Xcode, navigate deep, send the app to the background, stop it with Xcode's Stop button (not the app switcher, which discards restoration data), and launch again. Then repeat with a notification tap as the launch.
+
+## Trade-offs
+
+| | Restore nothing | The tab only | Tabs and validated paths | Everything, presented flows included |
+| --- | --- | --- | --- | --- |
+| After a background kill | feels like a crash | roughly where they were | where they were | exactly where they were |
+| Risk of confusing or unsafe screens | none | none | low, with validation | high: half-finished tasks, stale content |
+| Work | none | trivial | a snapshot type, lenient decoding, validation | all of that, plus restoring each flow's internals |
+| Interaction with entry points | trivial | simple | entry route on top of the base | conflicts with the restored presentation |
+| Wins for | apps with one screen | apps whose tabs are shallow | most apps | almost never; restore a draft instead |
+
+<Callout kind="interview">
+
+**What to say:** "Navigation is a per-window value of typed routes, so restoration is a deep link with history. On background the window saves a small versioned snapshot naming its user; at launch it's decoded leniently, checked for user, version and age, validated route by route, and applied through the router without animation. Presented tasks aren't restored, their drafts are saved as data. A launching notification or link is held until restoration is done, then applied on top: it wins its own tab, the others keep their stacks."
+
+**What to ask:** how long after leaving should the app still restore? Are there screens that mustn't come back without re-authentication? Does the app support several windows? Which entry points can launch it cold?
+
+**Red flags:** saving `NavigationPath` representations or whole model objects; a restore that can throw on launch; restoring a payment step or an alert; snapshots that don't record their user; releasing a launching notification's route before the restore has run.
+
+</Callout>
+
+<Callout kind="gotcha" title="iOS gotcha: restored state can belong to someone else">
+
+Restoration data lives with the scene, not with the account. If user A signs out and user B signs in, or a session expires and a different account is used, the next background kill and relaunch can bring back A's order screen for B, unless something stops it. Write the user id into every snapshot and refuse mismatches at restore, and clear scene storage at sign-out as well.
+
+</Callout>
+
+## Practice
+
+[Routing for a tabbed shopping app](/design/practice/sd-design-navigation-shop-routing) includes restoration in a real design: decide what each tab restores, what happens to an open checkout, how long a snapshot lives, and what a cold start from a notification shows. [A navigation reducer for a tabbed app](/design/practice/sd-kata-navigation-path-reducer) has the rule this lesson relies on, a deep link applied on top of existing state, as tested code.
+
+```cards
+- id: restore-through-router
+  front: "Why restore navigation through the router?"
+  back: "A snapshot of routes is a deep link with history. Applying it through the router reuses every rule already there (validation, sign-in, plans) instead of a second, untested path."
+- id: what-not-to-restore
+  front: "What shouldn't be restored?"
+  back: "Alerts and spinners, half-finished presented tasks (restore their start and save the draft as data), sensitive screens without re-authentication, another account's screens, and detail from snapshots older than your time limit."
+- id: lenient-restore
+  front: "How should a navigation snapshot be decoded?"
+  back: "Leniently and defensively: each route on its own, keeping the prefix that decodes and still validates; checking user, version and age; and falling back to a fresh window instead of ever throwing."
+- id: entry-on-top
+  front: "On a cold start with both a snapshot and a launching notification, what should happen?"
+  back: "Restore the snapshot first, then apply the notification's route on top: it selects its tab and replaces that tab's stack, while other tabs keep their restored stacks."
+```
+
+```quiz
+- id: q1
+  type: sort
+  prompt: "The app was ended in the background. What should come back?"
+  buckets: [Restore, Don't restore]
+  items:
+    - ["The selected tab", 0]
+    - ["Home's stack: shoes, then a product", 0]
+    - ["The search query", 0]
+    - ["The results the search showed", 1]
+    - ["The payment step of checkout", 1]
+    - ["A \"Card declined\" alert", 1]
+  explain: "Where the user was (tab, browsing stacks, query) comes back, validated. Content is refetched, half-finished tasks restart from their beginning with their draft data, and moments like alerts are gone."
+- id: q2
+  type: mcq
+  prompt: "Version 5.2 removes the gift card screen. A user upgrading from 5.1 had Home → Gift cards → a gift card open. What should 5.2 restore?"
+  options:
+    - "Nothing: the snapshot can't be decoded, so start fresh"
+    - "Home's root, keeping the selected tab: drop the unknown route and everything above it"
+    - "Home → the gift card, skipping only the removed screen"
+    - "Crash, so the problem is reported"
+  answer: 1
+  explain: "Decoding route by route keeps what this build understands, and a screen opened from a removed one goes too, because it no longer has its context. Throwing everything away is safe but needlessly harsh; skipping a level invents a stack the user never had."
+- id: q3
+  type: bug
+  prompt: "Tapping a notification while the app isn't running sometimes lands on the restored screen instead of the order. Which line is the cause?"
+  code: |
+    func scene(_ scene: UIScene, willConnectTo session: UISceneSession, options connectionOptions: UIScene.ConnectionOptions) {
+        window = makeWindow(for: scene)
+        entryHandler.uiIsReady()
+        if let activity = session.stateRestorationActivity {
+            appCoordinator.restore(from: activity)
+        }
+    }
+  answer: 3
+  explain: "The entry handler releases its pending route (the notification's) before the snapshot has been applied, so the restore then overwrites the stack the notification built. Mark the UI ready only after restoring, so the entry route lands on top."
+- id: q4
+  type: truefalse
+  prompt: "Including the signed-in user's id in the navigation snapshot is unnecessary if the app clears scene storage at sign-out."
+  answer: false
+  explain: "Clearing at sign-out helps, but it doesn't run if the session expires, the app is killed before it finishes, or another window's storage is missed. The check at restore always runs, so it's the guarantee."
+- id: q5
+  type: mcq
+  prompt: "A restored product screen's id refers to a product that may have been withdrawn. What should launch do?"
+  options:
+    - "Wait for the network to confirm each restored id before showing anything"
+    - "Restore the routes at once; each screen resolves its id with a loading state and handles \"not found\""
+    - "Skip restoring products, since they might be stale"
+    - "Restore the product from a cached copy and never check again"
+  answer: 1
+  explain: "Launch must not block on the network. Restore the stack immediately and let each destination resolve its id as it would for a deep link, showing a \"no longer available\" state or pruning itself if the data is gone."
+```

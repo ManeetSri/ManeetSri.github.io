@@ -1,0 +1,389 @@
+## Why it matters
+
+`NavigationStack` turned SwiftUI navigation from something views *do* into something your code *holds*: the stack is an array of values, and changing the array changes the screens. That one change is what makes deep links, restoration, pop-to-root after a purchase, and tests of navigation possible. It also brings new ways to fail: destinations registered in the wrong place, paths that can't be saved, and view models recreated on every update. "How does navigation work in your SwiftUI app?" is now a standard interview question, and "the path is a value I own" is the start of a good answer.
+
+## From views that push to values that push
+
+Before iOS 16, SwiftUI used `NavigationView`, and a link carried the view it would push: `NavigationLink(destination: ProductScreen(id: 7))`. The pushed screen existed only inside SwiftUI. Your code couldn't read which screens were open, push three at once, or pop to the root without tricks. `NavigationView` is deprecated; you'll still meet it in older code.
+
+`NavigationStack` separates two things a link used to tie together:
+
+- **What to show** is a value: `NavigationLink("Running shoes", value: ShopRoute.product(id: 7))`. A link appends that value to the stack's path.
+- **How to show it** is registered once, by type: `.navigationDestination(for: ShopRoute.self) { route in … }` turns any `ShopRoute` on the path into a view.
+
+Because the link only appends a value, anything else can append values too: a button's action, a model's method, a deep-link handler. And because the path is plain data, you can store it, compare it, test it and save it.
+
+## The path is the stack
+
+Step through a path changing, and watch the screens follow it.
+
+```visual flow
+title: The path is the stack
+nodes:
+  - { id: path, label: path, kind: store, at: [0, 1] }
+  - { id: stack, label: NavigationStack, kind: view, at: [2, 1] }
+  - { id: root, label: Catalogue, kind: view, at: [4, 0] }
+  - { id: product, label: Product, kind: view, at: [4, 1] }
+  - { id: reviews, label: Reviews, kind: view, at: [4, 2] }
+edges:
+  - [path, stack, binding, { style: data }]
+  - [stack, root]
+  - [stack, product]
+  - [stack, reviews]
+steps:
+  - say: "The stack's **root view** is always there. The path starts empty: an empty path means \"only the root\"."
+    show: [path, stack, root]
+    label: { path: "[]" }
+  - say: "Tapping `NavigationLink(value: .product(id: 7))` doesn't push a view. It **appends a value** to the path."
+    send: path->stack
+    label: { path: "[product 7]" }
+  - say: "The stack finds the destination registered for `ShopRoute`, builds the product screen from the value, and pushes it."
+    show: [product]
+    send: stack->product
+    label: { product: "id 7" }
+  - say: "The reviews link appends another value; the stack pushes another screen."
+    show: [reviews]
+    send: stack->reviews
+    label: { path: "[product 7, reviews 7]", reviews: "id 7" }
+  - say: "Back, or the edge swipe, removes the last value. The reviews screen and all its `@State` are gone."
+    hide: [reviews]
+    label: { path: "[product 7]" }
+  - say: "Code can change the path any way an array can change. `path.removeAll()` pops to the root in one step, say after adding to the basket."
+    hide: [product]
+    label: { path: "[]" }
+  - say: "A deep link **assigns** a whole path. Both screens appear at once, with Back going to the product, then the root."
+    show: [product, reviews]
+    label: { path: "[product 9, reviews 9]", product: "id 9", reviews: "id 9" }
+```
+
+Every navigation operation is an array operation:
+
+| You want | Typed array `[ShopRoute]` | `NavigationPath` |
+| --- | --- | --- |
+| Push | `path.append(.product(id: 7))` | `path.append(ShopRoute.product(id: 7))` |
+| Pop one | `path.removeLast()` | `path.removeLast()` |
+| Pop to root | `path.removeAll()` | `path.removeLast(path.count)` |
+| Deep link | `path = [.category(slug: "shoes"), .product(id: 7)]` | append each value to a fresh path |
+| Read what's open | `path.last`, `path.contains(…)`, any `Array` API | only `count` and `isEmpty` |
+
+## A stack your model owns
+
+Here's a catalogue tab whose navigation belongs to a model rather than to its views, so logic can navigate (pop to the root after adding to the basket) and a deep link can replace the whole path:
+
+```swift check ios title="CatalogueTab.swift"
+import SwiftUI
+
+enum ShopRoute: Hashable, Codable {
+    case category(slug: String)
+    case product(id: Int)
+    case reviews(productID: Int)
+}
+
+@MainActor @Observable
+final class CatalogueModel {
+    var path: [ShopRoute] = []
+
+    func showReviews(for productID: Int) {
+        path.append(.reviews(productID: productID))
+    }
+
+    /// After a purchase the browsing trail is done: back to the catalogue in one step
+    func addedToBasket() {
+        path.removeAll()
+    }
+
+    /// A deep link replaces the whole stack, so Back makes sense afterwards
+    func open(_ route: [ShopRoute]) {
+        path = route
+    }
+}
+
+struct CatalogueTab: View {
+    @State private var model = CatalogueModel()
+
+    var body: some View {
+        NavigationStack(path: $model.path) {
+            List {
+                NavigationLink("Shoes", value: ShopRoute.category(slug: "shoes"))
+                NavigationLink("Bags", value: ShopRoute.category(slug: "bags"))
+            }
+            .navigationTitle("Catalogue")
+            // Registered once, on the root content and outside the List's rows, for every depth
+            .navigationDestination(for: ShopRoute.self) { route in
+                switch route {
+                case .category(let slug):
+                    CategoryScreen(slug: slug)
+                case .product(let id):
+                    ProductScreen(
+                        id: id,
+                        onShowReviews: { model.showReviews(for: id) },
+                        onAddedToBasket: { model.addedToBasket() }
+                    )
+                case .reviews(let productID):
+                    Text("Reviews for product \(productID)")
+                }
+            }
+        }
+    }
+}
+
+struct CategoryScreen: View {
+    let slug: String
+
+    var body: some View {
+        List([7, 8, 9], id: \.self) { id in
+            // The row only says *what*; the registration above says *how*
+            NavigationLink("Product \(id)", value: ShopRoute.product(id: id))
+        }
+        .navigationTitle(slug.capitalized)
+    }
+}
+
+struct ProductScreen: View {
+    let id: Int
+    let onShowReviews: () -> Void
+    let onAddedToBasket: () -> Void
+
+    var body: some View {
+        VStack(spacing: 16) {
+            Text("Product \(id)")
+            Button("Reviews", action: onShowReviews)
+            Button("Add to basket", action: onAddedToBasket)
+        }
+    }
+}
+```
+
+Look at what each part knows. The screens know their inputs and report what happened through closures; none of them names another screen's type or touches the path. The tab knows which view each route becomes. The model knows the navigation rules. That's the split the rest of this module builds on, and later in this module those closures become a SwiftUI coordinator's outputs.
+
+### Where destinations are registered
+
+`navigationDestination(for:)` is a registration, and SwiftUI is particular about where it goes:
+
+- **Inside the stack**, on its root content or any view the stack shows. A registration on the root covers every depth.
+- **Not inside a lazy container's rows.** `List`, `LazyVStack` and friends only build rows that are on screen, so a registration attached to a row may not exist when the stack needs it. Attach it to the `List` itself, as above, or higher.
+- **Once per type.** Registering `ShopRoute` twice in one stack is ambiguous; SwiftUI warns that it uses the one closest to the root.
+
+Two variations drive a push from state without a path entry of your own: `navigationDestination(isPresented:)` pushes while a `Bool` is true, and `navigationDestination(item:)` (iOS 17) pushes while an optional holds a value, which suits "a barcode was scanned, show that product" on a screen that otherwise doesn't navigate.
+
+## Typed paths and `NavigationPath`
+
+A stack's path can be a typed array, `[ShopRoute]`, or a `NavigationPath`, which erases the types so one path can hold values of several unrelated types.
+
+`NavigationPath` exists for one situation: **features that don't share a route type.** If the reviews feature lives in its own module and defines `ReviewsRoute`, it can register its own destination without the app's `ShopRoute` knowing it exists:
+
+```swift check ios title="A feature that registers its own destinations"
+import SwiftUI
+
+// In the Reviews module, which knows nothing about the app's other routes
+struct ReviewsRoute: Hashable, Codable {
+    let productID: Int
+}
+
+extension View {
+    func reviewsDestinations() -> some View {
+        navigationDestination(for: ReviewsRoute.self) { route in
+            Text("Reviews for product \(route.productID)")
+        }
+    }
+}
+
+// In the app, which assembles the features
+struct ProductRoute: Hashable, Codable {
+    let id: Int
+}
+
+struct ShopStack: View {
+    @State private var path = NavigationPath()
+
+    var body: some View {
+        NavigationStack(path: $path) {
+            Button("Open product 7") { path.append(ProductRoute(id: 7)) }
+                .navigationDestination(for: ProductRoute.self) { route in
+                    Button("Reviews") { path.append(ReviewsRoute(productID: route.id)) }
+                }
+                .reviewsDestinations()
+        }
+    }
+}
+```
+
+The price is that a `NavigationPath` is opaque. You can't ask what's on it, find the product screen, or drop the screens for a deleted product, which [Coupling between state and navigation](/design/learn/sd-state-navigation-coupling) showed you need. A typed array gives you all of that, plus equality for tests. Prefer `[Route]` for any stack whose routes one module can name, which is most of them, and reach for `NavigationPath` at module boundaries where a shared enum would couple features together. A middle way, nesting feature enums inside an app enum (`case reviews(ReviewsRoute)`), keeps the path typed at the cost of the app module depending on every feature's route type; the lesson on routers and route enums, later in this module, weighs that choice.
+
+## Saving a path
+
+To restore navigation after a relaunch, the path has to become data. A typed array of `Codable` routes encodes like any array. A `NavigationPath` offers `codable`, a `CodableRepresentation` you can encode, and it's worth seeing what that contains:
+
+```swift run title="What a saved NavigationPath looks like"
+import SwiftUI
+
+enum ShopRoute: Hashable, Codable {
+    case product(id: Int)
+    case reviews(productID: Int)
+}
+
+struct Category: Hashable, Codable {
+    var slug: String
+}
+
+var path = NavigationPath()
+path.append(Category(slug: "shoes"))
+path.append(ShopRoute.product(id: 7))
+path.append(ShopRoute.reviews(productID: 7))
+
+// Each element is saved as its type's name and its own JSON, last element first
+if let representation = path.codable {
+    let data = try JSONEncoder().encode(representation)
+    print(String(decoding: data, as: UTF8.self))
+}
+
+// One element that isn't Codable, and the whole path can't be saved
+struct Draft: Hashable {
+    var text: String
+}
+var withDraft = path
+withDraft.append(Draft(text: "Great shoes"))
+print("\(withDraft.count) screens, codable: \(withDraft.codable == nil ? "nil" : "yes")")
+
+// Restoring doesn't check the elements: a renamed type still "decodes"
+let fromOldBuild = #"["main.ProductRoute","{\"product\":{\"id\":7}}"]"#
+let old = try JSONDecoder().decode(NavigationPath.CodableRepresentation.self, from: Data(fromOldBuild.utf8))
+print("restored \(NavigationPath(old).count) screen of a type that no longer exists")
+```
+
+```output
+["main.ShopRoute","{\"reviews\":{\"productID\":7}}","main.ShopRoute","{\"product\":{\"id\":7}}","main.Category","{\"slug\":\"shoes\"}"]
+4 screens, codable: nil
+restored 1 screen of a type that no longer exists
+```
+
+Three things to take from that output:
+
+1. **The type's full name is in the data.** In this script the module is `main`; in your app it's your module's name, as in `Shop.ShopRoute`. Rename the type, or move it into a feature module during modularisation, and every saved path names a type that no longer exists.
+2. **One element that isn't `Codable` makes the whole path unsavable.** `codable` returns `nil`, and nothing tells you which element was the problem.
+3. **Restoring checks nothing.** The representation keeps each element as its saved name and JSON and resolves it only when the stack needs it, so a stale path isn't caught where you could handle it.
+
+A typed `[ShopRoute]` that you encode yourself avoids all three: no type names in the data, a compiler error if a route isn't `Codable`, and a decoding error you can catch, element by element if you like. The last lesson of this module, on restoring navigation, builds on that.
+
+## Lifetimes: what lives on the stack
+
+A pushed screen is a view with an identity: its position on the stack plus its route value. While it's on the stack its `@State` survives; when its value is removed from the path, the screen and its state are discarded. Push `.product(id: 7)` twice and you get two independent product screens. That much matches UIKit.
+
+What differs is that the destination closure runs whenever SwiftUI needs to re-evaluate it, not once per push. Anything created *inside* the closure is created again:
+
+```swift
+// Each evaluation makes a new model; the screen loses whatever the old one loaded
+case .product(let id):
+    ProductScreen(model: ProductModel(id: id))
+```
+
+Pass the id and let the screen own its model as `@State`, created cheaply and loaded in `.task(id:)`, so its lifetime matches the screen's ([View lifetime vs state lifetime](/design/learn/sd-swiftui-lifetimes) explains why). Or have a model that outlives the screens hand out per-route models from a cache keyed by route. Either way, a destination closure should be a cheap mapping from a value to a view.
+
+## Trade-offs
+
+| | `[Route]` path | `NavigationPath` | `navigationDestination(item:)` | `NavigationLink(destination:)` |
+| --- | --- | --- | --- | --- |
+| Code can read the stack | yes, any array API | count only | the one optional | no |
+| Deep links and pop-to-root | assign the array | rebuild a path | one screen only | no |
+| Saving for restoration | encode it yourself, safely | `CodableRepresentation`, with type names | the optional's value | no |
+| Features with their own route types | need a shared or nested enum | yes | yes | yes |
+| Testable without UI | equality on the array | barely | yes | no |
+| Wins for | most stacks | stacks assembled from independent modules | a single push from screen state | static content with no programmatic navigation |
+
+<Callout kind="interview">
+
+**What to say:** "Each tab's `NavigationStack` is bound to a typed array of `Codable`, `Hashable` routes that hold ids, owned by the feature's model. Destinations are registered once at the root of the stack. Pushing is appending, a deep link assigns the array, and restoration encodes it." If modules are in play: "At module boundaries I'd use `NavigationPath` or nested route enums, and I know `NavigationPath` saves type names."
+
+**What to ask:** which screens must be reachable from a link or a notification? Will the app be split into modules? Does navigation need to survive a relaunch?
+
+**Red flags:** model objects or view models in the path; `NavigationView` in new code; `navigationDestination` attached inside `List` rows; a `NavigationStack` inside a pushed screen; creating view models in the destination closure.
+
+</Callout>
+
+<Callout kind="gotcha" title="iOS gotcha: view-destination links aren't in the path">
+
+A `NavigationLink(destination:)` (or `NavigationLink { … } label: { … }`) inside a path-driven stack still pushes, but nothing is appended to your path. Your model believes the stack is shorter than it is, restoration loses that screen, and code that pops or prunes by editing the path can't see it. In a stack bound to a path, use value-based links only.
+
+</Callout>
+
+<Callout kind="gotcha" title="iOS gotcha: one NavigationStack per column">
+
+A screen pushed onto a stack must not contain a `NavigationStack` of its own. Nested stacks aren't supported: you get doubled navigation bars, pushes that land in the wrong stack, or nothing at all. Each tab, each `NavigationSplitView` column and each presented sheet gets exactly one stack, at its root.
+
+</Callout>
+
+## Practice
+
+[A navigation reducer for a tabbed app](/design/practice/sd-kata-navigation-path-reducer) has you write every operation in this lesson as a pure function over a value: push, pop, pop to root and replace on each tab's typed path, plus the harder one, applying a deep link onto whatever the user already had open. It's what a `[Route]` path makes possible and a `NavigationPath` doesn't.
+
+```cards
+- id: link-appends-value
+  front: "What does `NavigationLink(value:)` do in a `NavigationStack`?"
+  back: "It appends the value to the stack's path. The stack then looks up the destination registered for that value's type with `navigationDestination(for:)` and pushes the view it returns."
+- id: typed-vs-erased
+  front: "When should a stack use `NavigationPath` instead of `[Route]`?"
+  back: "When features in separate modules push their own route types without a shared enum. Otherwise prefer `[Route]`: you can inspect, prune, compare and safely encode it."
+- id: codable-representation
+  front: "What's risky about saving `NavigationPath.CodableRepresentation`?"
+  back: "It stores each element's full type name, including the module. Renaming or moving a type breaks saved paths, and restoring doesn't check the elements, so the failure surfaces later inside SwiftUI."
+- id: destination-placement
+  front: "Where should `navigationDestination(for:)` go?"
+  back: "Inside the stack, once per type, on the root content or the container itself, never on rows of a lazy container like `List`, which may not exist when the stack needs the registration."
+```
+
+```quiz
+- id: q1
+  type: mcq
+  prompt: "Products can be deleted by a sync while their screens are open, and you must drop those screens from the stack. Which path type do you choose?"
+  options:
+    - "`NavigationPath`, because it can hold any Hashable value"
+    - "`[ShopRoute]`, because you can inspect each route and remove the broken ones"
+    - "No path: use `NavigationLink(destination:)` and let SwiftUI manage it"
+    - "`navigationDestination(isPresented:)` for every screen"
+  answer: 1
+  explain: "Pruning needs to read the path: which routes refer to the deleted product, and where they are. A typed array gives you every Array API; a `NavigationPath` exposes only its count."
+- id: q2
+  type: bug
+  prompt: "Product links work when the list first appears, but after scrolling far down they sometimes push nothing. Which line is the problem?"
+  code: |
+    struct CategoryScreen: View {
+        let productIDs: [Int]
+
+        var body: some View {
+            List(productIDs, id: \.self) { id in
+                NavigationLink("Product \(id)", value: ShopRoute.product(id: id))
+                    .navigationDestination(for: ShopRoute.self) { route in
+                        ProductDestination(route: route)
+                    }
+            }
+        }
+    }
+  answer: 7
+  explain: "The registration is attached to each row of a lazy List, so it exists only while that row does. Attach `navigationDestination(for:)` to the List itself, or higher in the stack, so it's always there."
+- id: q3
+  type: truefalse
+  prompt: "Decoding a saved `NavigationPath.CodableRepresentation` throws if one of its elements names a type that has since been renamed."
+  answer: false
+  explain: "The representation keeps each element as its saved type name and JSON, and only resolves it when the stack needs it. The decode succeeds; the problem surfaces later, inside SwiftUI. Encoding a typed `[Route]` yourself gives you an error you can handle."
+- id: q4
+  type: order
+  prompt: "Put what happens, from a tap on `NavigationLink(\"Reviews\", value: ShopRoute.reviews(productID: 7))`, in order."
+  lines:
+    - "The link appends `.reviews(productID: 7)` to the bound path"
+    - "The model that owns the path sees its array change"
+    - "The stack finds the destination registered for `ShopRoute`"
+    - "The destination closure builds the reviews view from the value"
+    - "The stack pushes the view with the usual animation"
+  explain: "The link changes data; the stack reacts to the data. That's why any code that can change the path, not only links, can navigate."
+- id: q5
+  type: multi
+  prompt: "Which of these belong in a route value on the path? Choose all that apply."
+  options:
+    - "The product's id"
+    - "The product view model, so the screen keeps its loaded data"
+    - "A category's slug"
+    - "A closure to run when the screen is dismissed"
+    - "Which reviews sort order the link asked for"
+  answer: [0, 2, 4]
+  explain: "Routes are small, Hashable, Codable values: ids and the parameters that choose what to show. Objects and closures break equality, encoding and restoration, and tie lifetimes to the path."
+```

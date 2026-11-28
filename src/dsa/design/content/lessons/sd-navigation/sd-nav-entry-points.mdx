@@ -1,0 +1,528 @@
+## Why it matters
+
+Links are one way into an app. There are at least six more: tapping a notification or one of its buttons, tapping a widget or a Live Activity, choosing a Spotlight result, picking a quick action from the Home Screen icon, continuing on the iPhone what you started on the Mac, and asking Siri or the Shortcuts app. Each arrives through a different API, at a different moment, with a different payload, and each has its own cold-start trap. Apps that handle them one by one end up with seven slightly different ideas of "open order 42". Apps that funnel them all into one route and one router get every entry point for the price of a small adapter. Interviewers probe this with "the user taps the shipping notification while the app isn't running: walk me through it".
+
+## Every door into the app
+
+| Entry point | What arrives | UIKit | SwiftUI | Opens the app? |
+| --- | --- | --- | --- | --- |
+| Notification tap | the notification's `userInfo` and an action id | `UNUserNotificationCenterDelegate`, `didReceive` | the same, through an app delegate adaptor | yes |
+| Notification action button | the same, with the action's id | `didReceive` | the same | only if the action has the `.foreground` option |
+| Widget or Live Activity tap | a URL from `widgetURL` or `Link` | `openURLContexts`, or `urlContexts` when cold | `onOpenURL` | yes |
+| Interactive widget button (iOS 17) | an App Intent | the intent's `perform()` | the same | no, unless the intent opens it |
+| Spotlight result | an `NSUserActivity` of type `CSSearchableItemActionType` | `scene(_:continue:)`, or `userActivities` when cold | `onContinueUserActivity` | yes |
+| Home Screen quick action | a `UIApplicationShortcutItem` | `windowScene(_:performActionFor:completionHandler:)`, or `shortcutItem` when cold | no modifier: a scene delegate | yes |
+| Handoff | an `NSUserActivity` of your own type | `scene(_:continue:)`, or `userActivities` when cold | `onContinueUserActivity` | yes |
+| Siri, Shortcuts, Spotlight actions | an App Intent | `perform()` | the same | if the intent asks to |
+
+Seven columns of detail, and one design idea: **every door's code does one thing, which is turn its payload into an `AppRoute`.** Everything after that is shared.
+
+```visual flow
+title: Seven doors, one route
+nodes:
+  - { id: notification, label: Notification, kind: external, at: [0, 0] }
+  - { id: widget, label: Widget, kind: external, at: [0, 1] }
+  - { id: spotlight, label: Spotlight, kind: external, at: [0, 2] }
+  - { id: shortcut, label: Quick action, kind: external, at: [0, 3] }
+  - { id: handoff, label: Handoff, kind: external, at: [0, 4] }
+  - { id: parse, label: Adapt + parse, kind: service, at: [2, 2] }
+  - { id: entry, label: Entry handler, kind: service, at: [4, 2] }
+  - { id: router, label: Router, kind: service, at: [4, 4] }
+edges:
+  - [notification, parse, userInfo]
+  - [widget, parse, URL]
+  - [spotlight, parse, identifier]
+  - [shortcut, parse, type]
+  - [handoff, parse, activity]
+  - [parse, entry, route]
+  - [entry, router, when ready]
+steps:
+  - say: "Five of the doors, five payload shapes: a dictionary, a URL, a string identifier, a shortcut type and a user activity."
+    show: [notification, widget, spotlight, shortcut, handoff]
+  - say: "Each door's callback does one thing: hand its payload to a small **adapter**. Widgets, Spotlight items and Handoff carry the route's URL, so most adapters end in the same parser that handles links."
+    show: [parse]
+    send: [notification->parse, widget->parse, spotlight->parse, shortcut->parse, handoff->parse]
+  - say: "Out comes the same `AppRoute` whichever door it came through, tagged with its source for analytics."
+    show: [entry]
+    send: parse->entry
+    label: { entry: "order A1B2C3" }
+  - say: "On a cold start the UI isn't ready yet, so the **entry handler** holds the route, exactly as it holds a link. It also waits for sign-in if the route needs it."
+    state: { entry: wait }
+  - say: "Once the window is up and the session restored, the route goes to the router, which dismisses, selects the tab and builds the stack."
+    show: [router]
+    send: entry->router
+    state: { entry: null, router: ok }
+    label: { entry: null }
+```
+
+The adapter layer is small enough to show whole. Here it is, run against payloads a real shop receives:
+
+```swift run title="Every door's payload, adapted to one route"
+import Foundation
+
+enum AppRoute: Equatable {
+    case order(id: String)
+    case product(id: Int)
+    case search
+}
+
+/// Where a route came from: for analytics, and for rules such as "notifications may switch tabs"
+enum Source: String {
+    case notification, widget, spotlight, quickAction, handoff
+}
+
+/// The one parser every entry point shares, for links on the shop's domain
+func parse(_ url: URL) -> AppRoute? {
+    let segments = url.pathComponents.filter { $0 != "/" }
+    guard url.scheme == "https", url.host()?.lowercased() == "shop.example.com" else { return nil }
+    switch (segments.first, segments.count) {
+    case ("orders", 2): return .order(id: segments[1])
+    case ("product", 2): return Int(segments[1]).map { .product(id: $0) }
+    case ("search", 1): return .search
+    default: return nil
+    }
+}
+
+/// Each door's payload, adapted to a URL or a route, and nothing more
+enum Arrival {
+    case notification(userInfo: [String: Any])
+    case widget(url: URL)
+    case spotlight(identifier: String)
+    case quickAction(type: String)
+    case handoff(webpageURL: URL?)
+
+    var source: Source {
+        switch self {
+        case .notification: .notification
+        case .widget: .widget
+        case .spotlight: .spotlight
+        case .quickAction: .quickAction
+        case .handoff: .handoff
+        }
+    }
+
+    /// The route this arrival asks for, or nil when there is nothing to open
+    var route: AppRoute? {
+        switch self {
+        case .notification(let userInfo):
+            // New payloads carry a link; older app versions' payloads used a type and an id
+            if let link = userInfo["link"] as? String, let url = URL(string: link) { return parse(url) }
+            if userInfo["type"] as? String == "order_shipped", let id = userInfo["orderID"] as? String { return .order(id: id) }
+            return nil
+        case .widget(let url):
+            return parse(url)
+        case .spotlight(let identifier):
+            return URL(string: identifier).flatMap(parse)   // items are indexed by their route's URL
+        case .quickAction(let type):
+            return type == "com.example.shop.search" ? .search : nil
+        case .handoff(let webpageURL):
+            return webpageURL.flatMap(parse)
+        }
+    }
+}
+
+let arrivals: [Arrival] = [
+    .notification(userInfo: ["aps": ["alert": "Your order has shipped"], "link": "https://shop.example.com/orders/A1B2C3"]),
+    .notification(userInfo: ["type": "order_shipped", "orderID": "Z9Y8X7"]),
+    .widget(url: URL(string: "https://shop.example.com/orders/A1B2C3")!),
+    .spotlight(identifier: "https://shop.example.com/product/42"),
+    .quickAction(type: "com.example.shop.search"),
+    .handoff(webpageURL: URL(string: "https://shop.example.com/product/42")),
+    .notification(userInfo: ["type": "survey"]),
+]
+for arrival in arrivals {
+    let outcome = arrival.route.map { "\($0)" } ?? "nothing to open: stay where the user is"
+    print("\(arrival.source.rawValue) → \(outcome)")
+}
+```
+
+```output
+notification → order(id: "A1B2C3")
+notification → order(id: "Z9Y8X7")
+widget → order(id: "A1B2C3")
+spotlight → product(id: 42)
+quickAction → search
+handoff → product(id: 42)
+notification → nothing to open: stay where the user is
+```
+
+Two decisions are hiding in there. **Everything that can carry a URL does**: widgets, Spotlight identifiers and Handoff activities all use the route's universal link, so they share the link parser and its validation, and a Handoff to a Mac without the app opens the same page in Safari. And **old payload formats keep working**: a notification queued by last month's server, or sent to a user who hasn't updated, still opens the order.
+
+## Notifications
+
+### Design the payload as an API
+
+The server and many versions of the app share the notification payload, so design it as carefully as an endpoint:
+
+```json
+{
+  "aps": {
+    "alert": { "title": "Your order has shipped", "body": "Arriving Thursday" },
+    "category": "ORDER_SHIPPED",
+    "thread-id": "order-A1B2C3",
+    "target-content-id": "order-A1B2C3"
+  },
+  "link": "https://shop.example.com/orders/A1B2C3",
+  "orderID": "A1B2C3"
+}
+```
+
+- **`link`** is the destination, as a universal link. One field, parsed by the same code as every other link, and meaningful to any future app version that can open that URL.
+- **`category`** picks the action buttons the app registered for it (Track, Contact support).
+- **`thread-id`** groups notifications in Notification Centre; **`target-content-id`** says which content it's about, which iPadOS uses to choose the window to open it in when the app has several.
+- **Typed fields** such as `orderID` serve the app's own logic: updating a badge, or a notification service extension that adds an image.
+
+### Receive it in one place, from launch
+
+```swift check ios group=entry title="AppDelegate.swift"
+import SwiftUI
+import UIKit
+import UserNotifications
+
+enum AppRoute: Equatable, Sendable {
+    case order(id: String)
+    case tracking(orderID: String)
+    case product(id: Int)
+    case search
+
+    /// The link parser every entry point shares
+    init?(url: URL) {
+        let segments = url.pathComponents.filter { $0 != "/" }
+        guard url.scheme == "https", url.host()?.lowercased() == "shop.example.com" else { return nil }
+        switch (segments.first, segments.count) {
+        case ("orders", 2): self = .order(id: segments[1])
+        case ("orders", 3) where segments[2] == "tracking": self = .tracking(orderID: segments[1])
+        case ("product", 2):
+            guard let id = Int(segments[1]), id > 0 else { return nil }
+            self = .product(id: id)
+        case ("search", 1): self = .search
+        default: return nil
+        }
+    }
+
+    /// Notifications carry a link, so they share that parser
+    init?(notification userInfo: [AnyHashable: Any]) {
+        guard let link = userInfo["link"] as? String, let url = URL(string: link) else { return nil }
+        self.init(url: url)
+    }
+}
+
+/// Builds the universal link for a route, for widgets, Spotlight and Handoff
+enum ShopLink {
+    static let base = URL(string: "https://shop.example.com")!
+    static func product(_ id: Int) -> URL { base.appending(path: "product/\(id)") }
+    static func order(_ id: String) -> URL { base.appending(path: "orders/\(id)") }
+}
+
+@MainActor @Observable
+final class EntryRouter {
+    private(set) var current: AppRoute?
+
+    func open(_ route: AppRoute) {
+        current = route   // in the real app: hold until ready, then hand to the router
+    }
+}
+
+final class AppDelegate: NSObject, UIApplicationDelegate, UNUserNotificationCenterDelegate {
+    let router = EntryRouter()
+
+    func application(_ application: UIApplication, didFinishLaunchingWithOptions launchOptions: [UIApplication.LaunchOptionsKey: Any]? = nil) -> Bool {
+        // Before launch finishes, or the tap that launched the app is never delivered
+        UNUserNotificationCenter.current().delegate = self
+        return true
+    }
+
+    // A tap on the notification itself, cold or warm. Called off the main actor, so parse
+    // into a Sendable route here, then hop over.
+    nonisolated func userNotificationCenter(_ center: UNUserNotificationCenter, didReceive response: UNNotificationResponse) async {
+        guard response.actionIdentifier == UNNotificationDefaultActionIdentifier,
+              let route = AppRoute(notification: response.notification.request.content.userInfo) else { return }
+        await router.open(route)
+    }
+
+    // Arriving while the app is open: show a banner, but don't yank the user somewhere else
+    nonisolated func userNotificationCenter(_ center: UNUserNotificationCenter, willPresent notification: UNNotification) async -> UNNotificationPresentationOptions {
+        [.banner, .list, .sound]
+    }
+}
+
+struct ShopApp: App {   // @main in the real app
+    @UIApplicationDelegateAdaptor(AppDelegate.self) private var delegate
+
+    var body: some Scene {
+        WindowGroup {
+            Text("Shop")
+                .environment(delegate.router)
+        }
+    }
+}
+```
+
+The details that matter:
+
+- **Set the delegate before launch finishes**, in `application(_:didFinishLaunchingWithOptions:)`. Set it later (in a view's `onAppear`, after sign-in) and the tap that launched the app is never delivered.
+- **Pick one place.** Scene-based apps also find the launching notification in `connectionOptions.notificationResponse`. Handle it there *and* in the delegate and the order opens twice. The delegate covers cold and warm starts, so it's usually the one.
+- **Swift 6 isolation.** The delegate methods aren't main-actor isolated, and `UNNotificationResponse` isn't `Sendable`, so a main-actor implementation doesn't compile. Mark them `nonisolated`, extract a `Sendable` route, then `await` the main actor.
+- **Foreground arrivals present, they don't navigate.** If the user is mid-checkout when "your order shipped" arrives, show the banner and navigate only if they tap it.
+- **Action buttons.** A custom action without the `.foreground` option runs your handler in the background without opening the app: it can mark something as read or snooze a reminder, and it must not try to navigate.
+
+## Widgets and Live Activities
+
+A widget can't run code when tapped; it opens your app with a URL. The small family has one tap target for the whole widget, set with `widgetURL`; medium and larger families can add `Link`s for regions. Live Activities work the same way.
+
+```swift check ios group=entry title="OrderWidgetView.swift"
+import WidgetKit
+
+struct OrderEntry: TimelineEntry {
+    let date: Date
+    let orderID: String
+    let status: String
+}
+
+struct OrderWidgetView: View {
+    let entry: OrderEntry
+    @Environment(\.widgetFamily) private var family
+
+    var body: some View {
+        VStack(alignment: .leading) {
+            Text(entry.status)
+            if family != .systemSmall {
+                // A second tap target, for larger families only
+                Link("Track parcel", destination: ShopLink.order(entry.orderID).appending(path: "tracking"))
+            }
+        }
+        // The whole widget's tap target, and the only one a small widget has
+        .widgetURL(ShopLink.order(entry.orderID))
+        .containerBackground(.fill.tertiary, for: .widget)
+    }
+}
+```
+
+The URLs arrive in `onOpenURL` like any link, so use the same universal-link format and the same parser. Since iOS 17, widget buttons and toggles can run an App Intent *without* opening the app: "mark as received" is an intent, "show me the order" is a URL.
+
+## Spotlight and Handoff: user activities in both directions
+
+`NSUserActivity` describes "what the user is doing" in a form the system can carry elsewhere: to another device for Handoff, into search results, into Siri suggestions. Your app both **advertises** activities and **continues** them.
+
+```swift check ios group=entry title="Advertising and continuing activities"
+import CoreSpotlight
+import UniformTypeIdentifiers
+
+struct ProductScreen: View {
+    let productID: Int
+    let name: String
+
+    var body: some View {
+        Text(name)
+            // While this screen is showing, offer it to Handoff and to on-device search
+            .userActivity("com.example.shop.product") { activity in
+                activity.title = name
+                activity.webpageURL = ShopLink.product(productID)   // a Mac without the app opens this in Safari
+                activity.targetContentIdentifier = "product-\(productID)"
+                activity.isEligibleForHandoff = true
+                activity.isEligibleForSearch = true
+            }
+    }
+}
+
+/// Recently viewed products, findable from Spotlight. Each item's identifier is its route's URL.
+func indexRecentlyViewed(_ products: [(id: Int, name: String)]) async throws {
+    let items = products.map { product in
+        let attributes = CSSearchableItemAttributeSet(contentType: .content)
+        attributes.title = product.name
+        return CSSearchableItem(uniqueIdentifier: ShopLink.product(product.id).absoluteString, domainIdentifier: "recently-viewed", attributeSet: attributes)
+    }
+    try await CSSearchableIndex.default().indexSearchableItems(items)
+}
+
+struct EntryPointsRoot: View {
+    @Environment(EntryRouter.self) private var router
+
+    var body: some View {
+        Text("Shop")
+            .onOpenURL { url in
+                if let route = AppRoute(url: url) { router.open(route) }   // links and widgets
+            }
+            .onContinueUserActivity(CSSearchableItemActionType) { activity in
+                if let identifier = activity.userInfo?[CSSearchableItemActivityIdentifier] as? String,
+                   let url = URL(string: identifier), let route = AppRoute(url: url) {
+                    router.open(route)
+                }
+            }
+            .onContinueUserActivity("com.example.shop.product") { activity in
+                if let url = activity.webpageURL, let route = AppRoute(url: url) { router.open(route) }   // Handoff
+            }
+    }
+}
+```
+
+Activity types you continue must be listed in the Info.plist's `NSUserActivityTypes`. Keep anything private out of activities marked eligible for search, since they're indexed on the device, and set `isEligibleForPublicIndexing` only for content that's public on your website too.
+
+## Home Screen quick actions
+
+Quick actions are the menu that appears when the user touches and holds the app icon: static ones declared in the Info.plist under `UIApplicationShortcutItems`, and dynamic ones the app sets at run time on `UIApplication.shared.shortcutItems`, such as "Track your latest order". Keep them to the few most useful tasks.
+
+They arrive through the scene delegate, and SwiftUI has no modifier for them, so a SwiftUI app supplies a scene delegate class. If that class is an `ObservableObject`, SwiftUI puts the instance in each scene's environment, which is a tidy way to get the action to your views:
+
+```swift check ios group=entry title="Quick actions in a SwiftUI app"
+extension AppDelegate {
+    func application(_ application: UIApplication, configurationForConnecting connectingSceneSession: UISceneSession, options: UIScene.ConnectionOptions) -> UISceneConfiguration {
+        let configuration = UISceneConfiguration(name: nil, sessionRole: connectingSceneSession.role)
+        configuration.delegateClass = QuickActionSceneDelegate.self
+        return configuration
+    }
+}
+
+/// One per window; SwiftUI makes it available to that window's views as an environment object
+final class QuickActionSceneDelegate: NSObject, UIWindowSceneDelegate, ObservableObject {
+    @Published var route: AppRoute?
+
+    // Cold start: the action that launched the app
+    func scene(_ scene: UIScene, willConnectTo session: UISceneSession, options connectionOptions: UIScene.ConnectionOptions) {
+        if let item = connectionOptions.shortcutItem { route = Self.route(for: item) }
+    }
+
+    // Warm start
+    func windowScene(_ windowScene: UIWindowScene, performActionFor shortcutItem: UIApplicationShortcutItem, completionHandler: @escaping (Bool) -> Void) {
+        route = Self.route(for: shortcutItem)
+        completionHandler(route != nil)
+    }
+
+    private static func route(for item: UIApplicationShortcutItem) -> AppRoute? {
+        switch item.type {
+        case "com.example.shop.search": .search
+        case "com.example.shop.lastOrder": (item.userInfo?["orderID"] as? String).map { .order(id: $0) }
+        default: nil
+        }
+    }
+}
+
+struct QuickActionRoot: View {
+    @Environment(EntryRouter.self) private var router
+    @EnvironmentObject private var scene: QuickActionSceneDelegate
+
+    var body: some View {
+        Text("Shop")
+            .onChange(of: scene.route) { _, route in
+                if let route { router.open(route) }
+            }
+    }
+}
+```
+
+## Siri, Shortcuts and App Intents
+
+App Intents describe actions the system can run: from Siri, the Shortcuts app, Spotlight's action results, the Action button and controls. Many shouldn't navigate at all ("reorder my usual coffee" can run without showing anything). Those that should, set `openAppWhenRun` or adopt `OpenIntent`, and their `perform()` hands a route to the same router as every other door, through a dependency the app registers at launch. An intent that builds view controllers or sets paths directly is the eighth copy of "open order 42".
+
+## Trade-offs
+
+| | Handle each entry point where it arrives | Adapters into one route and router |
+| --- | --- | --- |
+| Code per entry point | the whole navigation, again | a few lines of adapting |
+| Consistency | each door drifts | one meaning per route |
+| Cold start, sign-in gating, "dismiss first" | solved per door, or not | solved once, in the entry handler and router |
+| Analytics | per door, if remembered | a `source` on every route |
+| Adding a new entry point | a new navigation path | a new adapter |
+| Testing | one UI test per door | adapters and parser in unit tests |
+
+<Callout kind="interview">
+
+**What to say:** "Every entry point is an adapter that turns its payload into the same typed route, tagged with its source. Notifications carry a universal link in the payload; widgets, Spotlight items and Handoff activities use the route's URL too, so one parser validates everything. The notification delegate is set before launch finishes. Routes wait in one entry handler until the UI and session are ready, then go to the router." For the cold-start walk-through: launch, delegate set, window built, session restored, delegate delivers the response, route parsed, held, released, router dismisses and builds the stack.
+
+**What to ask:** which notifications exist, and which should open which screen? Do old app versions receive the same payloads? Is the app multi-window on iPad (then which window opens it)? Which intents should open the app at all?
+
+**Red flags:** setting the notification delegate in a view; handling the same notification in `connectionOptions` and the delegate; navigation code inside a widget's intent; Spotlight identifiers that are database ids only the current schema understands; foreground notifications that navigate without a tap.
+
+</Callout>
+
+<Callout kind="gotcha" title="iOS gotcha: onOpenURL needs a view that exists">
+
+SwiftUI delivers URLs and activities to `onOpenURL` and `onContinueUserActivity` modifiers on views that are currently in the hierarchy. Attach them to a screen that only exists once the user is signed in, or to one tab's content, and a widget tap on a signed-out launch, or while another tab is showing, arrives at nobody. Attach them at the root of the window and hand the route to the entry handler, which decides what to do and when.
+
+</Callout>
+
+## Practice
+
+[Parse every entry point into a route](/design/practice/sd-kata-navigation-route-parsing) includes notification payloads alongside URLs: the new `link` field, the older typed format and everything malformed. [Routing for a tabbed shopping app](/design/practice/sd-design-navigation-shop-routing) asks you to design the notifications, widgets and quick actions of a real shop around one router, including what happens when two arrive at once on a cold start.
+
+```cards
+- id: one-route-many-doors
+  front: "How should an app handle notifications, widgets, Spotlight, quick actions and Handoff?"
+  back: "Each entry point is an adapter that turns its payload into the same typed route (tagged with its source); one entry handler holds it until the UI is ready, and one router performs it."
+- id: notification-delegate-timing
+  front: "When must the notification centre's delegate be set, and why?"
+  back: "Before the app finishes launching, in didFinishLaunching. Otherwise the tap that launched the app isn't delivered to it."
+- id: payload-link
+  front: "Why put a universal link in a notification payload?"
+  back: "One field names the destination in a format every entry point already parses and validates, and any app version that understands the URL can open it."
+- id: quick-actions-swiftui
+  front: "How does a SwiftUI app receive Home Screen quick actions?"
+  back: "Through a scene delegate class supplied by the app delegate's configurationForConnecting: connectionOptions.shortcutItem on a cold start, windowScene(_:performActionFor:completionHandler:) when running."
+```
+
+```quiz
+- id: q1
+  type: order
+  prompt: "The app isn't running. The user taps \"Your order has shipped\". Put what happens in order."
+  lines:
+    - "iOS launches the app"
+    - "didFinishLaunching sets the notification centre's delegate"
+    - "The scene connects and the window and tabs are built"
+    - "The delegate's didReceive delivers the response"
+    - "The adapter parses the payload's link into a route"
+    - "The entry handler releases the route once the UI is ready"
+    - "The router dismisses anything presented and shows the order"
+  explain: "The delegate must exist before the response is delivered, and the route must wait until there's a UI to show it in. Everything after parsing is the same path a link takes."
+- id: q2
+  type: bug
+  prompt: "Tapping a notification while the app is closed opens the app but not the order. Taps while it's open work. Which line is the cause?"
+  code: |
+    struct RootView: View {
+        @Environment(EntryRouter.self) private var router
+        @State private var session = Session()
+
+        var body: some View {
+            if session.isRestored {
+                MainTabs()
+                    .onAppear {
+                        UNUserNotificationCenter.current().delegate = router.notifications
+                    }
+            } else {
+                ProgressView()
+            }
+        }
+    }
+  answer: 9
+  explain: "The delegate is set when the tabs appear, long after launch has finished, so the response that launched the app is never delivered. Set it in `application(_:didFinishLaunchingWithOptions:)` and let the entry handler hold the route until the tabs exist."
+- id: q3
+  type: sort
+  prompt: "Which should open the app, and which should run without opening it?"
+  buckets: [Open the app, Run in the background]
+  items:
+    - ["Tapping the order-shipped notification", 0]
+    - ["A \"Mark as received\" button on the order widget", 1]
+    - ["A \"Snooze\" action on a basket reminder", 1]
+    - ["Choosing a product in Spotlight", 0]
+    - ["The \"Track your latest order\" quick action", 0]
+  explain: "Things the user wants to see open the app at a route. Small tasks that change state (an interactive widget's intent, a notification action without the foreground option) run without navigating anywhere."
+- id: q4
+  type: mcq
+  prompt: "A notification arrives while the user is entering their card details in checkout. What should the app do?"
+  options:
+    - "Dismiss checkout and show the notification's screen at once"
+    - "Show the banner from `willPresent`, and navigate only if the user taps it"
+    - "Suppress it until checkout is finished"
+    - "Show an alert asking whether to leave checkout"
+  answer: 1
+  explain: "An arrival isn't a request to navigate. Present it (banner, list, sound) and leave the user where they are; a tap is the request, and the router then decides how to get there safely."
+- id: q5
+  type: multi
+  prompt: "Which are good identifiers for a recently viewed product in Spotlight? Choose all that apply."
+  options:
+    - "`https://shop.example.com/product/42`, the route's universal link"
+    - "The product's Core Data object id"
+    - "A random UUID generated at indexing time"
+    - "A stable product id that the route parser accepts"
+  answer: [0, 3]
+  explain: "The identifier comes back when the user taps the result, so it must map to a route with code every version shares. The route's URL is best; a stable public id works. Database object ids change with the schema, and a random UUID means nothing on its own."
+```
