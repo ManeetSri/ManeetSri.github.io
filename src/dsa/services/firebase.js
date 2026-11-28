@@ -28,8 +28,7 @@ const createAuth = () => {
 
 const auth = createAuth();
 
-// Firestore is most of the console's Firebase code, so it lives in ./sync.js and loads separately:
-// the passphrase screen only needs Auth. Starting the download early means it's ready by sign-in.
+// The passphrase screen only needs Auth. Load Firestore after restoring or unlocking a session.
 export const loadSync = () => import('./sync.js');
 
 export const watchUser = (callback) => onAuthStateChanged(auth, callback);

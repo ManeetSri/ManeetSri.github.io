@@ -48,6 +48,7 @@ const contentSecurityPolicy = (html) => {
     return [
         "default-src 'self'",
         `script-src 'self' ${[...inlineScripts, ...SOURCES.scripts].join(' ')}`,
+        "worker-src 'self'",
         `style-src 'self' ${inlineStyles.join(' ')}`,
         `img-src 'self' ${SOURCES.images.join(' ')}`,
         "font-src 'self'",
@@ -71,6 +72,10 @@ const headersFile = (html) => `/*
   Cross-Origin-Resource-Policy: same-site
 /assets/*
   Cache-Control: public, max-age=31536000, immutable
+/sw.js
+  Cache-Control: no-cache
+/manifest.webmanifest
+  Cache-Control: no-cache
 ${PRIVATE_PATHS.map((path) => `${path}\n  X-Robots-Tag: noindex, nofollow, noarchive\n`).join('')}`;
 
 // Writes Netlify's _headers file after the build, because the hashes depend on the final HTML.

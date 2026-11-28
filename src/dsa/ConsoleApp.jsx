@@ -68,7 +68,7 @@ export const CourseRoutes = ({ course: id }) => {
     );
 };
 
-// The private learning console. Not linked from the portfolio, never indexed, and behind a passphrase.
+// The console is never indexed and sits behind a passphrase.
 // The gate and the progress store sit above every course, so switching courses keeps the same session
 // and the same Firestore listeners. Everything it needs loads in its own chunks.
 const ConsoleApp = () => (

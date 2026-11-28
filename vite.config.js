@@ -5,6 +5,7 @@ import remarkGfm from 'remark-gfm'
 import remarkDsaBlocks from './scripts/remark-dsa-blocks.js'
 import { seoContent } from './seo-plugin.js'
 import { securityHeaders } from './security-headers-plugin.js'
+import { pwa } from './pwa-plugin.js'
 import { dsaExerciseWriter } from './scripts/dsa-exercise-writer.js'
 
 // The console's code, and the exercise stubs its solution editor starts from
@@ -18,6 +19,7 @@ export default defineConfig({
     react({ include: /\.(mdx|js|jsx)$/ }),
     seoContent(),
     securityHeaders(),
+    pwa(),
     dsaExerciseWriter(),
   ],
   build: {

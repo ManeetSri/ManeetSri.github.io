@@ -14,6 +14,7 @@ import Stage from './sections/Stage';
 import StaticStory from './sections/StaticStory';
 import Instruments from './sections/Instruments';
 import Services from './sections/Services';
+import Learning from './sections/Learning';
 import Notes from './sections/Notes';
 import Contact from './sections/Contact';
 import NotFoundPage from './pages/NotFoundPage';
@@ -66,6 +67,7 @@ const Home = () => {
         {reduceMotion ? <StaticStory /> : <Stage ready={ready} />}
         <Instruments />
         <Services />
+        <Learning />
         <Notes />
         <Contact />
       </main>
