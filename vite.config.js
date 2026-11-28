@@ -25,6 +25,8 @@ export default defineConfig({
     assetsInlineLimit: 0,
     // Firestore with offline persistence is about 620 kB. Only the private console loads it, on demand.
     chunkSizeWarningLimit: 650,
+    // Gzipping all ~2,400 chunks only to print their sizes costs memory and time; Netlify's ~2 GB heap ran out
+    reportCompressedSize: false,
     rollupOptions: {
       output: {
         // The console's chunks get their own folder, which _headers marks as never indexed
