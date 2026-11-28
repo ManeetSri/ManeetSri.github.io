@@ -1,7 +1,8 @@
 import { useEffect, useRef, useState } from 'react';
 import { Link, useLocation, useNavigate } from 'react-router-dom';
 import { motion } from 'framer-motion';
-import { ArrowUp, FileText, Github, Linkedin, Mail } from 'lucide-react';
+import { ArrowUp, FileText, Mail } from 'lucide-react';
+import { Github, Linkedin } from '../components/BrandIcons';
 import { FIELD_LIMITS, FormCooldownError, submitNetlifyForm } from '../utils/netlifyForm';
 import { track } from '../analytics';
 import { openCookieSettings } from '../analytics/consent';

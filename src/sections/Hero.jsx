@@ -1,5 +1,6 @@
 import { motion } from 'framer-motion';
-import { ArrowDown, ArrowRight, FileText, Github } from 'lucide-react';
+import { ArrowDown, ArrowRight, FileText } from 'lucide-react';
+import { Github } from '../components/BrandIcons';
 import Phone from '../components/device/Phone';
 import LockScreen from '../components/device/LockScreen';
 import AppIcon from '../components/device/AppIcon';
