@@ -1,0 +1,301 @@
+## Why it matters
+
+Sooner or later every app grows state that several features share: the signed-in user, the basket, unread counts, entitlements. The tempting answer is one big store that holds it all. Some of the best-run apps work that way, and so do some of the slowest and most tangled. "Would you use a global store?" is a staple of senior interviews precisely because the honest answer is a set of trade-offs: what it buys, what it costs, and the shape most teams end up with.
+
+## What a global store is
+
+A global store is state that lives outside every screen, which features read and change. It comes in three common shapes:
+
+- **The singleton:** `AppState.shared`, reachable from any line of code.
+- **An injected app model:** an `@Observable` object (or a few) created at launch and handed to screens through the environment or initialisers.
+- **A single state tree with actions:** one state value for the whole app, changed only by sending actions through a reducer, as in Redux, ReSwift and The Composable Architecture (TCA). You'll meet these properly in D28.
+
+They share the idea of state above the screens; they differ in how features reach it and how changes happen.
+
+## What it buys
+
+- **One place to look.** Anything shared has an obvious home, so "where does this live?" has one answer.
+- **Cross-feature consistency.** Adding to the basket from a product page updates the tab badge, the basket screen and the checkout button together, because they all read one value.
+- **Whole-app snapshots.** One value is easy to save for restoration, log with a bug report, or reset on sign-out.
+- **With actions, a record of every change.** A single stream of actions can be logged, replayed in a test, or stepped through in a debugger, and the reducer that handles them is pure and testable.
+
+## What it costs
+
+### Coupling
+
+If every feature reads one root `AppState` type, every feature depends on every other feature's state. Change the basket's state and the search feature recompiles. Split the app into modules (D61) and you find a root type that can only live in a module everything imports. The cure is to let each feature **own its state type**, and have the root merely *compose* them, so a feature sees only its own slice.
+
+### Update fan-out
+
+The more views observe one object, the more matters what a change notifies. With `ObservableObject`, a store has one `objectWillChange` publisher: *any* `@Published` change tells *every* observing view to re-evaluate its body, whether or not it reads that property. With `@Observable`, SwiftUI records which properties each body read, and re-renders only the views whose properties changed.
+
+```visual flow
+title: A new message arrives
+nodes:
+  - { id: store, label: App store, kind: service, at: [2, 0] }
+  - { id: push, label: Push service, kind: external, at: [4, 0] }
+  - { id: profile, label: Profile header, kind: view, at: [0, 2] }
+  - { id: basket, label: Basket badge, kind: view, at: [2, 2] }
+  - { id: inbox, label: Inbox badge, kind: view, at: [4, 2] }
+edges:
+  - [push, store, new message]
+  - [store, profile, userName, { style: data }]
+  - [store, basket, basketCount, { style: data }]
+  - [store, inbox, unreadCount, { style: data }]
+steps:
+  - say: "Three views read one store. Each reads a single property: the user's name, the basket count, the unread count."
+    show: [store, profile, basket, inbox]
+  - say: "A push brings a new message, and the store's `unreadCount` changes."
+    show: [push]
+    send: push->store
+    state: { store: active }
+  - say: "With `ObservableObject`, `objectWillChange` only says *something* changed, so all three views re-evaluate. Two of them did the work for nothing."
+    send: [store->profile, store->basket, store->inbox]
+    state: { store: null, profile: error, basket: error, inbox: ok }
+    label: { profile: wasted, basket: wasted, inbox: needed }
+  - say: "With `@Observable`, each view depends only on what its body read. Only the inbox badge re-renders."
+    send: store->inbox
+    state: { profile: null, basket: null, inbox: ok }
+    label: { profile: null, basket: null, inbox: re-renders }
+```
+
+You can watch the same difference outside SwiftUI. `withObservationTracking` is the mechanism SwiftUI uses: it runs a closure, records the properties it read, and calls `onChange` when one of *those* changes:
+
+```swift run title="Who hears about a change"
+import Combine
+import Observation
+
+/// The ObservableObject way: the whole store has one objectWillChange
+final class LegacyAppStore: ObservableObject {
+    @Published var userName = "Maneet"
+    @Published var basketCount = 0
+    @Published var unreadCount = 0
+}
+
+/// The @Observable way: each property is tracked on its own
+@Observable
+final class AppStore {
+    var userName = "Maneet"
+    var basketCount = 0
+    var unreadCount = 0
+}
+
+// Three views, each showing one property. Then a new message arrives.
+let legacy = LegacyAppStore()
+var redrawn: [String] = []
+var subscriptions: Set<AnyCancellable> = []
+for view in ["Profile header", "Basket badge", "Inbox badge"] {
+    legacy.objectWillChange
+        .sink { redrawn.append(view) }
+        .store(in: &subscriptions)
+}
+legacy.unreadCount = 4
+print("ObservableObject re-renders:", redrawn.sorted().joined(separator: ", "))
+
+let store = AppStore()
+withObservationTracking { _ = store.userName } onChange: { print("@Observable re-renders: Profile header") }
+withObservationTracking { _ = store.basketCount } onChange: { print("@Observable re-renders: Basket badge") }
+withObservationTracking { _ = store.unreadCount } onChange: { print("@Observable re-renders: Inbox badge") }
+store.unreadCount = 4
+```
+
+```output
+ObservableObject re-renders: Basket badge, Inbox badge, Profile header
+@Observable re-renders: Inbox badge
+```
+
+`@Observable` (iOS 17) removes most of the fan-out problem, but not all of it. Tracking is per property, so a view that reads `store.messages` still re-renders when *any* message in the array changes. Keep what each view reads small: pass a row its own value, or give rows their own observable objects.
+
+### State that outlives its screen
+
+Global state lives as long as the app. That's right for the session and wrong for most feature state. Put the search query in the global store and it's still there next week; put the loaded search results there and they hold memory long after the user has left. A feature's state should be created with the feature and released with it, unless the product says otherwise.
+
+### Everything drifts into it
+
+Once a store exists, every bit of state drifts towards it: text field drafts, scroll offsets, whether an animation has played. Now each keystroke is a store change that every reader of that property re-renders for, and simple screens need actions, reducer cases and plumbing. Local UI state should stay local ([Local, shared and app-wide state](/design/learn/sd-state-kinds)), even in a store-based app.
+
+### Hidden dependencies
+
+A singleton adds one more cost: anything can reach it without saying so. Tests share its state and leak into each other, previews can't swap it, and initialisation order starts to matter ([Singleton abuse, global state and service locators](/design/learn/sd-refactoring-global-state)). An injected store has every other trade-off on this page, but at least its dependencies are visible.
+
+## The middle ground: compose small models
+
+Most production apps end up in the middle. A small **app model** at the root holds only what's truly app-wide, as separate objects with their own owners; features receive the one or two they need; everything else lives in feature models with feature lifetimes.
+
+```swift check ios title="App-wide models, composed at the root and injected by type"
+import SwiftUI
+
+@MainActor @Observable
+final class Session {
+    private(set) var userName: String?
+
+    func signIn(as name: String) { userName = name }
+    func signOut() { userName = nil }
+}
+
+@MainActor @Observable
+final class Basket {
+    private(set) var quantities: [String: Int] = [:]
+
+    var itemCount: Int { quantities.values.reduce(0, +) }
+
+    func add(_ productID: String) { quantities[productID, default: 0] += 1 }
+    func empty() { quantities = [:] }
+}
+
+/// Only what every feature shares. Feature state stays in the features.
+@MainActor
+final class AppModel {
+    let session = Session()
+    let basket = Basket()
+
+    /// One place that knows everything sign-out must clear
+    func signOut() {
+        basket.empty()
+        session.signOut()
+    }
+}
+
+struct ShopApp: App {
+    @State private var app = AppModel()
+
+    var body: some Scene {
+        WindowGroup {
+            MainTabs()
+                .environment(app.session)
+                .environment(app.basket)
+        }
+    }
+}
+
+struct MainTabs: View {
+    @Environment(Basket.self) private var basket
+
+    var body: some View {
+        TabView {
+            Tab("Shop", systemImage: "bag") {
+                ShopScreen()
+            }
+            Tab("Basket", systemImage: "cart") {
+                Text("Your basket")
+            }
+            .badge(basket.itemCount)
+        }
+    }
+}
+
+struct ShopScreen: View {
+    @Environment(Basket.self) private var basket   // only the app-wide state it needs
+    @State private var query = ""                   // feature state: lives with the screen
+
+    var body: some View {
+        NavigationStack {
+            List {
+                Button("Add flat white") { basket.add("flat-white") }
+            }
+            .searchable(text: $query)
+        }
+    }
+}
+```
+
+The shop screen depends on `Basket`, not on an `AppState` with fifty properties, so it builds, previews and tests with a `Basket` alone. The app model is the one place that knows how the pieces relate, which is why sign-out lives there. Everything is `@MainActor` because it's UI state; background services hand results back to it rather than sharing it.
+
+A single state tree can reach the same place. TCA keeps one root `Store`, but each feature receives a **scoped** store that sees only its slice of state and sends only its own actions, and with `@ObservableState` its views track individual fields, as `@Observable` does. The difference is how much ceremony you buy: actions and reducers for every change, in exchange for one place that sees, logs and tests them all.
+
+## Choosing
+
+Lean towards **one store with actions** when many features interact in complicated ways, when you need to reproduce bugs from a log of actions, or when a team has agreed on TCA and will use its tests. Lean towards **composed models** when features are mostly independent, when modularity and build times matter, or when a team is new to unidirectional patterns. Avoid **the singleton** for anything beyond a prototype: its convenience costs you every seam.
+
+The questions that decide it: how much state is genuinely cross-feature (often less than it seems: a session, a basket, a few counts)? How many teams touch it? What must be debuggable after the fact?
+
+## Trade-offs
+
+| | Singleton | Composed, injected models | One state tree with scoped actions |
+| --- | --- | --- | --- |
+| Finding shared state | easy, and easy to abuse | one object per concern | one place |
+| Coupling | everything to everything, invisibly | features to the models they take | features to their slice, via scoping |
+| Update fan-out | depends on observation; often wide | per property with `@Observable` | per field with scoping and observable state |
+| Lifetime | the process | per model: app, scene or feature | the root's, unless features are scoped and torn down |
+| Testing | shared state leaks between tests | inject a fresh model per test | pure reducers; exhaustive tests |
+| Boilerplate | none | a little wiring | actions and reducer cases for every change |
+| Wins for | prototypes | most apps, most teams | complex, highly interactive apps with a team that knows the pattern |
+
+<Callout kind="interview">
+
+**What to say:** "Only state that's genuinely app-wide goes at the root: the session, the basket, entitlements. Each is its own observable model, injected by type, so features depend only on what they use. Feature state lives with the feature and dies with it." If you choose a single store, say how you'll scope it and keep local UI state out of it.
+
+**What to ask:** how many features read the same data? Is there a team-wide architecture already (TCA, say)? Do we need to reproduce sessions from logs?
+
+**Red flags:** "everything goes in AppState" with no scoping; a singleton reached from views; text field drafts in a global store; no story for what sign-out clears.
+
+</Callout>
+
+<Callout kind="gotcha" title="iOS gotcha: a missing environment object crashes">
+
+`@Environment(Basket.self) private var basket` traps at runtime if no ancestor called `.environment(basket)`; so does the older `@EnvironmentObject`. It works in the app and crashes the first preview, test host or new entry point (a widget's configuration screen, a sheet presented from UIKit) that forgets it. Inject in one helper used by the app, previews and tests, or declare it optional (`private var basket: Basket?`) where it's genuinely optional.
+
+</Callout>
+
+## Practice
+
+The design exercise **App-wide state for a multi-tab app** puts this lesson to work: decide what's app-wide, per window and per feature in a four-tab grocery app, how features reach it without importing each other, and what sign-out must clear.
+
+```cards
+- id: store-buys
+  front: "What does a global store buy you?"
+  back: "One home for shared state, consistency across features, whole-app snapshots, and (with actions) a log of every change that can be replayed and tested."
+- id: fan-out
+  front: "Why did big ObservableObject stores make SwiftUI slow?"
+  back: "One objectWillChange for the whole object: any @Published change re-evaluates every observing view. @Observable tracks each property, so only views that read the changed property re-render."
+- id: compose-models
+  front: "What's the usual middle ground to a single global store?"
+  back: "A small root that composes separate app-wide models (session, basket), injected by type; feature state stays in feature models with feature lifetimes."
+- id: stays-local
+  front: "Which state should stay out of a global store?"
+  back: "Local UI state: drafts, scroll positions, focus, animation flags, and feature state that should end when the feature does."
+```
+
+```quiz
+- id: q1
+  type: mcq
+  prompt: "A large app keeps an `ObservableObject` `AppStore` with 60 `@Published` properties, observed by most screens. Typing in the search field stutters. What's the most likely cause?"
+  options:
+    - "`@Published` properties are slow to set"
+    - "Each keystroke changes a property of the store, and `objectWillChange` re-evaluates every view observing it"
+    - "The search field should use UIKit"
+    - "There are too many properties for Swift to type-check"
+  answer: 1
+  explain: "`objectWillChange` fires for any property, so every observing view re-runs its body on each keystroke. Keep the query local to the search screen, and move to `@Observable` so views depend only on what they read."
+- id: q2
+  type: sort
+  prompt: "In a store-based shopping app, where does each piece of state belong?"
+  buckets: [App-wide store, The feature that uses it, The view itself]
+  items:
+    - [The signed-in session, 0]
+    - ["The basket, which the tab badge also shows", 0]
+    - [The loaded page of search results, 1]
+    - [The checkout flow's chosen delivery slot, 1]
+    - [Whether the size picker sheet is open, 2]
+    - [The text typed in a review field, 2]
+  explain: "Only genuinely cross-feature state belongs in the store. Feature state should be released with the feature; view state is the view's own business."
+- id: q3
+  type: truefalse
+  prompt: "With `@Observable`, a view that reads `store.messages` re-renders only when a message it displays changes."
+  answer: false
+  explain: "Tracking is per property. Reading `messages` makes the view depend on the whole array, so any change to it (a new message, an edit, a read flag) re-renders the view. Give rows their own values or objects to narrow it."
+- id: q4
+  type: multi
+  prompt: "A team is choosing between TCA with one root store and composed `@Observable` models. Which points favour the single store?"
+  options:
+    - "Many features react to each other's changes in complicated ways"
+    - "They want to replay a user's session from a log of actions"
+    - "Features are mostly independent and owned by separate teams"
+    - "They want exhaustive tests of every state change"
+  answer: [0, 1, 3]
+  explain: "A single store shines when interactions are complex and every change must be logged, replayed and tested. Independent features owned by separate teams fit composed models, with less ceremony and looser coupling."
+- id: q5
+  type: recall
+  prompt: "An interviewer asks: \"Would you put all your app's state in one global store?\" Give a two-or-three-sentence answer."
+  model: "Not all of it. App-wide state such as the session, basket and entitlements goes at the root, as small observable models (or a scoped single store, if the team uses TCA), injected so features depend only on what they read. Feature and view state stay local, so they're released with their screens, don't widen updates, and don't couple features together."
+```

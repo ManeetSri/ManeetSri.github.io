@@ -1,0 +1,245 @@
+## Why it matters
+
+When you store a million structs in an array, the bytes each one takes decide how much memory the array needs and how quickly the processor can walk through it. Swift's `MemoryLayout` tells you those numbers exactly. This is a deep-dive lesson: you don't need it to solve problems, but it explains why reordering a struct's properties can shrink it, and it's the foundation for the performance work in Part IX.
+
+## Three numbers: size, stride and alignment
+
+For any type `T`, `MemoryLayout<T>` gives three measurements, all in bytes:
+
+- **`size`**: how many bytes one value actually uses.
+- **`alignment`**: values of this type must start at a memory address that's a multiple of this number.
+- **`stride`**: the distance from one value to the next when they're stored side by side, as in an array. It's the size rounded up to a multiple of the alignment.
+
+```swift run
+func describe<T>(_ type: T.Type, _ name: String) {
+    let size = MemoryLayout<T>.size
+    let stride = MemoryLayout<T>.stride
+    let alignment = MemoryLayout<T>.alignment
+    print("\(name): size \(size), stride \(stride), alignment \(alignment)")
+}
+
+describe(Int.self, "Int")
+describe(Bool.self, "Bool")
+describe(Double.self, "Double")
+describe(Int32.self, "Int32")
+describe(UInt8.self, "UInt8")
+```
+
+```output
+Int: size 8, stride 8, alignment 8
+Bool: size 1, stride 1, alignment 1
+Double: size 8, stride 8, alignment 8
+Int32: size 4, stride 4, alignment 4
+UInt8: size 1, stride 1, alignment 1
+```
+
+`T.Type` is the type of a type, and `Int.self` passes the `Int` type itself as a value: that lets one generic function measure any type. For simple numbers, all three measurements match. A `Bool` takes a whole byte, not one bit, because a byte is the smallest piece of memory that has its own address.
+
+These numbers are for 64-bit platforms: every current Mac, iPhone and iPad. On a 32-bit platform `Int` would be 4 bytes.
+
+## Alignment creates padding
+
+Why must an `Int` start at an address that's a multiple of 8? Processors read memory in aligned chunks. A value that sits neatly inside one chunk can be read in one step; a value straddling two chunks is slower to read, and on some processors can't be read directly at all. So the compiler places each stored property at the next offset that suits its alignment, leaving unused bytes, called **padding**, when it has to.
+
+```swift run
+struct Padded {
+    var flag: Bool
+    var count: Int
+    var done: Bool
+}
+
+print(MemoryLayout<Padded>.size)
+print(MemoryLayout<Padded>.stride)
+print(MemoryLayout<Padded>.alignment)
+print(MemoryLayout<Padded>.offset(of: \.flag)!)
+print(MemoryLayout<Padded>.offset(of: \.count)!)
+print(MemoryLayout<Padded>.offset(of: \.done)!)
+```
+
+```output
+17
+24
+8
+0
+8
+16
+```
+
+`offset(of:)` takes a **key path**, written `\.count`, that names a property; it returns the byte where that property starts (as an optional, hence the `!`). Here's the picture, one box per byte:
+
+```text title="Padded: 17 bytes used, 24 per array element"
+offset  0   1 2 3 4 5 6 7   8 ... 15   16   17 ... 23
+       [flag][  padding  ][  count   ][done][ padding ]
+        Bool   7 wasted      Int       Bool  7 wasted
+```
+
+- `flag` sits at offset 0.
+- `count` needs an offset that's a multiple of 8, so bytes 1 to 7 are padding.
+- `done` fits at 16, making the size 17.
+- The struct's alignment is its largest property's alignment, 8. The stride rounds 17 up to 24, so in an array the next `Padded` starts at a multiple of 8.
+
+Only 10 of every 24 bytes hold data.
+
+## Reordering shrinks the struct
+
+Swift's compiler currently lays out a struct's stored properties in the order you declare them. It isn't a promise the language makes, but it's how today's compiler behaves. Put the biggest-alignment properties first and the small ones can share the space at the end:
+
+```swift run
+struct Packed {
+    var count: Int
+    var flag: Bool
+    var done: Bool
+}
+
+print(MemoryLayout<Packed>.size)
+print(MemoryLayout<Packed>.stride)
+print(MemoryLayout<Packed>.offset(of: \.flag)!)
+print(MemoryLayout<Packed>.offset(of: \.done)!)
+```
+
+```output
+10
+16
+8
+9
+```
+
+The same three properties now take 16 bytes per element instead of 24. For a million elements that's 16 MB instead of 24 MB, and the processor has a third less memory to read. Declaring properties from largest alignment to smallest is a simple rule that removes most padding.
+
+## Arrays use stride, not size
+
+An array stores its elements one stride apart, so `count × stride` is how many bytes its buffer needs for the elements:
+
+```swift run
+struct Padded {
+    var flag: Bool
+    var count: Int
+    var done: Bool
+}
+
+struct Packed {
+    var count: Int
+    var flag: Bool
+    var done: Bool
+}
+
+let elements = 1_000
+print(elements * MemoryLayout<Padded>.stride)
+print(elements * MemoryLayout<Packed>.stride)
+```
+
+```output
+24000
+16000
+```
+
+## Optionals, enums and references
+
+An optional needs to record whether a value is there. Sometimes that costs an extra byte, and sometimes it's free:
+
+```swift run
+final class Node {
+    var value = 0
+}
+
+enum Direction {
+    case north, east, south, west
+}
+
+print(MemoryLayout<Int?>.size, MemoryLayout<Int?>.stride)
+print(MemoryLayout<Node>.size, MemoryLayout<Node?>.size)
+print(MemoryLayout<Bool?>.size)
+print(MemoryLayout<Direction>.size)
+print(MemoryLayout<[Int]>.size, MemoryLayout<String>.size)
+```
+
+```output
+9 16
+8 8
+1
+1
+8 16
+```
+
+- **`Int?` is 9 bytes**: 8 for the number and one to say "is there a value?". Its stride rounds that up to 16, so an `[Int?]` uses twice the memory of an `[Int]`.
+- **`Node?` is still 8 bytes.** Some bit patterns can never be a valid object address, such as all zeros, so Swift uses one of them to mean `nil`. Optional references are free.
+- **`Bool?` is 1 byte**, because a `Bool` only uses two of the 256 values a byte can hold. Swift reuses spare values like this whenever a type has them.
+- **A simple enum** with up to 256 cases fits in 1 byte.
+- **A class variable is 8 bytes** whatever the class holds, because it's a reference. The object itself lives on the heap, where it also carries a 16-byte header that the runtime uses for its type information and reference count. `MemoryLayout` measures only the inline part.
+
+<Callout kind="gotcha" title="Swift gotchas: size vs stride">
+- **Step through memory by stride.** When you compute positions yourself, with buffer pointers or raw bytes, the *n*th element starts at `n * stride`, never `n * size`.
+- **Empty types.** A struct with no stored properties has size 0, but stride 1, so every element in an array still has its own address.
+- **Swift reuses tail padding.** A struct with `Int` then `Bool` has size 9 and stride 16. Put it inside another struct followed by a `Bool`, and that `Bool` goes at offset 9, inside the first struct's padding. C compilers don't do this, so don't assume C's rules apply to Swift structs.
+</Callout>
+
+The problem below asks you to compute a struct's size, stride and alignment from its properties, exactly as Swift does.
+
+```cards
+- id: size-stride-alignment
+  front: "What do `size`, `stride` and `alignment` measure?"
+  back: "Size: bytes one value uses. Alignment: its address must be a multiple of this. Stride: distance between neighbouring values in an array, the size rounded up to the alignment."
+- id: padding-cause
+  front: "Why does `struct { var a: Bool; var b: Int; var c: Bool }` take 24 bytes per array element?"
+  back: "`b` must start at a multiple of 8, so 7 padding bytes follow `a`. The size is 17, and the stride rounds it up to 24."
+- id: reorder-rule
+  front: "How can you shrink a struct's stride without removing properties?"
+  back: "Declare properties from largest alignment to smallest, so small ones share the space at the end instead of creating padding."
+- id: optional-reference-free
+  front: "Why is `Node?` the same size as `Node` for a class `Node`?"
+  back: "An address of all zeros can never be a real object, so Swift uses it to represent `nil`. No extra byte is needed."
+```
+
+```quiz
+- id: q1
+  type: output
+  prompt: "What does this print on a 64-bit Mac?"
+  code: |
+    struct Reading {
+        var flag: Bool
+        var value: Double
+    }
+    print(MemoryLayout<Reading>.size)
+    print(MemoryLayout<Reading>.stride)
+    print(MemoryLayout<Reading>.alignment)
+  answer: |
+    16
+    16
+    8
+  explain: "`flag` takes byte 0. `value` needs an offset that's a multiple of 8, so it starts at 8 after 7 padding bytes. The size is 16, already a multiple of the alignment 8, so the stride is 16 too."
+- id: q2
+  type: trace
+  prompt: "For `struct Mixed { var a: Int8; var b: Int16; var c: Int8; var d: Int64 }`, give the offsets of `a`, `b`, `c` and `d`, separated by commas."
+  answer: "0, 2, 4, 8"
+  explain: "`a` (1 byte) is at 0. `b` needs a multiple of 2, so it's at 2. `c` (alignment 1) fits right after `b` at 4. `d` needs a multiple of 8, so it starts at 8."
+- id: q3
+  type: mcq
+  prompt: "An array holds 1,000 values of a struct with size 17 and stride 24. Roughly how many bytes does its buffer need for the elements?"
+  options:
+    - "17,000"
+    - "24,000"
+    - "17"
+    - "8"
+  answer: 1
+  explain: "Array elements sit one stride apart, so the buffer needs `count × stride` = 24,000 bytes. The size, 17, ignores the padding between elements."
+- id: q4
+  type: truefalse
+  prompt: "For a class `Node`, `MemoryLayout<Node>.size` tells you how many bytes the object itself takes on the heap."
+  answer: false
+  explain: "It reports the size of the reference stored inline, always 8 bytes on 64-bit platforms. The object on the heap is separate, with its own header."
+- id: q5
+  type: output
+  prompt: "What does this print?"
+  code: |
+    struct Slim {
+        var a: Int32
+        var c: Int32
+        var b: Bool
+    }
+    print(MemoryLayout<Slim>.size, MemoryLayout<Slim>.stride)
+    print(MemoryLayout<Int?>.size, MemoryLayout<Int?>.stride)
+  answer: |
+    9 12
+    9 16
+  explain: "`Slim` uses bytes 0–3, 4–7 and 8, so its size is 9; with alignment 4, the stride rounds up to 12. `Int?` needs 8 bytes plus one for \"is there a value?\", and its stride rounds 9 up to 16."
+```

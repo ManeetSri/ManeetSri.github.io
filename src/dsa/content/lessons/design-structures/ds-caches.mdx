@@ -1,0 +1,332 @@
+## Why it matters
+
+"Design an LRU cache" is probably the most asked design question there is, and "now make it LFU" is its favourite follow-up. In apps, caches sit in front of everything slow: decoded images, network responses, laid-out text, database rows. You built both already, in [LRU cache](/dsa/learn/ll-lru-cache) and [LFU cache](/dsa/learn/as-lfu). This lesson doesn't derive them again. It gives you a one-page guide for choosing a policy, and both caches side by side, built from one shared piece, so you can write either quickly under pressure.
+
+## The decision guide
+
+A cache with a fixed capacity must decide what to throw out when something new arrives. That decision is its **eviction policy**, and the right one depends on how your data is used.
+
+| | LRU | LFU | FIFO | `NSCache` |
+| --- | --- | --- | --- | --- |
+| Evicts | the least **recently** used | the least **frequently** used; ties go to the least recent | the oldest **inserted** | whatever the system picks |
+| Shines when | what was used lately is used again: feeds, back navigation | popularity is stable: emoji, common words, hot endpoints | items age evenly, and simplicity matters | memory pressure matters more than exact order |
+| Weak spot | one pass over many new items flushes everything | old favourites hog space; newcomers churn | ignores use completely | no promise about which entry goes |
+| Structures | dictionary + doubly linked list | dictionary + use counts + a list per count + the smallest count | dictionary + queue | built into Foundation |
+| `get` / `put` | O(1) / O(1) | O(1) / O(1) | O(1) / O(1) | managed for you |
+
+Two words from the table:
+
+- A **scan** is a one-off pass over many items that won't be needed again, such as scrolling quickly through a whole photo library once. Under LRU, each scanned item is "most recent" for a moment and pushes out something you'll want back.
+- **Cache pollution** under LFU is the opposite problem: an item that was popular last week keeps its huge count and its slot, even though nobody wants it now. Real LFU caches let counts decay over time.
+
+For a wider tour, including random eviction and how real systems mix policies, see [Cache policies: LRU, LFU and FIFO](/dsa/learn/rand-cache-policies).
+
+## Questions to ask before you code
+
+Caches look simple, so interviewers judge you on the questions you ask first:
+
+- **Capacity in what?** A count of entries, or a total cost such as bytes? Cost limits evict until the total fits, which can mean several evictions per insert.
+- **Does a read count as a use? Does an update?** Usually yes to both. An update must never evict anything, because it doesn't add an entry.
+- **LFU ties:** among keys with the same count, evict the least recently used. Say so; it decides the structure.
+- **Expiry?** Entries that go stale after a time are a separate concern, with its own lesson later in this module: a key-value store with a time to live.
+- **Threads?** A cache shared between threads needs protecting. An actor is the Swift answer, covered in [Actors as thread-safe caches](/dsa/learn/cc-actors).
+
+## One building block, two caches
+
+Both caches need the same piece: keys kept in order of use, with "move this key to the newest end", "remove this key" and "remove the oldest key", all O(1). That's a doubly linked list plus a dictionary from each key to its node. Call it a `RecencyList`.
+
+- **LRU** = values in a dictionary + one `RecencyList` of all keys.
+- **LFU** = values + a use count per key + one `RecencyList` **per count** (a "bucket") + the smallest count that has any keys. Evict the oldest key in the smallest bucket. A use moves a key from bucket c to bucket c + 1.
+
+Here are both, running the same requests with capacity 3:
+
+```swift run
+/// Keys in order of use, oldest first: a doubly linked list plus a dictionary from each key to its
+/// node, as in the LRU cache lesson. Every operation is O(1) on average.
+final class RecencyList {
+    final class Node {
+        let key: String
+        weak var previous: Node?
+        var next: Node?
+        init(key: String) { self.key = key }
+    }
+
+    private let head = Node(key: "")          // sentinel before the oldest
+    private let tail = Node(key: "")          // sentinel after the newest
+    private var nodes: [String: Node] = [:]
+
+    init() {
+        head.next = tail
+        tail.previous = head
+    }
+
+    var isEmpty: Bool { nodes.isEmpty }
+
+    private func unlink(_ node: Node) {
+        node.previous!.next = node.next
+        node.next!.previous = node.previous
+    }
+
+    private func linkAsNewest(_ node: Node) {
+        let last = tail.previous!
+        last.next = node
+        node.previous = last
+        node.next = tail
+        tail.previous = node
+    }
+
+    func append(_ key: String) {
+        let node = Node(key: key)
+        nodes[key] = node
+        linkAsNewest(node)
+    }
+
+    func moveToNewest(_ key: String) {
+        guard let node = nodes[key] else { return }
+        unlink(node)
+        linkAsNewest(node)
+    }
+
+    func remove(_ key: String) {
+        guard let node = nodes.removeValue(forKey: key) else { return }
+        unlink(node)
+    }
+
+    func removeOldest() -> String? {
+        guard let oldest = head.next, oldest !== tail else { return nil }
+        remove(oldest.key)
+        return oldest.key
+    }
+}
+
+protocol Cache: AnyObject {
+    func get(_ key: String) -> Int?
+    func put(_ key: String, _ value: Int)
+}
+
+final class LRUCache: Cache {
+    private let capacity: Int
+    private var values: [String: Int] = [:]
+    private let order = RecencyList()         // least recently used first
+
+    init(capacity: Int) { self.capacity = capacity }
+
+    func get(_ key: String) -> Int? {
+        guard let value = values[key] else { return nil }
+        order.moveToNewest(key)
+        return value
+    }
+
+    func put(_ key: String, _ value: Int) {
+        if values[key] != nil {               // an update is a use, never an eviction
+            values[key] = value
+            order.moveToNewest(key)
+            return
+        }
+        if values.count == capacity, let victim = order.removeOldest() {
+            values[victim] = nil
+            print("  evicts \(victim)")
+        }
+        values[key] = value
+        order.append(key)
+    }
+}
+
+final class LFUCache: Cache {
+    private let capacity: Int
+    private var values: [String: Int] = [:]
+    private var uses: [String: Int] = [:]
+    private var buckets: [Int: RecencyList] = [:]   // use count -> its keys, least recent first
+    private var fewestUses = 0
+
+    init(capacity: Int) { self.capacity = capacity }
+
+    private func bucket(_ count: Int) -> RecencyList {
+        if let existing = buckets[count] { return existing }
+        let made = RecencyList()
+        buckets[count] = made
+        return made
+    }
+
+    /// One more use: move the key from its count's bucket to the next one.
+    private func touch(_ key: String) {
+        let count = uses[key]!
+        let old = bucket(count)
+        old.remove(key)
+        if old.isEmpty {
+            buckets[count] = nil
+            if fewestUses == count { fewestUses = count + 1 }
+        }
+        uses[key] = count + 1
+        bucket(count + 1).append(key)
+    }
+
+    func get(_ key: String) -> Int? {
+        guard let value = values[key] else { return nil }
+        touch(key)
+        return value
+    }
+
+    func put(_ key: String, _ value: Int) {
+        if values[key] != nil {
+            values[key] = value
+            touch(key)
+            return
+        }
+        if values.count == capacity, let victim = buckets[fewestUses]?.removeOldest() {
+            if buckets[fewestUses]!.isEmpty { buckets[fewestUses] = nil }
+            values[victim] = nil
+            uses[victim] = nil
+            print("  evicts \(victim)")
+        }
+        values[key] = value
+        uses[key] = 1
+        bucket(1).append(key)
+        fewestUses = 1                        // a newcomer always has the fewest uses
+    }
+}
+
+let caches: [(name: String, cache: any Cache)] = [("LRU", LRUCache(capacity: 3)), ("LFU", LFUCache(capacity: 3))]
+for (name, cache) in caches {
+    print("\(name):")
+    cache.put("a", 1)
+    for _ in 1...3 { _ = cache.get("a") }     // a is popular...
+    cache.put("b", 2)
+    cache.put("c", 3)
+    _ = cache.get("b")
+    _ = cache.get("c")                        // ...but b and c are more recent
+    cache.put("d", 4)
+    cache.put("e", 5)                         // e and f are a one-off scan
+    cache.put("f", 6)
+    print("  a is", cache.get("a").map(String.init) ?? "gone")
+}
+```
+
+```output
+LRU:
+  evicts a
+  evicts b
+  evicts c
+  a is gone
+LFU:
+  evicts b
+  evicts d
+  evicts e
+  a is 1
+```
+
+Read the evictions against the guide:
+
+- When `d` arrives, LRU throws out `a`, the least recent, even though it was used four times. LFU throws out `b`: `b` and `c` tie with two uses each, and `b` is the less recent of the two.
+- The scan (`e`, `f`) flushes LRU completely: `b` and `c` go, and the popular `a` is long gone. LFU keeps `a` and `c` and churns only the newcomers: `d` goes, then `e`. That's LFU's strength, and also its weak spot. If `a` stopped being popular, it would stay anyway.
+
+### The two designs, side by side
+
+| | LRU | LFU |
+| --- | --- | --- |
+| State | `values`, one `RecencyList` | `values`, `uses`, `buckets: [Int: RecencyList]`, `fewestUses` |
+| A use (get or update) | move the key to the newest end | move the key from bucket c to bucket c + 1; if bucket c is now empty and was the smallest, the smallest becomes c + 1 |
+| Insert into a full cache | remove the oldest key | remove the oldest key in bucket `fewestUses` |
+| After an insert | — | `fewestUses = 1` |
+| Time per operation | O(1) average | O(1) average |
+| Extra memory per key | a node and a dictionary entry | a node, two dictionary entries, a share of the buckets |
+
+The only clever line in LFU is the last row of "a use": `fewestUses` can only grow by one at a time during a use, because the key that emptied the smallest bucket moved to the very next one. And an insert always resets it to 1. So it never has to be searched for.
+
+<Callout kind="gotcha" title="Swift gotcha: default values and classes">
+With a dictionary of **arrays**, `buckets[count, default: []].append(key)` stores the new array, because `append` mutates it. With a dictionary of **class instances**, `buckets[count, default: RecencyList()].append(key)` does not: calling a method on a class reference only reads the subscript, so the new list is created, used and thrown away, and the key vanishes. That's why the LFU cache has its `bucket(_:)` helper.
+</Callout>
+
+## In an iOS app
+
+Foundation's `NSCache` is the first thing to reach for when the cache only needs to save memory: it evicts automatically when the system is short of memory, supports a `totalCostLimit`, and is safe to use from several threads. What it doesn't give you:
+
+- **A policy.** It doesn't promise which entries go first, so it can't be the answer to "design an LRU cache", and you can't predict hits in tests.
+- **Value-type keys.** Keys and values must be class instances (`NSString`, `NSNumber`, or your own classes), so a `String` key needs wrapping.
+
+So use `NSCache` for "keep these images if there's room", and your own LRU or LFU when the behaviour must be exact, testable, or work with plain Swift types. For an image cache, limit by cost (bytes), not count: one panorama can weigh as much as fifty thumbnails.
+
+## How to write it in an interview
+
+1. State the API and the questions above, then say the structures out loud: "a dictionary for O(1) lookup, a doubly linked list for O(1) reordering".
+2. Write the list helpers first (`unlink`, `linkAsNewest`), with sentinels so they never meet `nil`.
+3. Write `get`, then `put` with the **update check before the capacity check**.
+4. For LFU, add the counts and buckets, and say how `fewestUses` stays right without searching.
+5. Test aloud with a capacity of 1 and 2, an update in a full cache, and an LFU tie.
+
+<Callout kind="gotcha" title="Common mistakes">
+- **Evicting on update.** Check "is the key already here?" before "is the cache full?".
+- **LFU: losing track of the smallest count.** When a use empties the smallest bucket, the smallest count goes up by one; after any insert, it's 1.
+- **LFU: no tie-break.** Without recency order inside each bucket, which key goes among equal counts is arbitrary, and tests will catch it.
+- **Leaving ghosts.** Removing a key from the list but not from the dictionaries (or the other way round) leaves an entry that counts towards capacity.
+</Callout>
+
+If you haven't yet, build the generic version in the [LRU cache](/dsa/practice/lru-cache) problem; the LFU problem comes with its lesson in Part VIII.
+
+```cards
+- id: lru-vs-lfu
+  front: "When is LFU a better eviction policy than LRU, and when is it worse?"
+  back: "Better when popularity is stable, because a one-off scan can't flush the popular items. Worse when popularity changes, because old favourites keep their high counts and their slots."
+- id: shared-block
+  front: "Which building block do LRU and LFU caches share?"
+  back: "A recency list: a doubly linked list of keys plus a dictionary from key to node, giving O(1) move-to-newest, remove and remove-oldest. LRU uses one; LFU uses one per use count."
+- id: lfu-min-count
+  front: "How does an LFU cache know the smallest use count without searching?"
+  back: "It keeps `fewestUses`. A use that empties the smallest bucket raises it by one (the key moved to the next count), and every insert sets it to 1."
+- id: default-class-gotcha
+  front: "Why doesn't `dict[key, default: SomeClass()].method()` store anything?"
+  back: "Calling a method on a class reference only reads the subscript, so the default instance is created and thrown away. Only mutating a value (such as appending to an array) writes it back."
+```
+
+```quiz
+- id: q1
+  type: trace
+  prompt: "An LFU cache with capacity 2 runs: put x, get x, put y, get y, put z. Which key does `put z` evict?"
+  answer: "x"
+  explain: "x and y both have two uses (a put and a get), so the tie goes to the less recently used of the two. y was used last, so x is evicted."
+- id: q2
+  type: mcq
+  prompt: "A photo app caches decoded thumbnails while the user scrolls up and down the same part of a grid. Which policy fits best?"
+  options:
+    - "LRU"
+    - "LFU"
+    - "FIFO"
+    - "No cache: decode every time"
+  answer: 0
+  explain: "The user keeps returning to what they saw recently, which is exactly what LRU keeps. LFU would favour thumbnails that were popular long ago, even after the user has scrolled far away."
+- id: q3
+  type: match
+  prompt: "Match each policy with its weak spot."
+  pairs:
+    - ["LRU", "A one-off scan flushes the useful entries"]
+    - ["LFU", "Old favourites hog space after popularity changes"]
+    - ["FIFO", "Ignores how often or how recently entries were used"]
+    - ["NSCache", "No promise about which entry is evicted"]
+  explain: "Each policy optimises one signal (recency, frequency, age or memory pressure) and is blind to the others."
+- id: q4
+  type: truefalse
+  prompt: "In an LFU cache, right after inserting a new key, the smallest use count is always 1."
+  answer: true
+  explain: "The newcomer has been used exactly once (the put), and no key can have fewer uses than that, so `fewestUses` is 1."
+- id: q5
+  type: bug
+  prompt: "With this LFU `touch`, the cache sometimes evicts a key that was used many times while keys used only once are still cached. Which line is the bug?"
+  code: |
+    func touch(_ key: String) {
+        let count = uses[key]!
+        let old = bucket(count)
+        old.remove(key)
+        if old.isEmpty {
+            buckets[count] = nil
+            fewestUses = count + 1
+        }
+        uses[key] = count + 1
+        bucket(count + 1).append(key)
+    }
+  answer: 7
+  explain: "Emptying a bucket only changes the smallest count if it **was** the smallest bucket. Here, emptying bucket 5 while one-use keys exist sets `fewestUses` to 6, so the next eviction takes from the six-use bucket. Line 7 needs a condition: `if fewestUses == count { fewestUses = count + 1 }`."
+- id: q6
+  type: recall
+  prompt: "When would you use `NSCache` in an app instead of writing your own LRU cache, and when not?"
+  model: "Use NSCache when the goal is to save work while there's memory to spare: it evicts automatically under memory pressure, supports a cost limit and is thread-safe. Write your own when the eviction order must be exact and testable (a required LRU or LFU policy), when keys or values are value types like String or structs, or when you need features such as expiry."
+```

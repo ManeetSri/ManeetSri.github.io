@@ -1,0 +1,436 @@
+## Why it matters
+
+The last lesson showed that an array lives in one fixed-size block of memory. Yet Swift's `Array` grows whenever you `append`. The trick is a **dynamic array**: a fixed block plus a little bookkeeping, swapped for a bigger block when it fills up. Swift's `Array`, Java's `ArrayList`, C++'s `vector` and Python's `list` all work this way. In this lesson you'll build one yourself, step by step, so that every cost you've been told about becomes something you can point at in your own code.
+
+## The plan: a block, a count and a capacity
+
+A dynamic array needs three things:
+
+| Piece | Meaning |
+| --- | --- |
+| **buffer** | a fixed-size block of slots |
+| **capacity** | how many slots the buffer has |
+| **count** | how many slots are actually in use, always at the front |
+
+Slots `0..<count` hold elements. Slots `count..<capacity` are spare room. When `count` reaches `capacity`, there's no room left, and the next append must first move everything into a bigger buffer.
+
+Swift's real `Array` uses raw memory for its buffer. Raw memory is unsafe, so this lesson uses a safe stand-in: a Swift array of **optionals**, `[Element?]`, created at a fixed size and never appended to. `nil` marks an empty slot. The buffer's `count` is our capacity, and we choose exactly when it changes. Here's the skeleton:
+
+```swift
+struct DynamicArray<Element> {
+    private var buffer: [Element?] = []     // buffer.count is the capacity
+    private(set) var count = 0              // slots 0..<count are in use
+
+    var capacity: Int {
+        buffer.count
+    }
+
+    var isEmpty: Bool {
+        count == 0
+    }
+}
+```
+
+`private(set)` lets anyone read `count` but only the struct itself change it, so the bookkeeping can't be broken from outside. It's generic over `Element`, like the `Stack<Element>` you built in [Generic types: `Stack<Element>`](/dsa/learn/swift-generic-types).
+
+## Appending, and growing when full
+
+Appending has two cases. If there's a spare slot, write into slot `count` and add one to `count`. If there isn't, **grow** first: allocate a buffer twice the size, copy every element across, and replace the old buffer.
+
+```swift
+mutating func append(_ element: Element) {
+    if count == capacity {
+        var bigger = [Element?](repeating: nil, count: max(1, capacity * 2))
+        for position in 0..<count {
+            bigger[position] = buffer[position]
+        }
+        buffer = bigger
+    }
+    buffer[count] = element
+    count += 1
+}
+```
+
+A new array has capacity 0, and doubling 0 gives 0, so `max(1, capacity * 2)` makes the first growth go to 1. After that the capacity runs 2, 4, 8, 16 and so on.
+
+Step through ten appends to a buffer that starts with one slot. Watch the copies column: it jumps at each growth, but stays below twice the number of appends.
+
+```visual arrayTrace
+program: dynamicAppend
+input:
+  count: 10
+  capacity: 1
+```
+
+This is exactly the model from [Amortised analysis](/dsa/learn/bigo-amortised). The growths copy 1, 2, 4, 8, … elements, a geometric series that totals less than 2n for n appends, so `append` is **O(1) amortised**, even though one unlucky append costs O(n).
+
+## Reading and writing with a subscript
+
+A dynamic array is no use if you can't reach its elements. A subscript with a getter and a setter, from [Collection conformance and subscripts](/dsa/learn/swift-collection-subscripts), gives `numbers[i]` its meaning:
+
+```swift
+subscript(index: Int) -> Element {
+    get {
+        precondition(index >= 0 && index < count, "Index out of range")
+        return buffer[index]!
+    }
+    set {
+        precondition(index >= 0 && index < count, "Index out of range")
+        buffer[index] = newValue
+    }
+}
+```
+
+The `precondition` checks against `count`, not `capacity`. Slot 5 might exist in an 8-slot buffer, but if only 3 elements are stored, index 5 is out of range. Without that check, `buffer[index]!` would find `nil` in a spare slot and crash with a confusing message. With it, the crash says exactly what went wrong, just as Swift's own arrays do. The force unwrap is safe whenever the check passes, because every slot below `count` holds an element.
+
+## Removing from the end
+
+Removing the last element is the cheap removal. Nothing else moves:
+
+```swift
+mutating func removeLast() -> Element {
+    precondition(count > 0, "Can't remove from an empty array")
+    count -= 1
+    let removed = buffer[count]!
+    buffer[count] = nil      // let go of the element
+    return removed
+}
+```
+
+Why set the slot back to `nil`, when `count` already says it's unused? Because the buffer would otherwise keep a strong reference to the old element. If it's a class instance, ARC, from [Automatic Reference Counting](/dsa/learn/swift-arc), would never free it while the array exists. Clearing the slot releases it.
+
+Notice what doesn't happen: the capacity stays the same. Swift's arrays don't shrink when you remove elements either. The room is kept for the next append.
+
+Here's everything so far in one program. Watch the capacity jump at each power of two:
+
+```swift run
+struct DynamicArray<Element> {
+    private var buffer: [Element?] = []
+    private(set) var count = 0
+
+    var capacity: Int {
+        buffer.count
+    }
+
+    mutating func append(_ element: Element) {
+        if count == capacity {
+            var bigger = [Element?](repeating: nil, count: max(1, capacity * 2))
+            for position in 0..<count {
+                bigger[position] = buffer[position]
+            }
+            buffer = bigger
+        }
+        buffer[count] = element
+        count += 1
+    }
+
+    mutating func removeLast() -> Element {
+        precondition(count > 0, "Can't remove from an empty array")
+        count -= 1
+        let removed = buffer[count]!
+        buffer[count] = nil
+        return removed
+    }
+}
+
+var numbers = DynamicArray<Int>()
+for value in 1...5 {
+    numbers.append(value)
+    print("appended \(value): count \(numbers.count), capacity \(numbers.capacity)")
+}
+print("removed", numbers.removeLast())
+print("count \(numbers.count), capacity \(numbers.capacity)")
+```
+
+```output
+appended 1: count 1, capacity 1
+appended 2: count 2, capacity 2
+appended 3: count 3, capacity 4
+appended 4: count 4, capacity 4
+appended 5: count 5, capacity 8
+removed 5
+count 4, capacity 8
+```
+
+## Inserting and removing in the middle
+
+To insert at `index`, every element from `index` onwards moves one slot to the right to open a gap. The direction matters. Moving front to back would overwrite each element before it had moved, so you move them **back to front**:
+
+| Step | Buffer |
+| --- | --- |
+| start: insert `X` at 1 | A B C D _ |
+| move D right | A B C D D |
+| move C right | A B C C D |
+| move B right | A B B C D |
+| write `X` at 1 | A X B C D |
+
+```swift
+mutating func insert(_ element: Element, at index: Int) {
+    precondition(index >= 0 && index <= count, "Index out of range")
+    growIfFull()
+    var position = count
+    while position > index {
+        buffer[position] = buffer[position - 1]
+        position -= 1
+    }
+    buffer[index] = element
+    count += 1
+}
+```
+
+`index` may equal `count`, which means "insert at the end", the same as appending. The growth code now appears in two places, so it moves into a private helper, `growIfFull()`.
+
+Removing at `index` is the mirror image. Elements after it move one slot **left**, front to back, then the last used slot is cleared:
+
+```swift
+mutating func remove(at index: Int) -> Element {
+    precondition(index >= 0 && index < count, "Index out of range")
+    let removed = buffer[index]!
+    for position in index..<(count - 1) {
+        buffer[position] = buffer[position + 1]
+    }
+    buffer[count - 1] = nil
+    count -= 1
+    return removed
+}
+```
+
+Both shift up to n elements, so both are O(n). The next lesson counts exactly how many.
+
+## Making it a real collection
+
+Right now `DynamicArray` can't be used in a `for` loop, printed nicely, or written as a literal. Three conformances fix that:
+
+- **`RandomAccessCollection`** needs `startIndex`, `endIndex`, `index(after:)`, `index(before:)` and a subscript. In return you get `for-in`, `map`, `filter`, `first`, `last`, `firstIndex(of:)`, slicing and the rest.
+- **`MutableCollection`** asks for one more thing: a subscript with a setter, which you already have. In return you get `swapAt`, `sort()` and `reverse()`, all working in place.
+- **`ExpressibleByArrayLiteral`**, from [ExpressibleByArrayLiteral](/dsa/learn/swift-array-literal), and **`CustomStringConvertible`**, from [Equatable, Comparable and CustomStringConvertible](/dsa/learn/swift-standard-protocols), let you write `[1, 2, 3]` and print the result.
+
+Here's the finished type, with a short tour:
+
+```swift run
+struct DynamicArray<Element> {
+    private var buffer: [Element?] = []
+    private(set) var count = 0
+
+    var capacity: Int {
+        buffer.count
+    }
+
+    var isEmpty: Bool {
+        count == 0
+    }
+
+    mutating func append(_ element: Element) {
+        growIfFull()
+        buffer[count] = element
+        count += 1
+    }
+
+    mutating func insert(_ element: Element, at index: Int) {
+        precondition(index >= 0 && index <= count, "Index out of range")
+        growIfFull()
+        var position = count
+        while position > index {
+            buffer[position] = buffer[position - 1]
+            position -= 1
+        }
+        buffer[index] = element
+        count += 1
+    }
+
+    @discardableResult
+    mutating func remove(at index: Int) -> Element {
+        precondition(index >= 0 && index < count, "Index out of range")
+        let removed = buffer[index]!
+        for position in index..<(count - 1) {
+            buffer[position] = buffer[position + 1]
+        }
+        buffer[count - 1] = nil
+        count -= 1
+        return removed
+    }
+
+    @discardableResult
+    mutating func removeLast() -> Element {
+        precondition(count > 0, "Can't remove from an empty array")
+        count -= 1
+        let removed = buffer[count]!
+        buffer[count] = nil
+        return removed
+    }
+
+    private mutating func growIfFull() {
+        guard count == capacity else { return }
+        var bigger = [Element?](repeating: nil, count: Swift.max(1, capacity * 2))
+        for position in 0..<count {
+            bigger[position] = buffer[position]
+        }
+        buffer = bigger
+    }
+}
+
+extension DynamicArray: RandomAccessCollection, MutableCollection {
+    var startIndex: Int { 0 }
+    var endIndex: Int { count }
+    func index(after i: Int) -> Int { i + 1 }
+    func index(before i: Int) -> Int { i - 1 }
+
+    subscript(position: Int) -> Element {
+        get {
+            precondition(position >= 0 && position < count, "Index out of range")
+            return buffer[position]!
+        }
+        set {
+            precondition(position >= 0 && position < count, "Index out of range")
+            buffer[position] = newValue
+        }
+    }
+}
+
+extension DynamicArray: ExpressibleByArrayLiteral {
+    init(arrayLiteral elements: Element...) {
+        self.init()
+        for element in elements {
+            append(element)
+        }
+    }
+}
+
+extension DynamicArray: CustomStringConvertible {
+    var description: String {
+        "[" + map { "\($0)" }.joined(separator: ", ") + "]"
+    }
+}
+
+var scores: DynamicArray = [40, 10, 30]
+scores.append(20)
+scores.insert(50, at: 0)
+print(scores, scores.count, scores.capacity)
+
+scores.remove(at: 2)
+scores.sort()
+print(scores)
+print(scores.map { $0 * 2 }, scores.reduce(0, +))
+for (index, score) in scores.enumerated() where score > 25 {
+    print(index, score)
+}
+```
+
+```output
+[50, 40, 10, 30, 20] 5 8
+[20, 30, 40, 50]
+[40, 60, 80, 100] 140
+1 30
+2 40
+3 50
+```
+
+Around fifty lines of your own code, and `sort()`, `map`, `reduce` and `enumerated()` all work on it, because the standard library builds them from the few members a collection provides. The literal `[40, 10, 30]` grew the capacity to 4, the append filled it, and the insert doubled it to 8.
+
+<Callout kind="gotcha" title="Swift gotcha: max inside a collection">
+Once `DynamicArray` is a collection, it has an instance method called `max()`, which finds its largest element. Inside the type, a plain `max(1, capacity * 2)` now finds that method first and fails to compile. Writing `Swift.max(1, capacity * 2)` says you mean the global function from the Swift module. The same goes for `min`.
+</Callout>
+
+## Design choices
+
+Every dynamic array makes a few decisions. These are the common ones:
+
+- **Growth factor.** Doubling is the classic. Some libraries grow by 1.5× to waste less memory; any factor above 1 keeps `append` O(1) amortised, while growing by a fixed number of slots makes it O(n), as the amortised analysis lesson proved.
+- **Starting capacity.** Starting at 0 means empty arrays cost nothing. If you know roughly how many elements are coming, reserving room up front, as Swift's `reserveCapacity(_:)` does, skips the early growths.
+- **Shrinking.** Ours never shrinks, like Swift's. A design that does shrink must be careful. Halving the buffer as soon as it's half empty is a trap: at exactly half full, one append doubles the buffer and one removal halves it again, and alternating the two makes every operation copy n elements. Shrinking only when it's a **quarter** full leaves room for growth in both directions and keeps both operations O(1) amortised.
+
+## The DSAKit version
+
+The companion package has a finished, tested `DynamicArray<Element>` in DSAKit, built exactly this way, with a few extras: `init(minimumCapacity:)`, `reserveCapacity(_:)`, `popLast()`, `removeAll(keepingCapacity:)` and equality. Later problems can use it with `import DSAKit`. Build your own first, though. Writing the shifting loops yourself is what makes the costs stick.
+
+<Callout kind="gotcha" title="Copies share a buffer until one changes">
+`DynamicArray` is a struct whose buffer is a Swift array, so it inherits copy-on-write from [Copy-on-write explained](/dsa/learn/swift-copy-on-write-intro). `var b = a` is cheap. The first change to `b` copies the whole buffer, O(n), so that `a` is unaffected. That's the right behaviour for a value type, but it means a copy kept alive in a loop makes every append expensive.
+</Callout>
+
+## Practice
+
+**Build a dynamic array** asks you to write this type yourself, with `insert`, `remove(at:)`, `popLast()` and a settable subscript, and checks that your capacity doubles exactly as described. Write the growth helper first, then append, then the shifting operations.
+
+```cards
+- id: dynamic-array-pieces
+  front: "What three pieces make up a dynamic array?"
+  back: "A fixed-size buffer, its capacity (the number of slots), and a count of slots in use, which are always the first `count` slots."
+- id: dynamic-array-growth
+  front: "What happens when you append to a full dynamic array?"
+  back: "It allocates a buffer twice the size, copies every element across, replaces the old buffer, then writes the new element. O(n) for that append, O(1) amortised."
+- id: insert-shift-direction
+  front: "Why does insert shift elements from the back to the front?"
+  back: "Moving front to back would overwrite each element before it had been moved. Starting at the end, each element moves into a slot that's already free."
+- id: clear-removed-slot
+  front: "Why set a removed element's slot back to nil?"
+  back: "Otherwise the buffer keeps a strong reference to it, and a class instance would never be freed while the array exists."
+```
+
+```quiz
+- id: q1
+  type: trace
+  prompt: "A dynamic array starts with capacity 0 and doubles when full, starting at 1. Write its capacity after each of 6 appends, separated by commas."
+  answer: "1, 2, 4, 4, 8, 8"
+  explain: "The first append grows 0 to 1. The second finds the buffer full and doubles to 2, the third to 4, and the fifth to 8. The others fit in spare room."
+- id: q2
+  type: output
+  prompt: "This models the growths for 20 appends. What does it print?"
+  code: |
+    var capacity = 0
+    var count = 0
+    var copies = 0
+    for _ in 1...20 {
+        if count == capacity {
+            copies += count
+            capacity = max(1, capacity * 2)
+        }
+        count += 1
+    }
+    print(capacity, copies)
+  answer: "32 31"
+  explain: "Growths happen at counts 0, 1, 2, 4, 8 and 16, copying 0 + 1 + 2 + 4 + 8 + 16 = 31 elements, and the capacity ends at 32. That's under 2 × 20, as the amortised argument promises."
+- id: q3
+  type: bug
+  prompt: "This insert gives the wrong result: inserting X at 1 into A B C D gives A X B B B. Click the faulty line."
+  code: |
+    mutating func insert(_ element: Element, at index: Int) {
+        growIfFull()
+        for position in index..<count {
+            buffer[position + 1] = buffer[position]
+        }
+        buffer[index] = element
+        count += 1
+    }
+  answer: 3
+  explain: "Shifting front to back copies B over C, then that B over D, and so on, so every later element becomes B. The loop must run from the back: `stride(from: count, to: index, by: -1)`, copying `buffer[position - 1]` into `buffer[position]`."
+- id: q4
+  type: mcq
+  prompt: "A dynamic array holds 3 elements and has capacity 8. What should `array[5]` do?"
+  options:
+    - "Return nil, because slot 5 is empty"
+    - "Stop the program with an index-out-of-range error"
+    - "Return the last element"
+    - "Grow the array to 6 elements"
+  answer: 1
+  explain: "Only indices `0..<count` are valid. Slot 5 exists in the buffer, but it's spare room, not an element. The precondition compares against `count`, not `capacity`."
+- id: q5
+  type: truefalse
+  prompt: "Removing the last element of the dynamic array in this lesson halves its capacity when it becomes half empty."
+  answer: false
+  explain: "It never shrinks, like Swift's own Array. If a design does shrink, it should wait until the array is a quarter full, or alternating appends and removals at the boundary would copy everything every time."
+- id: q6
+  type: blank
+  prompt: "Complete the growth step of `append`."
+  code: |
+    if count == capacity {
+        var bigger = [Element?](repeating: nil, count: max(1, ___))
+        for position in 0..<count {
+            bigger[position] = buffer[position]
+        }
+        buffer = ___
+    }
+  answers:
+    - ["capacity * 2", "2 * capacity"]
+    - "bigger"
+  explain: "Doubling the capacity keeps the total copying under 2n, which makes `append` O(1) amortised. The new buffer then replaces the old one."
+```

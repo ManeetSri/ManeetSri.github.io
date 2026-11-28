@@ -1,0 +1,218 @@
+## Why it matters
+
+Hash tables are fast and forgiving, until a key misbehaves. Then the symptoms are strange: an entry you inserted a moment ago can't be found, a set holds "duplicates", or a server slows to a crawl under a flood of carefully chosen input. Each of these comes from breaking one of the assumptions behind hashing. This short lesson covers the three you're most likely to meet: keys that change, keys chosen by an attacker, and floating-point keys.
+
+## Changing a key after inserting it
+
+A hash table files each key under the bucket its hash pointed to **when it was inserted**. If the key later changes, its hash changes too, and lookups search the wrong bucket.
+
+With structs, Swift protects you. A set stores its own **copy** of each value, so changing your variable afterwards can't touch the stored one:
+
+```swift run
+struct Cell: Hashable {
+    var row: Int
+    var column: Int
+}
+
+var start = Cell(row: 0, column: 0)
+var visited: Set<Cell> = [start]
+start.row = 5                                  // changes our copy only
+
+print(visited.contains(Cell(row: 0, column: 0)))
+print(visited.contains(start))
+```
+
+```output
+true
+false
+```
+
+The set still holds (0, 0), exactly as inserted. That's value semantics from M09 doing its job.
+
+Classes are different. The set stores a **reference**, so changing the object through any other reference changes the key inside the set:
+
+```swift
+final class Tag: Hashable {
+    var name: String
+    init(_ name: String) { self.name = name }
+
+    static func == (lhs: Tag, rhs: Tag) -> Bool { lhs.name == rhs.name }
+    func hash(into hasher: inout Hasher) { hasher.combine(name) }
+}
+
+let tag = Tag("draft")
+var tags: Set<Tag> = [tag]
+tag.name = "published"            // the object inside the set changes too
+print(tags.contains(tag))
+```
+
+This usually prints `false`: the set hashes `"published"`, looks in that bucket, and the object is filed under `"draft"`'s bucket. Searching for `Tag("draft")` fails too, because the stored object's name is no longer `"draft"`. The entry is still in the set, taking up space, but nothing can find it. As with the broken contract in the custom-keys lesson, it fails only *usually*, which makes it hard to track down.
+
+The fixes:
+
+- Make a class's hashed properties `let`, so they can't change.
+- Hash its identity with `ObjectIdentifier`, as in [Custom Hashable keys](/dsa/learn/hash-custom-keys), so its contents don't matter.
+- If a key really must change, remove it, change it, and insert it again.
+
+## Hash flooding: when the input is the attacker
+
+Hash tables are O(1) **on average**, assuming keys spread out. If someone can choose keys that all collide, every operation becomes O(n), and n insertions cost O(n²). With a predictable hash, that's easy. Here's a chained table with 1,024 buckets and the hash `key % 1024`, counting comparisons for 2,000 ordinary keys and for 2,000 keys chosen by someone who knows the formula:
+
+```swift run
+var comparisons = 0
+
+struct ToyTable {
+    var buckets: [[Int]] = Array(repeating: [], count: 1_024)
+
+    mutating func insert(_ key: Int) {
+        let index = key % buckets.count        // predictable: anyone can work it out
+        for stored in buckets[index] {
+            comparisons += 1
+            if stored == key {
+                return
+            }
+        }
+        buckets[index].append(key)
+    }
+}
+
+var normal = ToyTable()
+for key in 0..<2_000 {
+    normal.insert(key)
+}
+print("ordinary keys:", comparisons)
+
+comparisons = 0
+var attacked = ToyTable()
+for i in 0..<2_000 {
+    attacked.insert(i * 1_024)               // every one lands in bucket 0
+}
+print("crafted keys:", comparisons)
+```
+
+```output
+ordinary keys: 976
+crafted keys: 1999000
+```
+
+Two thousand crafted keys cost two thousand times as much work. Scale that to the hundreds of thousands of form fields or JSON keys a server might parse from one request, and a single request can keep a processor busy for minutes. This is **hash flooding**, and in 2011 researchers showed it working against the web frameworks of several popular languages at once, which all used predictable string hashes.
+
+The defence is to make collisions impossible to predict. That's why Swift's `Hasher` uses **SipHash**, a hash designed for this job, with a **secret random seed** chosen when the program starts. Without the seed, an attacker can't work out which keys collide, and a seed from one run is useless against the next. Python, Rust and many other languages made the same choice. The price is that hash values and iteration orders change between runs, which is why this course never prints a whole set or dictionary.
+
+## Floating-point keys
+
+`Double` is `Hashable`, so you *can* use it as a key. It's rarely a good idea, because floating-point arithmetic is approximate.
+
+**Arithmetic rarely lands exactly on the key.** 0.1 + 0.2 isn't exactly 0.3 in binary floating point:
+
+```swift run
+let prices: [Double: String] = [0.3: "thirty pence"]
+print(prices[0.1 + 0.2] ?? "not found")
+print(0.1 + 0.2)
+
+let pence: [Int: String] = [30: "thirty pence"]
+print(pence[10 + 20] ?? "not found")
+```
+
+```output
+not found
+0.30000000000000004
+thirty pence
+```
+
+The fix is to store an exact representation: whole pence instead of pounds, millimetres instead of metres, or a value rounded to a fixed number of decimal places and stored as an `Int`.
+
+**NaN is never equal to anything, including itself.** "Not a number", the result of something like `0.0 / 0.0`, breaks the rule that every value equals itself:
+
+```swift run
+var readings: Set<Double> = []
+readings.insert(.nan)
+readings.insert(.nan)
+print(readings.count, readings.contains(.nan))
+
+let zeros: Set<Double> = [0.0, -0.0]
+print(zeros.count)
+```
+
+```output
+2 false
+1
+```
+
+Each NaN is a new element that can never be found again. Swift does handle the other oddity correctly: `0.0` and `-0.0` are equal, so it gives them the same hash, and the set holds one zero.
+
+**Different values can round to the same `Double`.** A `Double` holds about 16 significant digits, so two different slopes can become the same number:
+
+```swift run
+let first = 999_999_999.0 / 1_000_000_000.0
+let second = 999_999_998.0 / 999_999_999.0
+print(first == second)
+```
+
+```output
+true
+```
+
+The fractions 999,999,999/1,000,000,000 and 999,999,998/999,999,999 differ by about 10⁻¹⁸, far below what a `Double` can distinguish. Used as dictionary keys, they'd be merged into one. The exact alternative is to store the fraction itself: divide the top and bottom by their greatest common divisor, from [GCD, LCM and Euclid's algorithm](/dsa/learn/math-gcd-lcm), fix the sign, and use the pair of integers in a `Hashable` struct.
+
+<Callout kind="gotcha" title="Swift gotcha: hashValue is not an identity">
+Never use `hashValue` to decide whether two values are equal (different values can share one), and never save it to a file or send it over the network (it changes every run). It exists only for hash tables to use within one run.
+</Callout>
+
+## Practice
+
+**Most points on one line** is the classic trap: grouping points by slope as a `Double` gives wrong answers for nearly parallel lines. Use an exact, reduced-fraction key instead.
+
+```cards
+- id: mutable-class-key
+  front: "What happens if you change a class instance's hashed property while it's in a Set?"
+  back: "Its hash changes, so lookups search the wrong bucket and usually can't find it, even though it's still stored. Hash only `let` properties or the object's identity."
+- id: hash-flooding
+  front: "What is hash flooding, and how does Swift defend against it?"
+  back: "An attacker sends keys that all collide, making each operation O(n). Swift's Hasher uses SipHash with a secret random seed per run, so collisions can't be predicted."
+- id: float-keys
+  front: "Why are `Double` dictionary keys risky?"
+  back: "Arithmetic is approximate (0.1 + 0.2 isn't 0.3), NaN never equals itself, and different values can round to the same Double. Store an exact integer form instead."
+```
+
+```quiz
+- id: q1
+  type: output
+  prompt: "What does this print?"
+  code: |
+    struct Point: Hashable {
+        var x: Int
+        var y: Int
+    }
+    var p = Point(x: 1, y: 1)
+    var seen: Set<Point> = [p]
+    p.x = 2
+    seen.insert(p)
+    print(seen.count, seen.contains(Point(x: 1, y: 1)))
+  answer: "2 true"
+  explain: "The set stored its own copy of (1, 1). Changing `p` only changed the variable, so inserting it adds (2, 1) as a second element."
+- id: q2
+  type: truefalse
+  prompt: "Inserting `Double.nan` into a `Set<Double>` three times gives a set with one element."
+  answer: false
+  explain: "NaN is never equal to itself, so the set can never find an existing NaN and inserts a new one every time: three elements."
+- id: q3
+  type: mcq
+  prompt: "Why does Swift seed its hasher randomly each time a program starts?"
+  options:
+    - "To make dictionaries faster"
+    - "So that attackers can't predict which keys collide and flood a table"
+    - "Because SipHash doesn't work without randomness"
+    - "To save memory"
+  answer: 1
+  explain: "With a predictable hash, an attacker can send keys that all collide and make every operation O(n). A secret seed makes collisions unpredictable."
+- id: q4
+  type: bigo
+  prompt: "An attacker sends n keys that all land in the same bucket of a chained hash table. What does inserting all of them cost?"
+  answer: "O(n²)"
+  explain: "Each new key is compared with every key already in the bucket: 0 + 1 + … + (n − 1), about n²/2 comparisons."
+- id: q5
+  type: recall
+  prompt: "You need a dictionary keyed by prices like £2.49. How would you avoid floating-point problems?"
+  model: "Store prices as an integer number of pence (249) and use `Int` keys. Integer arithmetic is exact, so 10 + 20 really equals 30 and lookups find the entry. Convert to pounds only for display."
+```

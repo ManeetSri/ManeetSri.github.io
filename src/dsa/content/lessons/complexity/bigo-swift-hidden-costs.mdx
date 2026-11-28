@@ -1,0 +1,340 @@
+## Why it matters
+
+Big-O analysis assumes you know what each line costs. In Swift, some innocent-looking lines walk a whole collection, copy an array or hash a long key. Put one inside a loop and an O(n) algorithm quietly becomes O(n²). These traps are behind many "correct but too slow" submissions and sluggish app screens. You've met several of them in Part I; this lesson gathers them into one reference, with counting experiments and real timings, so you can spot them at a glance.
+
+## The cost of common operations
+
+Keep this table nearby. n is the size of the collection, k the size of the part involved.
+
+| Operation | Cost |
+| --- | --- |
+| `array[i]`, `array.count`, `array.isEmpty`, `first`, `last` | O(1) |
+| `append`, `removeLast()`, `popLast()` | O(1) (append amortised) |
+| `insert(_:at:)`, `remove(at:)`, `removeFirst()` | O(n), worst at the front |
+| `contains`, `firstIndex(of:)`, `min()`, `max()`, `reduce`, `filter`, `map` | O(n) |
+| `sorted()`, `sort()` | O(n log n) |
+| `array == other`, `Array(slice)`, `Array(text)` | O(n) or O(k) |
+| `array[i..<j]`, `dropFirst()`, `prefix(k)`, `reversed()` | O(1): a view, no copy |
+| `set.contains`, `set.insert`, `dict[key]`, `dict[key] = value` | O(1) on average, plus hashing the key |
+| `text.count` | **O(n)** |
+| `text.isEmpty`, `text.first` | O(1) |
+| `text.index(i, offsetBy: k)`, `text.distance(from:to:)` | O(k) |
+| `text + other`, `text == other`, `text.lowercased()` | O(n) |
+| `text += piece` | O(length of piece), amortised |
+| `text.prefix(k)`, `text.dropFirst(k)` | O(k) to find the boundary; nothing is copied |
+| `text.split(separator:)` | O(n); the pieces share the original's storage |
+| `String(substring)` | O(k) |
+
+The rest of the lesson looks at the traps that cause the most trouble.
+
+## Trap 1: counting and indexing a String in a loop
+
+A `String` can't jump to its i-th character, because characters take different numbers of bytes, as [String.Index and why s[i] does not exist](/dsa/learn/swift-string-index) explained. For the same reason, `count` has to walk the whole string. Both look cheap:
+
+```swift
+var i = 0
+while i < text.count {                                     // O(n) every time round
+    let character = text[text.index(text.startIndex, offsetBy: i)]   // O(i)
+    // …
+    i += 1
+}
+```
+
+Each pass costs O(n) for `count` and O(i) for the index: O(n²) in total, twice over. Converting once fixes both:
+
+```swift
+let characters = Array(text)          // O(n), once
+for i in 0..<characters.count {       // count of an Array is O(1)
+    let character = characters[i]     // O(1)
+    // …
+}
+```
+
+```text title="Sample timings: a 20,000-character string, release build"
+text.count in the loop condition       0.37 s
+index(_:offsetBy:) on every pass       0.32 s
+Array(text) once, then index it        0.0002 s
+```
+
+Over a thousand times faster, and the gap grows with the string. If you only need to know whether a string is empty, use `isEmpty`, which is O(1); `text.count == 0` walks the whole thing.
+
+## Trap 2: removing or inserting at the front
+
+`removeFirst()` and `insert(_:at: 0)` shift every remaining element, so they're O(n). Fine once; a disaster in a loop:
+
+```swift
+while !queue.isEmpty {
+    let next = queue.removeFirst()    // shifts everything left: O(n)
+    // …
+}
+```
+
+```text title="Sample timings: 100,000 elements, release build"
+removeFirst() until empty               0.60 s
+a head index instead                    0.00003 s
+insert(_:at: 0) for each element        0.60 s
+append each, then reverse() once        0.0002 s
+```
+
+The fixes: walk with an index (`var head = 0; … queue[head]; head += 1`), or build the array backwards with `append` and call `reversed()` or `reverse()` once at the end. M27 builds proper queues on the index idea.
+
+## Trap 3: contains on an Array
+
+`array.contains(x)` checks elements one by one. Inside a loop over another collection, that's the hidden nested loop from M06. A counting experiment shows how quickly the comparisons pile up:
+
+```swift run
+let numbers = Array(0..<1_000)
+let lookups = Array(500..<1_500)
+
+var comparisons = 0
+var found = 0
+for target in lookups {
+    if numbers.contains(where: { value in
+        comparisons += 1
+        return value == target
+    }) {
+        found += 1
+    }
+}
+print("array: found \(found), comparisons \(comparisons)")
+
+let numberSet = Set(numbers)
+found = lookups.filter { numberSet.contains($0) }.count
+print("set: found \(found), one hash lookup each")
+```
+
+```output
+array: found 500, comparisons 875250
+set: found 500, one hash lookup each
+```
+
+A thousand lookups cost 875,250 comparisons in the array: the 500 that are missing each check all 1,000 elements. Building the `Set` costs O(n) once, and then each lookup is O(1) on average.
+
+```text title="Sample timings: 20,000 lookups in 20,000 elements, release build"
+Array.contains                          70 ms
+Set.contains                            0.3 ms
+```
+
+## Trap 4: copy-on-write copies
+
+Copying an array is O(1), until somebody writes to storage that's shared. Then the write copies all n elements first, as [Copy-on-write explained](/dsa/learn/swift-copy-on-write-intro) showed. The trap is keeping copies alive without meaning to, for example by saving a snapshot on every pass:
+
+```swift run
+// Where an array's elements live in memory, as a number
+func storageAddress(_ array: [Int]) -> Int {
+    array.withUnsafeBufferPointer { buffer in
+        Int(bitPattern: buffer.baseAddress)
+    }
+}
+
+// Counts how many writes had to copy the whole array first
+func copiesMade(rounds: Int, keepHistory: Bool) -> Int {
+    var board = Array(repeating: 0, count: 10_000)
+    var history: [[Int]] = []
+    var copies = 0
+    for round in 0..<rounds {
+        if keepHistory {
+            history.append(board)          // a snapshot: shares board's storage
+        }
+        let before = storageAddress(board)
+        board[round] = 1                   // one small write
+        if storageAddress(board) != before {
+            copies += 1                    // the write moved board to new storage
+        }
+    }
+    return copies
+}
+
+print("with snapshots:", copiesMade(rounds: 5, keepHistory: true))
+print("without snapshots:", copiesMade(rounds: 5, keepHistory: false))
+```
+
+```output
+with snapshots: 5
+without snapshots: 0
+```
+
+With snapshots, every one-element write copied all 10,000 elements: n rounds cost O(n · size). Sometimes that's exactly what you want, since each snapshot must stay frozen. When it isn't, look for a stray `let copy = array`, a property holding an old version, or a closure that captured the array.
+
+## Trap 5: long chains that build whole arrays
+
+Each eager `map` or `filter` builds a complete new array before the next step starts. Usually that's fine. It's wasteful when you only need part of the result:
+
+```swift run
+let numbers = Array(1...10_000)
+var mapCalls = 0
+var filterCalls = 0
+
+// Each step builds a whole new array before the next one starts
+let chained = numbers
+    .map { n -> Int in
+        mapCalls += 1
+        return n * 3
+    }
+    .filter { n -> Bool in
+        filterCalls += 1
+        return n % 2 == 0
+    }
+    .prefix(3)
+print(Array(chained), "map calls:", mapCalls, "filter calls:", filterCalls)
+
+// One loop that stops as soon as it has three
+var steps = 0
+var firstThree: [Int] = []
+for n in numbers {
+    steps += 1
+    let tripled = n * 3
+    if tripled % 2 == 0 {
+        firstThree.append(tripled)
+        if firstThree.count == 3 {
+            break
+        }
+    }
+}
+print(firstThree, "loop steps:", steps)
+```
+
+```output
+[6, 12, 18] map calls: 10000 filter calls: 10000
+[6, 12, 18] loop steps: 6
+```
+
+The chain did 20,000 closure calls and built two 10,000-element arrays to produce three numbers; the loop took six steps. Both are O(n) in the worst case, but the chain always pays the worst case. `first(where:)`, `lazy` (from [enumerated, zip, reversed and lazy](/dsa/learn/swift-enumerated-zip)) or a loop with `break` stop early.
+
+## Trap 6: hashing long keys
+
+"O(1) on average" for a `Set` or `Dictionary` counts the table lookup, but every lookup first **hashes** the key, and hashing reads the whole key. For an `Int` that's instant. For a long `String` or an array used as a key, it's O(k) for a key of size k:
+
+```swift run
+var elementHashes = 0
+
+struct Tracked: Hashable {
+    let value: Int
+
+    func hash(into hasher: inout Hasher) {
+        elementHashes += 1
+        hasher.combine(value)
+    }
+}
+
+let longKey = (0..<1_000).map { Tracked(value: $0) }
+var scores: [[Tracked]: Int] = [longKey: 7]
+
+elementHashes = 0
+print(scores[longKey] ?? 0)
+print("elements hashed for one lookup:", elementHashes)
+```
+
+```output
+7
+elements hashed for one lookup: 1000
+```
+
+One "O(1)" lookup hashed all 1,000 elements of its key (and a successful lookup then compares the keys, another O(k)). So a dictionary keyed by strings of length k really costs O(k) per operation, and n lookups cost O(n · k). When keys are long, hash something shorter, such as an ID, or count with an array when the keys are small integers or letters.
+
+## Substring and String
+
+Making a `Substring` copies nothing: `split`, `prefix` and `dropFirst` return pieces that share the original's storage. Converting with `String(substring)` copies, O(k). Two consequences, both from [Substring and memory](/dsa/learn/swift-substring):
+
+- Converting each piece once is fine. Converting the same piece over and over in a loop repeats the copy.
+- Keeping a small `Substring` around keeps its entire original string in memory. Convert to `String` before storing pieces long-term.
+
+<Callout kind="tip" title="A checklist for every line inside a loop">
+Ask four questions: does it **walk** a collection (`contains`, `count` on a string, `firstIndex`, `min`)? Does it **copy** (`Array(...)`, `String(...)`, a write to shared storage, `+` on strings)? Does it **shift** (`insert`/`remove` near the front)? Does it **hash** something long? A yes means the line costs more than one step, and you should multiply.
+</Callout>
+
+## Practice
+
+**Characters at offsets** gives you a string and a list of positions. The obvious version indexes the string afresh for each position; make it O(n + q) instead.
+
+```cards
+- id: string-count
+  front: "What does `text.count` cost on a Swift String, and what should you use to check for emptiness?"
+  back: "O(n): it walks every character. Use `isEmpty`, which is O(1), and hoist `count` out of loop conditions."
+- id: front-removal
+  front: "Why is calling `removeFirst()` in a loop until an array is empty O(n²)?"
+  back: "Each call shifts every remaining element left, O(n). Walk with a head index instead, or reverse once and use removeLast."
+- id: cow-trap
+  front: "How can copy-on-write make a loop O(n²)?"
+  back: "If another copy of the array stays alive, such as a snapshot saved each pass, every write must first copy the whole array."
+- id: hash-cost
+  front: "Is a Dictionary lookup with a String key really O(1)?"
+  back: "The table lookup is O(1) on average, but hashing (and comparing) the key reads all k characters, so it's O(k) per lookup."
+```
+
+```quiz
+- id: q1
+  type: bigo
+  prompt: "What is the time complexity, where n is the number of characters in `text`?"
+  code: |
+    var vowels = 0
+    var i = 0
+    while i < text.count {
+        let c = text[text.index(text.startIndex, offsetBy: i)]
+        if "aeiou".contains(c) {
+            vowels += 1
+        }
+        i += 1
+    }
+  answer: "O(n²)"
+  explain: "`text.count` walks the whole string on every pass, and `index(_:offsetBy: i)` walks i characters. Looping `for c in text` makes it O(n)."
+- id: q2
+  type: multi
+  prompt: "Which operations are O(1) (on average where relevant)? Choose all that apply."
+  options:
+    - "`array.count`"
+    - "`text.count` for a String"
+    - "`text.isEmpty`"
+    - "`array.removeLast()`"
+    - "`array.removeFirst()`"
+    - "`set.contains(x)` with Int elements"
+  answer: [0, 2, 3, 5]
+  explain: "Arrays store their count, `isEmpty` only checks the start, `removeLast` touches one element and set lookups are O(1) on average. A String's count walks every character, and `removeFirst` shifts every element."
+- id: q3
+  type: output
+  prompt: "What does this print?"
+  code: |
+    var calls = 0
+    let firstBig = (1...1_000).lazy.map { n -> Int in
+        calls += 1
+        return n * n
+    }.first { $0 > 50 }
+    print(firstBig ?? -1, calls)
+  answer: "64 8"
+  explain: "`lazy` squares numbers only as `first(where:)` asks for them: 1, 4, 9, …, 49, then 64 is the first over 50. Eight calls instead of a thousand."
+- id: q4
+  type: bigo
+  prompt: "What is the time complexity of draining an n-element array like this?"
+  code: |
+    while !queue.isEmpty {
+        let next = queue.removeFirst()
+        process(next)   // O(1)
+    }
+  answer: "O(n²)"
+  explain: "Each `removeFirst()` shifts all remaining elements: (n − 1) + (n − 2) + … + 0, about n²/2 moves. A head index makes it O(n)."
+- id: q5
+  type: bug
+  prompt: "This function is correct but O(n · m). Click the line responsible."
+  code: |
+    func countKnown(_ words: [String], known: [String]) -> Int {
+        var total = 0
+        for word in words {
+            if known.contains(word) {
+                total += 1
+            }
+        }
+        return total
+    }
+  answer: 4
+  explain: "`known.contains(word)` walks the whole `known` array for every word. Build `let knownSet = Set(known)` once and look words up in it, for O(n + m) on average."
+- id: q6
+  type: mcq
+  prompt: "A dictionary is keyed by strings of length k. What does one lookup cost, on average?"
+  options:
+    - "O(1), always"
+    - "O(k), because the key must be hashed and compared"
+    - "O(n), where n is the number of keys"
+    - "O(log n)"
+  answer: 1
+  explain: "Finding the slot is O(1) on average, but hashing reads all k characters of the key, and a match is confirmed by comparing them. With short keys, k is a small constant."
+```

@@ -1,0 +1,168 @@
+<Brief>
+
+You're on the iOS team of a city's metro operator. Riders buy tickets and passes in the app and show a **QR code at the gate**. The product brief for the next version says the ticket must be "fast, secure, always available and accessible". Your job is to turn those four words into requirements the team can build and test, then design the feature around them.
+
+What you know:
+
+- **1.2 million** riders use the app; gates see **3 million taps a weekday**, a quarter of them between 8 and 9 am. A busy gate lets a rider through about every 2 seconds.
+- **40% of platforms and most ticket halls underground have no mobile signal.** Gate readers are usually online, but can lose their backend connection for hours, and must decide in 300 ms either way.
+- Today's code is a static QR code. Finance estimates that **screenshots shared between riders cost about 2% of ticket revenue.**
+- Riders include many VoiceOver and low-vision users, and the operator must meet accessibility law.
+- The app supports iOS 17 and later. The team is four iOS engineers; the ticketing backend and the reader software can change, but readers can't get new hardware this year.
+
+In **Requirements**, write at least five **quality-attribute scenarios** in the six-part form (source, stimulus, environment, artefact, response, response measure) and say which matter most. Then design the feature so that each scenario is met. Spend about 35 minutes.
+
+</Brief>
+
+```workspace
+template: feature
+omit: [api]
+minutes: 35
+```
+
+<ModelAnswer section="requirements">
+
+**Functional:** show each valid ticket or pass as a scannable code; buy and renew (existing flow, out of scope here); move tickets to a new phone; show validity and zones.
+
+**Quality-attribute scenarios**, most important first:
+
+1. **Gate speed (performance).** A rider (source) opens their ticket from the Lock Screen (stimulus) underground, with no signal and the app not running (environment). The ticket screen (artefact) shows a valid code (response) within **1.5 s at p90 on an iPhone 12**, with no network request on that path (measure).
+2. **Offline availability.** A rider who bought a pass, then had no network for 3 days, taps in at a gate whose reader is also offline. The ticket shows and validates: **100% of unexpired tickets work with no network on either side.**
+3. **Screenshot fraud (security).** A rider shares a screenshot of their code; a friend shows it at a gate (reader offline). It's rejected: **no code older than 60 s is accepted, and a copied ticket can't produce new codes on another device.** Target: fraud below 0.2% of revenue.
+4. **Accessibility.** A VoiceOver user at a crowded gate opens the app. VoiceOver reaches the code **in one swipe**, announces the ticket and how to hold it, and focus **doesn't move** when the code refreshes. Measure: under 10 s in testing with VoiceOver users; passes an accessibility audit.
+5. **Lost phone (security, operability).** A rider reports their phone stolen and signs in on a new one. The ticket works on the new phone **within 5 minutes**, and codes from the old phone are rejected by online readers within 15 minutes and by every reader within 24 hours.
+6. **Privacy.** Anyone who decodes a code learns **nothing personal**: no name, email or account id in the payload; tap history linked to an account is kept for 90 days, then aggregated.
+
+**Priorities** (business value, difficulty): gate speed (high, medium), offline (high, medium), fraud (high, high), accessibility (high, low), lost phone (medium, medium), privacy (medium, low). Fraud is the hardest because it pulls against offline: that's where the design time goes.
+
+</ModelAnswer>
+
+<ModelAnswer section="estimates">
+
+- **Peak load:** 3M × 25% = 750k taps in the peak hour ≈ **210 taps a second** across the network. Readers validate locally, so none of that hits the backend synchronously; tap logs (about 300 bytes each, ≈ 1 GB a day) upload in batches.
+- **Time budget at the gate:** about 2 s per rider, of which the reader takes 300 ms. The phone has to be showing a code *before* the rider reaches the reader, hence the 1.5 s open target.
+- **Code payload:** ticket id, product and validity (≈ 28 B) + device public key (33 B compressed) + operator signature (64 B) + time slot (4 B) + device signature (64 B) ≈ **200 bytes**: a version 10–12 QR code at medium error correction. Draw it large, several centimetres across, and test it on the real readers in a dim station.
+- **Revocation list:** if 0.5% of 1.2M tickets are revoked at any time, 6,000 ids × 16 B ≈ **100 KB**, small enough to push to every reader and phone.
+
+</ModelAnswer>
+
+<ModelAnswer section="architecture">
+
+Three parties, and only one of them needs to be online at a time:
+
+- **Backend (ticketing):** sells tickets and **signs** each one with the operator's private key: ticket id, product, validity, and the public key of the device it's bound to. Publishes a revocation list and the current time.
+- **Phone:** stores signed tickets and a device key pair whose private key lives in the **Secure Enclave**. Every 30 seconds it builds a code: the signed ticket, the current time slot, and its own signature over (ticket id, slot).
+- **Gate reader:** holds the operator's **public** key and the latest revocation list. It checks the operator signature, then the device signature using the public key inside the ticket, then that the slot is within ±60 s of its clock, then the revocation list. All of that is local, so it works offline.
+
+A screenshot stops working in a minute, and copying the ticket file to another phone doesn't help, because the private key can't leave the Secure Enclave.
+
+</ModelAnswer>
+
+<ModelAnswer section="client">
+
+- **Entry points:** an iOS 18 **Control** (Lock Screen, Control Center, Action button) and an App Shortcut, "Show my ticket", both open straight to the ticket screen; iOS 17 users get the shortcut and a widget that deep-links. The ticket screen is the app's first screen when a valid ticket exists.
+- **`TicketWallet`** (an actor): loads signed tickets from a file in Application Support and the device key from the Keychain. No network on the read path.
+- **`CodeGenerator`**: a pure function from (ticket, signing key, now) to the payload, with the clock injected, so the rotation is tested without waiting 30 seconds.
+- **`TicketView`** (SwiftUI): a `TimelineView` drives a countdown and regenerates the code when the slot changes. Code always black on white, whatever the appearance; brightness raised while it's on screen and restored when it leaves.
+- **`TicketSync`**: online only. Downloads new tickets, the revocation list and the server time offset, at launch and from a `BGAppRefreshTask`.
+
+</ModelAnswer>
+
+<ModelAnswer section="data">
+
+| Data | Where | Why |
+| --- | --- | --- |
+| Device private key | Secure Enclave; its encrypted `dataRepresentation` in the Keychain, `WhenUnlockedThisDeviceOnly` | Can't be exported, backed up or restored onto another phone |
+| Signed tickets | A file in Application Support, file protection `completeUntilFirstUserAuthentication` | The default class: readable after the first unlock, so a background sync can update tickets while the phone is locked |
+| Server time offset, revocation list | Small file next to the tickets | Needed offline; harmless if stale for a day |
+| Tap history | Server only, keyed by ticket id | The phone doesn't need it at the gate |
+
+Invalidation: a ticket leaves the phone when it expires, when the server says it moved to another device, or when the user signs out.
+
+</ModelAnswer>
+
+<ModelAnswer section="deepdive">
+
+**Rotating codes that verify offline.** A shared-secret code (like an authenticator app's) needs the reader to know every ticket's secret: either an online lookup, which breaks scenario 2, or every secret copied to thousands of readers, which makes one stolen reader a disaster. Signatures avoid both: readers hold only public keys. Signing with a Secure Enclave key takes milliseconds, so it fits the open budget.
+
+**The open path (scenario 1).** Launch → read the ticket file and key blob → sign → render. Nothing else may run first: analytics, remote config and ticket sync start *after* the code is on screen. Measure it on the oldest supported phone with a launch performance test in CI and launch metrics in production, against the 1.5 s budget.
+
+**Clocks.** A phone with the wrong time produces codes the reader rejects, which turns a security rule into an availability failure. The phone stores the offset between its clock and the server's at every sync and signs with corrected time; readers sync their clocks whenever they're online; the window is ±60 s, wide enough for drift and narrow enough to make a screenshot worthless.
+
+</ModelAnswer>
+
+<ModelAnswer section="failure">
+
+- **Wrong phone clock and no recent sync:** generate the code anyway with the last offset, and show "Can't confirm the time: connect once to refresh" if the offset is over 7 days old.
+- **Ticket bought on the web, not yet on the phone:** sync on launch when online; offline, say clearly that the ticket isn't on this phone yet rather than showing an empty screen.
+- **Reader offline for days:** still validates (public key and clock); a revoked ticket may work until the reader's list refreshes. That's the bounded, accepted risk in scenario 5.
+- **Lost phone:** the server re-binds the ticket to the new device's public key and adds the old binding to the revocation list.
+- **Replay inside the 60 s window:** a live photo of a code used at another gate. Readers share recent (ticket, slot) pairs when online, and passes can add an anti-passback rule (no second entry on the same pass within, say, 20 minutes).
+- **Dead battery:** out of the app's hands; staff and a contactless card remain the fallback.
+
+</ModelAnswer>
+
+<ModelAnswer section="tradeoffs">
+
+- **Device-bound signatures over a static code:** stops screenshot sharing and works offline, at the cost of key management, clock handling and a reader software update.
+- **Over shared-secret rotating codes:** no secrets on readers, at the cost of a larger QR code (about 200 bytes), which needs testing on old readers.
+- **Over NFC and Express Mode in Apple Wallet:** that's the best experience at a gate, but needs an agreement with Apple and new reader hardware; it's the right next step once hardware changes, and the backend's signed tickets carry over.
+- **Security against availability:** the 60 s window and the clock offset are the dial. Narrower means less replay, more false rejections.
+- **Brightness against battery and user control:** raised only while the code is visible.
+
+Evolution: an Apple Watch app (its own Secure Enclave key, bound like a second device), family tickets, and Wallet once the operator joins Apple's transit programme.
+
+</ModelAnswer>
+
+```rubric
+- id: scenarios
+  label: Turned the brief's adjectives into measurable scenarios
+  skill: requirements
+  look_for:
+    - At least five scenarios with a source, stimulus, environment, artefact, response and a number in the response measure
+    - Environments that matter here, such as no signal, a cold launch or an offline reader
+    - Performance, availability, security and accessibility each covered by at least one scenario
+- id: priorities
+  label: Prioritised the scenarios and named where they conflict
+  skill: tradeoffs
+  look_for:
+    - A ranking by business value and difficulty, not a flat list
+    - Security against offline (rotating codes need time and keys without a network)
+    - A strict time window against riders whose phone clocks are wrong
+- id: offline-security
+  label: Codes that resist screenshots and still verify offline
+  skill: security
+  look_for:
+    - Codes that expire within about a minute
+    - Codes that can't be produced on another device (a device-bound key, ideally in the Secure Enclave)
+    - Verification at the reader without a backend call, and no personal data in the payload
+- id: fast-path
+  label: A ticket on screen fast, with nothing in the way
+  skill: performance
+  look_for:
+    - No network request on the path from tap to code
+    - Quick entry points such as a Control, an App Shortcut or a widget deep link
+    - The target measured on an older supported device, in CI and in production
+- id: accessible-ticket
+  label: A ticket screen that works with VoiceOver and in poor conditions
+  skill: client
+  look_for:
+    - A meaningful accessibility label, and focus that stays put when the code refreshes
+    - High contrast whatever the appearance, and brightness handled
+- id: failure
+  label: Handled the ways the gate can still fail
+  skill: offline
+  look_for:
+    - Clock skew, a lost phone and a ticket not yet on the device
+    - A bounded, stated risk for readers whose revocation list is stale
+```
+
+<Pitfalls>
+
+- Writing "fast", "secure" and "available" again in different words, with no environment and no number. If a tester can't check it, it isn't a requirement yet.
+- A design that calls the backend at the gate: it fails scenario 2 for 40% of platforms.
+- Fixing fraud with a short-lived code fetched from the server, which trades screenshots for a ticket that doesn't open underground.
+- Leaving accessibility to the end, then discovering a code that refreshes every 30 seconds keeps stealing VoiceOver focus.
+- Putting the rider's name or account id in the code, where anyone with a QR reader app can see it.
+
+</Pitfalls>

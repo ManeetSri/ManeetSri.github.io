@@ -1,0 +1,316 @@
+## Why it matters
+
+In a social app the same person appears everywhere: as a post's author in the feed, beside her comments, in a follower list, in her profile header. Decode the API's nested JSON straight into nested structs and you hold a separate copy of her in each place. She changes her name or her avatar, and half the app shows the old one. **Normalisation** stores each entity once, by id, and lets everything else refer to it. It's how Apollo's GraphQL cache, Redux's recommended state shape and every relational database work, and it comes up whenever an interview design has entities shared across screens.
+
+## The same entity, in many places
+
+APIs are shaped for one screen at a time, so they nest:
+
+```json
+[
+  { "id": 1, "text": "Shipping Swift 6 today", "author": { "id": 7, "name": "Ada" } },
+  { "id": 2, "text": "Observation is great", "author": { "id": 9, "name": "Grace" } },
+  { "id": 3, "text": "Strict concurrency: done", "author": { "id": 7, "name": "Ada" } }
+]
+```
+
+Decoded as `[Post]` with an `author: User` inside each, user 7 now exists twice, and once more in every other response that mentions her. This is [A single source of truth](/design/learn/sd-state-source-of-truth)'s problem again, this time built into the *shape* of the data rather than added by one careless line.
+
+## Normalised state: tables of entities, lists of ids
+
+Normalised state has three parts:
+
+- **One table per entity type,** keyed by id: `users: [User.ID: User]`, `posts: [Post.ID: Post]`.
+- **Relationships as ids:** a post holds `authorID`, not an author.
+- **Lists as ordered arrays of ids:** the feed is `[Post.ID]`, a thread is `[Comment.ID]`. The order belongs to the list; the content belongs to the tables.
+
+```visual flow
+title: One row per entity, shared by every screen
+nodes:
+  - { id: feed, label: Feed, kind: view, at: [0, 0] }
+  - { id: comments, label: Comments, kind: view, at: [0, 2] }
+  - { id: posts, label: Posts by id, kind: store, at: [2, 0] }
+  - { id: users, label: Users by id, kind: store, at: [2, 2] }
+  - { id: api, label: Feed API, kind: external, at: [4, 0] }
+  - { id: profile, label: Edit profile, kind: view, at: [4, 2] }
+edges:
+  - [api, posts, upsert, { style: data }]
+  - [api, users, upsert, { style: data }]
+  - [posts, feed, posts, { style: data }]
+  - [users, feed, author, { style: data }]
+  - [users, comments, author, { style: data }]
+  - [profile, users, rename]
+steps:
+  - say: "The feed API returns posts with their authors nested inside. The store splits them up: each post once in **Posts**, each author once in **Users**."
+    show: [api, posts, users]
+    send: [api->posts, api->users]
+    label: { users: Ada once }
+  - say: "Screens hold ids. The feed resolves post 1's `authorID`, 7, through the **Users** table."
+    show: [feed]
+    send: [posts->feed, users->feed]
+  - say: "The comments screen resolves the same id to the same row. There's no second Ada to drift."
+    show: [comments]
+    send: users->comments
+  - say: "Ada renames herself on her profile. The rename writes **one** row."
+    show: [profile]
+    send: profile->users
+    state: { users: active }
+    label: { users: Ada Lovelace }
+  - say: "Every screen that shows her reads that row again. Nothing else needed updating, because nothing else held her name."
+    send: [users->feed, users->comments]
+    state: { users: null, feed: ok, comments: ok }
+```
+
+Here's the same thing in code. The store splits the nested payload as it arrives, and a **selector** joins the tables back together for the screen to show:
+
+```swift run title="Normalising a nested feed response"
+import Foundation
+
+// What the API sends: each post carries a full copy of its author
+struct PostPayload: Decodable {
+    let id: Int
+    let text: String
+    let author: UserPayload
+}
+
+struct UserPayload: Decodable {
+    let id: Int
+    let name: String
+}
+
+// What the app stores: each entity once, related by id
+struct User {
+    let id: Int
+    var name: String
+}
+
+struct Post {
+    let id: Int
+    let text: String
+    let authorID: Int
+}
+
+struct FeedStore {
+    private(set) var users: [Int: User] = [:]
+    private(set) var posts: [Int: Post] = [:]
+    private(set) var feed: [Int] = []
+
+    mutating func ingest(_ payloads: [PostPayload]) {
+        for payload in payloads {
+            users[payload.author.id] = User(id: payload.author.id, name: payload.author.name)
+            posts[payload.id] = Post(id: payload.id, text: payload.text, authorID: payload.author.id)
+        }
+        feed = payloads.map(\.id)
+    }
+
+    mutating func rename(user id: Int, to name: String) {
+        users[id]?.name = name
+    }
+
+    /// A selector: joins the tables into what each row shows
+    func rows() -> [String] {
+        feed.compactMap { id in
+            guard let post = posts[id], let author = users[post.authorID] else { return nil }
+            return "\(author.name): \(post.text)"
+        }
+    }
+}
+
+let json = """
+[
+  { "id": 1, "text": "Shipping Swift 6 today", "author": { "id": 7, "name": "Ada" } },
+  { "id": 2, "text": "Observation is great", "author": { "id": 9, "name": "Grace" } },
+  { "id": 3, "text": "Strict concurrency: done", "author": { "id": 7, "name": "Ada" } }
+]
+"""
+
+var store = FeedStore()
+store.ingest(try JSONDecoder().decode([PostPayload].self, from: Data(json.utf8)))
+print("Stored", store.users.count, "users for", store.posts.count, "posts")
+
+store.rename(user: 7, to: "Ada Lovelace")
+for row in store.rows() {
+    print(row)
+}
+```
+
+```output
+Stored 2 users for 3 posts
+Ada Lovelace: Shipping Swift 6 today
+Grace: Observation is great
+Ada Lovelace: Strict concurrency: done
+```
+
+Notice three things. The payload types and the stored types are different: decoding is shaped by the API, storage by the app. The selector is derived state, as in the previous lesson, so a rename can't leave a row behind. And `compactMap` quietly skips a post whose author is missing, so a dangling id degrades to a missing row instead of a crash.
+
+## Identity
+
+Normalisation rests on **identity**: being able to say that two values are the same thing. Identity and equality answer different questions:
+
+- **Equality** (`==`): do these two values hold the same data? Ada before and after her rename are *not* equal.
+- **Identity** (`id`): are these the same entity? Ada before and after her rename *are* the same user. Two £5 vouchers with equal fields are still two vouchers.
+
+Equality tells you whether something changed. Identity tells you *what* changed. You need both, and an id must be **stable** (never changes for the life of the entity) and **unique** (within its type, at least).
+
+### Where iOS uses identity
+
+- **SwiftUI's `List` and `ForEach`** use `id` to match rows between updates. That decides which row animates, and which row keeps its `@State`. With `id: \.self` on a struct whose fields change, an edit gives the row a new identity: SwiftUI removes the old row and inserts a new one, losing its state and animating a delete and insert instead of an update.
+- **Diffable data sources** match items by their hash. Use ids as the item identifiers, not whole model structs. Then editing a model is a `reconfigureItems(_:)` call (iOS 15) that updates the cell in place, instead of a delete and insert. Apple's own sample code puts identifiers in snapshots for exactly this reason.
+- **Navigation, restoration and deep links** pass ids, because ids are small, `Codable` and still meaningful after the model has changed.
+
+### Typed ids
+
+If every id is a `String`, nothing stops you passing a post's id where a user's is expected. A small generic wrapper makes them different types at no runtime cost (the same idea as [From primitive obsession to domain types](/design/learn/sd-modelling-domain-types)):
+
+```swift check title="Ids that can't be mixed up"
+struct Tagged<Entity, RawValue: Hashable & Sendable>: Hashable, Sendable {
+    let rawValue: RawValue
+}
+
+struct User: Identifiable {
+    typealias ID = Tagged<User, String>
+    let id: ID
+    var name: String
+}
+
+struct Post: Identifiable {
+    typealias ID = Tagged<Post, String>
+    let id: ID
+    let authorID: User.ID
+}
+
+func showProfile(_ id: User.ID) {}
+
+let post = Post(id: Post.ID(rawValue: "p1"), authorID: User.ID(rawValue: "u7"))
+showProfile(post.authorID)
+// showProfile(post.id)   // doesn't compile: a Post.ID isn't a User.ID
+```
+
+### Ids the server hasn't given yet
+
+When the user creates a comment offline, it needs an id *now*, so lists can refer to it before the server answers. Two designs work:
+
+- **The client creates the id** (a UUID) and the server accepts it as the entity's id. Nothing has to be rewritten later, and a retried create can be recognised as a duplicate. This is the better design when you can influence the API.
+- **A temporary id,** replaced when the server answers. The store must then rewrite every list and relationship that holds the temporary one, in one change, and screens holding it (an open detail screen, say) need to follow the mapping.
+
+## Merging: upserts, partial data and order
+
+Responses overlap. The feed sends a summary of each author (id, name, avatar); the profile endpoint sends the full user (bio, follower count). Writing whatever arrived last loses data. Three rules keep the tables right:
+
+- **Upsert, don't replace blindly.** Insert entities you don't have; merge into the ones you do. If summaries and details differ, give them separate types (`UserSummary`, `UserDetail`), or merge field by field so a summary never wipes a bio.
+- **Keep the newest.** Responses arrive out of order: a cached page loaded at launch can land after a live update. Compare a version number or `updatedAt` before overwriting, and keep the newer copy.
+- **Delete everywhere.** Removing an entity means removing its row *and* its id from every list that holds it, in the same change. Selectors that skip missing ids are a safety net, not the plan.
+
+Long sessions also collect entities nothing refers to any more: every author of every post the user ever scrolled past. Prune rows that no list references, on a memory warning or when a screen's list is discarded.
+
+## You may already have a normalised store
+
+If your source of truth is Core Data or SwiftData, you already have tables keyed by identity. Core Data guarantees **uniquing**: within one managed object context there's at most one object for each record, so every fetch that includes Ada hands you the same object. SwiftData's `ModelContext` gives the same guarantee for model instances. Normalising by hand is for in-memory stores and caches of API responses, which is most of the client state in apps that don't keep a database.
+
+For in-memory collections, Point-Free's swift-identified-collections (`IdentifiedArrayOf`) and Apple's swift-collections (`OrderedDictionary`) give you an ordered list with fast lookup by id in one type.
+
+## When not to normalise
+
+Normalising costs a second set of types, lookups on every read, and merge rules to get right. It's not worth it when the data is:
+
+- **Read-only and short-lived:** search results shown once, a receipt, a one-off report.
+- **Owned by one screen,** with no entity shared elsewhere.
+- **Already normalised** by a database you observe.
+
+It's worth it as soon as one entity appears on two screens and can change: users, products with live prices, messages that can be edited, anything with a like count.
+
+## Trade-offs
+
+| | Nested copies | Normalised, in memory | A database as the store |
+| --- | --- | --- | --- |
+| One change updates every screen | no | yes | yes |
+| Decoding | straight from the API | API types, then split into tables | API types, then upserted |
+| Reading | direct | a selector joins ids to rows | fetches or queries, observed |
+| Merge rules | none (each copy is overwritten) | upsert, versions, deletes: yours to write | constraints help; the rules are still yours |
+| Survives relaunch | no | no, unless you save it | yes |
+| Wins for | read-only, one-screen data | shared entities in a session | offline-first apps and large data sets |
+
+<Callout kind="interview">
+
+**What to say:** "Users, posts and comments each live once, keyed by id. The feed and threads are ordered lists of ids. Rows are built by selectors, so a rename or a new like count updates every screen." Then name the merge rules: upsert by id, keep the newest version, delete from every list.
+
+**What to ask:** do ids exist before the server answers (offline creates)? Do different endpoints return different amounts of the same entity? Can entities be deleted remotely?
+
+**Red flags:** nested model structs passed everywhere; equality used as identity (`id: \.self` on mutable data); no plan for a response that arrives after a newer one.
+
+</Callout>
+
+<Callout kind="gotcha" title="iOS gotcha: whole models in diffable snapshots">
+
+`NSDiffableDataSourceSnapshot<Section, Product>` with a `Hashable` `Product` looks convenient. But when a price changes, the new value hashes differently, so the data source sees a deleted item and an inserted one: the cell is rebuilt with a delete-insert animation, and scroll position and selection can jump. Use `Product.ID` as the item type, look the product up in the cell provider, and call `reconfigureItems` when its content changes.
+
+</Callout>
+
+## Practice
+
+The kata **Normalised playlist store** builds a small music library: it splits nested playlist payloads into a table of tracks and ordered id lists, keeps the newest version of each track, removes deleted tracks from every playlist, and derives totals and memberships.
+
+```cards
+- id: normalised-parts
+  front: "What are the three parts of a normalised store?"
+  back: "One table per entity type keyed by id, relationships held as ids, and lists held as ordered arrays of ids."
+- id: identity-equality
+  front: "What's the difference between identity and equality?"
+  back: "Equality says whether two values hold the same data; identity says whether they're the same entity. Ada before and after a rename isn't equal, but is identical."
+- id: diffable-ids
+  front: "What should a diffable data source's item identifiers be?"
+  back: "Ids, not whole models. Then a content change is a reconfigure in place, not a delete and insert."
+- id: merge-rules
+  front: "Which merge rules keep a normalised store right?"
+  back: "Upsert instead of replacing, never let an older version overwrite a newer one, and delete an entity from every list in the same change."
+```
+
+```quiz
+- id: q1
+  type: mcq
+  prompt: "A shopping app shows products in search, a category list, the basket and favourites. Prices change through a live update every 30 seconds. How should the client store products?"
+  options:
+    - "Each screen decodes and keeps its own `[Product]`"
+    - "One table of products by id; each screen holds an ordered list of ids"
+    - "One big array of every product, searched with `first(where:)` on each read"
+    - "Products nested inside basket lines and favourites, copied when added"
+  answer: 1
+  explain: "A price update then writes one row and every screen shows it. Per-screen copies drift; a flat array makes every lookup O(n); nested copies freeze the price at the moment the product was added."
+- id: q2
+  type: truefalse
+  prompt: "`ForEach(tasks, id: \\.self)` is a good choice for a list of editable `Task` structs, as long as `Task` is `Hashable`."
+  answer: false
+  explain: "With `\\.self`, the identity is the whole value, so editing a task gives it a new identity. SwiftUI treats it as a removal plus an insertion, losing the row's state and animating the wrong thing. Use a stable `id`."
+- id: q3
+  type: order
+  prompt: "A playlist payload arrives with five nested tracks. Put the store's steps in order."
+  lines:
+    - "Decode the payload into its API types"
+    - "Upsert each track into the tracks table, keeping the newer version"
+    - "Replace the playlist's ordered list of track ids"
+    - "Screens re-run their selectors and show the resolved tracks"
+  explain: "Entities go into their tables first, then the list that refers to them, so no screen ever resolves an id whose row isn't there yet. Selectors make the result visible."
+- id: q4
+  type: multi
+  prompt: "Which situations need a client-generated id, or a temporary id mapped later?"
+  options:
+    - "Creating a comment while offline, to show it in the thread straight away"
+    - "Showing a product the server already returned"
+    - "An optimistic like on a post the server knows about"
+    - "Queuing a new to-do item that a later edit, also queued, refers to"
+  answer: [0, 3]
+  explain: "Only entities that don't exist on the server yet need an id from the client. A like changes an existing post, which already has its server id."
+- id: q5
+  type: bug
+  prompt: "The profile endpoint returns full users; the feed returns summaries without a bio. Users' bios keep disappearing. Which line causes it?"
+  code: |
+    mutating func ingest(feed page: FeedPage) {
+        for post in page.posts {
+            posts[post.id] = Post(post)
+            users[post.author.id] = User(summary: post.author)
+            feedIDs.append(post.id)
+        }
+    }
+  answer: 4
+  explain: "Line 4 replaces a full user (with a bio from the profile endpoint) with one built from a summary that has none. Merge instead: insert when missing, otherwise update only the fields the summary carries."
+```

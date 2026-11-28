@@ -1,0 +1,316 @@
+## Why it matters
+
+A server writes millions of log lines a day, and you want 100 of them, chosen fairly, to inspect by hand. An analytics SDK in an iOS app wants to upload a random sample of events without storing them all on the phone. A "random line from this file" tool gets a file too big to load. In each case the data arrives as a **stream**: you see each item once, you don't know how many are coming, and you can't keep them all. **Reservoir sampling** picks k items uniformly at random in a single pass with only k items of memory, using a probability argument you can check in a few lines. It's a favourite interview question because the code is tiny and the proof is the point. This lesson also covers the other everyday sampling job: picking with **weights**.
+
+## One item from a stream
+
+Start with k = 1: pick one item, every item equally likely, without knowing the stream's length.
+
+The rule: **keep the ith item with probability 1/i** (counting from 1), replacing whatever you kept before.
+
+- The 1st item is kept with probability 1/1: always.
+- The 2nd replaces it with probability 1/2.
+- The 3rd replaces the current choice with probability 1/3, and so on.
+
+```swift run
+// Reservoir sampling with k = 1: keep the ith item with probability 1/i
+struct Dice {
+    private var state: UInt64
+    init(seed: UInt64) { state = seed }
+    mutating func roll(_ range: ClosedRange<Int>) -> Int {
+        state = state &* 6364136223846793005 &+ 1442695040888963407
+        return range.lowerBound + Int((state >> 33) % UInt64(range.count))
+    }
+}
+
+var dice = Dice(seed: 15)
+
+/// One item chosen uniformly from a stream, in one pass, remembering a single item
+func pickOne(from stream: [String]) -> String? {
+    var kept: String? = nil
+    var seen = 0
+    for item in stream {
+        seen += 1
+        if dice.roll(1...seen) == 1 {         // probability 1/seen
+            kept = item
+        }
+    }
+    return kept
+}
+
+let lines = ["GET /", "GET /about", "POST /login", "GET /cart", "GET /help"]
+var counts: [String: Int] = [:]
+for _ in 0..<100_000 {
+    counts[pickOne(from: lines)!, default: 0] += 1
+}
+for line in lines {
+    print(line, counts[line]!)
+}
+```
+
+```output
+GET / 20200
+GET /about 19902
+POST /login 20127
+GET /cart 19630
+GET /help 20141
+```
+
+Each of the five lines was picked about 20,000 times out of 100,000: a fifth each. `Dice` is the seeded generator from [Random pivots and 3-way partitioning](/dsa/learn/sort-quick-pivots), so the counts are the same every run. The function never looks ahead, and it stores one line, however long the stream is.
+
+### Why 1/i works
+
+Item i ends up as the final choice when two things happen: it's **kept** when it arrives, and **no later item replaces it**.
+
+- Kept on arrival: probability 1/i.
+- Not replaced by item i + 1: probability 1 − 1/(i + 1) = i/(i + 1).
+- Not replaced by item i + 2: (i + 1)/(i + 2). And so on, up to item n: (n − 1)/n.
+
+The events are independent (each uses its own random number), so multiply:
+
+```text
+1/i × i/(i + 1) × (i + 1)/(i + 2) × … × (n − 1)/n = 1/n
+```
+
+Every numerator cancels the denominator before it (a **telescoping** product), leaving 1/n. The same 1/n for every i: uniform. Exact fractions agree:
+
+```swift run
+// The probability that item i (counting from 1) is the one kept at the end of a stream of n
+func gcd(_ a: Int, _ b: Int) -> Int { b == 0 ? a : gcd(b, a % b) }
+
+let n = 5
+for i in 1...n {
+    var top = 1                              // kept when it arrives: 1/i
+    var bottom = i
+    for later in stride(from: i + 1, through: n, by: 1) {
+        top *= later - 1                     // not replaced by item `later`: (later − 1)/later
+        bottom *= later
+    }
+    let g = gcd(top, bottom)
+    print("item \(i): \(top / g)/\(bottom / g)")
+}
+```
+
+```output
+item 1: 1/5
+item 2: 1/5
+item 3: 1/5
+item 4: 1/5
+item 5: 1/5
+```
+
+The first item is kept for sure but has the most chances to be replaced; the last has only a 1/5 chance of being kept but nothing can replace it. The two effects balance exactly.
+
+## k items: the reservoir
+
+To keep k items, hold a **reservoir** array of size k:
+
+1. The first k items go straight in.
+2. For the ith item, with i > k: draw j uniformly from `0..<i`. If j < k, the new item replaces `reservoir[j]`; otherwise it's discarded.
+
+The new item gets in with probability k/i (j lands in `0..<k`), and when it does, it evicts a uniformly random resident (each slot with probability 1/k).
+
+```swift run
+// Reservoir sampling with k items: the ith item replaces a random slot with probability k/i
+struct Dice {
+    private var state: UInt64
+    init(seed: UInt64) { state = seed }
+    mutating func roll(_ range: ClosedRange<Int>) -> Int {
+        state = state &* 6364136223846793005 &+ 1442695040888963407
+        return range.lowerBound + Int((state >> 33) % UInt64(range.count))
+    }
+}
+
+var dice = Dice(seed: 3)
+
+func sample(_ k: Int, from stream: some Sequence<Int>) -> [Int] {
+    var reservoir: [Int] = []
+    var seen = 0
+    for item in stream {
+        seen += 1
+        if reservoir.count < k {
+            reservoir.append(item)                   // the first k fill the reservoir
+        } else {
+            let j = dice.roll(0...(seen - 1))        // uniform over the seen items' positions
+            if j < k {
+                reservoir[j] = item                  // probability k / seen: replace slot j
+            }
+        }
+    }
+    return reservoir
+}
+
+print("one sample:", sample(3, from: 1...10))
+var picked = [Int](repeating: 0, count: 11)
+for _ in 0..<100_000 {
+    for item in sample(3, from: 1...10) {
+        picked[item] += 1
+    }
+}
+print("times each of 1...10 was picked:")
+print(Array(picked[1...]))
+```
+
+```output
+one sample: [1, 2, 9]
+times each of 1...10 was picked:
+[29964, 29817, 30076, 29958, 29977, 30068, 29983, 30122, 30035, 30000]
+```
+
+Each number is in the sample about 30,000 times out of 100,000: probability 3/10 = k/n. Notice that 1 and 2, the first two items, are just as likely as 9 and 10.
+
+### Why k/i works
+
+The same telescoping argument. An item already in the reservoir when item i + 1 arrives is evicted only if item i + 1 gets in (probability k/(i + 1)) **and** picks its slot (1/k): probability 1/(i + 1). So it survives that step with probability i/(i + 1).
+
+- Item i, for i > k, gets in with probability k/i, then survives every later step: k/i × i/(i + 1) × … × (n − 1)/n = **k/n**.
+- Item i, for i ≤ k, starts in the reservoir and survives steps k + 1 to n: k/(k + 1) × (k + 1)/(k + 2) × … × (n − 1)/n = **k/n**.
+
+Every item ends up in the sample with probability k/n. (A fuller argument shows that every **set** of k items is equally likely, not only every single item, which is what "a uniform sample" really means.)
+
+The cost: O(1) work per item, one random number for each item after the first k, and **O(k) memory** whatever the stream's length. The sample is ready at every moment: stop the stream anywhere and the reservoir is a uniform sample of what you've seen so far.
+
+<Callout kind="analogy" title="A raffle with a small box">
+A raffle box only holds k tickets. As each new person arrives, you've now seen i people, so it's fair that they get a k/i chance of a place in the box. If they win one, they swap out a random ticket already there. The box never overflows, and at any moment it's a fair draw from everyone who's come so far.
+</Callout>
+
+## Weighted picks
+
+Reservoir sampling treats every item equally. Often you want **weights**: a load balancer sends each request to server i with probability `weights[i] / total`, a game drops rare items less often, an ad server shows bigger campaigns more.
+
+Lay the weights end to end on a number line. With weights [5, 1, 3, 1], server 0 owns `0..<5`, server 1 owns `5..<6`, server 2 owns `6..<9` and server 3 owns `9..<10`. A uniformly random point in `0..<10` lands in each stretch with probability proportional to its length.
+
+The ends of the stretches are the [prefix sums](/dsa/learn/prefix-1d) of the weights, `[5, 6, 9, 10]`. To find which stretch a point r falls in, find the **first prefix sum greater than r**, a [binary search for a bound](/dsa/learn/bs-bounds):
+
+```swift run
+// Weighted picks: prefix sums turn the weights into stretches of a number line, binary search finds one
+struct Dice {
+    private var state: UInt64
+    init(seed: UInt64) { state = seed }
+    mutating func roll(_ range: ClosedRange<Int>) -> Int {
+        state = state &* 6364136223846793005 &+ 1442695040888963407
+        return range.lowerBound + Int((state >> 33) % UInt64(range.count))
+    }
+}
+
+var dice = Dice(seed: 8)
+
+let weights = [5, 1, 3, 1]
+var prefix: [Int] = []                    // prefix[i] = weights[0] + ... + weights[i]
+var running = 0
+for weight in weights {
+    running += weight
+    prefix.append(running)
+}
+print("prefix sums:", prefix)
+
+/// The first index whose prefix sum is greater than r
+func pick() -> Int {
+    let r = dice.roll(0...(running - 1))  // a point on the line 0..<total
+    var low = 0
+    var high = prefix.count - 1
+    while low < high {
+        let mid = (low + high) / 2
+        if prefix[mid] > r { high = mid } else { low = mid + 1 }
+    }
+    return low
+}
+
+var counts = [Int](repeating: 0, count: weights.count)
+for _ in 0..<100_000 {
+    counts[pick()] += 1
+}
+print("picks:", counts)
+```
+
+```output
+prefix sums: [5, 6, 9, 10]
+picks: [49460, 10221, 30344, 9975]
+```
+
+About 50%, 10%, 30% and 10%, matching 5, 1, 3 and 1 out of 10. Building the prefix sums is O(n) once; each pick is O(log n). Check the edges: r = 4 gives server 0 (prefix 5 > 4), r = 5 gives server 1 (5 isn't > 5, but 6 is). Using `>=` instead of `>` would shift every boundary by one and hand server 0's last point to the wrong owner.
+
+A server with weight 0 owns an empty stretch: its prefix sum equals the previous one, so "first prefix sum greater than r" always skips it. That's exactly right, and a good test case.
+
+Two related tools you may meet: the **alias method** answers weighted picks in O(1) after O(n) preparation, for when you pick millions of times from the same weights; and **weighted reservoir sampling** combines both ideas for a stream of weighted items (each item gets a random key based on its weight, and you keep the k largest keys in a heap). Prefix sums plus binary search is the one to know cold.
+
+<Callout kind="gotcha" title="Common mistakes">
+- **Counting from 0 in the probability.** The ith item is kept with probability 1/i where i counts from **1**. With a 0-based index, it's 1/(index + 1): the first item must be kept for sure.
+- **Drawing from `0...seen` instead of `0..<seen`.** One extra outcome makes every item after the first k slightly less likely to get in.
+- **Replacing the oldest item instead of a random one.** The reservoir becomes "the most recent k", not a sample.
+- **A fresh generator per call.** Re-creating a seeded generator inside the function repeats the same choices every time. Create it once and pass it in, `inout`.
+- **Overflowing the total weight.** Big weights times many servers can exceed `Int.max`; check the constraints.
+</Callout>
+
+## Practice
+
+**Sample a log stream** is a reservoir of k lines, fed one line at a time, with the generator passed to each call. **Weighted server picker** is prefix sums plus binary search, with weights of zero and a test that makes 100,000 picks from 100,000 servers, so a linear scan per pick is too slow. Both are tested by counting picks over many runs with a seeded generator.
+
+```cards
+- id: reservoir-one
+  front: "In reservoir sampling with k = 1, with what probability do you keep the ith item?"
+  back: "1/i, counting from 1. The first item is always kept, the second replaces it with probability 1/2, and so on."
+- id: reservoir-proof
+  front: "Why does keeping the ith item with probability 1/i give each item probability 1/n?"
+  back: "Item i is kept (1/i) and then not replaced by items i + 1 to n: 1/i × i/(i + 1) × … × (n − 1)/n, which telescopes to 1/n."
+- id: reservoir-k
+  front: "How does reservoir sampling keep k items?"
+  back: "Fill the reservoir with the first k. For the ith item, draw j from 0..<i; if j < k, replace reservoir[j]. Each item ends up in the sample with probability k/n, using O(k) memory."
+- id: weighted-pick
+  front: "How do you pick index i with probability weights[i] / total?"
+  back: "Build prefix sums of the weights, draw r from 0..<total, and binary search for the first prefix sum greater than r. O(n) setup, O(log n) per pick."
+```
+
+```quiz
+- id: q1
+  type: mcq
+  prompt: "In single-item reservoir sampling, the 4th item of the stream arrives. With what probability does it replace the current choice?"
+  options: ["1/4", "1/3", "3/4", "1/2"]
+  answer: 0
+  explain: "The ith item is kept with probability 1/i. That's what makes every item's final probability 1/n."
+- id: q2
+  type: output
+  prompt: "This multiplies the probabilities that item 2 of a 6-item stream is kept and then never replaced. What does it print?"
+  code: |
+    var top = 1
+    var bottom = 2
+    for later in 3...6 {
+        top *= later - 1
+        bottom *= later
+    }
+    print(top, bottom, Double(top) / Double(bottom) == 1.0 / 6.0)
+  answer: "120 720 true"
+  explain: "1/2 × 2/3 × 3/4 × 4/5 × 5/6: the numerators multiply to 120 and the denominators to 720, and 120/720 is exactly 1/6."
+- id: q3
+  type: truefalse
+  prompt: "Reservoir sampling needs to know the length of the stream in advance."
+  answer: false
+  explain: "It only needs to know how many items it has seen so far. That's the point: the reservoir is a fair sample of the stream up to now, at every moment."
+- id: q4
+  type: trace
+  prompt: "Weights are [2, 0, 3, 5], so the prefix sums are [2, 2, 5, 10]. Which index does each r pick: r = 1, r = 2, r = 4, r = 5?"
+  answer: "0, 2, 2, 3"
+  explain: "The pick is the first index whose prefix sum is greater than r. For r = 1 that's index 0 (2 > 1). For r = 2, indexes 0 and 1 both have 2, which isn't greater, so index 2. For r = 4, index 2 (5 > 4). For r = 5, index 3. Index 1, with weight 0, is never picked."
+- id: q5
+  type: bigo
+  prompt: "With the sample size k fixed, how does reservoir sampling's memory grow with the stream's length n?"
+  answer: "O(1)"
+  options: ["O(1)", "O(log n)", "O(n)", "O(n log n)"]
+  explain: "It's O(k), independent of n: the reservoir, a counter and one random number at a time. As n grows with k fixed, that's constant."
+- id: q6
+  type: bug
+  prompt: "This should keep a uniform sample of k items. Click the faulty line."
+  code: |
+    var reservoir: [Int] = []
+    var seen = 0
+    for item in stream {
+        seen += 1
+        if reservoir.count < k {
+            reservoir.append(item)
+        } else if Int.random(in: 0..<seen, using: &generator) < k {
+            reservoir[0] = item
+        }
+    }
+  answer: 8
+  explain: "The new item gets in with the right probability, k/seen, but always evicts slot 0. It must evict a uniformly random slot: draw j once, and if j < k, replace reservoir[j]."
+```

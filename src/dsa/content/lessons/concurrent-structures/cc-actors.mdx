@@ -1,0 +1,313 @@
+## Why it matters
+
+Almost every app has a cache that many parts of the code share: thumbnails already downloaded, user profiles already fetched, results already computed. Requests for those arrive from many tasks at once, so the cache's dictionary is exactly the kind of shared mutable state the last lesson warned about. Swift's answer is the **actor**, a type that protects its own state by letting one task at a time inside. This lesson builds two caches with actors, and then covers the one trap that catches almost everyone who uses them: **reentrancy**.
+
+## An actor protects its own state
+
+You declare an actor like a class, with `actor` instead of `class`. Like a class, it's a reference type. The difference is **isolation**: the actor's mutable stored properties can only be touched by code running **inside** the actor, and the actor runs that code for one caller at a time.
+
+- **Inside** the actor, its methods read and write its properties directly, with no `await`, as in any class.
+- **Outside** the actor, every call to a method or read of a property that touches its mutable state needs `await`. That `await` is where your task may wait for its turn.
+
+<Callout kind="analogy" title="One clerk, one queue">
+An actor is like a post office counter with a single clerk. Customers queue, and the clerk serves one at a time, so two customers never scribble on the same form at once. Waiting in the queue is the `await`. While you wait, you're not blocking anyone: your thread goes off and serves other tasks until your turn comes.
+</Callout>
+
+Here's a memo cache for the Collatz step count, the number of "halve it if it's even, otherwise triple it and add one" steps from a number to 1. Each call fills in the answers for every number on its path, so later calls stop early:
+
+```swift run
+/// A memo cache for Collatz step counts: how many steps of "halve if even, else 3n + 1" reach 1
+actor CollatzCache {
+    private var steps: [Int: Int] = [1: 0]
+    private(set) var computed = 0
+
+    func stepCount(for start: Int) -> Int {
+        // Walk forward until a number whose answer is already known
+        var path: [Int] = []
+        var n = start
+        while steps[n] == nil {
+            path.append(n)
+            n = n.isMultiple(of: 2) ? n / 2 : 3 * n + 1
+        }
+        // Fill in the answers backwards along the path
+        var count = steps[n]!
+        for number in path.reversed() {
+            count += 1
+            steps[number] = count
+            computed += 1
+        }
+        return count
+    }
+
+    var cachedCount: Int {
+        steps.count
+    }
+}
+
+let cache = CollatzCache()
+let results = await withTaskGroup(of: (Int, Int).self) { group in
+    for start in [27, 9, 97, 27, 6, 9, 871] {
+        group.addTask { (start, await cache.stepCount(for: start)) }
+    }
+    var all: [(Int, Int)] = []
+    for await result in group {
+        all.append(result)
+    }
+    return all
+}
+for (start, steps) in results.sorted(by: { $0.0 < $1.0 }) {
+    print(start, steps)
+}
+print(await cache.computed, await cache.cachedCount)
+```
+
+```output
+6 8
+9 19
+9 19
+27 111
+27 111
+97 118
+871 178
+221 222
+```
+
+What to notice:
+
+- **`stepCount(for:)` has no `await` inside.** Once a task is in, it runs the whole method without interruption, so the dictionary can never be half-updated when another task looks at it.
+- **Each call from a child task is `await cache.stepCount(for:)`.** Seven tasks may arrive at once; they take turns.
+- **The output is deterministic** although the tasks run in an unpredictable order. Each number is computed exactly once, whichever task gets there first, so 221 numbers are computed and the cache holds those plus the starting entry for 1. The results are printed sorted, never in arrival order.
+
+The compiler enforces the isolation. Forget the `await`, and you get an error even in Swift 5 language mode:
+
+```text title="What Swift reports for print(cache.cachedCount) in an async function"
+error: actor-isolated property 'cachedCount' cannot be accessed from outside of the actor
+```
+
+## Reentrancy: state can change across an await
+
+The memo cache never awaits inside the actor. Real caches do: they fetch from the network or ask another actor. And here's the rule that surprises people: **while an actor method is suspended at an `await`, the actor serves other callers.** When the method resumes, anything it checked before the `await` may no longer be true. This is called **reentrancy**.
+
+Here's a first attempt at a thumbnail cache:
+
+```swift
+actor ThumbnailCache {
+    private var images: [URL: Data] = [:]
+
+    func image(for url: URL) async throws -> Data {
+        if let cached = images[url] {                              // 1. check
+            return cached
+        }
+        let (data, _) = try await URLSession.shared.data(from: url) // 2. suspend: other calls run here
+        images[url] = data                                         // 3. act
+        return data
+    }
+}
+```
+
+Imagine a table view asks for the same thumbnail from three cells at once. Call 1 checks, misses and suspends on the download. The actor is now free, so call 2 checks, also misses, and starts a second download. Then call 3 does the same. Three downloads of one image: there's no data race, the dictionary is always consistent, but the logic is wrong. This is the **check-then-act across an await** bug.
+
+The same pattern can do real damage. A seat-booking actor that checks `availableSeats >= count`, awaits a payment, and then subtracts can sell more seats than exist, because other bookings passed the same check while the first one was waiting.
+
+Swift made actors reentrant on purpose. If an actor stayed locked while it waited, two actors waiting on each other would **deadlock**, each holding what the other needs, and threads would sit idle. Reentrancy avoids both, at the price of this rule:
+
+- **Do the check and the change in one stretch with no `await` between them.** Code between two awaits runs without interruption.
+- **After an `await`, re-check anything you assumed before it.**
+- **Record "work in progress" before you await**, so other callers can see it.
+
+## The image cache shape: share the work in progress
+
+The fix for the thumbnail cache is the third rule. Instead of storing only finished images, store a `Task` for every download, created and recorded **before** the first `await`. A second caller then finds the task and waits for the same download:
+
+```swift
+actor ImageCache {
+    private var downloads: [URL: Task<Data, Error>] = [:]
+
+    func image(for url: URL) async throws -> Data {
+        if let download = downloads[url] {
+            return try await download.value             // finished or still running: share it
+        }
+        let download = Task {
+            let (data, _) = try await URLSession.shared.data(from: url)
+            return data
+        }
+        downloads[url] = download                       // recorded before the first await
+        do {
+            return try await download.value
+        } catch {
+            downloads[url] = nil                        // don't cache a failure: let a later call retry
+            throw error
+        }
+    }
+}
+```
+
+In an iOS app, the caller turns the data into a picture with `UIImage(data:)` and shows it. A few details make this work:
+
+- `Task { … }` starts the download as a separate task, so it runs **off** the actor. The actor stays free to answer other callers while bytes arrive.
+- Between `if let download = downloads[url]` and `downloads[url] = download` there's no `await`, so no other call can slip in between. That stretch is the whole trick.
+- A finished `Task` keeps its result, so `await download.value` on a completed download returns immediately. The dictionary of tasks doubles as the cache.
+- Failures are removed, so one dropped connection doesn't poison the cache forever.
+
+Here's the same shape running, with a fake server that counts requests and yields a few times to give other tasks a chance to arrive mid-download:
+
+```swift run
+/// Stands in for the network: counts requests and takes a while to answer
+actor FakeServer {
+    private(set) var requests = 0
+
+    func download(_ name: String) async -> String {
+        requests += 1
+        for _ in 0..<10 {
+            await Task.yield()          // let other tasks run, as a real download would
+        }
+        return "<\(name) image>"
+    }
+}
+
+actor ImageCache {
+    private var tasks: [String: Task<String, Never>] = [:]
+    private let server: FakeServer
+
+    init(server: FakeServer) {
+        self.server = server
+    }
+
+    func image(named name: String) async -> String {
+        if let task = tasks[name] {
+            return await task.value                     // finished or still running: share it
+        }
+        let server = self.server
+        let task = Task { await server.download(name) }
+        tasks[name] = task                              // recorded before the first await
+        return await task.value
+    }
+}
+
+let server = FakeServer()
+let cache = ImageCache(server: server)
+let names = ["cat", "dog", "cat", "owl", "dog", "cat", "cat", "owl"]
+let images = await withTaskGroup(of: String.self) { group in
+    for name in names {
+        group.addTask { await cache.image(named: name) }
+    }
+    var all: [String] = []
+    for await image in group {
+        all.append(image)
+    }
+    return all
+}
+print(images.count, Set(images).sorted())
+print(await server.requests)
+```
+
+```output
+8 ["<cat image>", "<dog image>", "<owl image>"]
+3
+```
+
+Eight requests, three distinct names, three downloads, on every run. `Task.yield()` suspends the current task briefly so others can run; it stands in for the time a real download takes. Without the recorded task, the number of downloads would depend on timing, which is exactly why this lesson doesn't print the naive version's count.
+
+## Keep the actor's work small
+
+An actor runs one caller at a time, so whatever happens inside it, everyone else waits for:
+
+- **Don't do heavy computing inside an actor method.** Decode, resize or sort outside, in the caller or a separate task, and only store the result inside. The image cache downloads in a `Task` for this reason.
+- **Never block inside an actor**, with a semaphore, `sleep` or a long busy loop. Swift's thread pool has only about one thread per core, and a blocked thread is one the whole app loses.
+- **One actor can become a bottleneck.** If thousands of tasks hammer one cache, consider several actors, each owning the keys whose hash falls in its share.
+
+You'll also meet the **main actor**, a single, app-wide actor tied to the main thread. UIKit and SwiftUI code runs on it, and marking a view model `@MainActor` makes all its state main-actor isolated. It's the same idea as this lesson's actors, applied to the user interface.
+
+<Callout kind="gotcha" title="Swift gotchas with actors">
+- **Reentrancy.** Every `await` inside an actor method is a point where other callers can change its state. Check and change in the same `await`-free stretch.
+- **Isolation covers the actor's properties, not what they point to.** Handing a caller a reference to a mutable class instance stored inside the actor lets two tasks share it again. The next lesson, Sendable, is how Swift prevents that.
+- **A plain `Task { … }` isn't tied to its caller.** If the task that started a download is cancelled, the download keeps going. That's what you want for a shared cache, but remember it.
+</Callout>
+
+## Practice
+
+**A coalescing memo cache** asks for this lesson's pattern as a reusable, generic actor: each key computed at most once however many tasks ask at the same time, with finished values stored separately from computations in progress.
+
+```cards
+- id: actor-isolation
+  front: "What does an actor guarantee about its mutable state?"
+  back: "Only code running inside the actor can touch it, and the actor runs that code for one caller at a time. Callers from outside must `await`."
+- id: actor-reentrancy
+  front: "What is actor reentrancy?"
+  back: "While an actor method is suspended at an await, the actor serves other callers. When the method resumes, anything it checked before the await may have changed."
+- id: actor-check-then-act
+  front: "How do you avoid the check-then-act bug in an actor cache?"
+  back: "Record the work in progress (a Task) in the actor's state before the first await, so later callers find it and await the same task."
+- id: actor-small-work
+  front: "Why should actor methods avoid heavy computation and blocking?"
+  back: "The actor serves one caller at a time, so everyone else waits. Compute outside and store inside, and never block a thread inside an actor."
+```
+
+```quiz
+- id: q1
+  type: mcq
+  prompt: "Inside an actor's own method, how do you read one of its stored properties?"
+  options:
+    - "With `await self.property`"
+    - "Directly, as `property`, with no await"
+    - "Only through a nonisolated accessor"
+    - "With a lock around the read"
+  answer: 1
+  explain: "Code inside the actor is already isolated to it, so its own state is accessed synchronously. `await` is needed when crossing into the actor from outside."
+- id: q2
+  type: bug
+  prompt: "Several tasks call `book(_:)` at once, and `seatsLeft` can go below zero. Which line lets other bookings run between the check and the update?"
+  code: |
+    actor Venue {
+        var seatsLeft = 10
+        func book(_ count: Int, payments: PaymentService) async -> Bool {
+            guard seatsLeft >= count else { return false }
+            let paid = await payments.charge(count)
+            guard paid else { return false }
+            seatsLeft -= count
+            return true
+        }
+    }
+  answer: 5
+  explain: "The `await` on line 5 lets other bookings run after this one passed the seat check on line 4. They pass the same check, and line 7 can drive `seatsLeft` below zero. Reserve the seats before the await (and give them back if the payment fails)."
+- id: q3
+  type: truefalse
+  prompt: "Swift actors stay locked while one of their methods is suspended at an `await`, so no other call can run until it finishes."
+  answer: false
+  explain: "Actors are reentrant: while a method is suspended, other calls run. That avoids deadlocks and idle threads, but means state can change across an await."
+- id: q4
+  type: output
+  prompt: "What does this print?"
+  code: |
+    actor Visits {
+        private var counts: [String: Int] = [:]
+        func record(_ page: String) -> Int {
+            counts[page, default: 0] += 1
+            return counts[page]!
+        }
+        var distinctPages: Int { counts.count }
+    }
+    let visits = Visits()
+    await withTaskGroup(of: Void.self) { group in
+        for page in ["home", "cart", "home", "home", "pay"] {
+            group.addTask { _ = await visits.record(page) }
+        }
+    }
+    print(await visits.record("home"), await visits.distinctPages)
+  answer: "4 3"
+  explain: "The actor applies the five recorded visits one at a time, so none is lost: home has 3 when the group finishes, and recording it once more returns 4. There are three distinct pages."
+- id: q5
+  type: multi
+  prompt: "Which of these belong inside an actor-based image cache's actor method? Choose all that apply."
+  options:
+    - "Looking up whether a download task for the URL already exists"
+    - "Storing a new download task in the dictionary"
+    - "Decoding and resizing a large image"
+    - "Waiting on a semaphore until the download completes"
+  answer: [0, 1]
+  explain: "The lookup and the store must happen together, without an await between them. Decoding is heavy work that should happen outside, and blocking a thread on a semaphore inside an actor stalls everyone."
+- id: q6
+  type: recall
+  prompt: "Explain why storing a Task for each download, rather than only the finished data, stops duplicate downloads."
+  model: "The first caller creates the Task and records it in the dictionary before its first await, so the record happens with no other call able to run in between. Any later caller, even while the download is still running, finds the Task and awaits its value instead of starting another download. A finished Task keeps its result, so the same dictionary also serves cached results."
+```

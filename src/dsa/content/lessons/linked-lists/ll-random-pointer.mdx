@@ -1,0 +1,329 @@
+## Why it matters
+
+Copying a plain list is easy: walk it and build new nodes. But real structures often contain **cross-references**: a document whose paragraphs link to other paragraphs, a playlist whose songs point at "play next" suggestions, a graph. Copying those properly, so the copy's links point into the copy and never back into the original, is called a **deep copy**, and it's harder than it looks. This lesson's list, where each node has an extra `random` reference to any node, is the classic small version. The dictionary technique it teaches is exactly how you'll clone graphs in Part VI.
+
+## A list with random references
+
+Each node has the usual `next`, plus `random`, which can point at any node in the same list (itself included), or be `nil`:
+
+```text
+values:   7      13     11     10     1
+random:   nil    7      1      11     7
+```
+
+Here the `13` node's `random` points back at the `7` node, the `11` node's points forward at the `1` node, and so on.
+
+In Swift, there's a decision to make about `random`. A `random` that points **backwards** forms a loop with the `next` references: the `7` node owns the `13` node through `next`, and the `13` node would own the `7` node through `random`. That's a retain cycle, and the list would never be freed. The `next` chain already owns every node, so make `random` **weak**, exactly like `previous` in a doubly linked list ([weak and unowned references](/dsa/learn/swift-weak-unowned)):
+
+```swift
+final class Node {
+    var value: Int
+    var next: Node?
+    weak var random: Node?
+
+    init(_ value: Int) {
+        self.value = value
+    }
+}
+```
+
+That works because every `random` target is also somewhere in the `next` chain, so something always holds it strongly.
+
+## Why the obvious copy fails
+
+Walking the list and making new nodes for the values and `next` links is easy. The trouble is `random`. When you copy the `13` node, its `random` should point at the **copy** of the `7` node, not the original. And when you copy the `11` node, its `random` should point at the copy of the `1` node, which **doesn't exist yet**. You can't set `random` in a single pass, because its target may be further along.
+
+Copy `random` directly (`copy.random = original.random`) and you get a **shallow copy**: the copy's random references lead back into the original list. Change the original and the copy appears to change. Free the original and, with a weak `random`, the copy's random references silently become `nil`.
+
+## Approach 1: a dictionary from old to new
+
+Make two passes:
+
+1. Walk the original, creating a copy of every node, and record in a dictionary which copy belongs to which original.
+2. Walk again, and for every original node `old`, set `copy(old).next = copy(old.next)` and `copy(old).random = copy(old.random)`, looking each copy up in the dictionary.
+
+The dictionary's key must identify a **node**, not a value: two nodes can hold the same value. `ObjectIdentifier`, from [Identity with ===](/dsa/learn/swift-identity), is exactly that.
+
+```swift run
+final class Node {
+    var value: Int
+    var next: Node?
+    weak var random: Node?
+
+    init(_ value: Int) {
+        self.value = value
+    }
+}
+
+func makeList(_ values: [Int], randoms: [Int?]) -> Node? {
+    let nodes = values.map { Node($0) }
+    for i in nodes.indices {
+        if i + 1 < nodes.count {
+            nodes[i].next = nodes[i + 1]
+        }
+        if let target = randoms[i] {
+            nodes[i].random = nodes[target]
+        }
+    }
+    return nodes.first
+}
+
+func describe(_ head: Node?) -> String {
+    var parts: [String] = []
+    var current = head
+    while let node = current {
+        let target = node.random.map { String($0.value) } ?? "nil"
+        parts.append("\(node.value)(r:\(target))")
+        current = node.next
+    }
+    parts.append("nil")
+    return parts.joined(separator: " -> ")
+}
+
+func copyWithDictionary(_ head: Node?) -> Node? {
+    var copies: [ObjectIdentifier: Node] = [:]
+
+    // Pass 1: a copy of every node, filed under its original's identity
+    var current = head
+    while let node = current {
+        copies[ObjectIdentifier(node)] = Node(node.value)
+        current = node.next
+    }
+
+    // Pass 2: wire up next and random between the copies
+    current = head
+    while let node = current {
+        let copy = copies[ObjectIdentifier(node)]!
+        copy.next = node.next.flatMap { copies[ObjectIdentifier($0)] }
+        copy.random = node.random.flatMap { copies[ObjectIdentifier($0)] }
+        current = node.next
+    }
+
+    return head.flatMap { copies[ObjectIdentifier($0)] }
+}
+
+let original = makeList([7, 13, 11, 10, 1], randoms: [nil, 0, 4, 2, 0])
+let copy = copyWithDictionary(original)
+print(describe(original))
+print(describe(copy))
+
+// Is it a deep copy? No node of the copy may be a node of the original.
+var originals = Set<ObjectIdentifier>()
+var walker = original
+while let node = walker {
+    originals.insert(ObjectIdentifier(node))
+    walker = node.next
+}
+var shared = 0
+walker = copy
+while let node = walker {
+    if originals.contains(ObjectIdentifier(node)) { shared += 1 }
+    if let target = node.random, originals.contains(ObjectIdentifier(target)) { shared += 1 }
+    walker = node.next
+}
+print("references into the original:", shared)
+```
+
+```output
+7(r:nil) -> 13(r:7) -> 11(r:1) -> 10(r:11) -> 1(r:7) -> nil
+7(r:nil) -> 13(r:7) -> 11(r:1) -> 10(r:11) -> 1(r:7) -> nil
+references into the original: 0
+```
+
+The copy prints identically, and none of its `next` or `random` references lead into the original: a true deep copy.
+
+`flatMap` on an optional, from [map and flatMap on optionals](/dsa/learn/swift-optional-map), handles the `nil` cases: if `node.random` is `nil`, the copy's `random` is `nil` too; otherwise it's the looked-up copy.
+
+Time is O(n): two passes with O(1) dictionary operations on average. Extra space is O(n) for the dictionary, on top of the n new nodes the answer needs anyway.
+
+<Callout kind="note" title="The same recipe clones any graph">
+"Make a copy of every object, remember which copy belongs to which original, then wire the copies up using that map" works for any web of references, including ones with cycles. You'll meet it again for cloning graphs in Part VI.
+</Callout>
+
+## Approach 2: weave the copies in
+
+There's a clever way to drop the dictionary. Its only job is to answer "where is the copy of this node?". What if every copy sat right **after** its original in the list? Then the copy of `node` would simply be `node.next`.
+
+1. **Weave.** Insert a copy after each original: `7 -> 7' -> 13 -> 13' -> 11 -> 11' -> …`
+2. **Set random.** For each original `node`, its copy is `node.next`, and the copy of its random target is `node.random.next`. So `node.next.random = node.random?.next`.
+3. **Unweave.** Separate the two lists again, restoring every original's `next` and linking the copies together.
+
+```swift run
+final class Node {
+    var value: Int
+    var next: Node?
+    weak var random: Node?
+
+    init(_ value: Int) {
+        self.value = value
+    }
+}
+
+func makeList(_ values: [Int], randoms: [Int?]) -> Node? {
+    let nodes = values.map { Node($0) }
+    for i in nodes.indices {
+        if i + 1 < nodes.count {
+            nodes[i].next = nodes[i + 1]
+        }
+        if let target = randoms[i] {
+            nodes[i].random = nodes[target]
+        }
+    }
+    return nodes.first
+}
+
+func describe(_ head: Node?) -> String {
+    var parts: [String] = []
+    var current = head
+    while let node = current {
+        let target = node.random.map { String($0.value) } ?? "nil"
+        parts.append("\(node.value)(r:\(target))")
+        current = node.next
+    }
+    parts.append("nil")
+    return parts.joined(separator: " -> ")
+}
+
+func copyByWeaving(_ head: Node?) -> Node? {
+    guard let head else { return nil }
+
+    // 1. Weave: original, copy, original, copy, ...
+    var current: Node? = head
+    while let node = current {
+        let copy = Node(node.value)
+        copy.next = node.next
+        node.next = copy
+        current = copy.next
+    }
+
+    // 2. Each copy's random is the copy of its original's random: the node right after it
+    current = head
+    while let node = current {
+        let copy = node.next!
+        copy.random = node.random?.next
+        current = copy.next
+    }
+
+    // 3. Unweave into two separate lists
+    let copyHead = head.next!
+    current = head
+    while let node = current {
+        let copy = node.next!
+        node.next = copy.next               // the original skips its copy
+        copy.next = copy.next?.next         // the copy skips the next original
+        current = node.next
+    }
+    return copyHead
+}
+
+let original = makeList([7, 13, 11, 10, 1], randoms: [nil, 0, 4, 2, 0])
+let copy = copyByWeaving(original)
+print(describe(original))
+print(describe(copy))
+print(copy === original, copy!.next!.random === original)
+print(describe(copyByWeaving(makeList([5], randoms: [0]))))
+```
+
+```output
+7(r:nil) -> 13(r:7) -> 11(r:1) -> 10(r:11) -> 1(r:7) -> nil
+7(r:nil) -> 13(r:7) -> 11(r:1) -> 10(r:11) -> 1(r:7) -> nil
+false false
+5(r:5) -> nil
+```
+
+The original list comes out exactly as it went in, and the copy's `13` node points at the copy's `7`, not the original's. A node whose `random` points at itself is copied correctly too.
+
+Step 2 is why the weaving works: `node.random?.next` reaches the copy of the random target in one step, wherever it is. During steps 1 to 3 every copy is in the woven chain, so the weak `random` references to copies always have a strong owner.
+
+Time is still O(n), three passes. Extra space beyond the answer's own nodes is O(1): no dictionary.
+
+## Comparing the two
+
+| | Dictionary | Weaving |
+| --- | --- | --- |
+| Extra space (beyond the copy) | O(n) | O(1) |
+| Changes the original while running | no | yes, then restores it |
+| Generalises to graphs | yes | no: it needs a `next` chain to weave into |
+| Easy to get right | very | fiddly |
+
+In practice, reach for the dictionary first. It's clearer, it never touches the input, and it's the one that grows into graph cloning. Weaving is the answer to "now do it without the extra space".
+
+<Callout kind="gotcha" title="Common mistakes">
+- **Keying by value.** Two nodes can both hold 7. Use `ObjectIdentifier(node)`, never `node.value`, as the dictionary key.
+- **Setting random in the first pass.** Its target's copy may not exist yet. Create every copy first.
+- **A strong `random` in Swift.** Backward random references then form retain cycles and the list leaks. The `next` chain owns the nodes; `random` should be `weak`.
+- **Forgetting to unweave the original.** Leaving copies woven into the caller's list is a nasty surprise. Restore every `next`.
+</Callout>
+
+```cards
+- id: ll-deep-copy
+  front: "What makes a copy of a list with random references a deep copy?"
+  back: "Every `next` and `random` in the copy points at copied nodes, never at nodes of the original."
+- id: ll-random-dictionary
+  front: "How does the dictionary approach copy a list with random references?"
+  back: "Pass 1 creates a copy of every node in a dictionary keyed by `ObjectIdentifier(original)`. Pass 2 sets each copy's `next` and `random` by looking up the copies of the original's targets."
+- id: ll-random-weave
+  front: "In the weaving approach, how do you find the copy of a node's random target?"
+  back: "Each copy sits right after its original, so it's `node.random?.next`."
+- id: ll-random-weak
+  front: "Why should `random` be `weak` in Swift?"
+  back: "A random reference pointing backwards would form a retain cycle with the `next` chain. The `next` chain already owns every node, so `random` doesn't need to."
+```
+
+```quiz
+- id: q1
+  type: mcq
+  prompt: "Why can't you set every copy's `random` during the first walk over the original list?"
+  options:
+    - "`random` is weak, so it can't be set yet"
+    - "The copy of a random target further down the list hasn't been created yet"
+    - "Dictionaries can't be read and written in the same loop"
+    - "Swift doesn't allow two optional properties to change in one loop"
+  answer: 1
+  explain: "A node's `random` may point forwards. Its target's copy only exists once the walk reaches that node, so the random links are set in a second pass."
+- id: q2
+  type: truefalse
+  prompt: "Using `node.value` as the dictionary key works as long as the copy prints correctly."
+  answer: false
+  explain: "If two nodes hold the same value, they share one key, and both originals map to the same copy. The output might even look right in small tests. Key by `ObjectIdentifier(node)`."
+- id: q3
+  type: blank
+  prompt: "In the weaving approach, complete the line that sets a copy's random reference."
+  code: |
+    let copy = node.next!
+    copy.random = ___
+  answers:
+    - ["node.random?.next", "node.random?.next ?? nil"]
+  explain: "The copy of any original sits straight after it, so the copy of `node.random` is `node.random?.next`, or `nil` if `node.random` is `nil`."
+- id: q4
+  type: output
+  prompt: "What does this print?"
+  code: |
+    final class Node {
+        let name: String
+        var next: Node?
+        weak var random: Node?
+        init(_ name: String) { self.name = name }
+        deinit { print("freed", name) }
+    }
+
+    do {
+        let a = Node("a")
+        let b = Node("b")
+        a.next = b
+        b.random = a
+    }
+    print("done")
+  answer: |
+    freed a
+    freed b
+    done
+  explain: "`b.random` is weak, so the only strong reference to `a` is the local constant. When the scope ends, `a` is freed, which releases `b`. With a strong `random`, neither would be freed."
+- id: q5
+  type: match
+  prompt: "Match each approach to its extra space, not counting the copied nodes."
+  pairs:
+    - ["Dictionary from old to new", "O(n)"]
+    - ["Weaving copies into the list", "O(1)"]
+  explain: "The dictionary stores one entry per node. Weaving keeps the copies inside the list itself until the end, so it needs only a few references."
+```

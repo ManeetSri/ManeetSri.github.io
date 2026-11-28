@@ -1,0 +1,275 @@
+## Why it matters
+
+Type "sw" into a search box and it offers "swiftui", "swift" and "sweater" before you've finished: the three most popular searches starting with what you typed, updated with every keystroke, and learning from what people actually search for. That's an **autocomplete system**, and "design search autocomplete" is a classic hard interview question. In [Autocomplete](/dsa/learn/trie-autocomplete) you built the core: a trie, a walk to the prefix's node, and ranked completions below it. This lesson turns that into a system that answers every keystroke instantly and keeps learning, and it's about one trade-off above all: do the ranking work when someone reads, or when the counts change?
+
+## Requirements
+
+- **Suggestions:** the 3 most searched phrases that start with the text typed so far. **Ranking:** higher count first; equal counts alphabetically.
+- **Typing:** one character at a time; each keystroke wants new suggestions.
+- **Learning:** when the user submits a search, that phrase's count goes up by one. A phrase never seen before joins with a count of 1.
+- **Sizes:** tens of thousands of phrases, and far more keystrokes than submits.
+
+The classic version of the question marks the end of a search by typing `#`. In Swift, a separate `submit()` method is clearer than a magic character.
+
+## The API
+
+```swift
+final class SearchEngine {
+    init(history: [String: Int], limit: Int = 3)
+    func type(_ character: Character) -> [String]   // suggestions for the new query
+    func submit()                                   // count the query, start a new one
+    func clear()                                    // start a new query, counting nothing
+}
+```
+
+A class, because the engine is one long-lived object that many parts of an app talk to, and it holds a tree of class nodes anyway.
+
+## Design A: collect on demand
+
+The trie from the earlier lesson stores a count at each phrase's last node. For each keystroke: walk to the prefix's node, collect every phrase below it with its count, sort by the ranking, keep 3. Submitting only updates one count.
+
+That's simple, and submits are cheap. But a one-letter prefix matches a large slice of every phrase there is, and the user types one letter at the start of **every** search. With 50,000 phrases, the first keystroke alone might visit tens of thousands of nodes and sort thousands of phrases, to show 3.
+
+## Design B: cache the answer at every node
+
+Flip it. Let every node keep its own answer, the best 3 phrases below it with their counts, best first. Then a keystroke is a single step down the trie, and the suggestions are already sitting at the node.
+
+The cost moves to updates. When a phrase's count changes, which caches can change? A phrase only appears in the caches of its own prefixes, and those are **exactly the nodes on its path** from the root. And since counts only go up, the phrase can only rise in rank: no other phrase's position relative to the others changes. So an update walks the phrase's path, and at each node: remove the phrase's old entry if it's there, add it with its new count, re-sort (at most 4 entries), and drop the worst if there are more than 3.
+
+Here are both designs over the same phrases, checking that they agree and counting how many nodes design A visits:
+
+```swift run
+final class Node {
+    var children: [Character: Node] = [:]
+    var count = 0                                      // searches of the phrase ending here (0: none)
+    var best: [(phrase: String, count: Int)] = []      // cached top k below this node, best first
+}
+
+final class Autocomplete {
+    private let root = Node()
+    private let k: Int
+    var nodesVisited = 0
+
+    init(k: Int) {
+        self.k = k
+    }
+
+    private func ranksHigher(_ a: (phrase: String, count: Int), _ b: (phrase: String, count: Int)) -> Bool {
+        a.count != b.count ? a.count > b.count : a.phrase < b.phrase
+    }
+
+    /// Adds searches of `phrase`, then refreshes the cache on every node of its path.
+    func record(_ phrase: String, times: Int = 1) {
+        var node = root
+        var path = [root]
+        for character in phrase {
+            if node.children[character] == nil {
+                node.children[character] = Node()
+            }
+            node = node.children[character]!
+            path.append(node)
+        }
+        node.count += times
+        for step in path {
+            step.best.removeAll { $0.phrase == phrase }      // at most k entries: cheap
+            step.best.append((phrase, node.count))
+            step.best.sort(by: ranksHigher)
+            if step.best.count > k {
+                step.best.removeLast()
+            }
+        }
+    }
+
+    private func node(for prefix: String) -> Node? {
+        var node = root
+        for character in prefix {
+            guard let next = node.children[character] else { return nil }
+            node = next
+        }
+        return node
+    }
+
+    /// Design A: collect every phrase below the prefix, sort, keep k
+    func collected(_ prefix: String) -> [String] {
+        guard let start = node(for: prefix) else { return [] }
+        var found: [(phrase: String, count: Int)] = []
+        var stack = [(node: start, text: prefix)]
+        while let (current, text) = stack.popLast() {
+            nodesVisited += 1
+            if current.count > 0 {
+                found.append((text, current.count))
+            }
+            for (character, child) in current.children {
+                stack.append((child, text + String(character)))
+            }
+        }
+        found.sort(by: ranksHigher)
+        return found.prefix(k).map(\.phrase)
+    }
+
+    /// Design B: the answer is already cached at the prefix's node
+    func cached(_ prefix: String) -> [String] {
+        nodesVisited += 1
+        return node(for: prefix)?.best.map(\.phrase) ?? []
+    }
+}
+
+let history = ["swift": 50, "swiftui": 90, "switch": 20, "sweater": 50, "struct": 70,
+               "string": 65, "stride": 15, "set": 40, "sort": 55, "sorted": 30, "stack": 45]
+let search = Autocomplete(k: 3)
+for phrase in history.keys.sorted() {
+    search.record(phrase, times: history[phrase]!)
+}
+
+for prefix in ["s", "sw", "st"] {
+    search.nodesVisited = 0
+    let a = search.collected(prefix)
+    let visitedA = search.nodesVisited
+    search.nodesVisited = 0
+    let b = search.cached(prefix)
+    print(prefix, a, "visited \(visitedA);", b == a ? "cache agrees" : "cache differs")
+}
+
+search.record("switch", times: 31)                     // switch: 20 + 31 = 51
+print(search.cached("sw"), search.cached("swi"), search.cached("x"))
+```
+
+```output
+s ["swiftui", "struct", "string"] visited 35; cache agrees
+sw ["swiftui", "sweater", "swift"] visited 14; cache agrees
+st ["struct", "string", "stack"] visited 13; cache agrees
+["swiftui", "switch", "sweater"] ["swiftui", "switch", "swift"] []
+```
+
+What to notice:
+
+- **The caches agree with the full collection** for every prefix, and "sweater" beats "swift" on the tie at 50 because it comes first alphabetically.
+- **Design A visited 35 nodes** for "s" with only eleven phrases. With 50,000 phrases it would be tens of thousands, on every first keystroke. Design B reads one node's list, whatever the size.
+- **The update**: 31 more searches lift "switch" to 51, and it rises above "sweater" in the "sw" cache and above "swift" in the "swi" cache. Only nodes on the path s, w, i, t, c, h were touched.
+- Iterating `children` (a dictionary) visits nodes in an unpredictable order, which is fine here because both designs end with the same total ranking.
+
+Watch a prefix walk on a few of these phrases:
+
+```visual trie
+words: [swift, swiftui, switch, sweater, struct]
+prefix: sw
+```
+
+## Typing one keystroke at a time
+
+Walking from the root on each keystroke costs O(length of the query), and the walk repeats work: "swi" walks through "sw", which the previous keystroke already found. So the engine keeps the **current node** between keystrokes:
+
+```swift
+func type(_ character: Character) -> [String] {
+    query.append(character)
+    current = current?.children[character]     // one step; nil once nothing matches
+    return current?.best.map(\.phrase) ?? []
+}
+```
+
+`current` is an optional: once the query leaves the trie ("swx"), no longer query can come back into it, so it stays `nil`, and every later keystroke answers `[]` at once until `submit()` or `clear()` resets it to the root. Each keystroke is now O(1) plus copying 3 strings.
+
+## The trade-offs
+
+| Design | Keystroke | Submit | Extra memory |
+| --- | --- | --- | --- |
+| A: trie, collect on demand | O(m log m) for m matching phrases | O(L) | a count per phrase |
+| B: trie, top-k cached at every node | O(1) plus copying k phrases | O(L × k log k) | k entries per node |
+| C: sorted array of phrases | O(log n) to find the range, then O(m) to rank it | O(n) to insert a new phrase | none beyond the array |
+
+(L is the length of the phrase; n the number of phrases.) Design C uses an idea from Part IV: in sorted order, all phrases starting with "sw" sit next to each other, so two binary searches find the range. It's compact, but ranking the range still touches every match.
+
+Design B wins for a search box, where keystrokes vastly outnumber submits. Its cost is memory: every node stores up to k strings. That's the trade-off to name in an interview, and it's worth estimating.
+
+## How much memory?
+
+Take 50,000 phrases averaging 12 characters. Shared prefixes save a lot, but in the worst case that's 600,000 nodes. With k = 3, each node caches 3 entries of a string (16 bytes in Swift) and a count (8 bytes): 72 bytes, so about 43 MB of caches at most, before the dictionaries of children. Real phrase sets share prefixes heavily, so the true number is usually several times smaller, but it's the right order of magnitude to reason with.
+
+Two Swift details make it cheaper than it looks:
+
+- **Copies of a string share storage.** The same phrase cached at 12 nodes is one buffer of characters with 12 references to it, not 12 copies of the text.
+- **Small strings live inline.** A string of up to 15 UTF-8 bytes fits entirely inside its 16 bytes, with no separate allocation at all, and most search phrases are that short.
+
+If memory were still too tight, each cache could store a phrase **number** (an index into one array of phrases) instead of the string: 8 bytes per entry. And caching only on the first few levels of the trie, where prefixes are short and match the most phrases, gets most of the speed for a fraction of the memory: deeper nodes have few phrases below them, so collecting on demand there is cheap.
+
+<Callout kind="warning" title="When counts can go down">
+The "only update the path" rule relies on counts only rising. If phrases can be deleted, or counts decay over time so that old trends fade, a phrase can fall out of a node's top k, and the node can't know what should replace it without looking below. Then each node on the path must be recomputed from its children's caches plus its own phrase, from the bottom up: still only the nodes on one path, but more work at each.
+</Callout>
+
+## In an iOS app
+
+- **Don't search on every keystroke from the main thread** if each search is slow. Wait until typing pauses for a moment (a **debounce**), and do the work in the background. You'll meet debouncing in [iOS-flavoured DSA questions](/dsa/learn/int-ios-flavoured).
+- **Personalise** by keeping a small trie of the user's own searches and merging its top results with the global ones, much as the feed merges timelines.
+- **Cap everything:** phrase length, the number of phrases kept, and the number of suggestions shown. A search box that shows 50 suggestions helps nobody.
+
+<Callout kind="gotcha" title="Common mistakes">
+- **Re-walking from the root on every keystroke.** Correct, but it ignores the work the last keystroke did. Keep the current node.
+- **Forgetting the tie-break.** "Top 3 by count" isn't a full ordering. Without the alphabetical tie-break, suggestions shuffle between runs.
+- **Updating only the phrase's last node.** Every prefix's cache can include the phrase, so every node on the path needs the update, including the root, which answers the empty prefix.
+- **Not resetting the current node** after `submit()`, so the next search starts from the end of the last one.
+</Callout>
+
+## Practice
+
+**Ranked search suggestions** builds the engine: `type(_:)`, `submit()`, `clear()` and `suggestions(for:)`, with a configurable limit. Its tests replay thousands of keystrokes against a model that filters and sorts every phrase, and then type 40,000 characters over 20,000 phrases.
+
+```cards
+- id: topk-cache
+  front: "How does an autocomplete trie answer each keystroke in O(1)?"
+  back: "Every node caches its best k phrases (with counts), best first, and the engine keeps the current node between keystrokes, so each keystroke is one step down and the answer is already there."
+- id: path-update
+  front: "When a phrase's count rises, which caches need updating, and why only those?"
+  back: "Only the nodes on the phrase's path. A phrase appears only in its prefixes' caches, and since only its count rose, the others keep their relative order."
+- id: read-vs-write
+  front: "What's the trade-off between collecting on demand and caching top k per node?"
+  back: "Collecting makes updates cheap but each keystroke costs O(matches); caching makes keystrokes O(1) but updates cost O(L × k log k) and every node stores k phrases."
+- id: no-match-stays
+  front: "Why can an autocomplete engine stop looking once the query has no trie node?"
+  back: "No phrase starts with the query, so no longer query can match either: the current node stays nil until the query is reset."
+```
+
+```quiz
+- id: q1
+  type: output
+  prompt: "What does this ranking print?"
+  code: |
+    var found = [("swift", 5), ("sweater", 5), ("swiftui", 9), ("switch", 2)]
+    found.sort { $0.1 != $1.1 ? $0.1 > $1.1 : $0.0 < $1.0 }
+    print(found.prefix(3).map { $0.0 })
+  answer: "[\"swiftui\", \"sweater\", \"swift\"]"
+  explain: "Highest count first puts swiftui (9) on top. sweater and swift tie at 5, so they're ordered alphabetically, and \"sweater\" < \"swift\" because e comes before i."
+- id: q2
+  type: truefalse
+  prompt: "When a phrase's count goes up, only the cached lists on that phrase's path from the root can change."
+  answer: true
+  explain: "A phrase can only be in the caches of its own prefixes, which are the nodes on its path. Everywhere else, nothing it could appear in has changed."
+- id: q3
+  type: bigo
+  prompt: "With top-k caches and the current node kept between keystrokes, what does one keystroke cost (treating k as a small constant)?"
+  answer: "O(1)"
+  explain: "One dictionary step to the child and copying at most k phrases, however many phrases exist."
+- id: q4
+  type: multi
+  prompt: "Which changes break the rule \"update only the caches on the phrase's path, inserting it and dropping the worst\"? Choose all that apply."
+  options:
+    - "Counts can decrease"
+    - "Phrases can be deleted"
+    - "A phrase that has never been seen is submitted"
+    - "The number of suggestions shown grows at run time"
+  answer: [0, 1, 3]
+  explain: "If a phrase falls or disappears, a node can't know what replaces it without looking below. If k grows, caches lack the extra entries. A brand-new phrase is fine: it's offered to every cache on its path like any other increase."
+- id: q5
+  type: mcq
+  prompt: "Which design suits a search box best, where keystrokes vastly outnumber submits?"
+  options:
+    - "A trie that collects and sorts completions on every keystroke"
+    - "A trie with the top k cached at every node"
+    - "An array of phrases scanned with hasPrefix on every keystroke"
+    - "A dictionary from each full phrase to its count"
+  answer: 1
+  explain: "Caching moves the work to submits, which are rare, and makes every keystroke a single step. The other designs do work proportional to the number of matching phrases on every keystroke."
+- id: q6
+  type: recall
+  prompt: "Explain why the engine keeps the current node between keystrokes instead of walking from the root each time."
+  model: "Each keystroke extends the previous query by one character, so the new node is a child of the previous one: one step instead of a walk of the whole query. And once the query has no node, nothing longer can match, so later keystrokes return no suggestions at once until submit or clear resets the node to the root."
+```

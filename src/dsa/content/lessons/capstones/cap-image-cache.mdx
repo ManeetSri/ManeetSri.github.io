@@ -1,0 +1,537 @@
+## Why it matters
+
+Almost every iOS app shows remote images: avatars, product photos, a feed. Downloading and decoding an image is slow, and a decoded image is big, so apps keep recently shown images in memory and throw out the ones least likely to be needed. SwiftUI's `AsyncImage` doesn't keep decoded images for you: scroll a cell away and back, and it loads and decodes again. In this project you build the cache that fixes that: an **LRU cache with a byte budget**, isolated in an **actor**, that shares downloads already in progress, downsamples big photos, and empties itself when the system runs low on memory. Then you compare it honestly with Foundation's `NSCache`. It's the iOS interview question from [iOS-flavoured DSA questions](/dsa/learn/int-ios-flavoured), built for real.
+
+## What you'll build
+
+- `LRUStore<Key, Value>`: a generic least-recently-used store with a budget in bytes, O(1) per operation, with index-based nodes.
+- `ImagePipeline`: an actor in front of it that returns cached images, joins downloads already in flight, downloads and downsamples otherwise, and trims itself on memory warnings.
+- `CachedImage(url:)`: a SwiftUI view that asks the pipeline for an image at the size it's shown.
+- A photo grid of a few hundred images to test it, an `NSCache` version of the same grid, and notes on how they differ.
+
+Budget about two hours.
+
+## Before you start
+
+- The structure: [LRU cache](/dsa/learn/ll-lru-cache), [Doubly linked and circular lists](/dsa/learn/ll-doubly-circular), [Index-based nodes vs class nodes](/dsa/learn/fs-index-based-nodes), and [LRU and LFU caches revisited](/dsa/learn/ds-caches).
+- The policy: [Cache policies: LRU, LFU and FIFO](/dsa/learn/rand-cache-policies).
+- The interview version with a byte budget: [iOS-flavoured DSA questions](/dsa/learn/int-ios-flavoured).
+- Concurrency: [Why shared mutable state breaks](/dsa/learn/cc-data-races), [Actors as thread-safe caches](/dsa/learn/cc-actors) and [Sendable](/dsa/learn/cc-sendable).
+- Measuring: [Instruments: Time Profiler and Allocations](/dsa/learn/fs-instruments).
+
+## The architecture
+
+```text
+ CachedImage(url:)  ──image(for: key)──▶  ImagePipeline (actor)
+   .task(id: url)                          │
+                                           ├─ 1. memory: LRUStore<ImageKey, UIImage>      hit ─▶ return
+                                           ├─ 2. in flight: [ImageKey: Task<UIImage, Error>]  ─▶ await it
+                                           └─ 3. load: download ─▶ downsample ─▶ cost ─▶ store ─▶ return
+                                                   (in a detached task, off the actor)
+
+ memory warning notification ─────────────▶ pipeline.trim(toFraction: 0.5)
+```
+
+- **The key is the URL and the pixel size.** The same photo shown as a 100-point thumbnail and full screen is two different decoded images with very different costs, so `ImageKey` holds both.
+- **Cost is the decoded size**, `bytesPerRow × height` of the bitmap, not the size of the downloaded file. A 2 MB JPEG of 4000 × 3000 pixels decodes to 48 MB.
+- **The store is a plain struct; the actor owns it.** The data structure stays easy to test on its own, and the actor provides the thread safety. That split is the same as "pure model, thin view" in the visualiser.
+
+```text title="ImageCache/"
+ImageCacheCore/                   a local package
+  Sources/ImageCacheCore/
+    LRUStore.swift                generic, byte budget, index-based nodes
+    ImagePipeline.swift           the actor: memory, in-flight tasks, loading, trimming
+    ImageLoader.swift             protocol ImageLoader, so tests can inject a fake
+  Tests/ImageCacheCoreTests/
+ImageCacheApp/
+  CachedImage.swift
+  Downsampler.swift               ImageIO thumbnails, cost of a bitmap
+  FeedView.swift                  LazyVGrid of 500 remote images
+  NSCacheFeedView.swift           the same grid on NSCache, for comparison
+```
+
+## Milestones
+
+### 1. The store
+
+Write `LRUStore` as in the key code below: a dictionary from key to slot, and a doubly linked list of slots in order of use, held in arrays. Inserting evicts from the least recent end **while** the total is over budget, which may evict nothing or several entries. Something bigger than the whole budget is refused: caching it would evict everything, itself included.
+
+- **Acceptance:** a model-based test against the simple model from [iOS-flavoured DSA questions](/dsa/learn/int-ios-flavoured) agrees over 10,000 seeded operations; every operation is O(1) apart from one step per eviction.
+- **Exercises:** the dictionary plus doubly linked list design, generic and without sentinel values.
+
+### 2. The actor, with shared downloads
+
+Wrap the store in `actor ImagePipeline`. Before loading, record a `Task` for the key in an in-flight table, so a second request for the same image awaits the first download instead of starting another. Remove the task when it finishes, successful or not.
+
+- **Acceptance:** 50 concurrent requests for 5 images cause exactly 5 loads, on every run; a failed load isn't cached, and the next request retries.
+- **Exercises:** actor isolation, and reentrancy: the state can change across every `await`.
+
+### 3. Real images, downsampled
+
+Download with `URLSession`, then decode with ImageIO straight to the pixel size the view needs. Compute the cost from the bitmap.
+
+- **Acceptance:** a 4000 × 3000 photo shown in a 100-point cell on a 3× screen costs about 270 KB, not 48 MB.
+- **Exercises:** measuring cost correctly. A budget is only as good as the costs you feed it.
+
+### 4. The view and the feed
+
+Write `CachedImage` and a `LazyVGrid` of 500 images. Show a debug overlay with hits, misses, the total cost and the budget.
+
+- **Acceptance:** scrolling back up shows images instantly (hits climb, misses don't); in Instruments' Allocations, memory levels off near the budget instead of growing with every image.
+- **Exercises:** hit rate, the number that decides whether a cache is worth having.
+
+### 5. Memory warnings, and NSCache
+
+Trim to half the budget when the system sends a memory warning (in the Simulator, **Debug ▸ Simulate Memory Warning**). Then build the same grid on `NSCache<NSURL, UIImage>` with `totalCostLimit` set to the same budget, and compare.
+
+- **Acceptance:** a simulated warning halves the cache's total; you've written down three differences you observed between your cache and `NSCache`.
+- **Exercises:** eviction policy as a design decision, not a detail.
+
+### 6. Measure the policy
+
+Log every request's key for a scrolling session, then replay the log against LRU and FIFO stores of several budgets and chart the hit rates.
+
+- **Acceptance:** you can name the budget beyond which a bigger cache barely improves the hit rate for your feed.
+- **Exercises:** evaluating a cache with a trace, as in [Cache policies: LRU, LFU and FIFO](/dsa/learn/rand-cache-policies).
+
+## Key code: an LRU store with a byte budget
+
+The store keeps its nodes in arrays: `keys`, `values`, `costs`, `previous` and `next`, with slot 0 as the head and slot 1 as the tail. A generic store can't make dummy nodes the way [LRU cache](/dsa/learn/ll-lru-cache) did with empty strings, because there's no "empty" value of an unknown type; slots with `nil` keys solve that. The actor around it stands in for the pipeline, with a fake decoder.
+
+```swift run
+/// A least-recently-used store with a budget in bytes. Entries sit in arrays and link to each other
+/// by index, so a generic Key and Value need no dummy values: slot 0 is the head, slot 1 the tail.
+struct LRUStore<Key: Hashable, Value> {
+    let budget: Int
+    let promotesOnRead: Bool                 // false turns it into a FIFO store, for comparison
+    private(set) var totalCost = 0
+    private(set) var evicted: [Key] = []
+    private var slotOf: [Key: Int] = [:]
+    private var keys: [Key?] = [nil, nil]
+    private var values: [Value?] = [nil, nil]
+    private var costs = [0, 0]
+    private var previous = [0, 0]
+    private var next = [1, 1]                // head -> tail
+    private var freeSlots: [Int] = []
+
+    init(budget: Int, promotesOnRead: Bool = true) {
+        self.budget = budget
+        self.promotesOnRead = promotesOnRead
+    }
+
+    private mutating func unlink(_ slot: Int) {
+        next[previous[slot]] = next[slot]
+        previous[next[slot]] = previous[slot]
+    }
+
+    private mutating func linkAtFront(_ slot: Int) {
+        previous[slot] = 0
+        next[slot] = next[0]
+        previous[next[0]] = slot
+        next[0] = slot
+    }
+
+    /// O(1): a hit moves the entry to the front
+    mutating func value(for key: Key) -> Value? {
+        guard let slot = slotOf[key] else { return nil }
+        if promotesOnRead {
+            unlink(slot)
+            linkAtFront(slot)
+        }
+        return values[slot]
+    }
+
+    /// O(1) amortised, plus one step per eviction. Refuses anything bigger than the whole budget.
+    @discardableResult
+    mutating func insert(_ value: Value, for key: Key, cost: Int) -> Bool {
+        guard cost <= budget else { return false }
+        if let slot = slotOf[key] {                       // an update: replace in place
+            totalCost += cost - costs[slot]
+            values[slot] = value
+            costs[slot] = cost
+            unlink(slot)
+            linkAtFront(slot)
+        } else {
+            let slot: Int
+            if let reused = freeSlots.popLast() {
+                slot = reused
+                keys[slot] = key
+                values[slot] = value
+                costs[slot] = cost
+            } else {
+                slot = keys.count
+                keys.append(key)
+                values.append(value)
+                costs.append(cost)
+                previous.append(0)
+                next.append(0)
+            }
+            slotOf[key] = slot
+            linkAtFront(slot)
+            totalCost += cost
+        }
+        trim(toCost: budget)
+        return true
+    }
+
+    /// Evicts least recently used entries until the total fits. A memory warning calls this too.
+    mutating func trim(toCost limit: Int) {
+        while totalCost > limit {
+            let oldest = previous[1]
+            unlink(oldest)
+            totalCost -= costs[oldest]
+            evicted.append(keys[oldest]!)
+            slotOf[keys[oldest]!] = nil
+            keys[oldest] = nil
+            values[oldest] = nil                          // release the image now, not later
+            freeSlots.append(oldest)
+        }
+    }
+
+    var keysByRecency: [Key] {
+        var result: [Key] = []
+        var slot = next[0]
+        while slot != 1 {
+            result.append(keys[slot]!)
+            slot = next[slot]
+        }
+        return result
+    }
+}
+
+/// Stands in for loading and decoding an image: slow in real life, so the cache matters
+func decode(_ name: String) async -> String {
+    "<\(name) pixels>"
+}
+
+actor ImageCache {
+    private var store: LRUStore<String, String>
+    private(set) var decodes = 0
+
+    init(budgetKB: Int) {
+        store = LRUStore(budget: budgetKB)
+    }
+
+    func image(named name: String, sizeKB: Int) async -> String {
+        if let cached = store.value(for: name) {
+            return cached
+        }
+        decodes += 1
+        let image = await decode(name)
+        store.insert(image, for: name, cost: sizeKB)
+        return image
+    }
+
+    func didReceiveMemoryWarning() {
+        store.trim(toCost: store.budget / 2)
+    }
+
+    var summary: String {
+        "\(store.keysByRecency) \(store.totalCost)KB, evicted \(store.evicted)"
+    }
+}
+
+// A feed: an avatar (10 KB) shown with every post, posts of 30 KB, and one 150 KB panorama
+let cache = ImageCache(budgetKB: 100)
+let sizes = ["avatar": 10, "post1": 30, "post2": 30, "post3": 30, "post4": 30, "panorama": 150]
+for name in ["avatar", "post1", "post2", "avatar", "post3", "post4", "avatar", "post1", "panorama"] {
+    _ = await cache.image(named: name, sizeKB: sizes[name]!)
+}
+print(await cache.summary)
+print("decodes:", await cache.decodes)
+await cache.didReceiveMemoryWarning()
+print("after memory warning:", await cache.summary)
+
+// The same kind of feed, longer, with and without moving entries on a hit
+func hits(promotesOnRead: Bool) -> Int {
+    var store = LRUStore<String, Int>(budget: 100, promotesOnRead: promotesOnRead)
+    var count = 0
+    for post in 1...20 {
+        for name in ["avatar", "post\(post)"] {
+            if store.value(for: name) != nil {
+                count += 1
+            } else {
+                store.insert(0, for: name, cost: name == "avatar" ? 10 : 30)
+            }
+        }
+    }
+    return count
+}
+print("hits out of 40, LRU:", hits(promotesOnRead: true), "FIFO:", hits(promotesOnRead: false))
+```
+
+```output
+["post1", "avatar", "post4", "post3"] 100KB, evicted ["post1", "post2"]
+decodes: 7
+after memory warning: ["post1", "avatar"] 40KB, evicted ["post1", "post2", "post3", "post4"]
+hits out of 40, LRU: 19 FIFO: 15
+```
+
+What to notice:
+
+- **Inserting `post4` evicted `post1`, not the avatar.** The avatar had been used one request earlier, so it was at the front. Using `post1` again later brought it back, and this time `post2` went.
+- **The panorama was decoded but not cached.** At 150 KB it's bigger than the whole budget. Caching it would empty the cache and then evict the panorama itself. That's the clarifying question from the interview lesson, answered: show it, don't keep it. In the app, consider downsampling such images harder instead.
+- **The memory warning** evicted from the least recent end until the total was at most 50 KB.
+- **LRU beat FIFO, 19 hits to 15**, on a feed where one small image appears next to every post. FIFO evicts the avatar whenever it becomes the oldest insertion, however recently it was shown. LRU never does. The only code difference is whether a hit moves the entry to the front.
+- **`evicted` grows forever** here so the output can show it. In the app, count evictions instead.
+
+## The pipeline and the view
+
+```swift title="ImagePipeline.swift"
+import UIKit
+
+struct ImageKey: Hashable, Sendable {
+    let url: URL
+    let maxPixels: Int
+}
+
+protocol ImageLoader: Sendable {
+    func image(for key: ImageKey) async throws -> UIImage
+}
+
+actor ImagePipeline {
+    static let shared = ImagePipeline(loader: NetworkLoader(), budget: 50 * 1024 * 1024)
+
+    private var memory: LRUStore<ImageKey, UIImage>
+    private var inFlight: [ImageKey: Task<UIImage, Error>] = [:]
+    private let loader: any ImageLoader
+    private(set) var hits = 0
+    private(set) var misses = 0
+
+    init(loader: any ImageLoader, budget: Int) {
+        self.loader = loader
+        self.memory = LRUStore(budget: budget)
+    }
+
+    func image(for key: ImageKey) async throws -> UIImage {
+        if let image = memory.value(for: key) {
+            hits += 1
+            return image
+        }
+        if let running = inFlight[key] {
+            return try await running.value              // someone else is already loading it
+        }
+        misses += 1
+        let loader = self.loader
+        let task = Task.detached(priority: .userInitiated) {
+            try await loader.image(for: key)            // download and decode off the actor
+        }
+        inFlight[key] = task                            // recorded before the first await
+        defer { inFlight[key] = nil }                   // success or failure: no longer in flight
+        let image = try await task.value
+        memory.insert(image, for: key, cost: Self.cost(of: image))
+        return image
+    }
+
+    func trim(toFraction fraction: Double) {
+        memory.trim(toCost: Int(Double(memory.budget) * fraction))
+    }
+
+    static func cost(of image: UIImage) -> Int {
+        guard let bitmap = image.cgImage else { return 1 }
+        return bitmap.bytesPerRow * bitmap.height
+    }
+}
+```
+
+The download runs in a **detached** task. A plain `Task { }` created inside an actor method inherits the actor, so the decoding, which is slow synchronous work, would run on the actor and hold up every other request. Detached, it runs elsewhere, and the actor is busy only for the dictionary lookups.
+
+Downsampling with ImageIO decodes straight to the small size, without ever creating the full bitmap:
+
+```swift title="Downsampler.swift"
+import ImageIO
+import UIKit
+
+struct NetworkLoader: ImageLoader {
+    func image(for key: ImageKey) async throws -> UIImage {
+        let (data, _) = try await URLSession.shared.data(from: key.url)
+        guard let source = CGImageSourceCreateWithData(data as CFData, [kCGImageSourceShouldCache: false] as CFDictionary),
+              let bitmap = CGImageSourceCreateThumbnailAtIndex(source, 0, [
+                  kCGImageSourceCreateThumbnailFromImageAlways: true,
+                  kCGImageSourceCreateThumbnailWithTransform: true,
+                  kCGImageSourceShouldCacheImmediately: true,
+                  kCGImageSourceThumbnailMaxPixelSize: key.maxPixels,
+              ] as CFDictionary)
+        else {
+            throw URLError(.cannotDecodeContentData)
+        }
+        return UIImage(cgImage: bitmap)
+    }
+}
+```
+
+```swift title="CachedImage.swift"
+import SwiftUI
+
+struct CachedImage: View {
+    let url: URL
+    @Environment(\.displayScale) private var scale
+    @State private var image: UIImage?
+
+    var body: some View {
+        GeometryReader { proxy in
+            ZStack {
+                Color.secondary.opacity(0.15)
+                if let image {
+                    Image(uiImage: image).resizable().scaledToFill()
+                }
+            }
+            .task(id: url) {
+                let pixels = Int(max(proxy.size.width, proxy.size.height) * scale)
+                image = try? await ImagePipeline.shared.image(for: ImageKey(url: url, maxPixels: pixels))
+            }
+        }
+        .clipped()
+    }
+}
+```
+
+Listening for memory warnings, once, at app launch:
+
+```swift
+Task {
+    for await _ in NotificationCenter.default.notifications(named: UIApplication.didReceiveMemoryWarningNotification) {
+        await ImagePipeline.shared.trim(toFraction: 0.5)
+    }
+}
+```
+
+### How NSCache differs
+
+The `NSCache` version is a few lines: `cache.totalCostLimit = budget`, then `setObject(image, forKey: url as NSURL, cost: cost)` and `object(forKey:)`. What you get and what you give up:
+
+| | Your `LRUStore` in an actor | `NSCache` |
+| --- | --- | --- |
+| Thread safety | the actor; callers must `await` | built in; callable from any thread |
+| Eviction order | exactly least recently used | not documented; don't rely on any order |
+| Cost limit | strict: the total never exceeds it | a hint: Apple documents that it isn't a strict limit |
+| Memory pressure | you trim on the warning yourself | evicts by itself when the system needs memory |
+| Keys and values | any `Hashable` key, any value | class instances: `NSURL`, `NSString`, `UIImage` |
+| Testability | deterministic, so tests can pin evictions | evictions can't be predicted in tests |
+
+Both are reasonable. `NSCache` is a fine default when you don't need to know what's in it. Build your own when you need predictable behaviour: exact budgets, LRU order, statistics, tests that pin evictions, or value-type keys like `ImageKey`.
+
+## Tests to write
+
+Inject a fake loader that counts loads and can be told to fail, so pipeline tests need no network:
+
+```swift title="Tests/ImageCacheCoreTests/ImagePipelineTests.swift"
+import Testing
+import UIKit
+@testable import ImageCacheCore
+
+actor CountingLoader: ImageLoader {
+    private(set) var loads = 0
+    func image(for key: ImageKey) async throws -> UIImage {
+        loads += 1
+        await Task.yield()                              // give other requests a chance to arrive
+        return UIImage()
+    }
+}
+
+@Suite struct ImagePipelineTests {
+    @Test("Concurrent requests for the same image share one load")
+    func sharesLoads() async throws {
+        let loader = CountingLoader()
+        let pipeline = ImagePipeline(loader: loader, budget: 1_000_000)
+        try await withThrowingTaskGroup(of: Void.self) { group in
+            for index in 0..<50 {
+                let key = ImageKey(url: URL(string: "https://example.com/\(index % 5).jpg")!, maxPixels: 100)
+                group.addTask { _ = try await pipeline.image(for: key) }
+            }
+            try await group.waitForAll()
+        }
+        #expect(await loader.loads == 5)
+    }
+}
+```
+
+More to cover:
+
+- `LRUStore` against the simple model, with seeded random inserts, reads, updates and trims, checking `keysByRecency` and `totalCost` after every step.
+- An update that makes an entry bigger evicts others, never the updated entry itself.
+- A value bigger than the budget is refused, and the store is unchanged.
+- A loader that fails once and then succeeds: the first request throws, the second succeeds, and nothing failed is left in memory or in flight.
+- `trim(toFraction: 0)` empties the store; slots are reused afterwards instead of the arrays growing.
+
+## Stretch goals
+
+- **A disk tier.** Below memory, keep downsampled images as files with their last-used date, and evict the oldest files when the folder passes a size limit. A memory miss checks disk before the network.
+- **Prefetching.** Start loading the images a few rows below the visible ones. The in-flight table means a prefetch and a real request never download twice.
+- **Cancellation with waiters.** When a cell scrolls away, cancel its download, but only if no other cell is waiting for the same key. Count the waiters per key.
+- **Cost-aware eviction.** LRU treats a cheap thumbnail and an expensive panorama alike. The GreedyDual-Size family of policies weighs recency against size and how costly an image was to fetch. Replay your trace to see whether it beats LRU for your feed.
+
+## Done when
+
+- `LRUStore` is generic, O(1) per operation, strict about its budget, and tested against a model.
+- The actor shares in-flight downloads, never caches failures, and decodes off the actor.
+- Costs are decoded bitmap sizes, and images are downsampled to the size they're shown at.
+- Memory warnings trim the cache, and you've measured LRU against FIFO on a real scrolling trace.
+- You can explain when you'd choose `NSCache` instead, and what you'd give up.
+
+```cards
+- id: cap-cache-cost
+  front: "What should an image cache count as an image's cost?"
+  back: "Its decoded size, bytesPerRow × height of the bitmap, not the downloaded file size. A 4000 × 3000 photo is 48 MB decoded."
+- id: cap-cache-key
+  front: "Why is the cache key the URL plus the pixel size?"
+  back: "The same photo as a thumbnail and full screen are different decoded images with very different costs; one URL key would mix them up."
+- id: cap-cache-inflight
+  front: "How does the pipeline avoid downloading the same image twice at once?"
+  back: "It records a Task in an in-flight table before the first await. Later requests find it and await the same task; it's removed when it finishes."
+- id: cap-cache-nscache
+  front: "Name two things NSCache doesn't promise that a custom LRU store does."
+  back: "Which entries it evicts (no documented order), and a strict cost limit (it's a hint). Evictions also can't be pinned down in tests."
+```
+
+```quiz
+- id: q1
+  type: trace
+  prompt: "An LRU store with a 100 KB budget receives: a (40 KB), b (30 KB), c (20 KB), read a, d (30 KB). Which keys remain, most recent first? Separate them with commas."
+  answer: "d, a, c"
+  explain: "After a, b, c the order is c, b, a (90 KB). Reading a moves it to the front: a, c, b. Inserting d brings the total to 120 KB, so the least recent, b (30 KB), is evicted, leaving 90 KB: d, a, c."
+- id: q2
+  type: output
+  prompt: "What does this print?"
+  code: |
+    let full = 4000 * 3000 * 4
+    let thumbnail = 300 * 225 * 4
+    print(full / 1_000_000, "MB", thumbnail / 1_000, "KB", full / thumbnail)
+  answer: "48 MB 270 KB 177"
+  explain: "Four bytes per pixel. Downsampling to the shown size makes the bitmap 177 times smaller, so the same budget holds 177 times as many images."
+- id: q3
+  type: truefalse
+  prompt: "NSCache evicts the least recently used object first when its totalCostLimit is exceeded."
+  answer: false
+  explain: "NSCache doesn't document an eviction order, and Apple describes the cost limit as not strict: an object may be evicted at once, later or never. If you need LRU order, build it."
+- id: q4
+  type: bug
+  prompt: "After a few evictions, `value(for:)` sometimes returns the wrong image. On which line does the eviction forget about the dictionary?"
+  code: |
+    mutating func trim(toCost limit: Int) {
+        while totalCost > limit {
+            let oldest = previous[1]
+            unlink(oldest)
+            totalCost -= costs[oldest]
+            keys[oldest] = nil
+            values[oldest] = nil
+            freeSlots.append(oldest)
+        }
+    }
+  answer: 6
+  explain: "The dictionary still maps the evicted key to its slot. When the slot is reused for another image, looking up the old key finds the new image. Before clearing the key, remove it: `slotOf[keys[oldest]!] = nil`."
+- id: q5
+  type: mcq
+  prompt: "Why does the pipeline load images in `Task.detached` rather than `Task { }`?"
+  options:
+    - "Detached tasks download faster"
+    - "A plain Task created in an actor method inherits the actor, so the slow decoding would run on the actor and block every other request"
+    - "Task { } can't throw"
+    - "Detached tasks are cached automatically"
+  answer: 1
+  explain: "The actor should only do quick bookkeeping. Decoding is slow synchronous work; in a task that inherits the actor it would occupy the actor until it finished."
+- id: q6
+  type: recall
+  prompt: "Why does the store refuse an entry whose cost is larger than the whole budget, instead of inserting it?"
+  model: "Inserting it would push the total over budget no matter what, so the eviction loop would remove every other entry and then the new one too. The cache would end up empty and the image uncached anyway. Refusing it keeps the useful entries; the caller shows the image without caching it, or downsamples it further."
+```

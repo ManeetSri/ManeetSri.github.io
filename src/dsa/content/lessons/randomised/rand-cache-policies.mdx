@@ -1,0 +1,247 @@
+## Why it matters
+
+Every fast system is a stack of caches: the CPU's caches in front of memory, an image cache in front of the disk, `URLCache` in front of the network, a CDN in front of a server. A cache is small by design, so when it's full and something new arrives, it must **evict** something. Which item it throws out, its **eviction policy**, decides its **hit rate**: the fraction of requests it can answer without the slow path. A better policy on the same memory can mean a scroll view that never stutters, or a server bill cut in half. Eviction is an online problem, as the last lesson explained: the cache can't see future requests. This lesson compares the three policies you'll meet everywhere, **FIFO**, **LRU** and **LFU**, on fixed access traces, computing every hit exactly, and measures them against the offline optimum that sees the future.
+
+## Four policies
+
+All four keep at most `capacity` items. They differ only in which item they evict when a new one arrives and the cache is full:
+
+| Policy | Evicts | Remembers per item | O(1) structure |
+| --- | --- | --- | --- |
+| **FIFO**, first in first out | the item that **entered** longest ago | arrival order | a queue and a set |
+| **LRU**, least recently used | the item **used** longest ago | recency | a dictionary and a doubly linked list |
+| **LFU**, least frequently used | the item used the **fewest times** (ties: least recently) | a use count | a dictionary of counts, one list per count |
+| **OPT** (Belady's) | the item whose **next use is furthest away**, or never | the whole future | offline only |
+
+The difference between FIFO and LRU is one line: on a **hit**, LRU moves the item to the "most recent" end; FIFO does nothing. You built an O(1) LRU cache in [LRU cache](/dsa/learn/ll-lru-cache), and an O(1) LFU cache in [LFU cache](/dsa/learn/as-lfu). OPT can't be built at all for a live system, because it needs to know the future, but it can be **simulated** on a recorded trace, which makes it the perfect yardstick: no policy can beat it.
+
+The LFU here counts an item's uses **since it entered the cache**: when it's evicted, its count is forgotten. That's the usual definition, and it matters, as you'll see.
+
+## Hit rates on fixed traces
+
+A trace is a recorded list of requests. Replaying it through each policy, with a tiny cache of 3 items, shows their characters. The simulation is plain and slow (O(capacity) per request), which is fine for measuring; the dictionary-based structures above do the same job in O(1).
+
+```swift run
+// Replaying one access trace through four eviction policies, with a cache of 3 items
+enum Policy: CaseIterable { case fifo, lru, lfu, optimal }
+
+func hits(_ trace: [Character], capacity: Int, policy: Policy) -> Int {
+    var cached: [Character] = []                 // FIFO: insertion order; LRU: least recent first
+    var uses: [Character: Int] = [:]             // LFU: uses since the item entered the cache
+    var lastUse: [Character: Int] = [:]          // LFU tie-break: least recently used goes first
+    var hitCount = 0
+    for (time, key) in trace.enumerated() {
+        if let index = cached.firstIndex(of: key) {
+            hitCount += 1
+            if policy == .lru {                  // a hit makes it the most recent
+                cached.remove(at: index)
+                cached.append(key)
+            }
+        } else {
+            if cached.count == capacity {
+                let victim: Int
+                switch policy {
+                case .fifo, .lru:
+                    victim = 0                   // the oldest, or the least recently used
+                case .lfu:
+                    victim = cached.indices.min { (uses[cached[$0]]!, lastUse[cached[$0]]!) < (uses[cached[$1]]!, lastUse[cached[$1]]!) }!
+                case .optimal:                   // the item needed furthest in the future, or never
+                    func nextUse(_ item: Character) -> Int {
+                        trace[(time + 1)...].firstIndex(of: item) ?? Int.max
+                    }
+                    victim = cached.indices.max { nextUse(cached[$0]) < nextUse(cached[$1]) }!
+                }
+                uses[cached[victim]] = nil
+                cached.remove(at: victim)
+            }
+            cached.append(key)
+        }
+        uses[key, default: 0] += 1
+        lastUse[key] = time
+    }
+    return hitCount
+}
+
+let traces: [(name: String, requests: String)] = [
+    ("locality", "ABCABDABEABFACAB"),
+    ("loop of 4", "ABCDABCDABCDABCD"),
+    ("shift", "AAAABBBBCDCDCDCD"),
+]
+print("trace       FIFO  LRU  LFU  OPT")
+for (name, requests) in traces {
+    let trace = Array(requests)
+    let row = Policy.allCases.map { policy in
+        let count = String(hits(trace, capacity: 3, policy: policy))
+        return String(repeating: " ", count: 5 - count.count) + count
+    }
+    print(name + String(repeating: " ", count: 10 - name.count) + row.joined() + "  of \(trace.count)")
+}
+```
+
+```output
+trace       FIFO  LRU  LFU  OPT
+locality      5    8    9    9  of 16
+loop of 4     0    0    0    8  of 16
+shift        12   12    6   12  of 16
+```
+
+Each trace tells a story:
+
+- **Locality.** A and B are popular; C to F each turn up once or twice, like a home screen with two favourite photos and a stream of one-off images. LRU keeps the favourites because they keep being used: 8 hits. FIFO evicts A soon after its third request, simply because A **arrived** first, then pays to fetch it again: 5 hits. LFU does best of the three, matching OPT here, because A and B pile up counts that one-off items can't beat.
+- **Loop of 4.** Four items cycle through a cache of 3. FIFO, LRU and LFU all evict exactly the item that's needed next: **zero hits**. OPT gets 8 by keeping two of the loop and sacrificing the third. Scanning a list slightly bigger than the cache is the classic way to defeat LRU; database buffer pools see it every time a query scans a big table.
+- **Shift.** A and B are hot early, then the traffic moves to C and D. LFU clings to A and B, whose counts of 4 the newcomers can't catch, and thrashes between C and D: 6 hits. LRU and FIFO forget the past and adapt. Popularity that changes over time is LFU's weakness.
+
+There's no single best policy. LRU is the usual default because real traces mostly look like the first one (recently used things get used again soon) and it adapts to shifts, and because it's simple to implement in O(1).
+
+## Belady's anomaly
+
+You'd expect a bigger cache to hit at least as often. For FIFO, it isn't always so:
+
+```swift run
+// Belady's anomaly: with FIFO, a bigger cache can get fewer hits
+func fifoHits(_ trace: [Int], capacity: Int) -> Int {
+    var queue: [Int] = []                        // oldest first
+    var hitCount = 0
+    for key in trace {
+        if queue.contains(key) {
+            hitCount += 1                        // FIFO ignores hits: the order doesn't change
+        } else {
+            if queue.count == capacity { queue.removeFirst() }
+            queue.append(key)
+        }
+    }
+    return hitCount
+}
+
+func lruHits(_ trace: [Int], capacity: Int) -> Int {
+    var order: [Int] = []                        // least recently used first
+    var hitCount = 0
+    for key in trace {
+        if let index = order.firstIndex(of: key) {
+            hitCount += 1
+            order.remove(at: index)
+        } else if order.count == capacity {
+            order.removeFirst()
+        }
+        order.append(key)
+    }
+    return hitCount
+}
+
+let trace = [1, 2, 3, 4, 1, 2, 5, 1, 2, 3, 4, 5]
+for capacity in 3...4 {
+    print("capacity \(capacity): FIFO \(fifoHits(trace, capacity: capacity)) hits, LRU \(lruHits(trace, capacity: capacity)) hits")
+}
+```
+
+```output
+capacity 3: FIFO 3 hits, LRU 2 hits
+capacity 4: FIFO 2 hits, LRU 4 hits
+```
+
+Growing FIFO's cache from 3 to 4 **loses** a hit. This is **Belady's anomaly**, found in 1969 in operating systems' page caches. LRU never suffers from it: an LRU cache of size 4 always holds everything an LRU cache of size 3 would hold, plus one more item, so it hits at least as often on every trace. (Policies with that property are called **stack algorithms**; OPT is one too.) FIFO's contents at different sizes aren't nested like that, so a larger cache can evict an item at exactly the wrong moment.
+
+<Callout kind="analogy" title="A fridge with three shelves">
+FIFO throws out whatever was bought first, even the milk you drink every morning. LRU throws out whatever nobody has touched for longest. LFU throws out whatever has been used least since it arrived, which keeps the milk, but also keeps last month's party food that was popular for one weekend. OPT is the flatmate who somehow knows the shopping list for next week.
+</Callout>
+
+## Online, with a competitive ratio
+
+In the language of the last lesson, LRU and FIFO are both **k-competitive** for a cache of k items: on any trace, they miss at most about k times as often as OPT with the same cache. No deterministic policy can promise better, because an adversary can always request the one item you just evicted, as the loop trace did. Choosing the victim **at random** (the randomised "marking" algorithm) improves the guarantee to about 2 ln k, which is why randomness shows up even here.
+
+Real systems refine these basics:
+
+- **CLOCK** approximates LRU with one "recently used" bit per item and a sweeping pointer, because moving a node on every hit is too expensive for operating-system page caches.
+- **2Q, ARC and TinyLFU** combine recency and frequency, so that a single scan can't flush the hot items (LRU's weakness) and old popularity fades (LFU's weakness).
+- **Cost-aware** caches evict by size or by how expensive an item is to recreate, not only by use.
+
+## Caches on Apple platforms
+
+- **`NSCache`** is Foundation's in-memory cache. You can set a `countLimit` and a `totalCostLimit`, it's safe to use from several threads, and the system evicts entries automatically when memory runs low. Its eviction order is deliberately **unspecified**: it's not guaranteed to be LRU. Use it for things you can always recreate, such as decoded images, and build your own LRU when you need exact behaviour.
+- **`URLCache`** caches HTTP responses in memory and on disk for `URLSession`, with separate memory and disk capacities. Which responses it keeps, and for how long, follows the HTTP caching headers the server sends (such as `Cache-Control`), on top of its own size limits.
+- An image pipeline in an app often stacks both: a memory cache of decoded images in front of a disk cache of downloaded files, each with its own policy.
+
+<Callout kind="gotcha" title="Common mistakes">
+- **Treating a hit as nothing in LRU.** If a hit doesn't move the item to the most recent end, you've built FIFO.
+- **Keeping LFU counts after eviction.** If an evicted item's count survives, it re-enters with a head start, and the cache behaves differently from what you designed (and tested).
+- **Comparing policies on one trace.** Every policy has a trace that makes it look bad. Measure on traces that resemble your real traffic.
+- **Assuming more memory always helps.** For FIFO it doesn't always, as Belady's anomaly shows. For LRU it never hurts.
+</Callout>
+
+## Practice
+
+**Replay a cache trace** asks for the number of hits of FIFO, LRU and LFU on traces of 100,000 requests with a cache of 2,000 items. The simulation above, scanning the cache on every request, is far too slow at that size: you'll need the O(1) structures, or at least O(log n) ones.
+
+```cards
+- id: fifo-vs-lru
+  front: "What is the only difference between FIFO and LRU eviction?"
+  back: "On a hit, LRU moves the item to the most-recent end; FIFO leaves the order alone. Both evict from the other end."
+- id: lfu-weakness
+  front: "When does LFU do badly, and when does LRU?"
+  back: "LFU clings to items that were popular in the past when popularity shifts. LRU (and FIFO) get zero hits on a loop slightly larger than the cache."
+- id: opt-policy
+  front: "What does Belady's optimal policy evict, and why can't a live cache use it?"
+  back: "The item whose next use is furthest in the future (or never). It needs to know future requests, so it's only usable offline, as a yardstick on recorded traces."
+- id: belady-anomaly
+  front: "What is Belady's anomaly?"
+  back: "With FIFO, a larger cache can get fewer hits on the same trace. LRU and OPT never suffer it, because their contents at size k are always contained in their contents at size k + 1."
+```
+
+```quiz
+- id: q1
+  type: trace
+  prompt: "An LRU cache of capacity 2 receives A, B, A, C, B, A. Write H for each hit and M for each miss."
+  answer: "M, M, H, M, M, M"
+  explain: "A, B miss. A hits (order B, A). C misses and evicts B (A, C). B misses and evicts A (C, B). A misses and evicts C. Only one hit."
+- id: q2
+  type: output
+  prompt: "This replays a trace through a FIFO cache of capacity 2. What does it print?"
+  code: |
+    var queue: [String] = []
+    var hits = 0
+    for key in ["A", "B", "A", "C", "A", "B"] {
+        if queue.contains(key) {
+            hits += 1
+        } else {
+            if queue.count == 2 { queue.removeFirst() }
+            queue.append(key)
+        }
+    }
+    print(hits, queue)
+  answer: "1 [\"A\", \"B\"]"
+  explain: "A, B miss. A hits, but FIFO doesn't reorder. C evicts A (the first in): [B, C]. A misses and evicts B: [C, A]. B misses and evicts C: [A, B]. One hit."
+- id: q3
+  type: mcq
+  prompt: "Four items are requested in a loop, A B C D A B C D …, through a cache of 3. Which policy gets hits?"
+  options:
+    - "LRU"
+    - "FIFO"
+    - "Belady's optimal policy"
+    - "None of them"
+  answer: 2
+  explain: "LRU and FIFO always evict exactly the item that's needed next, so they never hit. OPT keeps two of the loop and gives up the third, hitting about half the time."
+- id: q4
+  type: truefalse
+  prompt: "Making an LRU cache bigger can never reduce its number of hits on the same trace."
+  answer: true
+  explain: "LRU is a stack algorithm: a cache of size k + 1 always contains what a cache of size k would. FIFO lacks that property, which is why it can show Belady's anomaly."
+- id: q5
+  type: multi
+  prompt: "Which statements about NSCache are true? Choose all that apply."
+  options:
+    - "It can evict entries automatically when the system is low on memory"
+    - "It guarantees least-recently-used eviction order"
+    - "It supports a count limit and a total cost limit"
+    - "It's a good home for data you can't recreate"
+  answer: [0, 2]
+  explain: "NSCache evicts under memory pressure and supports countLimit and totalCostLimit, but its eviction order is unspecified, and anything in it can disappear, so only cache what you can rebuild."
+- id: q6
+  type: match
+  prompt: "Match each policy to the item it evicts."
+  pairs:
+    - ["FIFO", "The item that entered the cache longest ago"]
+    - ["LRU", "The item used longest ago"]
+    - ["LFU", "The item used the fewest times since it entered"]
+    - ["OPT", "The item whose next use is furthest in the future"]
+  explain: "They differ only in the victim. FIFO looks at arrival, LRU at the last use, LFU at the number of uses, and OPT at the future."
+```

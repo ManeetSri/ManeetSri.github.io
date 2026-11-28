@@ -1,0 +1,417 @@
+## Why it matters
+
+[Writing your own copy-on-write](/dsa/learn/swift-implementing-cow) gave you the recipe: data in a `final class`, a `private var` to hold it, and a `makeUnique()` check before every change. That recipe makes a type *correct*. This lesson is about making it *fast*: doing the uniqueness check once per operation rather than once per element, not copying data you're about to overwrite, keeping copy-on-write working when your type is wrapped inside another, and proving all of it with tests. These are the techniques behind the standard library's collections, swift-collections' `Deque`, and any matrix, buffer or image type you'll write in an app.
+
+## The recipe, applied to a matrix
+
+A matrix is a natural copy-on-write type: copying a 1,000 × 1,000 grid of `Double`s should cost nothing until somebody changes one. Here's one built on the M11 recipe, with a counter for storage copies:
+
+```swift run
+var storageCopies = 0
+
+final class MatrixStorage {
+    var cells: [Double]
+    init(cells: [Double]) { self.cells = cells }
+}
+
+struct Matrix {
+    let rows: Int
+    let columns: Int
+    private var storage: MatrixStorage
+
+    init(rows: Int, columns: Int) {
+        self.rows = rows
+        self.columns = columns
+        storage = MatrixStorage(cells: Array(repeating: 0, count: rows * columns))
+    }
+
+    private mutating func makeUnique() {
+        if !isKnownUniquelyReferenced(&storage) {
+            storageCopies += 1
+            storage = MatrixStorage(cells: storage.cells)
+        }
+    }
+
+    subscript(row: Int, column: Int) -> Double {
+        get { storage.cells[row * columns + column] }
+        set {
+            makeUnique()
+            storage.cells[row * columns + column] = newValue
+        }
+    }
+}
+
+var identity = Matrix(rows: 3, columns: 3)
+for i in 0..<3 {
+    identity[i, i] = 1
+}
+var doubled = identity
+for i in 0..<3 {
+    doubled[i, i] = 2
+}
+print("copies:", storageCopies)
+print(identity[1, 1], doubled[1, 1])
+```
+
+```output
+copies: 1
+1.0 2.0
+```
+
+The cells live row by row in one flat array: cell `(row, column)` is at `row * columns + column`. That's the layout from [Contiguous memory and O(1) indexing](/dsa/learn/arrays-memory): one allocation instead of one per row, and neighbouring cells side by side in memory.
+
+<Callout kind="note" title="Why a class, if an array is already copy-on-write?">
+A struct whose only data is an `[Double]` gets copy-on-write for free, and for this exact matrix that would be enough. You write it yourself when the storage is something an array can't express: a chain of nodes, bookkeeping that must be copied together with the data, or a single allocation holding a header and the elements. Swift's `ManagedBuffer` class exists for that last case: `Array` keeps its count, capacity and elements in one block of memory in the same way, and swift-collections' `Deque` is built on `ManagedBuffer`. `isKnownUniquelyReferenced` works on it exactly as it does here. The class in this lesson stands in for any of those.
+</Callout>
+
+## Bulk operations: check once, not per element
+
+Scaling a matrix touches every cell. Written with the subscript, it runs the uniqueness check once per cell. If the storage is shared, it also copies every cell and then overwrites every cell, two full passes:
+
+```swift run
+var storageCopies = 0
+var uniquenessChecks = 0
+
+final class MatrixStorage {
+    var cells: [Double]
+    init(cells: [Double]) { self.cells = cells }
+}
+
+struct Matrix {
+    let rows: Int
+    let columns: Int
+    private var storage: MatrixStorage
+
+    init(rows: Int, columns: Int) {
+        self.rows = rows
+        self.columns = columns
+        storage = MatrixStorage(cells: Array(repeating: 0, count: rows * columns))
+    }
+
+    private mutating func makeUnique() {
+        uniquenessChecks += 1
+        if !isKnownUniquelyReferenced(&storage) {
+            storageCopies += 1
+            storage = MatrixStorage(cells: storage.cells)
+        }
+    }
+
+    subscript(row: Int, column: Int) -> Double {
+        get { storage.cells[row * columns + column] }
+        set {
+            makeUnique()
+            storage.cells[row * columns + column] = newValue
+        }
+    }
+
+    // One check per cell, and a full copy first if the storage is shared
+    mutating func scaleCellByCell(by factor: Double) {
+        for row in 0..<rows {
+            for column in 0..<columns {
+                self[row, column] *= factor
+            }
+        }
+    }
+
+    // One check, then either a plain loop or a single pass that builds new storage
+    mutating func scale(by factor: Double) {
+        uniquenessChecks += 1
+        if isKnownUniquelyReferenced(&storage) {
+            for index in storage.cells.indices {
+                storage.cells[index] *= factor
+            }
+        } else {
+            storage = MatrixStorage(cells: storage.cells.map { $0 * factor })
+        }
+    }
+}
+
+let original = Matrix(rows: 3, columns: 3)
+
+var first = original
+uniquenessChecks = 0
+storageCopies = 0
+first.scaleCellByCell(by: 2)
+print("cell by cell:", uniquenessChecks, "checks,", storageCopies, "copy")
+
+var second = original
+uniquenessChecks = 0
+storageCopies = 0
+second.scale(by: 2)
+print("whole matrix:", uniquenessChecks, "check,", storageCopies, "copies")
+```
+
+```output
+cell by cell: 9 checks, 1 copy
+whole matrix: 1 check, 0 copies
+```
+
+Two ideas are at work in `scale(by:)`:
+
+1. **Check once per operation.** After one `isKnownUniquelyReferenced`, the method works on `storage.cells` directly. For a million cells that's one check instead of a million, and a loop the optimiser can turn into fast straight-line code.
+2. **When shared, build the result instead of copying the input.** Copying the old cells only to overwrite them all is wasted work. `map` reads each old cell once and writes the new storage once. It's still O(n), as any change to shared storage must be, but it's one pass instead of two, and no "copy" ever happens. An operation that overwrites everything, like filling the matrix with a value, needn't read the old cells at all.
+
+The practice problem asks for exactly these: a `fill` that never duplicates storage, and row operations that check once.
+
+## Wrappers that break copy-on-write
+
+Copy-on-write depends on one thing: at the moment of a write, the storage has a single owner. Wrap your type inside another, and a plain `get`/`set` accessor quietly adds a second one.
+
+Suppose a `Board` holds rows, each a copy-on-write `Row`, and offers `board[r]` to reach a row. `board[1][column] = 7` looks like an in-place change. With `get` and `set` it runs in three steps: `get` returns a copy of the row (now two owners: the board's array and the temporary), the temporary is changed (shared, so it copies), and `set` stores it back:
+
+```swift run
+var copies = 0
+
+final class RowStorage {
+    var cells: [Int]
+    init(_ cells: [Int]) { self.cells = cells }
+}
+
+struct Row {
+    private var storage = RowStorage([0, 0, 0])
+
+    subscript(column: Int) -> Int {
+        get { storage.cells[column] }
+        set {
+            if !isKnownUniquelyReferenced(&storage) {
+                copies += 1
+                storage = RowStorage(storage.cells)
+            }
+            storage.cells[column] = newValue
+        }
+    }
+}
+
+struct Board {
+    private var rows = [Row(), Row(), Row()]
+    private(set) var edits = 0
+
+    subscript(row: Int) -> Row {
+        get { rows[row] }
+        set {
+            rows[row] = newValue
+            edits += 1
+        }
+    }
+}
+
+struct FastBoard {
+    private var rows = [Row(), Row(), Row()]
+    private(set) var edits = 0
+
+    subscript(row: Int) -> Row {
+        get { rows[row] }
+        _modify {
+            yield &rows[row]     // lend the stored row itself
+            edits += 1           // runs after the caller's change has finished
+        }
+    }
+}
+
+var board = Board()
+copies = 0
+for column in 0..<3 {
+    board[1][column] = 7
+}
+print("get and set:", copies, "copies,", board.edits, "edits")
+
+var fast = FastBoard()
+copies = 0
+for column in 0..<3 {
+    fast[1][column] = 7
+}
+print("_modify:", copies, "copies,", fast.edits, "edits")
+print(fast[1][2], fast[0][2])
+```
+
+```output
+get and set: 3 copies, 3 edits
+_modify: 0 copies, 3 edits
+7 0
+```
+
+Every single write through `Board` copied the whole row. With rows of 10,000 cells, filling one row would cost 100 million cell copies.
+
+### _modify in plain words
+
+A `_modify` accessor replaces "hand out a copy, take it back" with "lend the real thing". When it reaches `yield &rows[row]`, it pauses and lets the caller change `rows[row]` directly, where it's stored, as if the caller had been passed it `inout`. When the caller's change is finished, the accessor carries on from the line after `yield`, which is the place for bookkeeping such as `edits += 1`. Because the row is never copied out, it keeps a single owner and the write happens in place.
+
+This is how the standard library does it. `Array`'s subscript, `Dictionary`'s subscripts (including `default:`) and many properties use a modify accessor, which is why `grid[r][c] = 1` and `graph[key, default: []].append(x)` were copy-free in [Avoiding accidental copies](/dsa/learn/fs-avoiding-copies).
+
+Three rules:
+
+- **Yield exactly once on every path**, with `&` in front of something mutable.
+- **Keep the `get`.** `_modify` only handles changes; reads still go through `get`.
+- **It's underscored for a reason.** A leading underscore marks a feature that isn't officially part of the language yet: it works in today's compilers and is used all over the standard library and swift-collections, but it could change. An official version, spelled `yielding mutate`, has been designed and is still experimental in current compilers. For library code where performance matters, `_modify` is the accepted tool; elsewhere, prefer a design that doesn't need it.
+
+### The alternative: mutating methods
+
+Often you can avoid the question by not handing out the inner value at all. A `mutating func setCell(row:column:to:)` on `Board` that does `rows[row][column] = value` works on the stored array directly, so it's in place with nothing special. Expose operations, not inner values, and plain Swift stays copy-free.
+
+An optimised build can sometimes remove the extra copy of a `get`/`set` pair, when the getter does nothing but return a stored property. It couldn't here, because the row comes out of an array, and it never can in a debug build, where your tests run. Don't rely on it.
+
+## Proving it with tests
+
+A copy-on-write type has two promises, and tests should check both:
+
+1. **Value semantics:** changing a copy never changes the original. Make a copy, change one, check the other.
+2. **Performance:** a change copies only when the storage is shared, and at most once.
+
+For the second, give the test a way to see the storage. An identity works without keeping anything alive:
+
+```swift run
+final class MatrixStorage {
+    var cells: [Double]
+    init(cells: [Double]) { self.cells = cells }
+}
+
+struct Matrix {
+    private var storage = MatrixStorage(cells: [0, 0, 0, 0])
+
+    // For tests: the identity of the storage object, which doesn't keep it alive
+    var storageID: ObjectIdentifier { ObjectIdentifier(storage) }
+
+    // For tests: must be mutating, because the check needs inout access
+    mutating func isUniquelyStored() -> Bool {
+        isKnownUniquelyReferenced(&storage)
+    }
+
+    subscript(index: Int) -> Double {
+        get { storage.cells[index] }
+        set {
+            if !isKnownUniquelyReferenced(&storage) {
+                storage = MatrixStorage(cells: storage.cells)
+            }
+            storage.cells[index] = newValue
+        }
+    }
+}
+
+var a = Matrix()
+let before = a.storageID
+a[0] = 1
+print("in place:", a.storageID == before)
+print("unique:", a.isUniquelyStored())
+
+let b = a
+print("unique while b exists:", a.isUniquelyStored())
+a[1] = 2
+print("in place:", a.storageID == before)
+print("b kept the old storage:", b.storageID == before, b[1])
+```
+
+```output
+in place: true
+unique: true
+unique while b exists: false
+in place: false
+b kept the old storage: true 0.0
+```
+
+An unchanged `storageID` after a write means "changed in place". A changed one means a copy happened, which is right only if the storage was shared.
+
+For counting copies across many operations, a counter is clearer still. Make it **an object passed to each instance**, not a global variable: Swift Testing runs tests in parallel, so a global counter would collect copies from every test at once, and two tests changing it at the same moment is a data race (M70 explains why that's dangerous). The practice problem's `CopyCounter` works this way: every grid copied from the same original shares one counter, and each test creates its own.
+
+<Callout kind="gotcha" title="Swift gotchas: copy-on-write in practice">
+- **`isKnownUniquelyReferenced` needs `inout` access**, so it only works on a `var` property, inside `mutating` code. That's why a test hook like `isUniquelyStored()` has to be `mutating`.
+- **`weak` and `unowned` references don't count**, and neither does an `ObjectIdentifier`. Only strong references make storage "shared".
+- **Uniqueness isn't thread safety.** Two threads writing to *the same* variable at once is still a data race; copy-on-write only protects *separate* copies. M70 covers this.
+- **Every mutating path needs the check**, including subscripts' setters, `_modify` accessors and methods that look read-only but cache something.
+</Callout>
+
+## Practice
+
+**A copy-on-write grid** gives you the storage class and a copy counter, and asks you to finish a grid whose copies are independent but cheap: one duplicate per sharing, a `fill` that never duplicates, and whole-row operations that check uniqueness once. The tests write every cell of a 300 × 300 copy and expect exactly one copy.
+
+```cards
+- id: bulk-check-once
+  front: "How should a bulk operation like `scale(by:)` handle copy-on-write?"
+  back: "Check uniqueness once. If unique, loop over the storage directly; if shared, build the new storage from the old in one pass instead of copying first and then overwriting."
+- id: getset-breaks-cow
+  front: "Why does `board[1][c] = 7` copy the row when `board`'s subscript has `get` and `set`?"
+  back: "`get` returns a copy of the row, so it has two owners while it's being changed; the write must copy it, and `set` stores the copy back."
+- id: modify-accessor
+  front: "What does a `_modify` accessor do?"
+  back: "It yields the stored value itself to the caller for the length of a change, like an `inout` argument, so no copy is made. Code after `yield` runs once the change is done."
+- id: counter-per-instance
+  front: "Why should a copy counter for tests be an object passed in, not a global variable?"
+  back: "Swift Testing runs tests in parallel. A shared global would mix counts from different tests and be changed from several threads at once."
+```
+
+```quiz
+- id: q1
+  type: output
+  prompt: "What does this print?"
+  code: |
+    var copies = 0
+
+    final class Storage {
+        var values: [Int]
+        init(_ values: [Int]) { self.values = values }
+    }
+
+    struct Bag {
+        private var storage = Storage([1, 2, 3])
+
+        mutating func addToAll(_ delta: Int) {
+            if !isKnownUniquelyReferenced(&storage) {
+                copies += 1
+                storage = Storage(storage.values.map { $0 + delta })
+                return
+            }
+            for i in storage.values.indices {
+                storage.values[i] += delta
+            }
+        }
+
+        var values: [Int] { storage.values }
+    }
+
+    var a = Bag()
+    var b = a
+    b.addToAll(10)
+    b.addToAll(1)
+    a.addToAll(100)
+    print(copies, a.values, b.values)
+  answer: "1 [101, 102, 103] [12, 13, 14]"
+  explain: "`b`'s first change finds the storage shared and builds new storage with 10 added, in one pass. After that `b` and `a` each own their storage, so both later changes happen in place."
+- id: q2
+  type: bug
+  prompt: "Writes through `Canvas.layer` copy the whole layer every time. Which line should change, and to what kind of accessor?"
+  code: |
+    struct Canvas {
+        private var layers: [Layer] = [Layer()]
+
+        var layer: Layer {
+            get { layers[0] }
+            set { layers[0] = newValue }
+        }
+    }
+  answer: 6
+  explain: "With `get` and `set`, a write fetches a copy of the layer, changes it (which duplicates the shared storage) and stores it back. Replacing the `set` line with `_modify { yield &layers[0] }` lends the stored layer to the caller instead, so writes happen in place. The `get` stays for reads."
+- id: q3
+  type: truefalse
+  prompt: "Code written after `yield` in a `_modify` accessor runs after the caller's change has been made."
+  answer: true
+  explain: "The accessor pauses at `yield` while the caller changes the value in place, then resumes. That makes the lines after `yield` the right place for bookkeeping such as invalidating a cache."
+- id: q4
+  type: mcq
+  prompt: "`fill(_:)` sets every cell of a matrix. When the storage is shared, what should it do?"
+  options:
+    - "Call `makeUnique()`, then overwrite every cell"
+    - "Create new storage filled with the value, without copying the old cells"
+    - "Overwrite the shared storage in place"
+    - "Do nothing until the next read"
+  answer: 1
+  explain: "Every old cell is about to be overwritten, so copying them first is wasted work. Building fresh storage gives this matrix its own buffer in one pass. Overwriting the shared storage would change the other copies."
+- id: q5
+  type: multi
+  prompt: "Which of these count as owners when `isKnownUniquelyReferenced` checks a storage object?"
+  options:
+    - "Another struct value holding the same storage in a `var`"
+    - "A `weak` reference to the storage"
+    - "An `ObjectIdentifier` made from the storage"
+    - "A closure that captured a struct value holding the storage"
+  answer: [0, 3]
+  explain: "Strong references count: another value holding it, or a closure that captured such a value. `weak` references and `ObjectIdentifier`s don't keep the object alive, so they don't count."
+```

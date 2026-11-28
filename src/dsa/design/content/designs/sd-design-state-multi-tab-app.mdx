@@ -1,0 +1,223 @@
+<Brief>
+
+You've joined the iOS team at **Basketful**, a grocery delivery app with four tabs: **Shop** (aisles and offers), **Search**, **Basket** and **Account**. Each tab fetches and keeps its own data today, and it shows:
+
+- The Basket tab's badge sometimes disagrees with the basket screen.
+- A product's price can differ between Search and Shop for up to a minute.
+- After signing out, the previous user's orders are still one swipe back in the Account tab's navigation stack.
+- On iPad, opening a second window resets the first window's tab, and every window comes back on the Shop tab after the app has been ended in the background.
+
+Design the app's **state layer**: what state exists, who owns each piece, how features read and change it, and how it's persisted, restored and reset.
+
+What you know:
+
+- About 1.5 million people use the app each month; around 8% of iPad sessions use two windows.
+- Three feature teams own the tabs (Discovery owns Shop and Search; Basket & Checkout; Account), each in its own Swift package. Feature packages must not import each other.
+- The catalogue has 20,000 products. A session touches 300 to 500 of them. Prices and stock change during the day; while the app is in the foreground it polls `/products/changes?since=` every 60 seconds.
+- The basket lives on the server, holds up to 100 lines, and must keep working offline: people add items on the train and expect them to sync later.
+- SwiftUI on iOS 18 in Swift 6 language mode, except the payment step of checkout, a UIKit screen that must show the same basket.
+
+Spend about 35 minutes. Write as if explaining your design to the three teams.
+
+</Brief>
+
+```workspace
+template: component
+minutes: 35
+```
+
+<ModelAnswer section="requirements">
+
+Questions worth asking first: is the basket per account or per device (per account: it's on the server)? What happens to a signed-out basket when someone signs in: merge or replace? Is the basket's price authoritative, or the product's? Must the Account tab's cached orders be deleted from disk on sign-out (yes: shared iPads exist)?
+
+- **Callers:** the four feature packages, the UIKit payment screen, and the app target, which assembles everything.
+- **Must:** one copy of each product, of the basket and of the session; the badge, the basket screen and checkout always agree; each window keeps and restores its own tab and navigation; sign-out removes everything user-scoped, in memory and on disk; basket edits work offline and sync later.
+- **Constraints:** UI state on the main actor (Swift 6 enforces it); features can't import each other; at most a few thousand products in memory; a 60-second change poll.
+- **Out of scope:** the payment flow itself, search ranking, push notifications (but don't design them out).
+
+</ModelAnswer>
+
+<ModelAnswer section="api">
+
+A small **AppState** package that every feature may import, and that imports no feature. It holds only what's genuinely shared:
+
+```swift check ios
+import SwiftUI
+
+public struct ProductID: Hashable, Codable, Sendable {
+    public let raw: String
+}
+
+public struct Product: Identifiable, Sendable {
+    public let id: ProductID
+    public var name: String
+    public var pricePence: Int
+    public var inStock: Bool
+    public var version: Int
+}
+
+/// Every product the session has seen, once, by id
+@MainActor @Observable
+public final class ProductStore {
+    private(set) var products: [ProductID: Product] = [:]
+
+    public init() {}
+
+    public func product(_ id: ProductID) -> Product? { products[id] }
+
+    /// Keeps the newest version of each product
+    public func upsert(_ incoming: [Product]) {
+        for product in incoming where (products[product.id]?.version ?? -1) <= product.version {
+            products[product.id] = product
+        }
+    }
+}
+
+public enum BasketSync: Equatable, Sendable {
+    case synced
+    case pending(changes: Int)
+    case failed(message: String)
+}
+
+/// The signed-in user's basket: the only writer of basket lines
+@MainActor @Observable
+public final class BasketModel {
+    public private(set) var quantities: [ProductID: Int] = [:]
+    public private(set) var sync = BasketSync.synced
+
+    public init() {}
+
+    public var itemCount: Int { quantities.values.reduce(0, +) }
+
+    public func setQuantity(_ quantity: Int, for id: ProductID) {
+        quantities[id] = quantity > 0 ? quantity : nil
+        // ...saved locally at once, then queued for the server
+    }
+}
+
+// In any feature: read only what you need, by type
+struct AddToBasketButton: View {
+    @Environment(BasketModel.self) private var basket
+    let productID: ProductID
+
+    var body: some View {
+        Button("Add") {
+            basket.setQuantity((basket.quantities[productID] ?? 0) + 1, for: productID)
+        }
+    }
+}
+```
+
+`SessionModel` (the signed-in account, or nil) follows the same pattern. Each feature declares its own `Route` enum of ids, so features stay independent; the app target composes them. Everything is changed through intent methods; nothing outside a model can assign its stored state.
+
+</ModelAnswer>
+
+<ModelAnswer section="internals">
+
+**Three scopes, three owners**, assembled in the app target:
+
+- **App scope** (one per process): `SessionModel` and `ProductStore`. The catalogue isn't personal, so it survives sign-out.
+- **User scope** (one per signed-in account): a `UserScope` object holding `BasketModel`, `OrdersModel` and anything else personal. It's **created on sign-in and replaced on sign-out**, never reset field by field.
+- **Window scope** (one per scene): a `WindowModel` holding the selected tab, each tab's navigation path (routes of ids) and the presented sheet.
+
+The root view injects the app and user models through the environment, and applies `.id(userScope.id)` to the signed-in tree, so a new user gets fresh views, paths and `@State` everywhere.
+
+**Products are normalised.** Aisles, search results, the basket and orders all hold `[ProductID]`; rows resolve the product from `ProductStore`. The change poller upserts into the store with a version check, so one price change updates every tab in the same frame, and a stale poll can't undo a newer one.
+
+**The basket is local-first.** `setQuantity` writes the lines to a file in the user's container immediately (it's user data, not UI state), then a sync queue sends changes to the server. The server's answer is applied to the model, never straight to a screen. The badge, the basket screen and checkout all read `itemCount` and `quantities` from the same model, so they can't disagree. The UIKit payment screen receives the same `BasketModel` in its initialiser and observes it: UIKit tracks `@Observable` reads in methods such as `viewWillLayoutSubviews()` automatically from iOS 26, and on iOS 18 when the Info.plist key `UIObservationTrackingEnabled` is on; otherwise `withObservationTracking` does it by hand.
+
+**A change, end to end:** tap Add in Search, `BasketModel` updates its lines, every view that read `itemCount` (the tab badge in each window) re-renders, the file is written, and the sync queue sends it when online.
+
+</ModelAnswer>
+
+<ModelAnswer section="concurrency">
+
+- **All UI state is `@MainActor` and `@Observable`:** one isolation domain, no locks, and the compiler stops background code touching it.
+- **Work happens off the main actor and hands back values.** The API client, the poller and the disk writer are actors or `Sendable` services that return `Sendable` structs (`Product`, a basket snapshot). The main-actor model applies them.
+- **Order is checked, not assumed.** Products carry versions; the basket carries a server revision, so a slow response for revision 7 can't overwrite revision 8. Pending local edits are re-applied over the server's basket until the server confirms them.
+- **Late work can't leak across sign-out.** Each task captures the `UserScope` it started for and applies its result only if that scope is still current, so an orders response that lands after sign-out goes nowhere.
+- **Two windows share app and user scope, not window scope.** Both observe the same `BasketModel`, so both badges agree; each has its own `WindowModel`, so each keeps its own tab.
+
+</ModelAnswer>
+
+<ModelAnswer section="failure">
+
+- **Offline:** basket edits succeed locally and show a "Will sync when you're back online" state from `BasketSync.pending`. When the server rejects a line (out of stock, price changed), the server's basket wins for stock and price, and the basket screen highlights what changed.
+- **Restoration:** each `WindowModel` saves a small `Codable` snapshot (tab plus routes of ids) to `@SceneStorage` on every change. On launch it decodes with `try?`, then validates against today's data: routes for products that are gone are pruned, user-only tabs fall back to their root if nobody is signed in, and anything unreadable becomes a fresh window. The basket is never restored from scene storage: it's data, loaded from the user's file.
+- **Sign-out:** cancel the user scope's tasks, delete its files (basket, cached orders), replace it with nil, and reset each window's user-tab paths. The `.id` change throws away every view's state. Nothing from the old account survives in memory, on disk or in navigation.
+- **Memory:** `ProductStore` drops products that no list references when it gets a memory warning, and caps itself at a few thousand entries.
+- **Misuse:** no singletons, so a feature can't reach state it wasn't given; a missing environment value crashes, so one `withAppEnvironment()` helper is used by the app, previews and tests.
+
+</ModelAnswer>
+
+<ModelAnswer section="testing">
+
+- **Models are plain classes with injected seams** (API, persistence, clock), so most tests are fast unit tests: basket edits offline then synced; a stale server revision ignored; product upserts keep the newest version; sign-out leaves no user files and no user scope.
+- **Restoration is a pure function** of a snapshot and today's data: test round-tripping, an old version, a deleted product and a signed-out user.
+- **The poller** gets a fake changes API and `TestClock`, so a test advances 60 seconds and checks the store.
+- **Previews and UI tests** use the same in-memory environment helper. One UI test covers the cross-tab path: add from Search, check the badge and the basket screen, sign out, and check the Account tab is at its root.
+
+</ModelAnswer>
+
+<ModelAnswer section="tradeoffs">
+
+- **Composed `@Observable` models over one TCA store.** The teams are independent and cross-feature state is small (session, basket, products), so a shared root reducer every team edits would cost more than it buys. TCA would give exhaustive tests and action logs; revisit if features start reacting to each other in complicated ways.
+- **An in-memory product store over SwiftData.** A session needs a few hundred products, the server is the truth and the poll keeps them fresh. If offline browsing of the catalogue becomes a requirement, move products into a database and observe it instead.
+- **Replacing the user scope over resetting each model.** Replacement can't forget a property; the cost is rebuilding a handful of models on sign-in, which is trivial.
+- **Per-window navigation over a global router.** Required for multiple windows. The price is that a deep link must pick a window (the frontmost, or a new one).
+
+</ModelAnswer>
+
+```rubric
+- id: ownership
+  label: Gave each piece of state one owner, at the right scope
+  skill: client
+  look_for:
+    - App-wide session and products, user-scoped basket and orders, per-window tab and navigation
+    - Products stored once by id, with tabs holding ids
+    - The badge and totals derived from the basket, not stored beside it
+- id: boundaries
+  label: Let features share state without importing each other
+  skill: architecture
+  look_for:
+    - A small shared state module (or protocols) that features depend on, and that depends on none of them
+    - Models injected through the environment or initialisers, not singletons
+    - State changed through intent methods, with stored state read-only outside its owner
+- id: persistence
+  label: Persisted and restored the right things
+  skill: data
+  look_for:
+    - The basket saved as user data, locally first, then synced
+    - Each window's tab and navigation saved as ids, restored with validation and a safe fallback
+    - Results and transient UI not restored
+- id: signout
+  label: Made sign-out remove everything personal
+  skill: security
+  look_for:
+    - User-scoped state held in one object that's replaced, not reset field by field
+    - User files deleted and in-flight work for the old user dropped
+    - Navigation and view state reset, for example with an identity tied to the session
+- id: async
+  label: Kept async updates in order, offline included
+  skill: offline
+  look_for:
+    - UI state on the main actor, with background work returning values
+    - Versions or revisions so stale responses can't overwrite newer data
+    - Offline basket edits queued, with a visible pending state and conflict handling
+- id: tradeoffs
+  label: Weighed the alternatives
+  skill: tradeoffs
+  look_for:
+    - Composed models compared with a single store, with a reason tied to the teams
+    - In-memory products compared with a database, and when that would change
+```
+
+<Pitfalls>
+
+- One `AppState` singleton holding every tab's data, which every package imports.
+- Navigation state that's app-wide, so two iPad windows fight over one tab.
+- Resetting sign-out by hand, model by model, and missing one (or forgetting the files on disk).
+- Restoring the basket or search results from scene storage instead of loading data from its owner.
+- Product structs copied into the basket and orders, so prices drift between tabs.
+
+</Pitfalls>

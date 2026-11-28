@@ -1,0 +1,473 @@
+## Why it matters
+
+So far every tree in this module has held `Int`s in bare `TreeNode`s, with functions that take and return roots. That's how interview problems are posed, but it isn't how you'd want to use a BST in an app. There you want a **type**: a sorted set of anything comparable (names, dates, version numbers) with methods, value semantics like Swift's own collections, and a `for` loop that works. This lesson designs and builds that type, `BinarySearchTree<Element: Comparable>`, which lives in DSAKit for later lessons to use. Most of the work isn't the algorithms, which you already know. It's the design decisions around them, and each one is a piece of Swift you've learned put to work.
+
+## What we're building
+
+```swift
+import DSAKit
+
+var tree: BinarySearchTree = [50, 30, 70, 20, 40]
+tree.insert(60)                // true
+tree.insert(30)                // false: already there
+tree.contains(40)              // true
+tree.remove(30)                // Optional(30)
+tree.floor(45)                 // Optional(40)
+tree.min                       // Optional(20)
+for value in tree {            // 20 40 50 60 70
+    print(value, terminator: " ")
+}
+```
+
+| Member | Does | Cost |
+| --- | --- | --- |
+| `insert(_:) -> Bool` | adds an element; false if it was already there | O(h) |
+| `contains(_:)` | membership | O(h) |
+| `remove(_:) -> Element?` | removes and returns the stored element | O(h) |
+| `min`, `max` | leftmost, rightmost | O(h) |
+| `floor(_:)`, `ceiling(_:)` | nearest at or below, at or above | O(h) |
+| `count`, `isEmpty` | size | O(1) |
+| `height` | levels | O(n) |
+| `for x in tree` | sorted order | O(n) in total, O(h) memory |
+
+h is the height. The tree doesn't rebalance itself, so h is about log₂ n for random insertion orders and n for sorted ones. That's the subject of the next lesson, and M38 fixes it.
+
+## Decision 1: generic over Comparable
+
+A BST only ever asks one question about its elements: "is this one smaller than that one?" That's exactly what [`Comparable`](/dsa/learn/swift-standard-protocols) provides, so it's the right constraint, as in [Generic types](/dsa/learn/swift-generic-types):
+
+```swift
+public struct BinarySearchTree<Element: Comparable> { … }
+```
+
+`Int`, `Double`, `String` and `Date` are all `Comparable`, and so is any type of yours that implements `<`.
+
+The code decides "equal" without calling `==`: if neither `a < b` nor `b < a`, the two are treated as the same element. For well-behaved types that's the same as `==`. It also means the tree only depends on `<`, which keeps every comparison consistent: the tree never asks `==` a question whose answer disagrees with the ordering.
+
+## Decision 2: a set
+
+Following this module's duplicates policy, the tree holds each element once, like `Set`. `insert` returns `Bool` (Swift's `Set.insert` returns a tuple whose first part, `inserted`, says the same thing), marked `@discardableResult` so callers who don't care can ignore it. `remove` returns the element the tree **held**, not the argument: for a type whose `<` compares only part of the value (say, a contact compared by name), the stored copy may differ from the one you passed in.
+
+## Decision 3: value semantics with copy-on-write
+
+The nodes must be class instances: a node's children are references, and the loops below move a reference down the tree. But if the tree type itself were a class, this would happen:
+
+```swift
+let original = SortedNames()      // imagine a class
+let copy = original
+copy.insert("Zoe")                // original has Zoe too
+```
+
+Every Swift collection behaves like a value: `var b = a` gives an independent copy. To get that while keeping class nodes, use the copy-on-write pattern from [Writing your own copy-on-write](/dsa/learn/swift-implementing-cow), as DSAKit's `LinkedList` does:
+
+- the nodes live in a private `Storage` object, which also keeps the count;
+- the struct holds one reference to it, so copying the struct is O(1) and the copies **share** storage;
+- every mutating method first calls `isKnownUniquelyReferenced(&storage)`. If another copy shares the storage, it clones the nodes before changing anything.
+
+```swift
+final class Node {
+    var value: Element
+    var left: Node?
+    var right: Node?
+    init(_ value: Element) { self.value = value }
+}
+
+final class Storage {
+    var root: Node?
+    var count = 0
+
+    /// Brand-new nodes in the same shape. Iterative, so depth doesn't matter. O(n).
+    func copy() -> Storage {
+        let result = Storage()
+        result.count = count
+        guard let root else { return result }
+        let rootCopy = Node(root.value)
+        result.root = rootCopy
+        var pending: [(original: Node, copy: Node)] = [(root, rootCopy)]
+        while let (original, copy) = pending.popLast() {
+            if let left = original.left {
+                let child = Node(left.value)
+                copy.left = child
+                pending.append((left, child))
+            }
+            if let right = original.right {
+                let child = Node(right.value)
+                copy.right = child
+                pending.append((right, child))
+            }
+        }
+        return result
+    }
+}
+
+private var storage = Storage()
+```
+
+Nodes never leave the type, so two storages never share a node, and changing one tree can't reach into another. One refinement: if the tree is shared and the operation won't change anything (inserting an element that's already there, removing one that isn't), there's no need to copy. Check first:
+
+```swift
+@discardableResult
+public mutating func insert(_ element: Element) -> Bool {
+    if !isKnownUniquelyReferenced(&storage) {
+        if contains(element) { return false }          // no change, so no copy
+        storage = storage.copy()
+    }
+    // … the insert loop from the first lesson, on storage.root …
+}
+```
+
+## Decision 4: no recursion anywhere
+
+A tree built from sorted input is a chain, and a chain of 100,000 nodes is 100,000 levels deep. Any recursive operation on it would make 100,000 nested calls and overflow the stack, as you saw in [Stack depth limits in Swift](/dsa/learn/rec-stack-limits). So every operation is a loop:
+
+- `insert`, `contains`, `min`, `max`, `floor` and `ceiling` walk one path with a `current` variable;
+- `remove` uses the parent-tracking loop from [Deleting from a BST](/dsa/learn/bst-delete);
+- `copy()` above uses an explicit stack of (original, copy) pairs;
+- `height` counts level by level, keeping one level of nodes in an array.
+
+There's one recursion you didn't write, and it's the sneakiest. When the last reference to a node goes away, [ARC](/dsa/learn/swift-arc) frees it, which releases its children, which frees **them**, which releases **their** children: one nested call per level. Dropping a deep chain overflows the stack inside ARC's own code. On a background thread, whose stack is much smaller than the main thread's, a chain of a few thousand nodes is enough.
+
+The fix is a `deinit` that takes the children apart with a loop, so ARC never has more than one level to free at a time:
+
+```swift
+deinit {
+    var pending: [Node] = []
+    if let left { pending.append(left) }
+    if let right { pending.append(right) }
+    left = nil
+    right = nil
+    while var node = pending.popLast() {
+        guard isKnownUniquelyReferenced(&node) else { continue }   // still used elsewhere
+        if let child = node.left {
+            pending.append(child)
+            node.left = nil
+        }
+        if let child = node.right {
+            pending.append(child)
+            node.right = nil
+        }
+    }
+}
+```
+
+By the time each node popped from `pending` is freed, its children have been moved to the array, so freeing it releases nothing further. DSAKit's `TreeNode` uses the same trick. The `isKnownUniquelyReferenced` check skips any node something else still holds, such as an iterator part-way through a walk.
+
+## Decision 5: a Sequence, in sorted order
+
+Conforming to [`Sequence`](/dsa/learn/swift-sequence-iterator) gives `for`-`in`, `map`, `filter`, `reduce`, `Array(tree)` and dozens more for free. The iterator is the stack-based one from [Floor, ceiling and a BST iterator](/dsa/learn/bst-floor-ceil-iterator), with one addition: it holds a reference to the storage.
+
+```swift
+extension BinarySearchTree: Sequence {
+    public struct Iterator: IteratorProtocol {
+        private let storage: Storage                 // keeps the nodes alive, and shared
+        private var stack: [Node] = []
+
+        init(_ storage: Storage) {
+            self.storage = storage
+            pushLeftSpine(from: storage.root)
+        }
+
+        private mutating func pushLeftSpine(from start: Node?) {
+            var current = start
+            while let node = current {
+                stack.append(node)
+                current = node.left
+            }
+        }
+
+        public mutating func next() -> Element? {
+            guard let node = stack.popLast() else { return nil }
+            pushLeftSpine(from: node.right)
+            return node.value
+        }
+    }
+
+    public func makeIterator() -> Iterator {
+        Iterator(storage)
+    }
+
+    public var underestimatedCount: Int {
+        storage.count                                // lets Array(tree) allocate once
+    }
+}
+```
+
+Why hold the storage? Because of this loop:
+
+```swift
+for value in tree {
+    tree.insert(value + 100)
+}
+```
+
+While the loop runs, the iterator holds a second reference to the storage, so `isKnownUniquelyReferenced` is false and `insert` copies the tree before changing it. The loop keeps walking the old, unchanged nodes, exactly as a `for` loop over an array keeps walking the array it started with. Without that reference, the iterator would be walking nodes that the loop body is changing underneath it.
+
+## All of it, small enough to run
+
+Here's a cut-down version with insert, copy-on-write and `Sequence`, printing a message whenever it copies. It works for `String` with no changes:
+
+```swift run
+struct SearchTree<Element: Comparable> {
+    final class Node {
+        var value: Element
+        var left: Node?
+        var right: Node?
+        init(_ value: Element) { self.value = value }
+    }
+
+    final class Storage {
+        var root: Node?
+        var count = 0
+
+        func copy() -> Storage {
+            let result = Storage()
+            result.count = count
+            guard let root else { return result }
+            let rootCopy = Node(root.value)
+            result.root = rootCopy
+            var pending = [(root, rootCopy)]
+            while let (original, copy) = pending.popLast() {
+                if let left = original.left {
+                    copy.left = Node(left.value)
+                    pending.append((left, copy.left!))
+                }
+                if let right = original.right {
+                    copy.right = Node(right.value)
+                    pending.append((right, copy.right!))
+                }
+            }
+            return result
+        }
+    }
+
+    private var storage = Storage()
+
+    var count: Int { storage.count }
+
+    @discardableResult
+    mutating func insert(_ element: Element) -> Bool {
+        if !isKnownUniquelyReferenced(&storage) {
+            print("  (copying \(storage.count) nodes first)")
+            storage = storage.copy()
+        }
+        guard var node = storage.root else {
+            storage.root = Node(element)
+            storage.count = 1
+            return true
+        }
+        while true {
+            if element < node.value {
+                guard let left = node.left else { node.left = Node(element); break }
+                node = left
+            } else if node.value < element {
+                guard let right = node.right else { node.right = Node(element); break }
+                node = right
+            } else {
+                return false
+            }
+        }
+        storage.count += 1
+        return true
+    }
+}
+
+extension SearchTree: Sequence {
+    struct Iterator: IteratorProtocol {
+        let storage: Storage
+        var stack: [Node] = []
+
+        init(_ storage: Storage) {
+            self.storage = storage
+            pushLeftSpine(from: storage.root)
+        }
+
+        mutating func pushLeftSpine(from start: Node?) {
+            var current = start
+            while let node = current {
+                stack.append(node)
+                current = node.left
+            }
+        }
+
+        mutating func next() -> Element? {
+            guard let node = stack.popLast() else { return nil }
+            pushLeftSpine(from: node.right)
+            return node.value
+        }
+    }
+
+    func makeIterator() -> Iterator { Iterator(storage) }
+}
+
+var fruit = SearchTree<String>()
+for name in ["pear", "fig", "apple", "kiwi", "fig"] {
+    fruit.insert(name)
+}
+print(Array(fruit), fruit.count)
+
+var copy = fruit                       // shares the nodes: O(1)
+copy.insert("banana")                  // shared, so it copies first
+copy.insert("cherry")                  // now unique: no copy
+print(Array(fruit))
+print(Array(copy))
+
+var numbers = SearchTree<Int>()
+for n in [5, 2, 8] { numbers.insert(n) }
+for n in numbers {
+    numbers.insert(n * 10)             // the loop keeps walking the original nodes
+}
+print(Array(numbers))
+print(numbers.map { $0 + 1 }.prefix(3), numbers.contains(80))
+```
+
+```output
+["apple", "fig", "kiwi", "pear"] 4
+  (copying 4 nodes first)
+["apple", "fig", "kiwi", "pear"]
+["apple", "banana", "cherry", "fig", "kiwi", "pear"]
+  (copying 3 nodes first)
+[2, 5, 8, 20, 50, 80]
+[3, 6, 9] true
+```
+
+What to notice:
+
+- The second "fig" changed nothing, and `count` is 4.
+- Only the first insert into `copy` copied. After that, `copy` owns its storage outright.
+- The `for` loop over `numbers` copied once, on its first insert, and the loop saw only 2, 5 and 8. Without the iterator's reference to the storage, it would have walked into the new values and kept going.
+- `map`, `prefix` and `contains` came free with `Sequence`. But that `contains` is Sequence's **linear scan**: this cut-down type has no `contains` of its own. The DSAKit version adds the O(h) one.
+
+## The rest of the API
+
+`remove`, `min`, `max`, `floor` and `ceiling` are the loops from earlier lessons, written for `Element` instead of `Int` and run on `storage.root`. A few small conformances finish the type:
+
+- `ExpressibleByArrayLiteral`, so `let tree: BinarySearchTree = [3, 1, 2]` works. It inserts the elements in the order written, so a sorted literal builds a chain.
+- `CustomStringConvertible`, printing `BinarySearchTree([1, 2, 3])`, the sorted elements.
+- `Equatable`: two trees are equal when they hold the same elements, whatever their shapes. `[2, 1, 3]` (balanced) equals `[1, 2, 3]` (a chain). Comparing counts first, then `elementsEqual`, makes that O(n).
+
+The full file is `dsa-swift/Sources/DSAKit/BinarySearchTree.swift`, and its tests, including 100,000 elements in random order, a 10,000-level chain, and thousands of random operations checked against a `Set` and a sorted array, are in `Tests/DSAKitTests/BinarySearchTreeTests.swift`. Read them: they're the specification in executable form.
+
+## Testing it against a model
+
+How do you know a tree like this is right? Tests for each case you can name (removing a leaf, a one-child node, the root, a floor below the minimum) catch the bugs you thought of. The bugs you didn't think of hide in **sequences** of operations: a removal that leaves a parent pointing at the wrong node only shows up when a later search walks through it.
+
+So DSAKit's tests add a **model-based test**. It performs thousands of random operations on the tree and, side by side, on a **model**: a structure too simple to be wrong, here a `Set<Int>` plus a sorted array. After every operation the two must agree:
+
+```swift
+for step in 0..<6_000 {
+    let value = steps.next(below: 400) - 200            // a small range, so values repeat
+    switch steps.next(below: 10) {
+    case 0...3:
+        let inserted = model.insert(value).inserted
+        if inserted { sorted.insert(value, at: sorted.firstIndex { $0 > value } ?? sorted.count) }
+        check(tree.insert(value) == inserted, "insert \(value) at step \(step)")
+    case 4...6:
+        let removed = model.remove(value)
+        sorted.removeAll { $0 == value }
+        check(tree.remove(value) == removed, "remove \(value) at step \(step)")
+    case 7:
+        check(tree.floor(value) == sorted.last { $0 <= value }, "floor \(value) at step \(step)")
+        check(tree.ceiling(value) == sorted.first { $0 >= value }, "ceiling \(value) at step \(step)")
+    case 8:
+        snapshot = tree                                  // a copy that must never change
+        snapshotContents = sorted
+    default:
+        check(tree.min == sorted.first && tree.max == sorted.last, "min and max at step \(step)")
+    }
+}
+```
+
+What makes it work:
+
+- **The model is slow but obviously right.** Inserting into a sorted array is O(n), which doesn't matter for a few thousand steps.
+- **The randomness is seeded.** `steps` is a tiny generator with a fixed starting value, so a failure happens identically on every run and can be debugged.
+- **The values come from a small range**, −200 to 199, so the same values are inserted, found and removed again and again. That exercises duplicates and every removal case, which spreading values over all of `Int` never would.
+- **Snapshots test copy-on-write.** Every so often the test copies the tree, and later checks that the copy still holds exactly what it held then.
+
+When a test like this fails, its message names the step and the operation. Cut the number of steps down to the smallest that still fails, and you have a short sequence that reproduces the bug.
+
+## What's still missing
+
+This tree is a complete, correct sorted set, but three things separate it from a production one:
+
+- **Balance.** Sorted input still builds a chain. M38's self-balancing trees fix that without changing the API.
+- **Indices.** It's a `Sequence`, not a `Collection`: there's no index you can keep and come back to, so no `first` property and no slicing. A tree index has to describe a path, and a change to the tree can invalidate it, which is why many tree types stop at `Sequence`.
+- **Values attached to keys.** An ordered **map** stores a value next to each key and orders by the key alone. It's the same tree with one more field per node, and it's built in [Build an ordered set and map in Swift](/dsa/learn/bal-ordered-map).
+
+<Callout kind="gotcha" title="Swift gotcha: the min property and the min() method">
+`tree.min` is the O(h) walk to the leftmost node. `tree.min()`, with parentheses, is `Sequence`'s method, which iterates over every element: O(n), with the same answer. Both compile, so be deliberate. The same trap applies to `contains`: inside a generic function that only knows it has "some `Sequence`", `contains` is the linear scan, even when the value is really a `BinarySearchTree`.
+</Callout>
+
+<Callout kind="gotcha" title="isKnownUniquelyReferenced needs a var">
+The function takes its argument `inout`, so it only works on a `var` stored property or local variable, and only on class instances. That's why `storage` is a `var`, and why the `deinit` loop pops into `while var node`, not `while let`.
+</Callout>
+
+## Practice
+
+**Build a binary search tree set** has you write your own generic tree from scratch: insert, contains, remove, min, max, floor, ceiling and the sorted elements. Copy-on-write isn't required there, so you can concentrate on the node logic. Then compare your version with DSAKit's file, decision by decision.
+
+```cards
+- id: generic-comparable
+  front: "Why is BinarySearchTree's element type constrained to Comparable?"
+  back: "A BST only needs to ask whether one element is smaller than another, which is what Comparable's < provides. Equal means neither is smaller."
+- id: generic-cow
+  front: "How does BinarySearchTree get value semantics while using class nodes?"
+  back: "The nodes live in a private Storage class that copies share; each mutating method checks isKnownUniquelyReferenced(&storage) and clones the nodes first if another copy shares them."
+- id: generic-deinit
+  front: "Why does a deep tree need a custom deinit on its nodes?"
+  back: "Freeing a node releases its children, which free theirs: one nested call per level. A long chain overflows the stack, so the deinit unhooks children with a loop instead."
+- id: generic-iterator-storage
+  front: "Why does BinarySearchTree's iterator hold a reference to the storage?"
+  back: "So the storage isn't uniquely referenced during a for loop: changing the tree inside the loop copies it first, and the loop keeps walking the unchanged nodes."
+```
+
+```quiz
+- id: q1
+  type: mcq
+  prompt: "Why is BinarySearchTree a struct wrapping a class, rather than a class?"
+  options:
+    - "Structs are always faster than classes"
+    - "So `var b = a` gives an independent tree, like Swift's own collections"
+    - "Because classes can't be generic"
+    - "Because a class can't conform to Sequence"
+  answer: 1
+  explain: "With a class, two variables would share one tree and a change through either would show in both. The struct plus copy-on-write keeps class nodes inside but behaves like a value."
+- id: q2
+  type: output
+  prompt: "What does this print?"
+  verify: false
+  code: |
+    import DSAKit
+
+    var a: BinarySearchTree = [2, 1]
+    var b = a
+    b.insert(3)
+    a.remove(1)
+    print(Array(a), Array(b), a == b)
+  answer: "[2] [1, 2, 3] false"
+  explain: "`b` starts out sharing `a`'s nodes. Its insert copies them first, and `a`'s remove then finds its own storage unique and changes it in place. Each tree ends up with its own changes only."
+- id: q3
+  type: truefalse
+  prompt: "Two BinarySearchTree values holding the same elements are equal, even if they have different shapes."
+  answer: true
+  explain: "Equality compares the elements in sorted order, not the node structure. `[2, 1, 3]` and `[1, 2, 3]` are equal trees."
+- id: q4
+  type: multi
+  prompt: "Which operations would overflow the stack on a 100,000-level chain if written recursively? Choose all that apply."
+  options:
+    - "insert"
+    - "copying the tree for copy-on-write"
+    - "freeing the nodes when the tree goes away"
+    - "count"
+  answer: [0, 1, 2]
+  explain: "Insert walks the whole chain, copying visits every node, and ARC's default freeing nests one call per level. `count` is a stored property, so it does no walking at all."
+- id: q5
+  type: bigo
+  prompt: "In BinarySearchTree, what does `tree.min()` (with parentheses) cost for n elements?"
+  answer: "O(n)"
+  explain: "That's Sequence's method, which iterates over every element. The `min` property walks to the leftmost node in O(h)."
+- id: q6
+  type: recall
+  prompt: "Explain why changing a BinarySearchTree inside a `for value in tree` loop is safe."
+  model: "The for loop's iterator holds a reference to the tree's storage. So when the loop body inserts or removes, isKnownUniquelyReferenced sees a second reference and the tree copies its nodes before changing them. The iterator keeps walking the old, unchanged nodes, as looping over an array walks the array as it was when the loop started."
+```

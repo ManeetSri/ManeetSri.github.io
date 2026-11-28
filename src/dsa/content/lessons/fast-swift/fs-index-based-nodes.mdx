@@ -1,0 +1,314 @@
+## Why it matters
+
+Every linked structure in this course so far, from [Build `LinkedList<T>`](/dsa/learn/ll-build-singly) to the trie in [Build a Trie: insert, search, startsWith](/dsa/learn/trie-build), has used a class per node. That's the clearest way to learn them. It's often not the fastest way to run them: each node is a separate heap allocation, every step along a link updates reference counts, and the nodes end up scattered through memory. Competitive programmers, game engines and performance-sensitive app code store nodes as **structs in an array** instead, linked by `Int` indices. This lesson rewrites a linked list and a trie that way and weighs what you gain against what you give up.
+
+## What a class node costs
+
+Recall from [Automatic Reference Counting](/dsa/learn/swift-arc) and [Stack vs heap](/dsa/learn/swift-stack-heap) what one class node means:
+
+- **An allocation.** Each node is its own heap object with a 16-byte header, created and later freed through the allocator.
+- **Reference counting.** Walking `current = current.next` retains the new node and releases the old one. The optimiser removes some of this, not all, and in a hot loop it shows up in profiles as `swift_retain` and `swift_release`.
+- **Scattered memory.** Nodes allocated at different times sit wherever the allocator put them. Following a link usually means a trip to a part of memory the cache hasn't seen, which is far slower than reading the next element of an array.
+- **Deep release chains.** Dropping the head of a very long list releases the first node, which releases the second, and so on: one nested call per node. A long enough chain overflows the stack and crashes.
+
+None of this matters for a hundred nodes. For a million, it can be most of the running time.
+
+## Nodes as structs in an array
+
+Instead, keep every node in one array and let a node's **position in the array** be its identity. A link is just the index of the next node, with `-1` meaning "none":
+
+```swift run
+struct Node {
+    var value: Int
+    var next: Int          // index of the next node, or -1
+}
+
+struct OptionalNode {
+    var value: Int
+    var next: Int?
+}
+
+struct SmallNode {
+    var value: Int32
+    var next: Int32
+}
+
+print(MemoryLayout<Node>.stride, MemoryLayout<OptionalNode>.stride, MemoryLayout<SmallNode>.stride)
+```
+
+```output
+16 24 8
+```
+
+Using `-1` rather than `Int?` keeps each node at 16 bytes instead of 24, for the reason [MemoryLayout: size, stride and alignment](/dsa/learn/swift-memory-layout) gave: `Int?` needs a ninth byte, which the stride rounds up to eight more. If the values and the node count fit in 32 bits, `Int32` fields halve it again. Either way, the nodes sit side by side in one buffer: one allocation for the whole structure, no reference counts, and neighbouring nodes often in the same cache line.
+
+## A linked list in an array, with a free list
+
+Removing a node leaves a hole in the array. Rather than shifting everything (which would make removal O(n) again), you keep the empty slots on a **free list**: a linked list of unused slots, threaded through the same `next` field. A new node takes a free slot if there is one, and only appends to the array when there isn't:
+
+```swift run
+struct IntList {
+    private struct Node {
+        var value: Int
+        var next: Int
+    }
+
+    private var nodes: [Node] = []
+    private var head = -1
+    private var freeHead = -1          // unused slots, linked through `next`
+
+    var slotCount: Int { nodes.count }
+
+    mutating func pushFront(_ value: Int) {
+        let node = Node(value: value, next: head)
+        if freeHead != -1 {            // reuse a slot
+            let slot = freeHead
+            freeHead = nodes[slot].next
+            nodes[slot] = node
+            head = slot
+        } else {                       // no free slot: grow the array
+            nodes.append(node)
+            head = nodes.count - 1
+        }
+    }
+
+    mutating func popFront() -> Int? {
+        guard head != -1 else { return nil }
+        let slot = head
+        head = nodes[slot].next
+        nodes[slot].next = freeHead    // the slot joins the free list
+        freeHead = slot
+        return nodes[slot].value
+    }
+
+    var values: [Int] {
+        var result: [Int] = []
+        var current = head
+        while current != -1 {
+            result.append(nodes[current].value)
+            current = nodes[current].next
+        }
+        return result
+    }
+}
+
+var list = IntList()
+for value in [3, 2, 1] {
+    list.pushFront(value)
+}
+print(list.values, "slots:", list.slotCount)
+print(list.popFront() ?? -1, list.popFront() ?? -1)
+list.pushFront(20)
+list.pushFront(10)
+print(list.values, "slots:", list.slotCount)
+
+var copy = list
+copy.pushFront(0)
+print(list.values, copy.values)
+```
+
+```output
+[1, 2, 3] slots: 3
+1 2
+[10, 20, 3] slots: 3
+[10, 20, 3] [0, 10, 20, 3]
+```
+
+What to notice:
+
+- **The pool didn't grow.** After two pops and two pushes, still three slots: the new nodes reused the freed ones, most recently freed first, because the free list is a stack.
+- **Copying is trivial, and correct.** `var copy = list` copied an array and three integers, lazily, thanks to copy-on-write. The copy is a fully independent list. A class-based list needs a deep copy that walks and recreates every node to get the same effect, as [Writing your own copy-on-write](/dsa/learn/swift-implementing-cow) warned.
+- **Handles are just numbers.** A node's slot index works like a pointer you can store anywhere: in a dictionary, in another array, in a test.
+
+The practice problem **A linked list in a slot pool** builds the doubly linked version, with a `previous` index as well, so that removing any node by its handle is O(1). That's exactly the structure inside an LRU cache ([LRU cache](/dsa/learn/ll-lru-cache)) when you want it without a class per entry.
+
+## A trie in flat arrays
+
+A trie node has up to 26 children. The class version keeps a `[Node?]` of 26 in each node, so every node is two allocations (the object and its array) and roughly 270 bytes. The flat version keeps **one array for all children**: node `n`'s 26 child slots are at positions `n * 26` to `n * 26 + 25`. It stores them as `Int32`, and uses 0 to mean "no child", which is safe because node 0, the root, is never anyone's child:
+
+```swift run
+struct FlatTrie {
+    private var children = [Int32](repeating: 0, count: 26)   // node n's children: n * 26 ..< n * 26 + 26
+    private var isWord = [false]                                // one entry per node; the root is node 0
+
+    var nodeCount: Int { isWord.count }
+
+    mutating func insert(_ word: String) {
+        var node = 0
+        for byte in word.utf8 {
+            let slot = node * 26 + Int(byte - 97)                // "a" is 97
+            if children[slot] == 0 {                             // no child yet: create node number nodeCount
+                children[slot] = Int32(isWord.count)
+                children.append(contentsOf: repeatElement(0, count: 26))
+                isWord.append(false)
+            }
+            node = Int(children[slot])
+        }
+        isWord[node] = true
+    }
+
+    func contains(_ word: String) -> Bool {
+        var node = 0
+        for byte in word.utf8 {
+            let next = children[node * 26 + Int(byte - 97)]
+            if next == 0 { return false }
+            node = Int(next)
+        }
+        return isWord[node]
+    }
+}
+
+var trie = FlatTrie()
+for word in ["tea", "ten", "to", "inn"] {
+    trie.insert(word)
+}
+print(trie.contains("ten"), trie.contains("te"), trie.contains("inn"))
+print("nodes:", trie.nodeCount)
+```
+
+```output
+true false true
+nodes: 9
+```
+
+Each node now costs 104 bytes of children plus one `Bool`, with no allocations of its own: the arrays grow geometrically, so a trie of a million nodes makes a few dozen allocations instead of two million. Nodes are numbered in the order they're created, so a word's path visits ever-larger numbers, and nodes created together sit together in memory. Extra per-node data, such as the pass counts from [Deleting and counting prefixes](/dsa/learn/trie-delete-count), is one more parallel array.
+
+The practice problem **A trie in flat arrays** asks for this structure with prefix counting, and checks the node numbering exactly.
+
+## Trees and graphs the same way
+
+The pattern works for any linked structure:
+
+- **Binary trees:** parallel arrays `left: [Int32]`, `right: [Int32]` and `value: [Int]`, with -1 for "no child". It's how segment trees and many competitive programming trees are stored. You've already seen the extreme case: a heap needs no links at all, because a complete tree's shape is implied by the index ([A complete tree in an array](/dsa/learn/heap-array-index)).
+- **Graphs:** competitive programmers often store every edge in arrays, with each node's edges forming a linked list through them, a layout called a **forward star**:
+
+```swift run
+var head = [Int](repeating: -1, count: 4)   // the first edge out of each node, or -1
+var target: [Int] = []                       // where each edge goes
+var nextEdge: [Int] = []                     // the next edge out of the same node, or -1
+
+func addEdge(_ from: Int, _ to: Int) {
+    target.append(to)
+    nextEdge.append(head[from])
+    head[from] = target.count - 1
+}
+
+for (from, to) in [(0, 1), (0, 2), (1, 3), (0, 3)] {
+    addEdge(from, to)
+}
+
+var edge = head[0]
+var neighbours: [Int] = []
+while edge != -1 {
+    neighbours.append(target[edge])
+    edge = nextEdge[edge]
+}
+print(neighbours)
+```
+
+```output
+[3, 2, 1]
+```
+
+Three flat arrays hold the whole graph, with no inner array per node. Neighbours come out newest first. The union-find parent array from [Disjoint sets and the parent array](/dsa/learn/uf-idea) is the same idea again: a forest stored as indices.
+
+## What you give up
+
+| | Class nodes | Index-based nodes |
+| --- | --- | --- |
+| Freeing nodes | automatic (ARC) | your job: a free list, or never free |
+| A link to a removed node | can't exist: the node stays alive | a **stale index**, which may now point at a reused slot |
+| Copying the structure | deep copy by hand | free, with value semantics |
+| Allocations | one or more per node | a few for the whole structure |
+| Reading the code | `node.left.value` | `value[left[node]]` |
+| Sharing parts between structures | natural | awkward |
+
+Stale indices are the real hazard. If code keeps the handle of a removed node, the slot may since have been given to a new node, and the old handle silently reads the wrong data. Systems that need protection pair each slot with a **generation** number that increases when the slot is reused, and store `(index, generation)` as the handle, so a stale one can be detected. In contest code and self-contained structures, you simply never keep a handle after removing its node.
+
+<Callout kind="tip" title="Which to choose">
+Start with classes when you're learning a structure or when nodes are shared, long-lived and few. Switch to indices when there are many nodes, when profiles show `swift_retain` and `swift_release`, or when you want value semantics for free. In competitive programming, index-based is the default.
+</Callout>
+
+## Practice
+
+**A linked list in a slot pool** is a doubly linked list in an array of structs, with a free list that must reuse slots in a precise order: the tests churn through 200,000 removals and insertions and expect the pool never to grow. **A trie in flat arrays** stores 40,000 words with no node objects at all.
+
+```cards
+- id: index-node-idea
+  front: "How do you build a linked structure without a class per node?"
+  back: "Store the nodes as structs in one array and use each node's index as its identity. Links are Int indices, with -1 (or 0 for a trie's children) meaning none."
+- id: free-list
+  front: "What is a free list in an index-based structure?"
+  back: "A linked list of unused slots, threaded through the nodes' own `next` field. New nodes take a free slot before the array grows, so removal stays O(1) and memory is reused."
+- id: index-node-gains
+  front: "Name three advantages of index-based nodes over class nodes."
+  back: "Few allocations, no reference-counting traffic, nodes close together in memory, and copying the structure is a cheap, correct value copy."
+- id: stale-index
+  front: "What is the main hazard of index-based nodes?"
+  back: "A stale index: a handle kept after its node was removed may point at a slot that's been reused for a different node. Generation counters can detect it."
+```
+
+```quiz
+- id: q1
+  type: output
+  prompt: "What does this print?"
+  code: |
+    struct Pool {
+        var next: [Int] = []
+        var freeHead = -1
+
+        mutating func take() -> Int {
+            if freeHead != -1 {
+                let slot = freeHead
+                freeHead = next[slot]
+                return slot
+            }
+            next.append(-1)
+            return next.count - 1
+        }
+
+        mutating func give(_ slot: Int) {
+            next[slot] = freeHead
+            freeHead = slot
+        }
+    }
+
+    var pool = Pool()
+    let a = pool.take()
+    let b = pool.take()
+    let c = pool.take()
+    pool.give(a)
+    pool.give(c)
+    print(pool.take(), pool.take(), pool.take(), b)
+  answer: "2 0 3 1"
+  explain: "Slots 0, 1 and 2 are taken. Giving back 0 and then 2 makes the free list 2 → 0. The next takes get 2, then 0, then a new slot 3, because the free list is empty. `b` is still 1."
+- id: q2
+  type: mcq
+  prompt: "Why does a flat trie use 0 to mean \"no child\" instead of -1 or an optional?"
+  options:
+    - "Because Int32 can't store -1"
+    - "Because the root is node 0 and is never anyone's child, so 0 is free to mean none, and new child arrays can start zero-filled"
+    - "Because optionals can't be stored in arrays"
+    - "Because 0 makes lookups O(1)"
+  answer: 1
+  explain: "No node points back to the root, so 0 never appears as a real child. That lets the children array be created with `repeating: 0` and avoids the extra byte and padding an optional would add."
+- id: q3
+  type: multi
+  prompt: "Which are real costs of class nodes that index-based nodes avoid?"
+  options:
+    - "A heap allocation per node"
+    - "Retain and release when following links"
+    - "Worse big-O complexity for insertion"
+    - "Recursive release that can overflow the stack for a very long chain"
+  answer: [0, 1, 3]
+  explain: "Index-based nodes don't change the algorithms' complexity. They remove per-node allocations, reference-counting traffic and deep release chains, and keep nodes close together in memory."
+- id: q4
+  type: truefalse
+  prompt: "After `var copy = list`, where `list` is an index-based linked list struct, changing `copy` can change `list`."
+  answer: false
+  explain: "The struct holds arrays and integers, which are value types with copy-on-write. The copy is fully independent, with no deep copy to write."
+- id: q5
+  type: recall
+  prompt: "A handle to a removed node is used later and returns a value that belongs to a different node. Explain what happened and one way to detect it."
+  model: "The removed node's slot went on the free list and was reused by a new node, so the old handle (a stale index) now points at the new node. Storing a generation number per slot, increased whenever the slot is reused, and keeping (index, generation) as the handle lets you detect a stale one: its generation won't match."
+```

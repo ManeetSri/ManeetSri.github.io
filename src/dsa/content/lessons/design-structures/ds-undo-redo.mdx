@@ -1,0 +1,313 @@
+## Why it matters
+
+Every app that lets people make things needs undo: notes, photo editors, drawing apps, spreadsheets, code editors. On iOS, shaking the phone offers "Undo Typing", and on iPad and Mac, ⌘Z works in any text field, all powered by Foundation's `UndoManager`. As an interview question, "design undo and redo" is a lovely small design problem: two stacks, a rule about when the redo history disappears, and a choice between saving **states** and saving **changes**. That last choice is the **command pattern**, one of the most useful ideas in app architecture.
+
+## Requirements
+
+- **Undo** reverts the most recent edit that hasn't been undone; **redo** re-applies the most recently undone edit. Both do nothing (and say so) when there's nothing to do.
+- **A new edit after some undos discards the redo history.**
+- **What counts as an edit?** Inserting an empty string, or deleting nothing, shouldn't create an undo step that does nothing.
+- **How much history?** Unlimited, or the last 100 steps?
+- **Grouping:** does typing a whole word undo as one step, or one letter at a time?
+
+## Design 1: save snapshots
+
+The simplest design saves a copy of the whole state before every edit, on an undo stack. Undo pushes the current state onto the redo stack and restores the top snapshot; redo does the opposite. This is the **memento** pattern, and it's hard to get wrong. Here it is with a text where every keystroke is an edit:
+
+```swift run
+struct SnapshotHistory {
+    private(set) var text = ""
+    private var undoTexts: [String] = []           // the whole text before each edit
+    private var redoTexts: [String] = []
+    private(set) var charactersStored = 0
+
+    mutating func edit(_ change: (inout String) -> Void) {
+        undoTexts.append(text)
+        charactersStored += text.count
+        redoTexts.removeAll()
+        change(&text)
+    }
+
+    mutating func undo() {
+        guard let previous = undoTexts.popLast() else { return }
+        redoTexts.append(text)
+        text = previous
+    }
+}
+
+let letters = Array("abcdefghijklmnopqrstuvwxyz")
+var essay = SnapshotHistory()
+for index in 0..<1_000 {
+    essay.edit { $0.append(letters[index % 26]) }  // one keystroke, one edit
+}
+print("characters typed:", essay.text.count)
+print("characters stored for undo:", essay.charactersStored)
+for _ in 1...3 {
+    essay.undo()
+}
+print("after 3 undos:", essay.text.count, essay.text.suffix(3))
+```
+
+```output
+characters typed: 1000
+characters stored for undo: 499500
+after 3 undos: 997 ghi
+```
+
+It works, but a thousand keystrokes stored half a million characters: 0 + 1 + 2 + … + 999. The history grows with the **square** of the document's length. For a short form or a few settings, that's fine and snapshots are the right choice. For a document, it isn't.
+
+## Design 2: save the changes (the command pattern)
+
+Instead of storing what the document looked like, store **what each edit did**, as a value that knows how to apply itself and how to take itself back. That value is a **command**. An append is undone by removing the last line; an edit is undone by putting the old text back, so the command remembers the old text; a removal is undone by inserting the removed line, so it remembers that line too.
+
+Two stacks of commands make the history:
+
+- **Perform** a command: apply it, push it onto the undo stack, and **empty the redo stack**.
+- **Undo:** pop from the undo stack, revert it, push it onto the redo stack.
+- **Redo:** pop from the redo stack, apply it again, push it onto the undo stack.
+
+```swift run
+struct Document {
+    var lines: [String] = []
+}
+
+/// An edit that knows how to do itself and how to take itself back.
+protocol Command {
+    var name: String { get }
+    func apply(to document: inout Document)
+    func revert(on document: inout Document)
+}
+
+struct AppendLine: Command {
+    let text: String
+    var name: String { "append \"\(text)\"" }
+    func apply(to document: inout Document) { document.lines.append(text) }
+    func revert(on document: inout Document) { document.lines.removeLast() }
+}
+
+struct EditLine: Command {
+    let index: Int
+    let old: String                                // remembered, so the edit can be reverted
+    let new: String
+    var name: String { "edit line \(index)" }
+    func apply(to document: inout Document) { document.lines[index] = new }
+    func revert(on document: inout Document) { document.lines[index] = old }
+}
+
+struct RemoveLine: Command {
+    let index: Int
+    let removed: String                            // remembered, so it can be put back
+    var name: String { "remove line \(index)" }
+    func apply(to document: inout Document) { document.lines.remove(at: index) }
+    func revert(on document: inout Document) { document.lines.insert(removed, at: index) }
+}
+
+struct History {
+    private(set) var document = Document()
+    private var undoStack: [any Command] = []
+    private var redoStack: [any Command] = []
+
+    private mutating func perform(_ command: any Command) {
+        command.apply(to: &document)
+        undoStack.append(command)
+        redoStack.removeAll()                      // a new edit starts a new future
+    }
+
+    mutating func append(_ text: String) {
+        perform(AppendLine(text: text))
+    }
+
+    mutating func edit(line index: Int, to text: String) {
+        perform(EditLine(index: index, old: document.lines[index], new: text))
+    }
+
+    mutating func remove(line index: Int) {
+        perform(RemoveLine(index: index, removed: document.lines[index]))
+    }
+
+    @discardableResult
+    mutating func undo() -> Bool {
+        guard let command = undoStack.popLast() else { return false }
+        command.revert(on: &document)
+        redoStack.append(command)
+        print("undo", command.name)
+        return true
+    }
+
+    @discardableResult
+    mutating func redo() -> Bool {
+        guard let command = redoStack.popLast() else { return false }
+        command.apply(to: &document)
+        undoStack.append(command)
+        print("redo", command.name)
+        return true
+    }
+
+    var summary: String {
+        "\(document.lines)  undo: \(undoStack.count), redo: \(redoStack.count)"
+    }
+}
+
+var notes = History()
+notes.append("buy milk")
+notes.append("call Ana")
+notes.edit(line: 0, to: "buy oat milk")
+print(notes.summary)
+notes.undo()
+notes.undo()
+print(notes.summary)
+notes.redo()
+print(notes.summary)
+notes.remove(line: 0)                              // a new edit: the redo history is gone
+print(notes.summary)
+print("redo possible:", notes.redo())
+notes.undo()
+print(notes.summary)
+```
+
+```output
+["buy oat milk", "call Ana"]  undo: 3, redo: 0
+undo edit line 0
+undo append "call Ana"
+["buy milk"]  undo: 1, redo: 2
+redo append "call Ana"
+["buy milk", "call Ana"]  undo: 2, redo: 1
+["call Ana"]  undo: 3, redo: 0
+redo possible: false
+undo remove line 0
+["buy milk", "call Ana"]  undo: 2, redo: 1
+```
+
+What to notice:
+
+- **The history stores changes, not documents.** Each command holds a line or two of text, however long the document grows. Undo and redo cost what the edit itself costs.
+- **Commands capture what they need when they're created.** `EditLine` stores the old text, read from the document by `History` before the edit happens. A command that tried to work out the old text later would find it already overwritten.
+- **The redo history vanished** when `remove(line:)` ran after the undos. The undone edit ("edit line 0") was made to a version of the document that no longer exists, so replaying it now could do something nonsensical.
+- **The commands are a protocol**, so new kinds of edit plug in without touching `History`. An enum with one case per edit, as the practice problem uses, works equally well when the set of edits is fixed.
+
+<Callout kind="analogy" title="Going back and forth in time">
+The undo stack is the past and the redo stack is a future you stepped back from. Undo moves one step into the past; redo walks forward again. But the moment you do something new, you're on a different path, and the old future can't be reached any more. Some editors (Vim, Emacs) keep every branch as an **undo tree** instead of throwing the old future away.
+</Callout>
+
+## Limits and grouping
+
+**Limiting the history.** Keeping only the last 100 steps means dropping the **oldest** command, from the bottom of the undo stack, when a new one arrives. An array's `removeFirst()` is O(n), so use a deque, with O(1) at both ends, as in [Build `Deque<T>`](/dsa/learn/queue-build-deque): push and pop at the back for undo, pop from the front to forget.
+
+**Grouping edits.** Nobody wants ⌘Z to remove one letter at a time. Editors **coalesce** consecutive typing into one step: if a new insert continues right where the previous insert ended, and arrives soon after it, extend the previous command instead of pushing a new one. More generally, "begin group … end group" wraps several commands into one compound command that applies them all in order and reverts them in reverse order.
+
+## UndoManager in iOS and macOS
+
+Foundation's `UndoManager` is the command pattern built into the platform, with the two stacks managed for you. Instead of command objects, you register a **closure** that performs the inverse of what you did:
+
+```swift
+final class Notes {
+    var lines: [String] = []
+    let undoManager = UndoManager()
+
+    func append(_ text: String) {
+        lines.append(text)
+        undoManager.registerUndo(withTarget: self) { notes in
+            notes.removeLast()                     // the inverse, run when the user undoes
+        }
+        undoManager.setActionName("Add Line")      // shown as "Undo Add Line"
+    }
+
+    func removeLast() {
+        let text = lines.removeLast()
+        undoManager.registerUndo(withTarget: self) { notes in
+            notes.append(text)
+        }
+    }
+}
+```
+
+How it fits the design you built above:
+
+- `registerUndo(withTarget:handler:)` pushes the closure onto the undo stack. Registering a new undo action normally clears the redo stack.
+- When the user undoes, `UndoManager` runs the closure, which calls `removeLast()`, which registers **its** inverse. Because `UndoManager` knows it's in the middle of an undo, that registration goes onto the **redo** stack. So each method only has to register its own inverse, and redo comes for free.
+- `groupsByEvent` (on by default) groups everything registered during one pass of the app's event loop, so one tap that changes three things undoes as one step. `beginUndoGrouping()` and `endUndoGrouping()` group by hand.
+- `levelsOfUndo` limits the history, exactly like the deque above.
+- Text fields and text views have undo built in, and in SwiftUI a view can read the window's manager from the environment through the `undoManager` key path.
+
+<Callout kind="gotcha" title="Common mistakes">
+- **Not clearing redo on a new edit.** Redo would then replay an edit onto a document it was never meant for.
+- **Commands that don't capture what they need.** A delete must store the deleted text; an edit must store the old value, read before the change.
+- **Recording no-op edits.** An empty insert that becomes an undo step makes ⌘Z appear to do nothing.
+- **Snapshots of a large document per keystroke.** The history grows with the square of the length. Store changes instead, or snapshot only occasionally.
+- **Commands holding references to objects that change later.** A command should hold values, or the inverse may "restore" something that has since been modified.
+</Callout>
+
+## Practice
+
+**Undo and redo for a text buffer** builds an editor with `insert(_:at:)`, `delete(from:count:)`, `undo()`, `redo()` and an optional undo limit, storing edits as commands. One test types 100,000 characters, undoes them all and redoes them all, which a snapshot design can't finish in time.
+
+```cards
+- id: undo-two-stacks
+  front: "How do two stacks implement undo and redo?"
+  back: "Perform: apply, push onto undo, clear redo. Undo: pop from undo, revert, push onto redo. Redo: pop from redo, apply, push onto undo."
+- id: undo-clear-redo
+  front: "Why does a new edit clear the redo stack?"
+  back: "The undone edits were made to a version of the document that no longer exists, so replaying them after a different edit could corrupt it. History is a line, not a tree."
+- id: undo-command-pattern
+  front: "What is the command pattern, and why is it better than snapshots for undo?"
+  back: "Each edit is a value that can apply and revert itself, storing only what it changed. History then grows with the size of the edits rather than the size of the document times the number of edits."
+- id: undomanager-redo
+  front: "How does UndoManager get redo for free?"
+  back: "An undo action that registers another undo while undoing is recorded on the redo stack, so each method only registers its own inverse."
+```
+
+```quiz
+- id: q1
+  type: trace
+  prompt: "Starting from an empty text: type \"a\", type \"b\", undo, type \"c\", redo. What's the text afterwards?"
+  answer: "ac"
+  explain: "After the undo the text is \"a\", with typing \"b\" on the redo stack. Typing \"c\" is a new edit, which clears the redo stack, so the final redo does nothing: \"ac\"."
+- id: q2
+  type: output
+  prompt: "This counts the characters a snapshot history stores while typing 5 characters, one edit each. What does it print?"
+  code: |
+    var stored = 0
+    var length = 0
+    for _ in 0..<5 {
+        stored += length      // a snapshot of the text before each edit
+        length += 1           // the edit types one character
+    }
+    print(stored, length)
+  answer: "10 5"
+  explain: "The snapshots hold 0, 1, 2, 3 and 4 characters: 10 in total for a 5-character text. For n keystrokes it's n(n − 1)/2, which grows with the square of n."
+- id: q3
+  type: bug
+  prompt: "After an undo, `redo()` always says there's nothing to redo. Which line is the bug?"
+  code: |
+    mutating func undo() -> Bool {
+        guard let command = undoStack.popLast() else { return false }
+        command.revert(on: &document)
+        undoStack.append(command)
+        return true
+    }
+  answer: 4
+  explain: "The undone command goes straight back onto the undo stack, so the redo stack never gets it (and the next undo reverts the same command again). Line 4 should push onto `redoStack`."
+- id: q4
+  type: match
+  prompt: "Match each design with its main trade-off."
+  pairs:
+    - ["Snapshots (memento)", "Simple, but memory grows with document size × edits"]
+    - ["Commands on two stacks", "Compact, but every edit needs a correct inverse"]
+    - ["Undo tree", "Never loses a branch, but is harder to navigate"]
+  explain: "Snapshots trade memory for simplicity; commands trade the effort of writing inverses for compact history; an undo tree keeps every future instead of discarding the redo stack on a new edit."
+- id: q5
+  type: truefalse
+  prompt: "With UndoManager, an undo handler that registers another undo action while the manager is undoing has that action recorded as a redo."
+  answer: true
+  explain: "That's how UndoManager provides redo: each method registers its own inverse, and the manager files the registration on the redo stack when it happens during an undo."
+- id: q6
+  type: mcq
+  prompt: "An editor keeps only the last 100 undo steps. Which structure suits the undo stack best?"
+  options:
+    - "An array, removing the oldest with removeFirst()"
+    - "A deque: push and pop at the back, drop the oldest from the front"
+    - "A Set of commands"
+    - "A dictionary from step number to command"
+  answer: 1
+  explain: "Undo and redo use the back like a stack, and the limit drops from the front. A deque does both in O(1); `removeFirst()` on an array shifts every element, O(n)."
+```

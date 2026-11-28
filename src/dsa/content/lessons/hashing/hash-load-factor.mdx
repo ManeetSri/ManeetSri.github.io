@@ -1,0 +1,276 @@
+## Why it matters
+
+A hash table's speed depends on one number: how full it is. Nearly empty, almost every key has a bucket to itself. Nearly full, keys pile up and lookups crawl. Every real hash table watches that number and, when it gets too high, moves everything into a bigger array. This lesson shows why the threshold sits around 0.75, why moving everything doesn't ruin the O(1) promise, and how to see Swift's `Dictionary` doing it.
+
+## The load factor
+
+The **load factor** is the number of entries divided by the number of buckets:
+
+> α = n / m   (n entries, m buckets)
+
+A table with 6 keys in 8 buckets has α = 0.75. With separate chaining, α is the average chain length, so it can exceed 1. With open addressing, each slot holds at most one entry, so α must stay below 1.
+
+## How full is too full?
+
+For **separate chaining** with a good hash, a lookup for a missing key walks a whole chain, α entries on average, and a lookup that succeeds walks about half of one. Cost grows gently, in a straight line with α.
+
+For **linear probing**, the cost explodes as the table fills. Donald Knuth worked out the average number of slots a lookup examines:
+
+| load factor α | finding a key | confirming a key is missing |
+| --- | --- | --- |
+| 0.25 | 1.2 | 1.4 |
+| 0.5 | 1.5 | 2.5 |
+| 0.75 | 2.5 | 8.5 |
+| 0.9 | 5.5 | 50.5 |
+| 0.99 | 50.5 | 5,000.5 |
+
+The formulas are ½(1 + 1/(1 − α)) and ½(1 + 1/(1 − α)²). The `1 − α` on the bottom is the trouble: as α creeps towards 1, the cost shoots up. You can check the theory by filling a table and measuring. This uses a fixed formula to generate scattered hash values, so it gives the same numbers every run:
+
+```swift run
+var state: UInt64 = 2024
+func scatteredHash() -> Int {              // a simple pseudo-random generator with a fixed start
+    state = state &* 6364136223846793005 &+ 1442695040888963407
+    return Int(state >> 33)
+}
+
+let size = 4_096
+var taken = [Bool](repeating: false, count: size)
+var count = 0
+
+func probes(from start: Int) -> Int {      // slots examined to reach an empty one
+    var index = start
+    var examined = 1
+    while taken[index] {
+        index = (index + 1) % size
+        examined += 1
+    }
+    return examined
+}
+
+for load in [0.5, 0.75, 0.9] {
+    while Double(count) < load * Double(size) {     // fill up to this load
+        var index = scatteredHash() % size
+        while taken[index] {
+            index = (index + 1) % size
+        }
+        taken[index] = true
+        count += 1
+    }
+    var total = 0
+    for _ in 0..<10_000 {                           // measure 10,000 lookups for missing keys
+        total += probes(from: scatteredHash() % size)
+    }
+    print("load \(load): \(Double(total) / 10_000) slots per missing-key lookup")
+}
+```
+
+```output
+load 0.5: 2.5468 slots per missing-key lookup
+load 0.75: 8.5519 slots per missing-key lookup
+load 0.9: 59.513 slots per missing-key lookup
+```
+
+Close to the predictions of 2.5, 8.5 and 50.5. At 90% full, every miss checks around fifty slots. That's why open-addressing tables never let themselves get that full.
+
+## Rehashing: grow, then move everything
+
+The fix is to keep α below a threshold, commonly 0.75. When an insert would push the table past it, the table:
+
+1. allocates a new array with **twice** as many buckets;
+2. **rehashes** every entry: works out its bucket again and inserts it into the new array;
+3. throws the old array away.
+
+Step 2 can't copy the buckets across as they are, because a key's bucket depends on the number of buckets:
+
+```swift run
+for key in [5, 13, 21, 29] {
+    print("key \(key): bucket \(key % 8) of 8, bucket \(key % 16) of 16")
+}
+```
+
+```output
+key 5: bucket 5 of 8, bucket 5 of 16
+key 13: bucket 5 of 8, bucket 13 of 16
+key 21: bucket 5 of 8, bucket 5 of 16
+key 29: bucket 5 of 8, bucket 13 of 16
+```
+
+Four keys shared bucket 5. After doubling, they split between buckets 5 and 13. Growing doesn't only add room; it also breaks up chains and clusters.
+
+## Why rehashing is still O(1) on average
+
+A rehash touches every entry, so the insert that triggers it costs O(n). That sounds bad until you remember [Amortised analysis](/dsa/learn/bigo-amortised). It's the same argument:
+
+- The table doubles, so after a rehash at n entries, the next one isn't until about 2n entries.
+- The rehashes move about 6, 12, 24, 48, … entries, a geometric series whose total is less than twice the final size.
+
+Count it for a table that starts with 8 buckets and doubles whenever α passes 0.75:
+
+```swift run
+func rehashMoves(inserting n: Int) -> Int {
+    var buckets = 8
+    var count = 0
+    var moves = 0
+    for _ in 0..<n {
+        count += 1
+        if count > buckets * 3 / 4 {
+            moves += count               // every entry moves to the new array
+            buckets *= 2
+        }
+    }
+    return moves
+}
+
+for n in [1_000, 10_000, 100_000, 1_000_000] {
+    print("\(n) inserts: \(rehashMoves(inserting: n)) entries moved")
+}
+```
+
+```output
+1000 inserts: 1538 entries moved
+10000 inserts: 12293 entries moved
+100000 inserts: 196617 entries moved
+1000000 inserts: 1572876 entries moved
+```
+
+Always fewer than 2n moves. Add the n ordinary inserts, and n inserts cost O(n) in total: **O(1) amortised** per insert.
+
+<Callout kind="analogy">
+It's like moving house. Each move is exhausting and you have to carry everything. But if every new home is twice the size of the last, you move rarely, and spread over all the years in between, the cost per year stays small.
+</Callout>
+
+## Watching Swift's Dictionary grow
+
+`Dictionary` has a `capacity` property: how many entries it can hold before it next grows. Watch it as entries go in:
+
+```swift run
+var squares: [Int: Int] = [:]
+var lastCapacity = squares.capacity
+print("count 0, capacity \(lastCapacity)")
+for number in 1...200 {
+    squares[number] = number * number
+    if squares.capacity != lastCapacity {
+        lastCapacity = squares.capacity
+        print("count \(squares.count), capacity \(lastCapacity)")
+    }
+}
+```
+
+```output
+count 0, capacity 0
+count 1, capacity 1
+count 2, capacity 3
+count 4, capacity 6
+count 7, capacity 12
+count 13, capacity 24
+count 25, capacity 48
+count 49, capacity 96
+count 97, capacity 192
+count 193, capacity 384
+```
+
+The capacity doubles each time, and it's always three quarters of a power of two: 6 of 8 buckets, 12 of 16, 24 of 32. Swift's maximum load factor is 0.75. Each line above is a rehash of everything in the dictionary.
+
+As with arrays, you can skip the rehashes when you know the size in advance, with `reserveCapacity(_:)` or `Dictionary(minimumCapacity:)`:
+
+```swift run
+var seen = Set<Int>(minimumCapacity: 1_000)
+let reserved = seen.capacity
+for value in 0..<1_000 {
+    seen.insert(value)
+}
+print(reserved >= 1_000, seen.capacity == reserved)
+```
+
+```output
+true true
+```
+
+The capacity never changed, so no rehash happened.
+
+## Choosing the threshold
+
+The threshold trades memory for speed. Lower means shorter probes and more empty buckets; higher means less memory and longer probes.
+
+- Java's `HashMap` uses chaining with a threshold of 0.75.
+- Python's `dict` uses open addressing and grows at about two thirds full.
+- Swift's `Dictionary` and `Set` use linear probing and grow at 0.75.
+
+Chaining can tolerate higher loads than open addressing, because its cost grows in a straight line rather than exploding.
+
+<Callout kind="gotcha" title="Swift gotcha: dictionaries don't shrink">
+Removing entries never lowers a dictionary's capacity. A dictionary that once held a million entries keeps its million-entry storage after you remove them all one by one. `removeAll()` frees it; `removeAll(keepingCapacity: true)` deliberately keeps it for reuse. And as with arrays, the occasional insert that triggers a rehash is O(n) on its own, so for a big dictionary filled during an animation, reserve the capacity up front.
+</Callout>
+
+## Practice
+
+**A hash map from scratch** follows exactly the rule from this lesson: start with 8 buckets and double when `count` passes three quarters of the bucket count. Its tests check the bucket count after every insert.
+
+```cards
+- id: load-factor-definition
+  front: "What is a hash table's load factor?"
+  back: "α = n / m: entries divided by buckets. For chaining it's the average chain length."
+- id: probing-blowup
+  front: "Why must open-addressing tables stay well below full?"
+  back: "Linear probing's cost grows like 1/(1 − α)²: about 8.5 slots per miss at α = 0.75, but about 50 at 0.9 and 5,000 at 0.99."
+- id: rehash-indexes-change
+  front: "Why can't a resize copy buckets across unchanged?"
+  back: "A key's bucket is its hash modulo the bucket count, so doubling the count changes where keys belong. Every entry is rehashed into the new array."
+- id: rehash-amortised
+  front: "Why are inserts O(1) amortised despite O(n) rehashes?"
+  back: "The table doubles, so rehashes happen at sizes forming a geometric series. All the moves for n inserts total less than 2n."
+```
+
+```quiz
+- id: q1
+  type: mcq
+  prompt: "A chained hash table holds 30 keys in 8 buckets. What is its load factor?"
+  options:
+    - "0.27"
+    - "3.75"
+    - "8"
+    - "It can't hold 30 keys"
+  answer: 1
+  explain: "α = 30 / 8 = 3.75. With chaining the load factor can pass 1: the average chain has 3.75 keys, which is far too long, so a real table would have grown long before."
+- id: q2
+  type: output
+  prompt: "This table starts with 8 buckets and doubles when `count > buckets * 3 / 4`. What does it print?"
+  code: |
+    var buckets = 8
+    var count = 0
+    var growths: [Int] = []
+    for _ in 0..<30 {
+        count += 1
+        if count > buckets * 3 / 4 {
+            buckets *= 2
+            growths.append(count)
+        }
+    }
+    print(growths, buckets)
+  answer: "[7, 13, 25] 64"
+  explain: "8 buckets allow 6 entries, so the 7th triggers a growth to 16 (allowing 12). The 13th grows it to 32 (allowing 24), and the 25th to 64."
+- id: q3
+  type: truefalse
+  prompt: "When a hash table doubles its bucket count, every key stays in the bucket with the same index."
+  answer: false
+  explain: "The bucket is the hash modulo the bucket count. With 8 buckets, 13 goes to bucket 5; with 16, it goes to bucket 13. Every entry has to be rehashed."
+- id: q4
+  type: bigo
+  prompt: "What's the total time to insert n keys into a hash table that doubles whenever its load factor passes 0.75, assuming a good hash?"
+  answer: "O(n)"
+  explain: "Each insert is O(1) on average, and the rehashes move fewer than 2n entries in total, a geometric series. So the whole sequence is O(n): O(1) amortised per insert."
+- id: q5
+  type: mcq
+  prompt: "Why does Swift's `Dictionary` grow at a load factor of 0.75 rather than waiting until it's 99% full?"
+  options:
+    - "Because 0.75 is easier to compute"
+    - "Because linear probing gets dramatically slower as the table fills: around 5,000 slots per failed lookup at 99%"
+    - "Because dictionaries can't hold more than 75% of their buckets in memory"
+    - "Because of the random seed"
+  answer: 1
+  explain: "The cost of a failed lookup grows like 1/(1 − α)². At 0.75 it's about 8.5 slots; near full it explodes."
+- id: q6
+  type: recall
+  prompt: "Explain why the occasional O(n) rehash doesn't stop hash table inserts from being O(1) amortised."
+  model: "Each rehash doubles the table, so after a rehash at size n the next one doesn't happen until roughly 2n entries. The rehashes move about 6, 12, 24, … entries: a geometric series that adds up to less than twice the final size. So n inserts cost O(n) in total, including all the rehashing, which averages out to O(1) per insert."
+```

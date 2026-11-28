@@ -1,0 +1,124 @@
+<Brief>
+
+This is the orders screen of a shopping app. It works on the developer's phone, but every change to it breaks something, nobody can test it, and support hears about blank screens and the occasional crash. Review it as you would a pull request: what's wrong, what matters most, and how you'd fix it.
+
+```swift check ios title="OrdersViewController.swift"
+import UIKit
+
+struct Order: Codable {
+    let id: String
+    let total: Double
+    let placedAt: Date
+}
+
+final class OrdersViewController: UIViewController, UITableViewDataSource, UITableViewDelegate {
+    let tableView = UITableView()
+    var orders: [Order] = []
+
+    override func viewDidLoad() {
+        super.viewDidLoad()
+        view.addSubview(tableView)
+        tableView.frame = view.bounds
+        tableView.dataSource = self
+        tableView.delegate = self
+        tableView.register(UITableViewCell.self, forCellReuseIdentifier: "cell")
+        let token = UserDefaults.standard.string(forKey: "authToken") ?? ""
+        var request = URLRequest(url: URL(string: "https://api.example.com/orders")!)
+        request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
+        URLSession.shared.dataTask(with: request) { data, _, _ in
+            let decoder = JSONDecoder()
+            decoder.dateDecodingStrategy = .iso8601
+            self.orders = try! decoder.decode([Order].self, from: data!)
+            UserDefaults.standard.set(data, forKey: "cachedOrders")
+            self.tableView.reloadData()
+        }.resume()
+    }
+
+    func tableView(_ tableView: UITableView, numberOfRowsInSection section: Int) -> Int {
+        orders.count
+    }
+
+    func tableView(_ tableView: UITableView, cellForRowAt indexPath: IndexPath) -> UITableViewCell {
+        let cell = tableView.dequeueReusableCell(withIdentifier: "cell", for: indexPath)
+        let order = orders[indexPath.row]
+        let formatter = DateFormatter()
+        formatter.dateFormat = "dd/MM/yyyy"
+        cell.textLabel?.text = "£" + String(format: "%.2f", order.total) + " · " + formatter.string(from: order.placedAt)
+        return cell
+    }
+
+    func tableView(_ tableView: UITableView, didSelectRowAt indexPath: IndexPath) {
+        let detail = UIViewController()
+        detail.title = orders[indexPath.row].id
+        navigationController?.pushViewController(detail, animated: true)
+    }
+}
+```
+
+</Brief>
+
+```workspace
+template: critique
+minutes: 25
+```
+
+```findings
+- id: off-main-thread
+  title: Updates state and the table view off the main thread
+  severity: high
+  lines: 23-28
+  detail: URLSession calls the completion handler on a background queue, so `orders` changes and `reloadData()` runs off the main thread. That's a data race with the table view's own reads, and UIKit isn't thread-safe; Swift 6 flags both lines.
+- id: crash-on-error
+  title: Crashes on any network failure or unexpected JSON
+  severity: high
+  lines: 26
+  detail: "`data!` crashes when the request fails (no data), and `try!` crashes on any decoding change, such as a new date format or a missing field. Both should be handled, with an error shown."
+- id: layering
+  title: Networking, auth, decoding and caching live in the view controller
+  severity: high
+  lines: 20-29
+  detail: The screen builds requests, reads the token, decodes and caches. None of it can be tested without UIKit and the real network, and the next screen that needs orders will copy it. Move it behind an OrdersRepository (or service) injected into the screen.
+- id: token-in-defaults
+  title: The auth token is kept in UserDefaults
+  severity: medium
+  lines: 20
+  detail: UserDefaults is an unencrypted plist that's included in backups. Tokens belong in the Keychain.
+- id: no-states
+  title: No loading, empty or error state; status codes ignored
+  severity: medium
+  lines: 23-29
+  detail: Failures and empty responses both show a blank table, and a 401 or 500 is decoded as if it were success. Model the screen's states (loading, loaded, empty, failed) and check the response.
+- id: cache-unused
+  title: Caches into UserDefaults but never reads the cache
+  severity: medium
+  lines: 27
+  detail: The response is written to UserDefaults (meant for small preferences, loaded whole at launch) and never read back, so it costs memory and buys nothing. Use a file or database cache and show it while refreshing.
+- id: formatter-per-cell
+  title: A DateFormatter per cell, and hard-coded formats
+  severity: low
+  lines: 39-41
+  detail: Creating a DateFormatter for every cell is expensive while scrolling. The fixed date format and the "£" sign ignore the user's locale; use a shared formatter or the `formatted()` APIs.
+- id: navigation-coupling
+  title: Pushes the next screen itself
+  severity: low
+  lines: 45-48
+  detail: The screen knows which controller comes next and how it's shown, so the flow can't change without editing it. A coordinator or a navigation callback keeps that decision outside.
+```
+
+<ReferenceReview>
+
+**Most important first.** Two crash-or-corrupt problems need fixing before anything else: the completion handler mutates `orders` and reloads the table **off the main thread** (a data race, and UIKit isn't thread-safe), and `data!` with `try!` **crashes** whenever the network fails or the JSON changes.
+
+**The design problem underneath** is that the view controller does everything: it reads the token, builds the request, decodes, caches and formats. That's why every change breaks something and nothing can be tested.
+
+**How I'd fix it, in small steps:**
+
+1. Add characterisation tests around today's formatting, so the refactor can't change what users see.
+2. Extract an `OrdersRepository` protocol with `func orders() async throws -> [Order]`; its implementation owns the request, the token (read from the Keychain), status checks, decoding and a file cache.
+3. Give the screen a view model, isolated to the main actor, that exposes a state enum: loading, loaded, empty or failed. It calls the repository with `async`/`await`, so updates land on the main actor and the race disappears. Failures become an error state instead of a crash.
+4. Inject the repository, so tests use a stub, and hand navigation to a coordinator through a closure.
+5. Replace the per-cell formatter with `order.placedAt.formatted(date: .abbreviated, time: .omitted)` and `order.total.formatted(.currency(code:))`.
+
+**Tests to add:** the view model's states for success, empty and failure with a stub repository; the repository's decoding and status handling with recorded responses.
+
+</ReferenceReview>

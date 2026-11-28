@@ -1,0 +1,168 @@
+A photo grid keeps decoded thumbnails in memory so scrolling back doesn't decode them again. Images vary a lot in size, so the cache's limit is a **byte budget**, not a number of entries, like `NSCache`'s `totalCostLimit`. Build it: when an insert takes the total over budget, evict least recently used images until everything fits. It also has to free memory on demand when the system sends a memory warning.
+
+`ThumbnailBudgetCache.Cache<Image>`, with `init(byteBudget: Int)`, `totalBytes`, `count`, `image(for url: String) -> Image?`, `insert(_ image: Image, for url: String, bytes: Int) -> [String]`, `trim(toBytes limit: Int) -> [String]` and `urlsByRecency: [String]`
+
+- `image(for:)` returns the cached image or `nil`. A hit makes the URL the most recently used; a miss changes nothing.
+- `insert` replaces any older image for the URL and makes it the most recently used. Then it evicts least recently used images until `totalBytes ≤ byteBudget`, and returns the evicted URLs in the order it evicted them. The image just inserted is never evicted.
+- An image bigger than the whole budget isn't cached at all. Any older image for its URL is removed, since it's out of date, nothing else changes, and `insert` returns `[]`.
+- `trim(toBytes:)` evicts least recently used images until `totalBytes ≤ limit`, and returns their URLs in order.
+- `urlsByRecency` lists the cached URLs, most recently used first.
+
+## Examples
+
+With `byteBudget: 100`, writing `_` for each image:
+
+| Call | Returns | Cached afterwards, most recent first |
+| --- | --- | --- |
+| `insert(_, for: "hero.jpg", bytes: 40)` | `[]` | hero (40) |
+| `insert(_, for: "avatar.png", bytes: 30)` | `[]` | avatar, hero: 70 bytes |
+| `insert(_, for: "logo.png", bytes: 20)` | `[]` | logo, avatar, hero: 90 |
+| `image(for: "hero.jpg")` | the image | hero, logo, avatar: 90 |
+| `insert(_, for: "banner.jpg", bytes: 45)` | `["avatar.png", "logo.png"]` | banner, hero: 85 |
+| `insert(_, for: "hero.jpg", bytes: 70)` | `["banner.jpg"]` | hero (70) |
+| `insert(_, for: "poster.jpg", bytes: 150)` | `[]` | hero (70): the poster is too big |
+| `trim(toBytes: 50)` | `["hero.jpg"]` | nothing |
+
+Adding the banner makes 135 bytes. Evicting the avatar leaves 105, still over, so the logo goes too. The hero survives because reading it made it recent. Re-inserting the hero at 70 bytes first removes its old 40-byte copy.
+
+## Constraints
+
+- `1 ≤ byteBudget ≤ 10⁹`, `1 ≤ bytes ≤ 10⁹` and `0 ≤ limit`
+- Up to 200,000 operations. The tests keep 5,000 images cached at once, so scanning the cache on each operation is too slow.
+
+<Hints>
+<Hint>
+This is the LRU cache from M25 with one change. There, an insert evicted one entry when the count went over capacity. Here, it evicts from the least recently used end in a loop, while the total is over budget.
+</Hint>
+<Hint>
+Use a dictionary from URL to a node, and a doubly linked list of nodes in order of use. Each node stores its URL (so an evicted node can be removed from the dictionary), its image and its size. Keep `totalBytes` up to date on every insert and removal rather than adding it up.
+</Hint>
+<Hint>
+Handle the order of an insert carefully: remove the old node for the URL first, then check for "too big", then link the new node at the recent end, then evict from the old end. Because the new image fits the budget on its own, the loop stops before reaching it.
+</Hint>
+</Hints>
+
+## Solutions
+
+<Approach title="Array in order of use" time="O(n) per operation" space="O(n)">
+
+Keep an array of entries, most recent first. Every lookup is a linear search and every move to the front shifts the array. It's the right model to test against, but with thousands of cached images every operation pays for all of them.
+
+```swift
+mutating func insert(_ image: Image, for url: String, bytes: Int) -> [String] {
+    entries.removeAll { $0.url == url }
+    guard bytes <= budget else { return [] }
+    entries.insert((url, image, bytes), at: 0)
+    var evicted: [String] = []
+    while total > budget, let last = entries.popLast() {
+        total -= last.bytes
+        evicted.append(last.url)
+    }
+    return evicted
+}
+```
+
+</Approach>
+
+<Approach title="Dictionary plus doubly linked list" time="O(1) per operation, plus O(1) per eviction" space="O(n)">
+
+The dictionary finds a node in O(1), and the list keeps the nodes in order of use, so moving one to the recent end or evicting from the old end is O(1). An operation that evicts k images costs O(k), but each image is evicted at most once after being inserted, so a long run of operations is O(1) amortised each.
+
+```swift
+public enum ThumbnailBudgetCache {
+    public final class Cache<Image> {
+        final class Node {
+            let url: String
+            var image: Image
+            var bytes: Int
+            var newer: Node?              // towards the most recently used end
+            weak var older: Node?         // weak, so neighbours don't keep each other alive
+
+            init(url: String, image: Image, bytes: Int) {
+                self.url = url
+                self.image = image
+                self.bytes = bytes
+            }
+        }
+
+        public let byteBudget: Int
+        public private(set) var totalBytes = 0
+        private var nodes: [String: Node] = [:]
+        private var newest: Node?
+        private var oldest: Node?
+
+        public init(byteBudget: Int) {
+            self.byteBudget = byteBudget
+        }
+
+        public var count: Int { nodes.count }
+
+        private func unlink(_ node: Node) {
+            if let older = node.older { older.newer = node.newer } else { oldest = node.newer }
+            if let newer = node.newer { newer.older = node.older } else { newest = node.older }
+            node.newer = nil
+            node.older = nil
+        }
+
+        private func append(_ node: Node) {
+            node.older = newest
+            newest?.newer = node
+            newest = node
+            if oldest == nil { oldest = node }
+        }
+
+        private func remove(_ node: Node) {
+            unlink(node)
+            nodes[node.url] = nil
+            totalBytes -= node.bytes
+        }
+
+        /// Evicts from the oldest end until the total is at most `limit`.
+        private func evict(downTo limit: Int) -> [String] {
+            var evicted: [String] = []
+            while totalBytes > limit, let victim = oldest {
+                remove(victim)
+                evicted.append(victim.url)
+            }
+            return evicted
+        }
+
+        public func image(for url: String) -> Image? {
+            guard let node = nodes[url] else { return nil }
+            unlink(node)
+            append(node)
+            return node.image
+        }
+
+        @discardableResult
+        public func insert(_ image: Image, for url: String, bytes: Int) -> [String] {
+            if let old = nodes[url] { remove(old) }
+            guard bytes <= byteBudget else { return [] }   // too big to ever fit: don't cache it
+            let node = Node(url: url, image: image, bytes: bytes)
+            nodes[url] = node
+            append(node)
+            totalBytes += bytes
+            return evict(downTo: byteBudget)               // never reaches the new node, which fits alone
+        }
+
+        @discardableResult
+        public func trim(toBytes limit: Int) -> [String] {
+            evict(downTo: max(0, limit))
+        }
+
+        public var urlsByRecency: [String] {
+            var urls: [String] = []
+            var node = newest
+            while let current = node {
+                urls.append(current.url)
+                node = current.older
+            }
+            return urls
+        }
+    }
+}
+```
+
+In an app you'd also clear the cache from `UIApplication.didReceiveMemoryWarningNotification`, which is what `trim(toBytes:)` models, and you'd measure an image's cost as its decoded size (width × height × 4 bytes), not the size of the file it came from.
+
+</Approach>

@@ -1,0 +1,237 @@
+## Why it matters
+
+An editor's undo history, a drawing app's list of past canvases, a debugger that can step **backwards** through an app's states, a version control system's commits: each one keeps many versions of a large piece of data, where each version differs from the last in a few places. Storing a full copy per version wastes memory and time. A **persistent data structure** keeps every old version intact and usable after a change, and shares almost all of its memory between versions, so a new version costs O(log n) instead of O(n). You met the idea for lists in [Copy-on-write and persistent lists](/dsa/learn/ll-persistent), and the immutable rope earlier in this module used it to get undo for free. This lesson makes it general, and pins down exactly how it differs from Swift's copy-on-write.
+
+## Ephemeral, copy-on-write, persistent
+
+Three ways a structure can treat its old versions:
+
+- **Ephemeral** structures change in place, and the old version is gone. A class-based linked list, or a `Dictionary` you mutate, are ephemeral from the point of view of anyone else holding a reference to the same storage.
+- **Value types with copy-on-write**, like Swift's `Array`, `Dictionary` and `String`, **behave** as if every version were kept: `var b = a; b.append(4)` leaves `a` unchanged. But the first write after a copy duplicates the **entire** buffer, as you saw in [Copy-on-write explained](/dsa/learn/swift-copy-on-write-intro). After that, the two versions share nothing.
+- **Persistent** structures also keep every version, but a change copies only the small part of the structure that actually changed, and every version **shares** everything else.
+
+So copy-on-write gives you persistence's **meaning** (old versions stay valid) at a price of O(n) per new version that you keep. True persistence gives the same meaning at O(log n) per version. When you keep one or two copies, copy-on-write is simpler and faster. When you keep a thousand versions, the difference is a factor of hundreds.
+
+## Path copying
+
+The standard technique is **path copying**, which you met with persistent lists. Store the data in a tree of **immutable** nodes, where every property is `let`. To change one element:
+
+1. Walk from the root down to the element, as for a lookup.
+2. Create a **new** leaf with the new value.
+3. Create a new copy of every node on the path back up, each pointing at the new child on the path and at the **same old child** off the path.
+4. The new root is the new version. The old root still exists, untouched, and still describes the old version.
+
+In a balanced tree, the path has O(log n) nodes, so that's all a change creates. Everything off the path, which is nearly the whole tree, is shared between the old version and the new one. Sharing is safe precisely **because** the nodes are immutable: no version can change a node that another version is using.
+
+## A persistent array
+
+Here's an array of 1,024 integers stored in a perfect binary tree. The bits of an index, read from the top, say which way to turn at each level: 0 for left, 1 for right. Ten levels of turns reach one of 2¹⁰ = 1,024 leaves:
+
+```swift run
+// An immutable node: a leaf holds a value, an inner node holds two children. Nothing can change it.
+final class Node {
+    static var created = 0
+    let left: Node?
+    let right: Node?
+    let value: Int
+
+    init(value: Int) {
+        left = nil
+        right = nil
+        self.value = value
+        Node.created += 1
+    }
+
+    init(left: Node, right: Node) {
+        self.left = left
+        self.right = right
+        value = 0
+        Node.created += 1
+    }
+}
+
+// An array of 2^depth Ints stored in a perfect binary tree. The bits of an index, from the top,
+// say which way to turn: 0 means left, 1 means right.
+struct PersistentArray {
+    let root: Node
+    let depth: Int
+
+    init(repeating value: Int, depth: Int) {
+        func build(_ level: Int) -> Node {
+            level == 0 ? Node(value: value) : Node(left: build(level - 1), right: build(level - 1))
+        }
+        root = build(depth)
+        self.depth = depth
+    }
+
+    private init(root: Node, depth: Int) {
+        self.root = root
+        self.depth = depth
+    }
+
+    subscript(index: Int) -> Int {
+        var node = root
+        for level in stride(from: depth - 1, through: 0, by: -1) {
+            node = (index >> level) & 1 == 0 ? node.left! : node.right!
+        }
+        return node.value
+    }
+
+    // A new version with one element changed: copy the path to it, share everything else
+    func setting(_ index: Int, to value: Int) -> PersistentArray {
+        func set(_ node: Node, _ level: Int) -> Node {
+            if level == 0 { return Node(value: value) }
+            if (index >> (level - 1)) & 1 == 0 {
+                return Node(left: set(node.left!, level - 1), right: node.right!)
+            }
+            return Node(left: node.left!, right: set(node.right!, level - 1))
+        }
+        return PersistentArray(root: set(root, depth), depth: depth)
+    }
+}
+
+// Nodes reachable from a but not shared with b: walk both, skipping identical subtrees
+func unshared(_ a: Node?, _ b: Node?) -> Int {
+    guard let a else { return 0 }
+    if a === b { return 0 }
+    return 1 + unshared(a.left, b?.left) + unshared(a.right, b?.right)
+}
+
+// 1,000 versions of a 1,024-element array, each changing one element
+var versions = [PersistentArray(repeating: 0, depth: 10)]
+print("first version:", Node.created, "nodes")
+Node.created = 0
+for step in 1...1_000 {
+    versions.append(versions.last!.setting((step * 37) % 1_024, to: step))
+}
+print("1,000 more versions:", Node.created, "new nodes,", Node.created / 1_000, "per version")
+print("index 136 in versions 0, 999 and 1000:", versions[0][136], versions[999][136], versions[1_000][136])
+print("nodes in version 1000 not shared with 999:", unshared(versions[1_000].root, versions[999].root))
+
+// The same history with Array: each version's first write copies the whole shared buffer
+var arrays = [Array(repeating: 0, count: 1_024)]
+var copied = 0
+for step in 1...1_000 {
+    var next = arrays.last!                      // shares the buffer: no copy yet
+    next[(step * 37) % 1_024] = step             // copy-on-write: all 1,024 elements are copied here
+    copied += next.count
+    arrays.append(next)
+}
+print("Array: \(copied) elements copied; index 136 in version 1000:", arrays[1_000][136])
+```
+
+```output
+first version: 2047 nodes
+1,000 more versions: 11000 new nodes, 11 per version
+index 136 in versions 0, 999 and 1000: 0 0 1000
+nodes in version 1000 not shared with 999: 11
+Array: 1024000 elements copied; index 136 in version 1000: 1000
+```
+
+What to notice:
+
+- **Each version cost exactly 11 new nodes**: one leaf and ten inner nodes, the path from the root. The other 2,036 nodes of each version are shared with the version before.
+- **Every version still works.** Index 136 was only changed at step 1,000, and versions 0 and 999 still read 0 there.
+- **`unshared` proves the sharing** with `===`, the identity test from [Identity with ===](/dsa/learn/swift-identity): walking versions 999 and 1,000 side by side, it stops at the first node they share and finds only 11 that differ.
+- **The Array history copied over a million elements**, 1,024 per version, and holds over a million `Int`s in memory. The persistent history holds about 13,000 nodes. Copy-on-write did exactly its job, which is to copy the whole buffer once a shared array is written.
+
+A lookup walks one path, so reading is O(log n) instead of an array's O(1). That's the trade: persistent structures make every version cheap to create and keep, and pay a logarithm on each access, plus more small allocations than one big buffer.
+
+## Real persistent structures
+
+The tree above is a teaching version. Production designs make it shallower and handle growth:
+
+- **Wide nodes.** Clojure's and Scala's persistent vectors use nodes with 32 children instead of 2, so a vector of a billion elements is only 6 or 7 levels deep. A change copies 6 or 7 nodes of 32 slots each, and lookups touch few nodes.
+- **Hashed keys.** A persistent dictionary can hash each key and use the hash's bits, 5 at a time, to choose a path through 32-way nodes. That's a **hash array mapped trie**, and it's how swift-collections' `TreeDictionary` works, as the last lesson of this module explains.
+- **Ordered keys.** A persistent balanced BST, an AVL or red-black tree whose insert copies its path (rotations included), gives a sorted map with old versions kept. Functional languages build their maps this way.
+- **Versions of a segment tree.** Keeping a version of a segment tree after each insertion lets you query "the state after the first k elements" for any k. It answers questions like "the kth smallest value in a range" in O(log n), and you'll see it in [Persistent segment trees](/dsa/learn/seg-persistent).
+
+There's also a different technique, **fat nodes**, where each field of a node stores a small list of (version, value) pairs instead of a single value. It avoids copying, but every read must search for the right version, so path copying is the more common choice.
+
+## Where persistence pays off
+
+- **Undo and redo.** Keep an array of versions. Undo moves back one; redo moves forward. No "inverse operations" to write and get wrong.
+- **Snapshots and time travel.** Apps built around a single state value can record every state after every action, and a debugging tool can scrub back and forth through them, as long as each snapshot is cheap.
+- **Diffing.** Two versions that share structure can be compared by skipping shared subtrees, like `unshared` above: the cost depends on how much changed, not on the size of the data.
+- **Version control.** Git stores each directory as an immutable tree object. A commit that changes one file creates new tree objects only along the path from that file to the root, and shares every other directory with the previous commit.
+- **Safe sharing.** An immutable version can be passed to any part of a program, and nobody has to worry that it might change underneath them.
+
+ARC handles the cleanup. When nothing references an old version's root any more, the nodes only it used are freed, and the shared ones live on in the newer versions.
+
+<Callout kind="gotcha" title="Swift gotcha: one var breaks everything">
+Persistence depends on nodes never changing. A single `var` property in a node class, changed by any version, silently changes **every** version that shares that node. Make every stored property `let`, make the node class `final` so no subclass can add a `var`, and give it no mutating methods. If you need a changed node, make a new one.
+</Callout>
+
+<Callout kind="gotcha" title="Common mistakes">
+- **Keeping every version forever.** Each version is cheap, not free: an undo history of a million edits holds a million paths of nodes. Cap the history, or keep only some old versions.
+- **Copying more than the path.** Rebuilding a subtree that didn't change wastes the sharing. Only nodes on the path to the change should be new.
+- **Very deep structures.** Freeing a long chain of nodes recurses once per node, which can overflow the stack, as the persistent list lesson found with long indirect enums. Keep trees balanced, so paths stay short.
+</Callout>
+
+## Practice
+
+**Rope text buffer**, from the rope lesson, asks for an editable text buffer with undo, checked over 10,000 edits that are all undone at the end. Build it from immutable nodes and undo becomes a stack of earlier roots, and copies of the buffer are independent for free: exactly the path copying above.
+
+```cards
+- id: persistent-definition
+  front: "What makes a data structure persistent?"
+  back: "Every change produces a new version and leaves the old one fully usable, with the versions sharing most of their memory."
+- id: path-copying
+  front: "What does path copying copy when one element of a persistent tree changes?"
+  back: "Only the nodes on the path from the root to the change: a new leaf and new copies of its ancestors. Everything off the path is shared with the old version. O(log n) in a balanced tree."
+- id: cow-vs-persistent
+  front: "How does Swift's copy-on-write differ from a persistent structure?"
+  back: "Both keep old versions valid. Copy-on-write duplicates the whole buffer on the first write to a shared copy, O(n), and then shares nothing; a persistent structure copies only the changed path, O(log n), and keeps sharing the rest."
+- id: persistent-immutable
+  front: "Why must the nodes of a persistent structure be immutable?"
+  back: "Many versions share each node. If a node could change, changing it for one version would change every version that shares it."
+```
+
+```quiz
+- id: q1
+  type: mcq
+  prompt: "You keep 500 versions of a 100,000-element Swift Array, each changing one element of the one before. Roughly how many elements are copied in total?"
+  options:
+    - "500"
+    - "About 8,500 (500 × log₂ 100,000)"
+    - "50,000,000 (500 × 100,000)"
+    - "None: copy-on-write avoids all copies"
+  answer: 2
+  explain: "Each new version shares its predecessor's buffer until it's written, and the first write copies all 100,000 elements. A persistent tree would create about 17 nodes per version instead."
+- id: q2
+  type: output
+  prompt: "In a persistent array stored in a perfect binary tree of depth 3, the bits of an index from the top choose left (0) or right (1). What does this print for index 6?"
+  code: |
+    let index = 6
+    let depth = 3
+    var turns: [String] = []
+    for level in stride(from: depth - 1, through: 0, by: -1) {
+        turns.append((index >> level) & 1 == 0 ? "left" : "right")
+    }
+    print(turns)
+  answer: "[\"right\", \"right\", \"left\"]"
+  explain: "6 is 110 in binary. Reading from the top bit: 1 (right), 1 (right), 0 (left). Changing element 6 would copy exactly the three nodes on that path, plus the leaf."
+- id: q3
+  type: truefalse
+  prompt: "After `var b = a; b.append(1)` on Swift arrays, `a` and `b` go on sharing all of their original elements in memory."
+  answer: false
+  explain: "The append found the buffer shared and copied it, so from then on the two arrays share nothing. They behave like separate versions, but without structural sharing."
+- id: q4
+  type: bigo
+  prompt: "In a balanced persistent tree of n elements, how many new nodes does changing one element create?"
+  answer: "O(log n)"
+  explain: "Path copying creates a new node for each node on the path from the root to the element, and a balanced tree's paths have O(log n) nodes."
+- id: q5
+  type: multi
+  prompt: "Which of these does a persistent structure make easy? Choose all that apply."
+  options:
+    - "Undo and redo without writing inverse operations"
+    - "O(1) reads by index"
+    - "Comparing two versions by skipping shared subtrees"
+    - "Handing a version to other code with no risk of it changing"
+  answer: [0, 2, 3]
+  explain: "Old versions stay valid, shared subtrees can be skipped with ===, and immutable versions can be shared safely. Reads walk a path, so they're O(log n), not O(1)."
+- id: q6
+  type: recall
+  prompt: "Why is sharing nodes between versions safe in a persistent structure, but not in an ordinary mutable tree?"
+  model: "In a persistent structure every node is immutable, so a node shared by many versions means the same thing to all of them forever; changes create new nodes instead. In a mutable tree, a change edits nodes in place, so any other version pointing at those nodes would see its data change too."

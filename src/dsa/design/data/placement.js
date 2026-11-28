@@ -1,0 +1,311 @@
+// The optional placement check for the design course: two questions per group of modules a working iOS
+// developer may already know. Answering both in a group right on the first try offers to skip those
+// modules. Questions use the same shape as lesson quizzes (see src/dsa/design/content/AUTHORING.md), and
+// each is written so that someone who hasn't met the idea is unlikely to guess it.
+
+export const PLACEMENT_GROUPS = [
+    {
+        id: 'foundations',
+        title: 'Design foundations: quality, modelling and coupling',
+        modules: ['sd-quality', 'sd-modelling', 'sd-coupling'],
+        questions: [
+            {
+                id: 'foundations-1',
+                type: 'mcq',
+                prompt: 'In a banking app, which of these is best modelled as a **value object** rather than an entity?',
+                options: [
+                    'A customer’s current account',
+                    'An amount of money with its currency',
+                    'A user’s profile',
+                    'A debit card that can be frozen and unfrozen',
+                ],
+                answer: 1,
+                explain: 'A value object is defined entirely by its values and has no identity of its own: any £5.00 is interchangeable with any other, so money is an immutable value. An account, a profile and a card keep their identity while their details change over time, which makes them entities.',
+            },
+            {
+                id: 'foundations-2',
+                type: 'multi',
+                prompt: 'A profile screen calls the networking layer. Which of these changes **reduce** the coupling between them? Choose all that apply.',
+                options: [
+                    'The screen depends on a small `ProfileLoading` protocol instead of the concrete `APIClient`',
+                    'The screen receives a `Profile` value instead of the raw JSON dictionary',
+                    'After calling `load()`, the screen reads the result from a property on `APIClient.shared`',
+                    'Before each call, the screen changes the timeout on the client’s own `URLSession`',
+                ],
+                answer: [0, 1],
+                explain: 'A narrow protocol and a domain value mean the screen knows less about the network layer, so either side can change on its own. Reading shared state after a call adds global and temporal coupling (it only works if nothing else ran in between), and reaching into the client’s session ties the screen to its internals.',
+            },
+        ],
+    },
+    {
+        id: 'principles',
+        title: 'SOLID and other design principles',
+        modules: ['sd-solid', 'sd-principles'],
+        questions: [
+            {
+                id: 'principles-1',
+                type: 'match',
+                prompt: 'Match each symptom to the SOLID principle it breaks.',
+                pairs: [
+                    ['A class changes for two unrelated reasons: tax rules and PDF layout', 'Single responsibility'],
+                    ['Adding a payment method means editing a `switch` in five files', 'Open–closed'],
+                    ['A subclass throws from a method its parent promises to support', 'Liskov substitution'],
+                    ['A screen depends on a 14-method protocol but calls two of the methods', 'Interface segregation'],
+                    ['The domain module imports the Core Data module to save orders', 'Dependency inversion'],
+                ],
+                explain: 'Each principle has a recognisable smell: two reasons to change (SRP), editing existing code to add behaviour (OCP), a subtype that can’t stand in for its parent (LSP), clients forced to depend on methods they don’t use (ISP), and high-level policy depending on a low-level detail (DIP).',
+            },
+            {
+                id: 'principles-2',
+                type: 'mcq',
+                prompt: 'Two screens share a `formatPrice` helper that takes four flags, such as `isCompact` and `forWidget`. Every change for one screen breaks the other, and a third caller wants a fifth flag. What does “prefer duplication over the wrong abstraction” suggest?',
+                options: [
+                    'Add the fifth flag: the shared helper keeps the code DRY',
+                    'Inline the helper back into each caller, then extract only what is genuinely shared',
+                    'Turn it into a protocol with one conforming type per screen',
+                    'Move it into a `PriceFormatter.shared` singleton',
+                ],
+                answer: 1,
+                explain: 'Flags that switch behaviour per caller show that the callers wanted different things. Putting the code back where it’s used, then extracting what really is the same, gives an abstraction that fits. Another flag, a protocol or a singleton all keep the wrong shape.',
+            },
+        ],
+    },
+    {
+        id: 'swift-design',
+        title: 'Swift as a design language, and functional design',
+        modules: ['sd-swift-design', 'sd-functional'],
+        questions: [
+            {
+                id: 'swift-design-1',
+                type: 'mcq',
+                prompt: 'What does `func makeStore() -> some KeyValueStore` promise that `-> any KeyValueStore` doesn’t?',
+                options: [
+                    'It always returns one specific concrete type, chosen by the function and fixed at compile time, which callers can’t name',
+                    'Nothing: `some` is the newer spelling of `any`',
+                    'It may return a different conforming type on each call',
+                    'The returned value is boxed, so every call goes through dynamic dispatch',
+                ],
+                answer: 0,
+                explain: '`some` is an opaque type: one concrete type, hidden from callers but known to the compiler, which can optimise and preserve associated types. `any` is an existential box that can hold any conforming type, varying at run time, at the cost of an indirection.',
+            },
+            {
+                id: 'swift-design-2',
+                type: 'bug',
+                prompt: 'This reducer is meant to be a pure function. Which line stops it being pure?',
+                code: 'func reduce(_ state: inout CartState, _ action: CartAction) {\n    switch action {\n    case .add(let item):\n        state.items.append(item)\n    case .remove(let id):\n        state.items.removeAll { $0.id == id }\n    case .checkout:\n        state.placedAt = Date()\n    }\n}',
+                answer: 8,
+                explain: '`Date()` reads the clock, a hidden input, so the same state and action can give different results and tests can’t predict them. Mutating `inout` state is fine: it’s equivalent to returning a new state. Pass the time in instead, as `.checkout(at: Date)`, or take it from an injected environment.',
+            },
+        ],
+    },
+    {
+        id: 'styles',
+        title: 'Architecture styles and diagrams',
+        modules: ['sd-styles', 'sd-diagrams'],
+        questions: [
+            {
+                id: 'styles-1',
+                type: 'sort',
+                prompt: 'Which architecture style does each describe?',
+                buckets: ['Layered', 'Event-driven', 'Pipes and filters', 'Microkernel (plug-ins)'],
+                items: [
+                    ['Presentation calls domain, and domain calls data, never the other way round', 0],
+                    ['Checkout announces “order placed”, and analytics, receipts and loyalty points react without checkout knowing they exist', 1],
+                    ['An image passes through fetch, decode, downsample and cache, each stage taking the previous one’s output', 2],
+                    ['A small editor core loads Markdown, rich text and PDF export as optional extensions', 3],
+                    ['Feature modules register with the app shell at launch, and the shell knows them only through one shared protocol', 3],
+                ],
+                explain: 'Layers depend in one direction only. Event-driven parts publish facts and don’t know who reacts. Pipes and filters chain independent stages, each feeding the next. A microkernel is a minimal core that plug-ins extend through a fixed interface.',
+            },
+            {
+                id: 'styles-2',
+                type: 'mcq',
+                prompt: 'In the C4 model, which diagram shows the iOS app, the backend API and its database as separate boxes, with the protocols between them?',
+                options: ['System context', 'Container', 'Component', 'Code'],
+                answer: 1,
+                explain: 'In C4, a container is anything that runs or stores data on its own: an app, a service, a database. The context diagram shows the whole system as one box among its users and neighbours, a component diagram zooms into one container, and a code diagram shows its types.',
+            },
+        ],
+    },
+    {
+        id: 'patterns',
+        title: 'Design patterns',
+        modules: ['sd-creational', 'sd-structural', 'sd-behavioural-1', 'sd-behavioural-2'],
+        questions: [
+            {
+                id: 'patterns-1',
+                type: 'match',
+                prompt: 'Match each piece of iOS code to the pattern it uses.',
+                pairs: [
+                    ['A type wraps any `HTTPClient`, logs each request, and is itself an `HTTPClient`', 'Decorator'],
+                    ['A wrapper makes an old analytics SDK conform to your own `Analytics` protocol', 'Adapter'],
+                    ['`UndoManager` records each edit as an object that can be undone and redone', 'Command'],
+                    ['A coordinator lets screens hand off to one another without knowing about each other', 'Mediator'],
+                    ['Chained calls such as `.method(.post)` and `.header(…)` produce a finished request', 'Builder'],
+                ],
+                explain: 'A decorator adds behaviour behind the same interface; an adapter converts one interface into another. Command turns an action into an object, a mediator centralises how peers interact, and a builder assembles a complex value step by step.',
+            },
+            {
+                id: 'patterns-2',
+                type: 'mcq',
+                prompt: '`AnalyticsService.shared` is called from 40 files, and none of them can be tested without sending real events. What’s the safest first step?',
+                options: [
+                    'Delete the singleton and pass the service through every initialiser in one large pull request',
+                    'Extract an `Analytics` protocol and inject it with the shared instance as the default, as in `init(analytics: any Analytics = AnalyticsService.shared)`, then move callers over a few at a time',
+                    'Make `shared` a `static var` so tests can swap in a fake',
+                    'Wrap every call in `#if DEBUG`',
+                ],
+                answer: 1,
+                explain: 'A protocol plus a defaulted parameter adds a seam without changing behaviour, so each call site can move on its own. A swappable `static var` is global mutable state: tests interfere with each other, and Swift 6 rejects it as unsafe without extra isolation. One giant pull request is risky and hard to review.',
+            },
+        ],
+    },
+    {
+        id: 'resilience',
+        title: 'Resilience patterns and refactoring',
+        modules: ['sd-resilience-patterns', 'sd-refactoring'],
+        questions: [
+            {
+                id: 'resilience-1',
+                type: 'multi',
+                prompt: 'A request times out, so the app can’t tell whether the server received it. Which of these can it safely retry automatically? Choose all that apply.',
+                options: [
+                    '`GET /feed?cursor=abc`',
+                    '`PUT /posts/42/like`',
+                    '`POST /orders` with no idempotency key',
+                    '`POST /payments` with an `Idempotency-Key` header that the server honours',
+                    '`POST /messages` to send a chat message, with no client-generated id',
+                ],
+                answer: [0, 1, 3],
+                explain: 'A retry is safe when doing a request twice has the same effect as doing it once. `GET` and `PUT` are idempotent by design, and an idempotency key lets the server recognise a repeated `POST`. Without one, a retried order or message can be created twice.',
+            },
+            {
+                id: 'resilience-2',
+                type: 'mcq',
+                prompt: 'Every time the team adds a payment method, they edit `PaymentView`, `PaymentValidator`, `ReceiptFormatter`, `AnalyticsEvents` and `Endpoints`. Which smell is this?',
+                options: ['Divergent change', 'Shotgun surgery', 'Feature envy', 'Speculative generality'],
+                answer: 1,
+                explain: 'Shotgun surgery is one kind of change scattered across many types. Divergent change is the opposite: one type changed for many unrelated reasons. The fix is to gather what varies with the payment method into one place, such as one type per method behind a protocol.',
+            },
+        ],
+    },
+    {
+        id: 'platform',
+        title: 'The iOS platform: runtime, UIKit and SwiftUI',
+        modules: ['sd-app-runtime', 'sd-uikit', 'sd-swiftui'],
+        questions: [
+            {
+                id: 'platform-1',
+                type: 'mcq',
+                prompt: 'Your app is suspended in the background, and iOS terminates it to reclaim memory. Which of your code runs?',
+                options: ['`applicationWillTerminate(_:)`', '`sceneDidDisconnect(_:)`', 'None of it', 'Every object’s `deinit`'],
+                answer: 2,
+                explain: 'A suspended app isn’t running, so it can’t be told: the process is simply removed. That’s why state is saved when the app moves to the background. `applicationWillTerminate(_:)` runs only in rarer cases, such as termination while the app is running in the background rather than suspended.',
+            },
+            {
+                id: 'platform-2',
+                type: 'bug',
+                prompt: 'This screen loses its loaded posts whenever its parent view redraws. Which line causes it?',
+                code: 'struct FeedScreen: View {\n    @ObservedObject var model = FeedModel()\n\n    var body: some View {\n        List(model.posts) { post in\n            Text(post.title)\n        }\n        .task { await model.load() }\n    }\n}',
+                answer: 2,
+                explain: '`@ObservedObject` doesn’t own its object, so each time the parent re-creates `FeedScreen`, a new, empty `FeedModel` replaces the old one. A view that creates its model should own it with `@StateObject`, or with `@State` for an `@Observable` model; SwiftUI keeps either for the view’s lifetime.',
+            },
+        ],
+    },
+    {
+        id: 'state-di',
+        title: 'State, navigation and dependency injection',
+        modules: ['sd-state', 'sd-navigation', 'sd-di'],
+        questions: [
+            {
+                id: 'state-di-1',
+                type: 'mcq',
+                prompt: 'An app uses `NavigationStack(path: $router.path)` with a `Route` enum. A deep link should open Settings, with Notifications on top of it. What does the router do?',
+                options: [
+                    'Calls `pushViewController` twice on the navigation controller',
+                    'Sets `path` to `[.settings, .notifications]`, and the stack shows both screens',
+                    'Presents Notifications as a sheet over Settings',
+                    'Posts a notification that Settings listens for, so it can push Notifications itself',
+                ],
+                answer: 1,
+                explain: 'With state-driven navigation the path is the source of truth: the stack shows one screen for each element. Deep links, restoring where the user was and popping to the root all become plain changes to that array.',
+            },
+            {
+                id: 'state-di-2',
+                type: 'mcq',
+                prompt: 'Where should a production app create its `APIClient`, repositories and view-model factories, and wire them together?',
+                options: [
+                    'Inside each view model’s initialiser, so every view model is self-contained',
+                    'In a global `Dependencies.shared` container that any type can read from',
+                    'In one place near the app’s entry point, the composition root, which passes them down',
+                    'In each view’s `onAppear`',
+                ],
+                answer: 2,
+                explain: 'A composition root keeps all the wiring in one place at launch, so every other type only declares what it needs. Creating dependencies inside view models hides them from tests, and a global container that anything can read from is a service locator.',
+            },
+        ],
+    },
+    {
+        id: 'concurrency',
+        title: 'Concurrency, reactive code and diagnostics',
+        modules: ['sd-concurrency', 'sd-reactive', 'sd-diagnostics'],
+        questions: [
+            {
+                id: 'concurrency-1',
+                type: 'mcq',
+                prompt: 'Three tasks call `validToken()` at the same moment, when no token is stored yet. `refresh()` awaits a network call. How many refreshes run?',
+                code: 'actor TokenStore {\n    private var token: String?\n\n    func validToken() async throws -> String {\n        if let token { return token }\n        let fresh = try await refresh()\n        token = fresh\n        return fresh\n    }\n}',
+                options: [
+                    'One: an actor runs each call of `validToken()` from start to finish before the next begins',
+                    'Three: while the first call is suspended in `refresh()`, the others enter the actor and also find no token',
+                    'None: the actor deadlocks waiting for itself',
+                    'It doesn’t compile in Swift 6 mode',
+                ],
+                answer: 1,
+                explain: 'Actors are reentrant: they run one task at a time only between suspension points. At each `await` another call can enter, and here it still sees `token` as `nil`. The fix is to keep the refresh in flight as a `Task` and have later callers await that same task.',
+            },
+            {
+                id: 'concurrency-2',
+                type: 'bug',
+                prompt: 'Typing in the search field never prints anything. Which line is the problem?',
+                code: 'final class SearchModel {\n    @Published var query = ""\n\n    func start() {\n        _ = $query\n            .debounce(for: .milliseconds(300), scheduler: RunLoop.main)\n            .sink { print("search", $0) }\n    }\n}',
+                answer: 5,
+                explain: '`sink` returns an `AnyCancellable`, and a Combine subscription is cancelled as soon as its cancellable is released. Assigning it to `_` releases it at once. Keep it, for example with `.store(in: &cancellables)`, for as long as the subscription should live.',
+            },
+        ],
+    },
+    {
+        id: 'architectures',
+        title: 'App architecture patterns',
+        modules: ['sd-arch-goals', 'sd-mvc', 'sd-mvvm', 'sd-unidirectional', 'sd-viper', 'sd-clean', 'sd-arch-evolution'],
+        questions: [
+            {
+                id: 'architectures-1',
+                type: 'sort',
+                prompt: 'In a Clean Architecture app, which layer does each belong to?',
+                buckets: ['Presentation', 'Domain', 'Data'],
+                items: [
+                    ['`OrdersViewModel`, which turns orders into view state', 0],
+                    ['`PlaceOrder`, the use case that checks stock and totals', 1],
+                    ['The `OrdersRepository` protocol that `PlaceOrder` depends on', 1],
+                    ['`RemoteOrdersRepository`, which uses URLSession and Core Data', 2],
+                    ['`OrderDTO`, which mirrors the server’s JSON', 2],
+                ],
+                explain: 'View models present, and use cases hold the rules. The dependency rule puts the repository *protocol* in the domain, owned by the code that uses it, while its implementation and the wire formats sit in the data layer and depend inwards.',
+            },
+            {
+                id: 'architectures-2',
+                type: 'mcq',
+                prompt: 'In a Redux-style unidirectional architecture such as TCA, where does a feature’s network request happen?',
+                options: [
+                    'Inside the reducer, which awaits the response before returning the new state',
+                    'In the view’s `body`, when the data is needed',
+                    'The reducer returns an effect; the store runs it and feeds the result back in as a new action',
+                    'In a `didSet` on the state, whenever it changes',
+                ],
+                answer: 2,
+                explain: 'Reducers stay pure and synchronous: given the state and an action, they produce the new state plus a description of any side effect. The store runs the effect and sends its result back as an action, so every change still passes through the reducer, where tests can check it.',
+            },
+        ],
+    },
+];

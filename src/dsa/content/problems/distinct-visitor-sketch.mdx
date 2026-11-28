@@ -1,0 +1,112 @@
+An analytics service wants "how many different visitors today?" for every page, every day, without storing anyone's id. Build a **HyperLogLog** sketch: a few kilobytes of one-byte registers that estimate the number of distinct ids added to within a couple of percent, ignore repeat visits, and merge across days. Then use merging to estimate how many visitors came on **both** of two days.
+
+`DistinctVisitorSketch.Sketch`, with `init(indexBits:)`, `indexBits: Int`, `registers: [UInt8]`, `add(_ id: Int)`, `estimate: Double` and `merged(with:) -> Sketch`; and `DistinctVisitorSketch.overlapEstimate(_:_:) -> Double`
+
+The stub already provides the hash, `DistinctVisitorSketch.mix(_:)`, which turns an id into 64 well-mixed bits (SplitMix64's mixing steps). Use it unchanged, so every sketch built from the same ids has exactly the same registers. With b = `indexBits` and m = 2^b registers, all starting at 0:
+
+- **add:** let h = `mix(id)`. The register index is the top b bits of h. The rank is the number of leading zeros of the remaining 64 − b bits (`h << b`), capped at 64 − b, plus 1. The register keeps the larger of its value and the rank.
+- **estimate:** with α = 0.7213 / (1 + 1.079 / m), the raw estimate is α · m² / (2^(−M[0]) + … + 2^(−M[m−1])). If the raw estimate is at most 2.5 · m and V > 0 registers are still 0, return m · ln(m / V) instead (linear counting). Otherwise return the raw estimate.
+- **merged(with:)** returns the sketch whose every register is the larger of the two sketches' registers. Both have the same `indexBits`.
+- **overlapEstimate(a, b)** estimates how many ids were added to both: |A| + |B| − |A ∪ B|, using the estimates.
+
+## Examples
+
+| Code | Result |
+| --- | --- |
+| a sketch with `indexBits: 4`, then add the ids 1 to 6 | `registers` = `[0, 1, 0, 0, 0, 0, 3, 0, 0, 4, 0, 1, 0, 0, 0, 0]` |
+| that sketch's `estimate` | about `4.603` (16 · ln(16 / 12)) |
+| `indexBits: 12`, add the ids `0..<100` (each twice) | `estimate` rounds to `97` |
+| `indexBits: 12`, add the ids `0..<100_000` | `estimate` rounds to `101737` |
+| a fresh sketch's `estimate` | `0.0` |
+| Monday: ids `0..<60_000`, Tuesday: ids `40_000..<100_000`, `indexBits: 12` | Monday ≈ 60863, Tuesday ≈ 60895, merged ≈ 101737, overlap ≈ 20021 |
+
+In the first example, `mix(1)` starts with the bits `1001`, so id 1 goes to register 9, and the next three bits are zeros followed by a one, so its rank is 4. Ids 1 and 2 both land in register 9; 2's rank is only 2, so the register keeps 4. Twelve registers are still 0, so the estimate uses linear counting: 16 · ln(16 / 12) ≈ 4.603. (Six ids, one of them colliding with another's register, and only 16 registers: tiny sketches are rough.)
+
+## Constraints
+
+- `4 ≤ indexBits ≤ 16`.
+- Up to 1,000,000 `add` calls; ids can be any `Int`, including negative ones.
+- `add` must be O(1). `estimate`, `merged(with:)` and `overlapEstimate` may be O(m).
+- The tests compare registers exactly and estimates to within 0.5, so follow the rules above precisely, including the cap on the rank and the switch to linear counting.
+
+<Hints>
+<Hint>
+`Int(h >> UInt64(64 - indexBits))` is the register index, and `(h << UInt64(indexBits)).leadingZeroBitCount` counts the zeros after it. Shifting left pushes the index bits out of the top and brings zeros in at the bottom, which is why the count needs capping at `64 - indexBits`: when every remaining bit is 0, the shifted value is 0 and has 64 leading zeros.
+</Hint>
+<Hint>
+For the estimate, `pow(2, -Double(register))` (from Foundation) or `1.0 / Double(1 << register)` gives 2^(−register). Count the zero registers in the same loop. `log` is the natural logarithm.
+</Hint>
+<Hint>
+The merge is exactly what you'd get by adding both days' ids into one sketch, because each register only ever keeps a maximum. That's why |A ∪ B| comes for free, and why the overlap must be computed from three estimates rather than read off the registers.
+</Hint>
+</Hints>
+
+## Solutions
+
+<Approach title="A Set of ids" time="O(1) per add" space="O(distinct ids)">
+
+Insert every id into a `Set<Int>` and read its `count`. Exact, but its memory grows with the number of visitors, which is what the sketch exists to avoid, and it can't produce the registers the tests check.
+
+</Approach>
+
+<Approach title="HyperLogLog registers" time="O(1) per add, O(m) per estimate" space="O(m)">
+
+```swift
+import Foundation
+
+public enum DistinctVisitorSketch {
+    public static func mix(_ id: Int) -> UInt64 {
+        var z = UInt64(bitPattern: Int64(id)) &+ 0x9E37_79B9_7F4A_7C15
+        z = (z ^ (z >> 30)) &* 0xBF58_476D_1CE4_E5B9
+        z = (z ^ (z >> 27)) &* 0x94D0_49BB_1331_11EB
+        return z ^ (z >> 31)
+    }
+
+    public struct Sketch {
+        public let indexBits: Int
+        public private(set) var registers: [UInt8]
+
+        public init(indexBits: Int) {
+            self.indexBits = indexBits
+            registers = Array(repeating: 0, count: 1 << indexBits)
+        }
+
+        public mutating func add(_ id: Int) {
+            let hash = mix(id)
+            let index = Int(hash >> UInt64(64 - indexBits))
+            let rest = hash << UInt64(indexBits)
+            let rank = UInt8(min(rest.leadingZeroBitCount, 64 - indexBits) + 1)
+            registers[index] = max(registers[index], rank)
+        }
+
+        public var estimate: Double {
+            let m = Double(registers.count)
+            let alpha = 0.7213 / (1 + 1.079 / m)
+            var sum = 0.0, empty = 0
+            for register in registers {
+                sum += pow(2, -Double(register))
+                if register == 0 { empty += 1 }
+            }
+            let raw = alpha * m * m / sum
+            if raw <= 2.5 * m && empty > 0 { return m * log(m / Double(empty)) }
+            return raw
+        }
+
+        public func merged(with other: Sketch) -> Sketch {
+            var result = self
+            for i in registers.indices {
+                result.registers[i] = max(registers[i], other.registers[i])
+            }
+            return result
+        }
+    }
+
+    public static func overlapEstimate(_ first: Sketch, _ second: Sketch) -> Double {
+        first.estimate + second.estimate - first.merged(with: second).estimate
+    }
+}
+```
+
+A repeated id has the same hash, so it reaches the same register with the same rank and changes nothing: the sketch counts distinct ids for free. With 4,096 registers the typical error is about 1.04 / √4096 ≈ 1.6%, whatever the count. The overlap inherits the errors of all three estimates, so it's only trustworthy when the overlap is a decent fraction of the union, as with Monday and Tuesday above.
+
+</Approach>

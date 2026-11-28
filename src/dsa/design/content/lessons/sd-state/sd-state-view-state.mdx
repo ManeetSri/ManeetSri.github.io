@@ -1,0 +1,420 @@
+## Why it matters
+
+Every screen that loads something has the same four moments: waiting, showing content, showing nothing, and failing. Model them carelessly and you ship a spinner on top of an error message, a blank table when the request failed, or a list that flickers to empty on every pull to refresh. A **view-state enum** makes the screen's states explicit, so each one is designed, rendered and tested on purpose. Interviewers expect it in any screen you design, and they listen for what you do about refreshing and stale responses.
+
+## Booleans multiply
+
+The first version of most screens looks like this:
+
+```swift
+final class ReadingListModel {
+    var isLoading = false
+    var error: Error?
+    var articles: [Article] = []
+}
+```
+
+Three properties, so 2 × 2 × 2 = 8 combinations (counting `articles` as empty or not). The screen only has about four meaningful states. The other combinations are bugs nobody designed: `isLoading` *and* `error` (a spinner over an error), `error` *and* articles (which wins?), not loading, no error, no articles (empty, or not loaded yet?). Every view and every test has to guess. [Making illegal states unrepresentable with enums](/design/learn/sd-modelling-illegal-states) taught the cure; here it is applied to screens.
+
+## One enum for what the screen shows
+
+```swift
+enum Content: Equatable {
+    case idle                        // the screen exists but hasn't asked for anything
+    case loading                     // the first load; nothing to show yet
+    case loaded([Article])
+    case empty                       // it worked, and there's nothing
+    case failed(message: String)     // the first load failed; nothing to show
+}
+```
+
+Each case is a state a designer can draw, and the compiler makes every `switch` handle all of them. A few decisions are worth making deliberately:
+
+- **`empty` is its own case.** An empty reading list isn't a list with no rows: it has its own illustration, its own call to action ("Save an article to read it later") and often its own analytics event. A separate case means no screen forgets to design it. The alternative, checking `articles.isEmpty` in the view, works but is easy to miss.
+- **`idle` is not `loading`.** The screen exists before it starts loading, and previews and tests need to build it in that state. Keeping them apart also lets "appear" start a load only once.
+- **Store a message, not `any Error`.** `any Error` isn't `Equatable`, so the whole state can't be compared in tests, and the view would have to map errors to text. Map errors to something presentable (a message, or a small domain enum like `.offline` and `.server`) where the error is caught.
+
+## Real screens need more than one enum
+
+The single enum breaks the moment the screen refreshes. If pull to refresh sets `.loading`, the articles vanish behind a spinner and come back: a flicker on every refresh. If a refresh fails, `.failed` blanks a screen that had perfectly good content a second ago.
+
+The fix is to notice that two things vary **independently**: *what's on screen* (the content) and *what's happening* (a refresh in progress, a banner about the last failure). Model them separately:
+
+```swift
+struct ScreenState: Equatable {
+    var content: Content = .idle     // what's on screen
+    var isRefreshing = false         // a reload is running; the content stays
+    var banner: String?              // the last refresh failed; the content stays
+}
+```
+
+This brings back a few illegal combinations, such as `isRefreshing` while `content` is `.loading`. You have two choices. Fold the activity into the cases that allow it (`.loaded([Article], isRefreshing: Bool)`), which rules the combinations out but makes every `switch` and every update longer. Or keep the struct and let **one function** own the transitions, so the illegal combinations can't be reached. For most screens the second reads better, and the reducer below is that function.
+
+Pagination is the same idea one level down: a loaded page holds its items, the cursor for the next page, and its own "loading more" and "couldn't load more" state, so a failure at the bottom of the list never touches the rows above it.
+
+## Transitions: a reducer owns them
+
+Write the rules as a pure function, as in [Reducers: state changes as pure functions](/design/learn/sd-functional-reducers): the current state and an event in, the next state and any work to start out. Here's the whole machine for a reading list, refresh included:
+
+```visual states
+title: The reading list's states
+states:
+  - { id: idle, label: Idle, at: [0, 0] }
+  - { id: loading, label: Loading, at: [1, 0] }
+  - { id: loaded, label: Loaded, at: [2, 0] }
+  - { id: refreshing, label: Refreshing, at: [3, 0] }
+  - { id: failed, label: Failed, at: [1, 1] }
+  - { id: empty, label: Empty, at: [2, 1] }
+initial: idle
+transitions:
+  - [idle, loading, appear]
+  - [loading, loaded, succeed, has articles]
+  - [loading, empty, succeed, no articles]
+  - [loading, failed, fail]
+  - [failed, loading, retry]
+  - [loaded, refreshing, pull]
+  - [refreshing, loaded, succeed]
+  - [refreshing, loaded, fail, keep + banner]
+events:
+  - { event: appear, say: "The screen appears and starts its first load. Nothing is on screen yet, so a spinner or skeleton is right." }
+  - { event: fail, say: "The first load fails. There's nothing to keep, so the whole screen becomes the error, with a retry button." }
+  - retry
+  - { event: succeed, guard: has articles, say: "The retry works. If the list had come back empty, the **Empty** state would show its own design instead." }
+  - { event: pull, say: "Pull to refresh keeps the articles on screen and shows the refresh control. No flicker." }
+  - { event: fail, guard: keep + banner, say: "The refresh fails, but good content is already showing, so it stays, with a banner saying the refresh didn't work." }
+  - pull
+  - { event: succeed, say: "This time it works: new articles, no banner." }
+```
+
+Here's the first-load half of that machine as code. The reducer does no networking and touches no UI: it decides what comes next, and returns an `Effect` naming the work to start.
+
+```swift run title="A screen's first load, as a reducer"
+struct Article: Equatable {
+    let title: String
+}
+
+enum Content: Equatable {
+    case idle
+    case loading
+    case loaded([Article])
+    case empty
+    case failed(message: String)
+}
+
+enum Event {
+    case appeared
+    case retryTapped
+    case fetched([Article])
+    case fetchFailed(message: String)
+}
+
+enum Effect {
+    case fetch
+}
+
+/// Pure: no networking and no UI. It decides the next state, and which work to start.
+func reduce(_ content: inout Content, _ event: Event) -> Effect? {
+    switch (content, event) {
+    case (.idle, .appeared), (.failed, .retryTapped):
+        content = .loading
+        return .fetch
+    case let (.loading, .fetched(articles)):
+        content = articles.isEmpty ? .empty : .loaded(articles)
+    case let (.loading, .fetchFailed(message)):
+        content = .failed(message: message)
+    default:
+        break   // an event this state ignores, such as appearing a second time
+    }
+    return nil
+}
+
+var content = Content.idle
+let events: [Event] = [
+    .appeared,
+    .fetchFailed(message: "Offline"),
+    .appeared,
+    .retryTapped,
+    .fetched([Article(title: "Swift 6 in practice"), Article(title: "Observation, explained")]),
+]
+for event in events {
+    let effect = reduce(&content, event)
+    print(describe(event), "→", describe(content), effect == nil ? "" : "+ start a fetch")
+}
+
+func describe(_ event: Event) -> String {
+    switch event {
+    case .appeared: "appeared"
+    case .retryTapped: "retryTapped"
+    case .fetched(let articles): "fetched \(articles.count) articles"
+    case .fetchFailed(let message): "fetchFailed(\(message))"
+    }
+}
+
+func describe(_ content: Content) -> String {
+    switch content {
+    case .idle: "idle"
+    case .loading: "loading"
+    case .loaded(let articles): "loaded(\(articles.count) articles)"
+    case .empty: "empty"
+    case .failed(let message): "failed(\(message))"
+    }
+}
+```
+
+```output
+appeared → loading + start a fetch
+fetchFailed(Offline) → failed(Offline)
+appeared → failed(Offline)
+retryTapped → loading + start a fetch
+fetched 2 articles → loaded(2 articles)
+```
+
+Switching on the pair `(content, event)` makes the rules read like a table, and the `default` case is a decision too: events that don't fit the current state are ignored, so appearing twice never fetches twice. The view model's job shrinks to running effects and feeding results back in as events, and every rule above is testable without a network or a simulator.
+
+### Stale answers
+
+Async work finishes out of order. A request can time out, the user taps Retry, and then the first request's answer finally arrives. If the reducer accepts any `fetched` event, the old answer overwrites the new one. Number the requests: the `fetch` effect carries an id, the state remembers the latest, and answers for any other id are dropped. The kata for this lesson builds exactly that, along with refresh and the banner. In SwiftUI, `.task(id:)` helps from the other side: when its id changes, it cancels the old task before starting the new one.
+
+## Rendering the state
+
+With the state explicit, the view is a `switch`. iOS 17 added `ContentUnavailableView` for the empty and failed cases, so they look like the system's own:
+
+```swift check ios group=reading-list title="Rendering every state in SwiftUI"
+import SwiftUI
+
+struct Article: Identifiable, Equatable {
+    let id: Int
+    let title: String
+}
+
+enum Content: Equatable {
+    case idle
+    case loading
+    case loaded([Article])
+    case empty
+    case failed(message: String)
+}
+
+protocol ArticleFeed: Sendable {
+    func latest() async throws -> [Article]
+}
+
+@MainActor @Observable
+final class ReadingListModel {
+    private(set) var content = Content.idle
+    private(set) var isRefreshing = false
+    private(set) var banner: String?
+    private let feed: any ArticleFeed
+
+    init(feed: any ArticleFeed) {
+        self.feed = feed
+    }
+
+    func appeared() async {
+        guard content == .idle else { return }
+        content = .loading
+        await load()
+    }
+
+    func retry() async {
+        guard case .failed = content else { return }
+        content = .loading
+        await load()
+    }
+
+    func refresh() async {
+        guard case .loaded = content, !isRefreshing else { return }
+        isRefreshing = true
+        banner = nil
+        await load()
+        isRefreshing = false
+    }
+
+    private func load() async {
+        do {
+            let articles = try await feed.latest()
+            content = articles.isEmpty ? .empty : .loaded(articles)
+        } catch is CancellationError {
+            // The screen went away. That isn't a failure to show anyone.
+        } catch let error as URLError where error.code == .cancelled {
+            // The same, reported by URLSession
+        } catch {
+            if case .loaded = content {
+                banner = "Couldn't refresh. Showing what you had."
+            } else {
+                content = .failed(message: "Check your connection and try again.")
+            }
+        }
+    }
+}
+
+struct ReadingListView: View {
+    let model: ReadingListModel
+
+    var body: some View {
+        Group {
+            switch model.content {
+            case .idle, .loading:
+                ProgressView()
+            case .loaded(let articles):
+                List(articles) { article in
+                    Text(article.title)
+                }
+                .refreshable { await model.refresh() }
+            case .empty:
+                ContentUnavailableView("Nothing saved yet", systemImage: "bookmark",
+                                       description: Text("Save an article to read it later."))
+            case .failed(let message):
+                ContentUnavailableView {
+                    Label("Couldn't load your list", systemImage: "wifi.exclamationmark")
+                } description: {
+                    Text(message)
+                } actions: {
+                    Button("Try again") {
+                        Task { await model.retry() }
+                    }
+                }
+            }
+        }
+        .overlay(alignment: .top) {
+            if let banner = model.banner {
+                Text(banner)
+                    .padding()
+                    .background(.thinMaterial, in: .capsule)
+            }
+        }
+        .task { await model.appeared() }
+    }
+}
+```
+
+This model mutates its state directly in methods, which is the same machine written imperatively. Either style works. The reducer style is easier to test exhaustively; the method style is shorter. What matters is that the states and their transitions are written down in one type.
+
+UIKit got the same tool in iOS 17: a view controller's `contentUnavailableConfiguration`, which UIKit asks you to update whenever you call `setNeedsUpdateContentUnavailableConfiguration()`:
+
+```swift check ios group=reading-list title="The same states in UIKit"
+import UIKit
+
+final class ReadingListViewController: UITableViewController {
+    var content = Content.idle {
+        didSet {
+            setNeedsUpdateContentUnavailableConfiguration()
+            tableView.reloadData()
+        }
+    }
+
+    override func updateContentUnavailableConfiguration(using state: UIContentUnavailableConfigurationState) {
+        switch content {
+        case .idle, .loading:
+            contentUnavailableConfiguration = UIContentUnavailableConfiguration.loading()
+        case .empty:
+            var empty = UIContentUnavailableConfiguration.empty()
+            empty.image = UIImage(systemName: "bookmark")
+            empty.text = "Nothing saved yet"
+            contentUnavailableConfiguration = empty
+        case .failed(let message):
+            var failed = UIContentUnavailableConfiguration.empty()
+            failed.image = UIImage(systemName: "wifi.exclamationmark")
+            failed.text = "Couldn't load your list"
+            failed.secondaryText = message
+            contentUnavailableConfiguration = failed
+        case .loaded:
+            contentUnavailableConfiguration = nil
+        }
+    }
+}
+```
+
+Two refinements make loading feel faster. If most loads finish in a few hundred milliseconds, don't show a spinner at once: wait about 0.3 seconds first, so fast loads never flash one. And where the layout is predictable, a skeleton (`.redacted(reason: .placeholder)` over placeholder rows) feels quicker than a spinner, because the screen's shape appears straight away.
+
+## Trade-offs
+
+| | Booleans and optionals | One enum | Content enum + activity | Content with activity folded in |
+| --- | --- | --- | --- | --- |
+| Illegal states | many | none | a few, kept out by the reducer | none |
+| Refresh without flicker | possible, by care | no | yes | yes |
+| Code size | smallest at first | small | medium | larger: every case carries flags |
+| Testing | must check combinations | compare one value | compare one struct | compare one value |
+| Wins for | nothing past a prototype | screens that load once | most screens with refresh or paging | small machines that must be airtight |
+
+A generic `Loadable<Value>` (`idle`, `loading`, `loaded(Value)`, `failed`) shared by every screen is tempting. It's good for consistency, but it tends to lose `empty` and refresh; give it those, or let screens wrap it.
+
+<Callout kind="interview">
+
+**What to say:** name the states before drawing the UI: "Idle, loading, loaded, empty and failed for the content, plus refreshing and a banner, because a failed refresh mustn't wipe what's on screen." Then say how stale responses are handled: request ids, or cancelling the previous task.
+
+**What to ask:** what should a user see when a refresh fails? Is the empty state designed? Is the list paginated? Each answer changes the state type.
+
+**Red flags:** `isLoading` plus `error` plus `data`; a spinner replacing content on refresh; no empty state; showing `error.localizedDescription` to users.
+
+</Callout>
+
+<Callout kind="gotcha" title="iOS gotcha: cancellation isn't failure">
+
+`.task` cancels its work when the view disappears, and `.task(id:)` cancels when the id changes. The cancelled call throws `CancellationError`, or `URLError(.cancelled)` from URLSession. Treat either as a failure and the screen flashes an error as the user navigates away, or records a bogus error in analytics. Catch cancellation separately and leave the state alone.
+
+</Callout>
+
+## Practice
+
+The kata **Reading list screen state** asks for the complete reducer from the diagram: first load, retry, pull to refresh that keeps content, a banner for failed refreshes, and numbered requests so that late answers are ignored.
+
+```cards
+- id: why-enum
+  front: "Why model a screen with an enum instead of isLoading, error and items?"
+  back: "Three independent properties allow eight combinations for about four real states. An enum allows only the real ones, and every switch must handle each."
+- id: empty-case
+  front: "Why give empty its own case?"
+  back: "It's a designed state, with its own copy and call to action. A separate case means no screen forgets to design it."
+- id: content-activity
+  front: "How do you refresh without wiping the content?"
+  back: "Model what's on screen (the content) separately from what's happening (refreshing, a banner), so a refresh or its failure keeps the content."
+- id: stale-answers
+  front: "How do you stop a late response overwriting a newer one?"
+  back: "Number each request, remember the latest in the state, and ignore answers for any other number (or cancel the old task)."
+```
+
+```quiz
+- id: q1
+  type: estimate
+  prompt: "A screen tracks `isLoading: Bool`, `isRefreshing: Bool`, `error: String?` and `items: [Item]` (treat it as empty or not). How many combinations can it represent?"
+  answer: 16
+  unit: combinations
+  within: { factor: 1.2 }
+  explain: "Four independent two-way choices make 2⁴ = 16 combinations, for roughly six states the screen actually has. The other ten are bugs waiting for a code path to reach them."
+- id: q2
+  type: mcq
+  prompt: "A loaded list of 40 orders is on screen. The user pulls to refresh and the request fails. What should the state become?"
+  options:
+    - "`failed`, with a retry button in place of the list"
+    - "The same 40 orders, not refreshing, with a banner saying the refresh failed"
+    - "`loading`, until a retry succeeds"
+    - "`empty`, because the latest request returned no orders"
+  answer: 1
+  explain: "The content is still good, so it stays. The failure is about the refresh, not the content: a banner says so and the user can pull again."
+- id: q3
+  type: multi
+  prompt: "Which belong in the view-state type of a paginated search results screen?"
+  options:
+    - "The results loaded so far, and the cursor for the next page"
+    - "Whether the next page is loading"
+    - "The `URLSessionDataTask` for the current request"
+    - "Why loading the next page failed, if it did"
+  answer: [0, 1, 3]
+  explain: "View state is what the screen shows and what it's waiting for. The task is an implementation detail of the effect; keep it in the view model (or let structured concurrency own it), not in the state you render and compare in tests."
+- id: q4
+  type: order
+  prompt: "Put the events in order for a screen that times out, is retried, and then gets a late answer from the first request."
+  lines:
+    - "The screen appears and starts request 1"
+    - "Request 1 times out, and the screen shows the error"
+    - "The user taps Try again, starting request 2"
+    - "Request 1's answer arrives late and is ignored"
+    - "Request 2's answer arrives and the articles show"
+  explain: "Because the state remembers that request 2 is the latest, request 1's late answer can't overwrite anything. Without the number, the old answer would win whenever it happened to arrive last."
+- id: q5
+  type: truefalse
+  prompt: "If a `.task` load is cancelled because the user left the screen, the view model should switch to the `failed` state so the error is visible if they come back."
+  answer: false
+  explain: "Cancellation isn't a failure. Catch `CancellationError` (and `URLError(.cancelled)`) separately and leave the state as it was, so coming back can load again."
+```

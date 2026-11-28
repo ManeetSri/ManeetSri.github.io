@@ -3,6 +3,7 @@
 //
 // Events never include what a visitor typed: only choices, counts and yes/no flags.
 
+import { isPrivatePath } from '../utils/privatePaths';
 import { allowsAnalytics, getConsent, needsChoice, saveConsent } from './consent';
 
 const MAX_VALUE_LENGTH = 100;
@@ -12,10 +13,11 @@ let client = null;
 let loading = false;
 let queue = [];
 
-// Local builds and Netlify deploy previews (their hostnames contain "--") stay out of the numbers
+// Local builds and Netlify deploy previews (their hostnames contain "--") stay out of the numbers,
+// and so does the private learning console
 const isProductionSite = () => {
-    const { hostname } = window.location;
-    return import.meta.env.PROD && hostname !== 'localhost' && hostname !== '127.0.0.1' && !hostname.includes('--');
+    const { hostname, pathname } = window.location;
+    return import.meta.env.PROD && hostname !== 'localhost' && hostname !== '127.0.0.1' && !hostname.includes('--') && !isPrivatePath(pathname);
 };
 
 const cleanParams = (params) => Object.fromEntries(

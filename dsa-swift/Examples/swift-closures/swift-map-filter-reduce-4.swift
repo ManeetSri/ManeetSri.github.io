@@ -1,0 +1,6 @@
+// Generated from src/dsa/content/lessons/swift-closures/swift-map-filter-reduce.mdx. Edit the lesson, then run
+// `npm run dsa:examples` to update this file. Run it from dsa-swift/ with: swift <this file>
+
+let scores = [72, 38, 50, 91, 45]
+print(scores.filter { $0 >= 50 }.count)
+print(scores.count(where: { $0 >= 50 }))

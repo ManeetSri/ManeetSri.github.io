@@ -1,0 +1,437 @@
+## Why it matters
+
+Type "sw" into a search field and the app offers "swift", "swiftui", "sweet" before you've finished the word. Good suggestions feel like the app knows you, and they come from two ideas you already have: a **trie** finds every word that starts with what's been typed, and **ranking** picks the few worth showing. In this project you build that as a SwiftUI search screen for an iOS app: suggestions ranked by how often each word is chosen, ties broken alphabetically, a search that waits until you pause typing, and frequencies that learn from what you pick and survive a relaunch. It's the interview question from [Autocomplete system](/dsa/learn/ds-autocomplete), turned into something you can hold in your hand.
+
+## What you'll build
+
+- An `Autocomplete` engine: an index-based trie in which each node caches the best `k` words below it, so a query costs O(prefix length + k), however many words share the prefix.
+- A search screen with `.searchable`, a short debounce so a burst of keystrokes runs one query, and the typed prefix highlighted in each suggestion.
+- Learning: choosing a suggestion increases its count, which can move it up the list.
+- Persistence: the counts are saved as JSON and reloaded at launch.
+
+Budget about two hours.
+
+## Before you start
+
+- Tries: [The prefix tree](/dsa/learn/trie-concept), [Build a Trie: insert, search, startsWith](/dsa/learn/trie-build) and [Autocomplete](/dsa/learn/trie-autocomplete).
+- Ranking: [Top K, kth largest and K closest](/dsa/learn/heap-top-k), and [sorted(by:), min, max, contains and first(where:)](/dsa/learn/swift-sorting-searching-api) for tie-breaking comparators.
+- Layout and speed: [Index-based nodes vs class nodes](/dsa/learn/fs-index-based-nodes) and [Benchmarking properly](/dsa/learn/fs-benchmarking).
+- The app side: [Actors as thread-safe caches](/dsa/learn/cc-actors), the debounce section of [iOS-flavoured DSA questions](/dsa/learn/int-ios-flavoured), and [Autocomplete system](/dsa/learn/ds-autocomplete) for the design discussion.
+- Strings: [Unicode and grapheme clusters](/dsa/learn/swift-unicode), because users type accents and capitals.
+
+## The architecture
+
+```text
+ keystrokes ─▶ SearchScreen (query) ─▶ .task(id: query): wait 200 ms ─▶ SuggestionEngine (actor)
+                     ▲                                                     │
+                     │                                       Autocomplete: walk the prefix,
+                     │                                       read the node's cached top k
+                     └────────── [Suggestion] ◀────────────────────────────┘
+
+ tap a suggestion ─▶ engine.record(word) ─▶ counts change ─▶ save counts.json (debounced)
+ app launch       ─▶ load counts.json ─▶ engine.record(word, times: count) for each word
+```
+
+Files:
+
+```text title="Suggest/"
+SuggestCore/                      a local package: the engine and its tests
+  Sources/SuggestCore/
+    Autocomplete.swift            index-based trie with cached top-k per node
+    Normalise.swift               the key a word is stored under: lowercased, accents removed
+    SuggestionEngine.swift        an actor that owns an Autocomplete and the saved counts
+  Tests/SuggestCoreTests/
+SuggestApp/
+  SearchScreen.swift
+  HighlightedText.swift
+  Resources/words.csv             the starting vocabulary: word,count
+```
+
+The engine is an actor so that loading tens of thousands of words, and saving, happen off the main actor; the view only ever awaits a short list.
+
+## Milestones
+
+### 1. The trie with counts
+
+Build an index-based trie: parallel arrays for each node's children, the word ending there and its count, with node 0 as the root. Load a starting vocabulary from a bundled CSV of `word,count` lines. A word-frequency list you're allowed to redistribute, or your own app's search history, both work; check the licence of any list you download.
+
+- **Acceptance:** 50,000 words load in well under a second in a release build; `frequency(of:)` returns the count, or 0 for unknown words.
+- **Exercises:** trie insertion, and the memory layout of nodes.
+
+### 2. Top k by searching the subtree
+
+For a prefix, walk to its node, then visit its whole subtree and keep the best `k` words with a min-heap of size `k`: each word is pushed, and when the heap holds more than `k`, the worst is popped. Rank by count, highest first; equal counts alphabetically.
+
+- **Acceptance:** results match a brute-force filter-and-sort over the word list for 1,000 seeded random prefixes.
+- **Exercises:** top-k with a bounded heap, O(m log k) for m words in the subtree.
+
+### 3. Cache the top k in every node
+
+Searching the subtree of "s" means visiting a large share of the whole dictionary on every keystroke. Instead, give each node a short list: the best `k` word nodes in its subtree. A query reads one list. Inserting or bumping a word updates the lists on its path from the root, as in the key code below.
+
+- **Acceptance:** same results as milestone 2 for every prefix; in a release-build benchmark, the query time for "s" and for "swiftu" is about the same.
+- **Exercises:** precomputation, trading memory (k indexes per node) and update time for query time.
+
+### 4. The search screen
+
+Add `.searchable`, run the query in `.task(id: query)` after a 200 ms pause, and highlight the typed prefix in each row.
+
+- **Acceptance:** typing "swi" quickly runs one query, not three (count them in a debug counter); clearing the field shows the most frequent words overall.
+- **Exercises:** debouncing, a form of rate limiting.
+
+### 5. Learning and persistence
+
+Tapping a suggestion calls `engine.record(word)`. Save the counts as JSON in Application Support, a moment after the last change rather than on every tap, and when the app moves to the background. At launch, load the JSON and rebuild the trie.
+
+- **Acceptance:** after choosing "sword" enough times, it tops the list for "sw", and still does after the app is killed and relaunched.
+- **Exercises:** updating cached data along a path, O(L · k log k) for a word of length L.
+
+### 6. Case and accents
+
+Store each word under a normalised key, so "Café", "cafe" and "CAFÉ" all match the prefix "caf", but show the word as it was first written. Foundation's `folding(options: [.caseInsensitive, .diacriticInsensitive], locale: nil)` produces such a key.
+
+- **Acceptance:** typing "cafe" suggests "Café"; the stored display form is unchanged.
+- **Exercises:** keys versus values. The trie indexes one string and returns another.
+
+## Key code: cached top k in a trie
+
+Every node keeps a list of at most `k` word nodes from its subtree, best first. When a word's count goes up, only the nodes on its path can change, and in each of them only that word can move: every other word's count is unchanged. So each update is "remove it if present, add it, sort, keep `k`". The slow subtree search is kept alongside, to check the fast one.
+
+```swift run
+/// A trie whose every node remembers the best `k` words below it, so a query only walks the prefix.
+/// Nodes live in arrays and refer to each other by index, as in "Index-based nodes vs class nodes".
+struct Autocomplete {
+    let k: Int
+    private var children: [[Character: Int]] = [[:]]   // node 0 is the root: the empty prefix
+    private var word: [String?] = [nil]                // the word ending at a node, if any
+    private var frequency: [Int] = [0]
+    private var top: [[Int]] = [[]]                    // word nodes in this subtree, best first, at most k
+    var nodesVisited = 0                               // for comparing the two query strategies
+
+    init(k: Int) {
+        self.k = k
+    }
+
+    /// Higher frequency first; equal frequencies in alphabetical order, so results never depend on luck
+    private func ranksAbove(_ a: Int, _ b: Int) -> Bool {
+        frequency[a] != frequency[b] ? frequency[a] > frequency[b] : word[a]! < word[b]!
+    }
+
+    /// Adds `times` uses of `text`, then refreshes the cached lists on the path from the root
+    mutating func record(_ text: String, times: Int = 1) {
+        var path = [0]
+        var node = 0
+        for character in text {
+            if let next = children[node][character] {
+                node = next
+            } else {
+                children.append([:])
+                word.append(nil)
+                frequency.append(0)
+                top.append([])
+                children[node][character] = children.count - 1
+                node = children.count - 1
+            }
+            path.append(node)
+        }
+        word[node] = text
+        frequency[node] += times
+        for ancestor in path {
+            // Only this word's count changed, and it only went up, so it's the only word that can move
+            var list = top[ancestor].filter { $0 != node }
+            list.append(node)
+            list.sort(by: ranksAbove)
+            top[ancestor] = Array(list.prefix(k))
+        }
+    }
+
+    private mutating func node(for prefix: String) -> Int? {
+        var node = 0
+        for character in prefix {
+            nodesVisited += 1
+            guard let next = children[node][character] else { return nil }
+            node = next
+        }
+        return node
+    }
+
+    /// O(prefix length + k): read the cached list
+    mutating func suggestions(for prefix: String) -> [String] {
+        guard let start = node(for: prefix) else { return [] }
+        return top[start].map { "\(word[$0]!) (\(frequency[$0]))" }
+    }
+
+    /// The slow way, for checking: visit the whole subtree, then sort what you found
+    mutating func suggestionsBySearch(for prefix: String) -> [String] {
+        guard let start = node(for: prefix) else { return [] }
+        var found: [Int] = []
+        var stack = [start]
+        while let current = stack.popLast() {
+            nodesVisited += 1
+            if word[current] != nil { found.append(current) }
+            stack.append(contentsOf: children[current].values)
+        }
+        return found.sorted(by: ranksAbove).prefix(k).map { "\(word[$0]!) (\(frequency[$0]))" }
+    }
+}
+
+var engine = Autocomplete(k: 3)
+let history = [("string", 60), ("swift", 50), ("struct", 45), ("swiftui", 40), ("static", 35),
+               ("sweet", 30), ("switch", 25), ("state", 20), ("stride", 12), ("swim", 10), ("sword", 5)]
+for (word, count) in history {
+    engine.record(word, times: count)
+}
+
+for prefix in ["s", "sw", "swi", "str", "x"] {
+    engine.nodesVisited = 0
+    let fast = engine.suggestions(for: prefix)
+    let fastCost = engine.nodesVisited
+    engine.nodesVisited = 0
+    let slow = engine.suggestionsBySearch(for: prefix)
+    let shown = fast.isEmpty ? "nothing" : fast.joined(separator: ", ")
+    print("\(prefix): \(shown)  [\(fastCost) vs \(engine.nodesVisited) nodes, \(fast == slow ? "same" : "DIFFERENT")]")
+}
+
+engine.record("sword", times: 48)          // the user keeps choosing "sword"
+print("after 48 more swords:", engine.suggestions(for: "sw").joined(separator: ", "))
+engine.record("swimming")                  // a brand-new word starts at 1
+print("swim:", engine.suggestions(for: "swim").joined(separator: ", "))
+```
+
+```output
+s: string (60), swift (50), struct (45)  [1 vs 33 nodes, same]
+sw: swift (50), swiftui (40), sweet (30)  [2 vs 18 nodes, same]
+swi: swift (50), swiftui (40), switch (25)  [3 vs 12 nodes, same]
+str: string (60), struct (45), stride (12)  [3 vs 12 nodes, same]
+x: nothing  [1 vs 1 nodes, same]
+after 48 more swords: sword (53), swift (50), swiftui (40)
+swim: swim (10), swimming (1)
+```
+
+What to notice:
+
+- **The cached query visits only the prefix.** For "s" it reads one node's list; the subtree search visits 33 nodes to find the same three words. With a real dictionary, the subtree under "s" has tens of thousands of nodes, and the gap is the difference between a smooth search field and a stuttering one.
+- **Ties never depend on luck.** "sweet" and "swim" could tie one day; the comparator falls back to alphabetical order, so tests can pin exact results. Without the tie-break, the order would depend on dictionary iteration, which changes between runs.
+- **Learning is the same operation as loading.** Starting counts are recorded with `times:`; a tap records one more. After 48 more choices, "sword" (53) overtakes "swift" (50) in every list on its path.
+- **The update trick needs counts that only go up.** If a count could go down, a word that drops out of a node's top `k` would have to be replaced by the best word *not* in the list, which the list doesn't know. That would need a search of the subtree. Keep counts increasing; the stretch goals show how to favour recent choices anyway.
+
+## The SwiftUI layer
+
+```swift title="SuggestionEngine.swift"
+import Foundation
+
+actor SuggestionEngine {
+    private var trie = Autocomplete(k: 5)
+    private var counts: [String: Int] = [:]
+    private let file = URL.applicationSupportDirectory.appending(path: "counts.json")
+
+    func load(bundled: [(String, Int)]) throws {
+        if let data = try? Data(contentsOf: file) {
+            counts = try JSONDecoder().decode([String: Int].self, from: data)
+        } else {
+            counts = Dictionary(bundled, uniquingKeysWith: +)
+        }
+        for word in counts.keys.sorted() {                  // sorted: the same node numbering every launch
+            trie.record(word, times: counts[word]!)
+        }
+    }
+
+    func suggestions(for prefix: String) -> [Suggestion] {
+        trie.top(for: prefix)          // like suggestions(for:) in the key code, as values, not text
+    }
+
+    func record(_ word: String) {
+        counts[word, default: 0] += 1
+        trie.record(word)
+    }
+
+    func save() throws {
+        try FileManager.default.createDirectory(at: file.deletingLastPathComponent(), withIntermediateDirectories: true)
+        try JSONEncoder().encode(counts).write(to: file, options: .atomic)
+    }
+}
+```
+
+Here `Suggestion` is a small struct holding a word and its count, and `top(for:)` is the key code's `suggestions(for:)` returning those instead of formatted text. Sorting the words before inserting them doesn't change any results, since the tie-break decides every order, but it makes the node numbering, and so any debugging output, identical on every launch.
+
+```swift title="SearchScreen.swift"
+import SwiftUI
+
+struct SearchScreen: View {
+    let engine: SuggestionEngine
+    @State private var query = ""
+    @State private var suggestions: [Suggestion] = []
+
+    var body: some View {
+        NavigationStack {
+            List(suggestions, id: \.word) { suggestion in
+                Button {
+                    Task { await engine.record(suggestion.word) }
+                    query = suggestion.word
+                } label: {
+                    HighlightedText(suggestion.word, prefix: query)
+                }
+            }
+            .navigationTitle("Search")
+            .searchable(text: $query)
+            .task(id: query) {
+                do {
+                    try await Task.sleep(for: .milliseconds(200))   // debounce
+                } catch {
+                    return                                          // another keystroke arrived
+                }
+                suggestions = await engine.suggestions(for: query)
+            }
+        }
+    }
+}
+```
+
+Every keystroke changes `query`, so SwiftUI cancels the previous task and starts a new one. The cancelled task's `Task.sleep` throws, and it returns without querying. Only when typing pauses for 200 ms does a query run. That's a debounce in five lines, with no timers to manage.
+
+```swift title="HighlightedText.swift"
+struct HighlightedText: View {
+    let text: AttributedString
+
+    init(_ word: String, prefix: String) {
+        var text = AttributedString(word)
+        if let range = text.range(of: prefix, options: [.caseInsensitive, .anchored]) {
+            text[range].font = .body.bold()
+        }
+        self.text = text
+    }
+
+    var body: some View {
+        Text(text)
+    }
+}
+```
+
+## Tests to write
+
+```swift title="Tests/SuggestCoreTests/AutocompleteTests.swift"
+import Testing
+@testable import SuggestCore
+
+@Suite struct AutocompleteTests {
+    @Test("Cached lists match a brute-force sort for every prefix of every word")
+    func matchesBruteForce() {
+        var random = SeededGenerator(seed: 11)
+        var engine = Autocomplete(k: 5)
+        var counts: [String: Int] = [:]
+        let letters = Array("abcde")
+        for _ in 0..<2_000 {
+            let length = Int.random(in: 1...6, using: &random)
+            let word = String((0..<length).map { _ in letters.randomElement(using: &random)! })
+            let times = Int.random(in: 1...20, using: &random)
+            engine.record(word, times: times)
+            counts[word, default: 0] += times
+        }
+        for word in counts.keys {
+            for end in word.indices {
+                let prefix = String(word[...end])
+                let expected = counts.filter { $0.key.hasPrefix(prefix) }
+                    .sorted { $0.value != $1.value ? $0.value > $1.value : $0.key < $1.key }
+                    .prefix(5).map { "\($0.key) (\($0.value))" }
+                #expect(engine.suggestions(for: prefix) == Array(expected))
+            }
+        }
+    }
+
+    @Test("Equal counts come out alphabetically")
+    func tiesAreAlphabetical() {
+        var engine = Autocomplete(k: 3)
+        for word in ["cherry", "apple", "banana"] { engine.record(word, times: 4) }
+        engine.record("ab", times: 4)
+        #expect(engine.suggestions(for: "") == ["ab (4)", "apple (4)", "banana (4)"])
+    }
+}
+```
+
+A small alphabet ("abcde") and short words make prefixes overlap heavily, which is where caching bugs hide. More to cover:
+
+- An unknown prefix returns an empty list; the empty prefix returns the global top `k`.
+- Recording the same word twice adds the counts and doesn't create a second entry.
+- `k = 1`, and a prefix with fewer than `k` words below it.
+- Saving and loading: encode, decode into a fresh engine, and compare suggestions for a set of prefixes.
+
+## Stretch goals
+
+- **Recency without decreasing counts.** To favour recent choices, you might multiply every count by 0.99 each day, but that decreases counts and breaks the cache. Instead, make each new choice worth a little more than the last: add `growth^t` for the t-th day, with `growth` slightly above 1. Old choices are worth relatively less, no count ever goes down, and the update trick still works. Use `Double` counts, and rescale everything occasionally before they overflow.
+- **Typo tolerance.** Walk the trie with a row of the edit-distance table per node, as the spell checker in [A spell checker with edit distance and a BK-tree](/dsa/learn/cap-spell-checker) explains, to suggest "swift" for "swfit".
+- **Compress the trie.** Merge chains of single-child nodes into one edge labelled with a string, as in [Radix trees and suffix tries](/dsa/learn/trie-radix), and measure the memory saved.
+- **Multi-word queries:** "new y" suggests "new york" by indexing phrases, or by completing only the last word in the context of the previous one.
+
+## Done when
+
+- Suggestions come from cached per-node lists, and a test checks them against brute force on thousands of overlapping words.
+- Typing quickly runs one query per pause, not one per keystroke.
+- Choosing a suggestion changes the ranking, and the change survives a relaunch.
+- Case and accents don't stop a word from matching.
+- You can explain why the cache stays correct only while counts never decrease.
+
+```cards
+- id: cap-auto-cache
+  front: "How does a trie answer top-k autocomplete in O(prefix length + k)?"
+  back: "Every node caches the best k word nodes in its subtree. A query walks the prefix and reads that node's list."
+- id: cap-auto-update
+  front: "When a word's count goes up, which cached lists can change?"
+  back: "Only those of the nodes on the word's path from the root, and in each one only that word can move, because no other count changed."
+- id: cap-auto-decrease
+  front: "Why does the per-node cache break if counts can decrease?"
+  back: "A word that drops out of a node's top k must be replaced by the best word not in the list, which the list doesn't know, so the subtree would have to be searched again."
+- id: cap-auto-debounce
+  front: "How does `.task(id: query)` plus `Task.sleep` debounce a search field?"
+  back: "Each change of query cancels the previous task, whose sleep throws, so it never queries. A query runs only after typing pauses for the whole sleep."
+```
+
+```quiz
+- id: q1
+  type: output
+  prompt: "What does this ranking print?"
+  code: |
+    let counts = [("sweet", 30), ("swift", 50), ("swim", 30), ("sword", 5)]
+    let ranked = counts.sorted { $0.1 != $1.1 ? $0.1 > $1.1 : $0.0 < $1.0 }
+    print(ranked.prefix(3).map { $0.0 })
+  answer: "[\"swift\", \"sweet\", \"swim\"]"
+  explain: "Higher counts first: swift (50). sweet and swim tie at 30, so the alphabetical tie-break puts sweet first."
+- id: q2
+  type: mcq
+  prompt: "With a cached top-k list in every node, what does a query cost for a prefix of length L that m stored words start with?"
+  options:
+    - "O(L + k)"
+    - "O(L + m)"
+    - "O(L + m log k)"
+    - "O(m log m)"
+  answer: 0
+  explain: "Walk L nodes to reach the prefix, then copy the k cached results. The cost doesn't depend on m, which is the whole point. O(L + m log k) is the subtree search with a bounded heap from milestone 2."
+- id: q3
+  type: truefalse
+  prompt: "In SwiftUI, changing the value passed to `.task(id:)` cancels the running task and starts a new one."
+  answer: true
+  explain: "That's what makes the debounce work: every keystroke cancels the previous wait, so only the last keystroke in a burst survives its sleep and runs the query."
+- id: q4
+  type: mcq
+  prompt: "Why does the update in `record(_:times:)` only need to consider the word whose count changed?"
+  options:
+    - "Because the trie is sorted alphabetically"
+    - "Because every other word's count is unchanged, so their relative order is the same, and only the changed word can enter or move"
+    - "Because k is small"
+    - "Because Swift sorts are stable"
+  answer: 1
+  explain: "The other k words in a node's list keep their order. The changed word either moves up within the list or enters it, pushing out the last one. Nothing else can happen while counts only increase."
+- id: q5
+  type: multi
+  prompt: "Which are good reasons to make the engine an actor? Choose all that apply."
+  options:
+    - "Loading tens of thousands of words happens off the main actor"
+    - "Taps and queries from different tasks can't change the trie at the same time"
+    - "Actors make trie lookups O(1)"
+    - "Saving to disk doesn't block the UI"
+  answer: [0, 1, 3]
+  explain: "An actor runs one call at a time on its own, off the main actor, so the work doesn't freeze the screen and the trie is never changed by two tasks at once. It doesn't change the algorithm's complexity."
+- id: q6
+  type: recall
+  prompt: "You want suggestions to favour what the user chose recently. Why not multiply every count by 0.99 each day, and what works instead?"
+  model: "Shrinking counts breaks the per-node caches, which are only correct while counts never decrease: a word falling out of a list would need a subtree search to replace it. Instead, make each new choice worth more, adding growth^t for day t with growth slightly above 1. Relative weights favour recent choices, counts only increase, and the cache stays valid; rescale occasionally to avoid overflow."
+```

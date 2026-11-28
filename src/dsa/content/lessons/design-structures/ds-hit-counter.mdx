@@ -1,0 +1,273 @@
+## Why it matters
+
+"1.2k views in the last hour", "5 failed logins in the last minute", "requests per second" on a dashboard: all of these are **hit counters** over a sliding window of time. Their cousin is the **time-based key-value store**, which remembers every value a key has had so you can ask what it was at any moment: a feature flag's value when a crash happened, a price at the time of an order, a document's title last Tuesday. Both questions are interview favourites because each has a naive answer that works and a better one that needs a small, precise idea: buckets for the counter, binary search for the store.
+
+## A hit counter
+
+You built the first version in [Stream problems: first unique, moving average](/dsa/learn/queue-streams): a queue of timestamps, oldest first. To count at time t, drop timestamps at or before t − window from the front, and the queue's length is the answer.
+
+Now run the design routine from [Iterators: peeking, flatten nested and zigzag](/dsa/learn/ds-iterators) on it.
+
+**Requirements.** The questions that change the design:
+
+- Do timestamps ever go backwards? (Assume not: they come from one clock.)
+- How many hits can share one second? One per user tap, or millions from a load balancer?
+- How big is the window: 60 seconds or a day? And is memory tight?
+
+**Structures.** Three designs, each a reasonable answer to different requirements:
+
+| Design | `record` | `count` | Memory |
+| --- | --- | --- | --- |
+| Queue of timestamps, one per hit | O(1) | amortised O(1) | O(hits in the window): unbounded |
+| Ring of `window` slots, one per second | O(1) | O(window) | O(window), fixed |
+| Queue of (second, hits) buckets + running total | amortised O(1) | amortised O(1) | O(window) at most |
+
+The first design stores a million entries for a million hits in one second. The fix is to **group hits by second**: a bucket per second that had hits, however many it had.
+
+### A ring of slots
+
+The simplest bucketed design uses a fixed array of `window` slots, like the [ring buffers](/dsa/learn/queue-ring-buffer) of Part III. Second t always lives in slot `t % window`. Each slot remembers which second it holds, so a slot left over from an older second can be recognised and reset:
+
+```swift run
+struct RingHitCounter {
+    private var slots: [(time: Int, hits: Int)]     // second t lives in slot t % window
+    let window: Int
+
+    init(window: Int) {
+        self.window = window
+        slots = Array(repeating: (time: -1, hits: 0), count: window)
+    }
+
+    mutating func record(_ hits: Int = 1, at time: Int) {
+        let index = time % window
+        if slots[index].time != time {             // the slot holds an older second: reuse it
+            slots[index] = (time, 0)
+        }
+        slots[index].hits += hits
+    }
+
+    func count(at time: Int) -> Int {
+        var total = 0
+        for slot in slots where slot.time > time - window {   // still inside the window
+            total += slot.hits
+        }
+        return total
+    }
+}
+
+var counter = RingHitCounter(window: 5)
+counter.record(at: 1)
+counter.record(at: 2)
+counter.record(4, at: 2)
+counter.record(at: 6)                              // second 6 reuses second 1's slot
+print(counter.count(at: 6))
+print(counter.count(at: 7))
+counter.record(1_000_000, at: 7)                   // a million hits: still one slot
+print(counter.count(at: 7))
+```
+
+```output
+6
+1
+1000001
+```
+
+At time 6 the window is seconds 2 to 6: the five hits at second 2 and one at 6. At time 7 the window has moved past second 2. Memory never grows, whatever the traffic, which makes this design popular in embedded systems and rate limiters. Its cost is `count`: it visits all `window` slots every time. For a five-minute window that's 300 slots per query, fine for a dashboard refreshed once a second, too slow for a window of a day queried thousands of times.
+
+### A queue of buckets and a running total
+
+To make `count` O(1), keep a **running total** and make expiry cheap: a queue of `(second, hits)` buckets, oldest first. Hits at the same second as the newest bucket join it; otherwise a new bucket goes on the back. Before answering, expired buckets leave from the front and their hits are subtracted. Here's a window of 5 receiving 1 hit at second 1, 5 at second 2 and 1 at second 6, then a query at second 7, writing each bucket as `second:hits`:
+
+```visual stackQueue
+kind: queue
+operations: ["enqueue 1:1", "enqueue 2:5", "dequeue", "enqueue 6:1", "dequeue", "peek"]
+```
+
+Recording at second 6 first expires second 1 (it's at or before 6 − 5), then adds the new bucket. The query at 7 expires second 2, leaving a total of 1. Each bucket joins once and leaves once, so the expiry loop is amortised O(1), and the queue never holds more than `window` buckets. That's the design the practice problem asks for.
+
+## A time-based key-value store
+
+**Requirements.** `set(value, for: key, at: time)` and `value(for: key, at: time)`, which returns the value set at the latest time **at or before** the given time, or `nil` if there wasn't one yet. Ask:
+
+- Do the times passed to `set` only increase? (Usually yes: they come from a clock.)
+- Can queries ask about any time, including the distant past? (Yes; that's the point.)
+- How many versions can one key have? (Tens of thousands, so a scan is too slow.)
+
+**Structures.** Give each key its own history: `[Key: [(time: Int, value: Value)]]`. Because times only increase, appending a new version keeps every history **sorted by time for free**. A query is then a search in one sorted array for "the last version with time ≤ t". That's one step before "the first version with time > t", the upper bound from [Lower bound, upper bound, first and last occurrence](/dsa/learn/bs-bounds):
+
+```swift run
+// The versions of one key, sorted by time because times only ever increase
+let theme: [(time: Int, value: String)] = [(10, "light"), (20, "dark"), (35, "sepia")]
+
+/// The value at the latest time ≤ t: one step before the first version later than t.
+func value(in history: [(time: Int, value: String)], at time: Int) -> String? {
+    var low = 0
+    var high = history.count                // half-open: the first later version is in low...high
+    while low < high {
+        let middle = low + (high - low) / 2
+        if history[middle].time <= time {
+            low = middle + 1                // middle isn't later than t: look right
+        } else {
+            high = middle                   // middle is later: it might be the first such
+        }
+    }
+    return low == 0 ? nil : history[low - 1].value
+}
+
+for t in [5, 10, 19, 20, 34, 35, 1_000] {
+    print(t, value(in: theme, at: t) ?? "nil")
+}
+```
+
+```output
+5 nil
+10 light
+19 light
+20 dark
+34 dark
+35 sepia
+1000 sepia
+```
+
+Exact matches (10, 20, 35) and times in between both work, and so do times before the first version and long after the last. `set` is an amortised O(1) append, and a lookup is O(log v) for a key with v versions. DSAKit's `partitionPoint(where:)` does the same search in one line: `history.partitionPoint { $0.time > t }`.
+
+### When the requirements change
+
+| If… | Then… |
+| --- | --- |
+| times can arrive out of order | appending no longer keeps histories sorted; give each key an ordered map such as DSAKit's `SortedMap`, and use `floor(_:)` for "latest at or before" |
+| old versions can be thrown away | trim each history from the front once it's older than you need, as with the hit counter |
+| most queries ask about "now" | also keep the latest value per key in a plain dictionary, for O(1) |
+
+## Testing a design against a model
+
+Step 5 of the routine is tests, and design problems have a wonderful way to test: compare your clever structure with a **model**, a slow implementation that's obviously right, over thousands of random operations. Use a seeded generator so a failure happens the same way every run. Here the model is a log of every `set`, searched from the end, and the test runs twice: once with the correct comparison, once with a classic off-by-one, `<` instead of `<=`:
+
+```swift run
+struct Dice {
+    private var state: UInt64
+    init(seed: UInt64) { state = seed }
+    mutating func roll(below limit: Int) -> Int {
+        state = state &* 6364136223846793005 &+ 1442695040888963407
+        return Int((state >> 33) % UInt64(limit))
+    }
+}
+
+/// The design under test: the index of the first version later than `time`
+func firstLater(in history: [(time: Int, value: Int)], than time: Int, buggy: Bool) -> Int {
+    var low = 0
+    var high = history.count
+    while low < high {
+        let middle = low + (high - low) / 2
+        let notLater = buggy ? history[middle].time < time : history[middle].time <= time
+        if notLater { low = middle + 1 } else { high = middle }
+    }
+    return low
+}
+
+func mismatches(buggy: Bool) -> Int {
+    var dice = Dice(seed: 7)
+    var store: [Int: [(time: Int, value: Int)]] = [:]      // the design
+    var log: [(key: Int, time: Int, value: Int)] = []      // the model: every set, in order
+    var now = 0
+    var wrong = 0
+    for step in 0..<2_000 {
+        let key = dice.roll(below: 4)
+        if dice.roll(below: 2) == 0 {
+            now += 1 + dice.roll(below: 3)
+            store[key, default: []].append((now, step))
+            log.append((key, now, step))
+        } else {
+            let asked = dice.roll(below: now + 3)
+            let expected = log.last { $0.key == key && $0.time <= asked }?.value   // slow but obviously right
+            let history = store[key] ?? []
+            let later = firstLater(in: history, than: asked, buggy: buggy)
+            let answer = later == 0 ? nil : history[later - 1].value
+            if answer != expected { wrong += 1 }
+        }
+    }
+    return wrong
+}
+
+print("correct search:", mismatches(buggy: false), "mismatches")
+print("< instead of <=:", mismatches(buggy: true), "mismatches")
+```
+
+```output
+correct search: 0 mismatches
+< instead of <=: 118 mismatches
+```
+
+The buggy version is only wrong when a query lands **exactly** on a version's time, which a few hand-written examples could easily miss. Two thousand random operations find it 118 times. Every design problem in this module is tested this way, and it's worth doing in interviews too, at least in words: "I'd check it against a brute-force version on random inputs." See [Testing your own code](/dsa/learn/int-testing) for more.
+
+<Callout kind="gotcha" title="Common mistakes">
+- **Window edges.** "The last 300 seconds" at time t means t − 299 through t. A hit at exactly t − 300 is out. Decide, say it, and test both edges.
+- **One entry per hit.** Fine for taps, fatal for traffic. Ask how many hits can share a second.
+- **Searching for the wrong bound.** "Latest at or before t" is the element **before** the first one later than t. Searching for the first one at or after t gives the right answer only on exact matches.
+- **Copying histories.** `var history = store[key]!; history.append(...)` changes a copy; `store[key, default: []].append(...)` changes the stored array in place.
+</Callout>
+
+## Practice
+
+**Bucketed view counter** builds the queue of buckets with a running total; one test records a million views per call. **Versioned key-value store** is the time-based store, with tens of thousands of versions per key, so a backwards scan is too slow.
+
+```cards
+- id: bucket-by-second
+  front: "Why group a hit counter's hits into one bucket per second?"
+  back: "Memory and time then depend on the window, not on the traffic: a million hits in one second are one bucket, not a million queue entries."
+- id: ring-vs-queue
+  front: "Compare a ring of window slots with a queue of buckets plus a running total for a hit counter."
+  back: "The ring has fixed O(window) memory and O(1) record, but each count visits every slot: O(window). The queue with a running total makes both operations amortised O(1)."
+- id: latest-at-or-before
+  front: "In a time-sorted history, how do you find the value at time t?"
+  back: "Binary search for the first version with time > t (the upper bound); the answer is the version immediately before it, or nil if that index is 0."
+- id: model-testing
+  front: "What is model-based testing of a data structure?"
+  back: "Run thousands of random operations (with a seeded generator) on both your structure and a slow, obviously correct model, and check that every answer matches."
+```
+
+```quiz
+- id: q1
+  type: trace
+  prompt: "A counter with a window of 10 seconds receives 3 hits at second 1, 2 at second 5 and 4 at second 12. What does `count(at: 14)` return?"
+  answer: "6"
+  explain: "At time 14 the window is seconds 5 to 14. Second 1 is out; seconds 5 and 12 are in: 2 + 4 = 6."
+- id: q2
+  type: bigo
+  prompt: "In the ring-of-slots hit counter, how long does `count(at:)` take?"
+  options: ["O(1)", "O(log window)", "O(window)", "O(total hits)"]
+  answer: "O(window)"
+  explain: "It checks every one of the `window` slots to add up those still inside the window, however few hits there were."
+- id: q3
+  type: output
+  prompt: "This binary search looks for the first time later than 20. What does it print?"
+  code: |
+    let times = [10, 20, 35]
+    var low = 0, high = times.count
+    while low < high {
+        let middle = (low + high) / 2
+        if times[middle] <= 20 { low = middle + 1 } else { high = middle }
+    }
+    print(low, low - 1)
+  answer: "2 1"
+  explain: "Index 2 (time 35) is the first later than 20, so the value at time 20 is the version at index 1, set at time 20 itself."
+- id: q4
+  type: truefalse
+  prompt: "If `set` could be called with times out of order, appending each version to its key's array would still keep the arrays sorted by time."
+  answer: false
+  explain: "Appending keeps an array sorted only if every new time is the largest so far. With out-of-order times you'd need an ordered map per key, such as `SortedMap`, with O(log v) inserts."
+- id: q5
+  type: multi
+  prompt: "Which of these questions change the design of a hit counter? Choose all that apply."
+  options:
+    - "Can many hits share the same second?"
+    - "Can timestamps arrive out of order?"
+    - "Is the count shown in a label or a chart?"
+    - "How long is the window, and how often is it queried?"
+  answer: [0, 1, 3]
+  explain: "Many hits per second calls for buckets; out-of-order times break the oldest-at-the-front queue; the window size and query rate decide between the ring (O(window) per count) and the running total. How the number is displayed changes nothing."
+- id: q6
+  type: recall
+  prompt: "Why test a data structure against a slow model with random operations instead of only writing examples by hand?"
+  model: "Random operations explore combinations and edge cases you wouldn't think to write, such as a query landing exactly on a stored time, and the slow model gives the right answer for each one automatically. A seeded generator makes any failure repeatable, so you can debug it."
+```

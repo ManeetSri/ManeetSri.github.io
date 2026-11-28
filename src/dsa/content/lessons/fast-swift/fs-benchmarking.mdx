@@ -1,0 +1,231 @@
+## Why it matters
+
+Every lesson in this module has made a claim of the form "this version is faster". Counting copies or reallocations proves some of those claims exactly. For the rest, such as "a flat trie beats a class trie" or "`ContiguousArray` helps this loop", you have to time real code, and timings lie easily: debug builds, cold caches, a single noisy run, or an optimiser that quietly deletes the work you meant to measure. [Timing code with ContinuousClock](/dsa/learn/swift-timing-code) gave you the clock and five habits. This lesson turns them into a small, reusable harness and a routine you can trust when a decision depends on the answer.
+
+## What goes wrong
+
+| Mistake | What it does to the number |
+| --- | --- |
+| Timing a debug build | 10–100× too slow, and the gaps between versions are distorted ([Debug vs release builds](/dsa/learn/swift-release-builds)) |
+| One run | dominated by whatever else the computer was doing at that moment |
+| No warm-up | the first run pays for touching new memory, filling the caches and one-off set-up |
+| Result never used | the optimiser may delete the work and report almost nothing |
+| Inputs known at compile time | the optimiser may compute the answer while compiling |
+| Building the input inside the timing | you measure the set-up, not the algorithm |
+| Comparing averages | one interrupted run drags the average up |
+
+## A harness that avoids them
+
+```swift title="Benchmark.swift"
+struct Measurement {
+    let median: Duration
+    let fastest: Duration
+    let checksum: Int
+}
+
+/// Warm-up runs first, then `samples` timed runs of `iterations` calls each.
+/// Every result is folded into a checksum, so the optimiser can't delete the work.
+func benchmark(warmUp: Int = 3, samples: Int = 21, iterations: Int = 1, _ work: () -> Int) -> Measurement {
+    let clock = ContinuousClock()
+    var checksum = 0
+    for _ in 0..<warmUp {
+        checksum &+= work()
+    }
+    var times: [Duration] = []
+    times.reserveCapacity(samples)
+    for _ in 0..<samples {
+        let start = clock.now
+        for _ in 0..<iterations {
+            checksum &+= work()
+        }
+        times.append((clock.now - start) / iterations)
+    }
+    times.sort()
+    return Measurement(median: times[samples / 2], fastest: times[0], checksum: checksum)
+}
+```
+
+Each piece answers one row of the table:
+
+- **Warm-up.** The first runs touch memory for the first time, fill the processor's caches with your data, and trigger one-off set-up such as a global variable's first use. Running the work a few times before timing gets that out of the way.
+- **Many samples.** Twenty-one timed runs give you a distribution instead of one lucky or unlucky number. An odd count makes the middle value exact.
+- **Iterations per sample.** For work that takes microseconds, timing a single call mostly measures the clock itself. Run it many times per sample and divide.
+- **The checksum.** Every result is added into `checksum` with `&+`, which can't overflow-trap, and you print the checksum afterwards. Because the printed value depends on every call, the optimiser can't skip any of them.
+
+Use it like this:
+
+```swift
+let words = makeWords(count: 50_000, seed: seedFromCommandLine)   // built once, outside the timing
+
+let classTrie = benchmark { buildClassTrie(words).nodeCount }
+let flatTrie = benchmark { buildFlatTrie(words).nodeCount }
+
+precondition(classTrie.checksum == flatTrie.checksum, "the two versions disagree")
+print("class nodes:", classTrie.median, "fastest", classTrie.fastest)
+print("flat arrays:", flatTrie.median, "fastest", flatTrie.fastest)
+```
+
+Build it with `swift run -c release` or `swiftc -O`. On one Mac that was busy compiling other code at the time, the flat trie's median was about a tenth of the class trie's, and the checksums matched. Running the program again moved every number by up to a third, but the ratio stayed close to 10×. That's typical: absolute times wander, ratios between versions measured side by side are much steadier.
+
+### Keeping the optimiser honest
+
+The checksum stops the optimiser deleting work whose result is unused. The other danger is work it can **predict**: if the input is a constant, such as `(1...1_000_000).reduce(0, +)`, the optimiser may work out the answer while compiling, and you'd time an addition that never happens at run time. Build inputs from something only known when the program runs: a seed read from `CommandLine.arguments`, a file, or random numbers. Then check the result, here by comparing checksums, so a fast wrong answer can't win.
+
+## Why the median
+
+Here are fifteen timings of the same work, in milliseconds. During one of them, something else on the computer took over for a moment:
+
+```swift run
+let samples = [4.1, 4.0, 4.3, 4.2, 19.7, 4.1, 4.0, 4.4, 4.1, 4.2, 4.0, 4.3, 4.1, 4.2, 4.1]
+let sorted = samples.sorted()
+let mean = samples.reduce(0, +) / Double(samples.count)
+print("fastest:", sorted[0])
+print("median:", sorted[sorted.count / 2])
+print("mean:", (mean * 100).rounded() / 100)
+print("slowest:", sorted[sorted.count - 1])
+```
+
+```output
+fastest: 4.0
+median: 4.1
+mean: 5.19
+slowest: 19.7
+```
+
+One interruption raised the mean by more than a quarter, while the median didn't move. Noise only ever makes code *slower*, never faster, so timings have a long tail on the slow side. That's why you compare **medians**, and keep the **fastest** time as a second view: it's the run with the least interference. The slowest tells you about the computer, not your code.
+
+## Comparing two versions
+
+1. **Same input, same build, same run.** Measure both versions in one program, on exactly the same data.
+2. **Alternate.** Measure A, B, A, B rather than all of A then all of B, so a slow patch on the computer doesn't land entirely on one version.
+3. **Check they agree** before believing the times.
+4. **Look at the size of the gap.** Small differences are often noise:
+
+```swift run
+func median(_ values: [Double]) -> Double {
+    values.sorted()[values.count / 2]
+}
+
+let before = [12.4, 12.1, 12.6, 12.2, 12.3]
+let after = [11.9, 12.5, 12.0, 12.2, 12.1]
+let change = (median(after) - median(before)) / median(before) * 100
+print("change: \((change * 10).rounded() / 10)%")
+```
+
+```output
+change: -1.6%
+```
+
+A 1.6% change, with the two sets of samples overlapping this much, isn't evidence of anything: run it again and it may flip sign. As a rule of thumb, believe a difference only if it's clearly bigger than the spread of each version's own samples, and it survives running the whole experiment again. For the kind of change this module teaches, removing a copy per iteration or an allocation per query, the difference is usually several times, not a few percent.
+
+## Measuring growth
+
+The doubling experiment from [Timing code with ContinuousClock](/dsa/learn/swift-timing-code) becomes reliable with medians. Measure n, 2n, 4n and 8n, then look at the ratios:
+
+```swift run
+let sizes = [10_000, 20_000, 40_000, 80_000]
+let medians = [1.9, 7.8, 31.5, 125.0]       // median milliseconds, from the harness
+for i in 1..<sizes.count {
+    let ratio = medians[i] / medians[i - 1]
+    print("n = \(sizes[i]): \((ratio * 10).rounded() / 10) times the previous median")
+}
+```
+
+```output
+n = 20000: 4.1 times the previous median
+n = 40000: 4.0 times the previous median
+n = 80000: 4.0 times the previous median
+```
+
+Four times per doubling is quadratic. If you expected O(n), this is how you find out that something inside the loop, such as a hidden copy or an `insert(at: 0)`, isn't O(1).
+
+## A quiet computer
+
+Even with a good harness, some noise comes from outside:
+
+- **Plug in a laptop** and turn off Low Power Mode. On battery, the system may slow the processor down.
+- **Heat matters.** A long benchmark can make the processor throttle itself; later samples get slower. Keep runs short, or watch for a trend in the samples.
+- **Apple silicon has two kinds of core.** The system decides whether your program runs on a performance or an efficiency core, which can change timings between runs. Many samples and medians absorb this.
+- **Close what you can**: builds, browsers with busy tabs, anything indexing files.
+
+## Tools that do this for you
+
+**package-benchmark**, an open-source Swift package from Ordo One, turns all of this into a SwiftPM plugin. You put benchmarks in a `Benchmarks` folder of your package and run them with `swift package benchmark`. It builds in release mode, warms up, runs each benchmark many times, and reports percentiles (the median is p50) for wall-clock time, CPU time, memory allocations and more. It can save a **baseline** and compare later runs against it, which makes it practical to catch a performance regression in continuous integration. It provides a `blackHole(_:)` function that does the checksum's job: the optimiser can't see inside it, so any value passed to it counts as used. Its README has the current set-up steps.
+
+**XCTest** has `measure { … }`, which runs a block several times and lets Xcode record a baseline and flag regressions. It's convenient for an app's performance tests, though it runs inside the test configuration you choose, so make sure that's optimised.
+
+Neither is required for this course. The harness above, a release build and the habits in this lesson are enough to settle any "which is faster?" question you'll meet. When the answer is "neither, and the whole thing is slow", the next lesson's profiler tells you *where* the time goes.
+
+<Callout kind="gotcha" title="Swift gotchas: benchmarking">
+- **Never put timing checks in unit tests.** A test that fails when code takes over 50 ms will fail on a busy build machine. This course's tests use large inputs and counts instead.
+- **`print` inside the timed work** measures printing. Collect results and print after.
+- **Debug-build timings are not a smaller version of release timings.** They can even rank two versions the wrong way round, because the optimiser helps some code far more than other code.
+</Callout>
+
+```cards
+- id: benchmark-habits
+  front: "What does a trustworthy benchmark do?"
+  back: "Runs a release build, warms up, takes many samples (several iterations each for tiny work), uses every result, builds inputs outside the timing from data unknown at compile time, and compares medians."
+- id: why-median
+  front: "Why compare medians rather than means?"
+  back: "Noise only makes runs slower, so timings have a long slow tail. One interrupted run shifts the mean but barely moves the median."
+- id: checksum-black-hole
+  front: "How do you stop the optimiser deleting the work you're timing?"
+  back: "Use every result: fold it into a checksum you print afterwards (or pass it to a black-hole function). Also make inputs unknown at compile time."
+- id: believe-difference
+  front: "When should you believe that version B is faster than version A?"
+  back: "When the gap between medians is clearly bigger than each version's own spread, both give the same results, and the gap survives re-running the experiment."
+```
+
+```quiz
+- id: q1
+  type: order
+  prompt: "Put the steps of comparing two implementations in order."
+  lines:
+    - "Build the program in release mode"
+    - "Create the input once, from data unknown at compile time"
+    - "Run each version a few times to warm up"
+    - "Take many timed samples, alternating between the versions"
+    - "Check that both versions produced the same results"
+    - "Compare the medians, and re-run if the gap is small"
+  explain: "Optimise first, keep set-up out of the timing, warm up, sample both versions under the same conditions, make sure neither is wrong, and only then read the times."
+- id: q2
+  type: output
+  prompt: "What does this print?"
+  code: |
+    let timings = [9.0, 8.0, 30.0, 8.0, 9.0, 10.0, 8.0]
+    let sorted = timings.sorted()
+    print(sorted[sorted.count / 2], sorted[0])
+    print(timings.reduce(0, +) / Double(timings.count))
+  answer: |
+    9.0 8.0
+    11.714285714285714
+  explain: "Sorted, the timings are 8, 8, 8, 9, 9, 10, 30, so the median (index 3) is 9.0 and the fastest is 8.0. The single 30 ms outlier pulls the mean up to about 11.7."
+- id: q3
+  type: bug
+  prompt: "This benchmark reports a time close to zero in a release build. Which line is responsible?"
+  code: |
+    let clock = ContinuousClock()
+    let numbers = Array(0..<1_000_000).shuffled()
+    let elapsed = clock.measure {
+        let sorted = numbers.sorted()
+    }
+    print(elapsed)
+  answer: 4
+  explain: "`sorted` is never used, so the optimiser is free to delete the sort entirely. Use the result after timing, for example by folding `sorted[0]` into a checksum you print."
+- id: q4
+  type: mcq
+  prompt: "Version B's median is 2% faster than version A's, and their samples overlap heavily. What should you conclude?"
+  options:
+    - "B is faster: ship it"
+    - "A is faster, because noise always favours the newer code"
+    - "Nothing yet: the gap is within the noise, so re-run or accept they're equal"
+    - "Switch to comparing the slowest runs"
+  answer: 2
+  explain: "A small gap inside each version's own spread isn't evidence. Re-running the whole experiment shows whether it's real; often it vanishes or flips."
+- id: q5
+  type: truefalse
+  prompt: "Summing `1...1_000_000` with constant bounds is a reliable benchmark of a loop in a release build."
+  answer: false
+  explain: "With constant inputs the optimiser can compute the answer while compiling, so the timed code may do almost nothing. Build inputs from values known only at run time."
+```

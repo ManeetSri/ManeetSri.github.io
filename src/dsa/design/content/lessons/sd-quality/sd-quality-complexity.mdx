@@ -1,0 +1,250 @@
+## Why it matters
+
+Complexity is the root cause behind most of the maintainability problems you met earlier: changes that take a week, bugs in code nobody touched, new engineers who need months. But not all complexity can be removed. Some of it *is* the problem: time zones are complicated because time is complicated. Telling the complexity you must manage from the complexity you created is how you spend effort in the right place, and in an interview it's how you defend a simple design, or justify a complicated one.
+
+## Essential and accidental complexity
+
+In his 1986 essay *No Silver Bullet*, Fred Brooks split software complexity into two kinds:
+
+- **Essential complexity** belongs to the problem. Any correct solution has to deal with it, whatever tools you use.
+- **Accidental complexity** comes from how we chose to solve it: our tools, frameworks, structure and habits. It could, in principle, be removed.
+
+Brooks's point was that tools had already removed much of the accidental kind, so no new tool would make software ten times easier to build: what's left is mostly essential. The practical lesson for you is the reverse: in a real codebase there's usually a *lot* of accidental complexity, and it's the part you can do something about.
+
+| Essential (it's the problem) | Accidental (it's the solution) |
+| --- | --- |
+| Time zones, daylight saving and calendars in a booking app | Converting time zones in views, view models *and* the API layer |
+| Two devices editing the same note offline | Three different ways of saving a note, written by three teams |
+| Payment states: authorised, captured, refunded, partly refunded, disputed | Payment state tracked in five booleans that can contradict each other |
+| The app can be suspended and killed at any moment | Work that assumes it will finish because "it's usually quick" |
+| Text that must fit at every Dynamic Type size, in 30 languages | A custom layout engine where a stack would do |
+| Networks that drop and reorder requests | A network wrapper around a wrapper around `URLSession` |
+
+You can't delete essential complexity; you can only decide **where it lives**. The good answer is almost always: in one place, behind a simple interface, with thorough tests. All the calendar logic in one `BookingCalendar` type that the rest of the app calls with plain questions ("is this slot bookable?") is manageable. The same logic scattered through every layer is not. D02 develops this as *deep modules*: a lot of functionality behind a small interface.
+
+## How complexity shows up
+
+John Ousterhout's *A Philosophy of Software Design* defines complexity as anything about a system's structure that makes it hard to understand and change, and names three symptoms you can spot in a code review:
+
+- **Change amplification:** a simple change needs edits in many places.
+- **Cognitive load:** how much you need to know before you can make a change safely.
+- **Unknown unknowns:** it isn't obvious what you need to change, or what you need to know. This is the worst of the three, because you find out in production.
+
+Its two causes are **dependencies** (a piece of code can't be understood or changed on its own) and **obscurity** (important information isn't visible where it's needed). Watch change amplification happen when a product manager asks for one small thing:
+
+```visual flow
+title: "One requirement, \"accept Apple Pay\", and every place it lands"
+nodes:
+  - { id: checkout, label: Checkout view, kind: view, at: [0, 0] }
+  - { id: api, label: API encoder, kind: service, at: [4, 0] }
+  - { id: method, label: PaymentMethod, kind: service, at: [2, 1] }
+  - { id: receipt, label: Receipt text, kind: view, at: [0, 2] }
+  - { id: analytics, label: Analytics names, kind: service, at: [4, 2] }
+  - { id: saved, label: Saved methods screen, kind: view, at: [2, 3] }
+edges:
+  - [method, checkout, switch]
+  - [method, api, switch]
+  - [method, receipt, switch]
+  - [method, analytics, switch]
+  - [method, saved, switch]
+steps:
+  - say: "The request: accept **Apple Pay**. It starts as one new case in the `PaymentMethod` enum."
+    state: { method: active }
+    label: { method: "+ applePay" }
+  - say: "Every `switch` over the enum must change too. First the checkout view, which shows the payment button."
+    send: method->checkout
+    state: { checkout: error }
+    label: { checkout: edit }
+  - say: "Then the API encoder and the receipt text, owned by a different team."
+    send: [method->api, method->receipt]
+    state: { api: error, receipt: error }
+    label: { api: edit, receipt: edit }
+  - say: "Then analytics and the saved-methods screen: six files for one requirement. That's **change amplification**."
+    send: [method->analytics, method->saved]
+    state: { analytics: error, saved: error }
+    label: { analytics: edit, saved: edit }
+  - say: "With exhaustive switches, the compiler at least lists every place. With `default:` branches or string comparisons, you'd have to find them yourself: **unknown unknowns**."
+    active: [api, analytics]
+  - say: "Give each method its display name, API value and analytics name **in one place**, and the change is one file the compiler checks."
+    state: { checkout: null, api: null, receipt: null, analytics: null, saved: null, method: ok }
+    label: { checkout: null, api: null, receipt: null, analytics: null, saved: null }
+```
+
+## State is the biggest source of accidental complexity
+
+In *Out of the Tar Pit* (2006), Ben Moseley and Peter Marks argued that most accidental complexity comes from **state**, and especially from state that's derived from other state and kept in step by hand. iOS code is full of it: `items` stored next to `isEmpty`, `selectedID` next to `selectedItem`, a cached `filteredResults` that someone forgets to recompute. Each copy is a promise that every code path will update both, and eventually one doesn't:
+
+```swift run
+import Foundation
+
+struct LineItem {
+    let name: String
+    let pence: Int
+    var quantity: Int
+}
+
+// Stores the total, so every mutation must remember to update it
+struct StoredTotalCart {
+    var items: [LineItem] = []
+    var total = 0
+
+    mutating func add(_ item: LineItem) {
+        items.append(item)
+        total += item.pence * item.quantity
+    }
+
+    mutating func setQuantity(_ quantity: Int, at index: Int) {
+        items[index].quantity = quantity   // the total is now wrong, and nothing says so
+    }
+}
+
+// Derives the total, so it can't disagree with the items
+struct DerivedTotalCart {
+    var items: [LineItem] = []
+    var total: Int { items.reduce(0) { $0 + $1.pence * $1.quantity } }
+
+    mutating func add(_ item: LineItem) { items.append(item) }
+    mutating func setQuantity(_ quantity: Int, at index: Int) { items[index].quantity = quantity }
+}
+
+var stored = StoredTotalCart()
+var derived = DerivedTotalCart()
+for item in [LineItem(name: "Coffee", pence: 350, quantity: 1), LineItem(name: "Croissant", pence: 280, quantity: 1)] {
+    stored.add(item)
+    derived.add(item)
+}
+stored.setQuantity(3, at: 0)
+derived.setQuantity(3, at: 0)
+
+print("Stored total: £" + String(format: "%.2f", Double(stored.total) / 100))
+print("Derived total: £" + String(format: "%.2f", Double(derived.total) / 100))
+```
+
+```output
+Stored total: £6.30
+Derived total: £13.30
+```
+
+The stored version is off by £7, and no test of `add` alone would notice. The fix removes state instead of adding a check: compute derived values, and keep one **source of truth** for each fact (D19 is about exactly this). Sometimes a cached value is worth it, because it's expensive and measured to be a bottleneck. Then make it private, update it in exactly one place, and treat it as the deliberate, contained piece of accidental complexity it is.
+
+## Where accidental complexity comes from
+
+It rarely arrives in one decision. It accumulates:
+
+- **Speculative generality:** abstractions for futures that never come, such as a plugin system for one plugin or a protocol with one conformer "in case we swap it". (D05 covers YAGNI.)
+- **Two ways to do one thing:** half the app on Combine, half on async/await, a few screens on delegates. Every engineer must know all of them.
+- **Workarounds that outlive their cause:** a delay added for an iOS 15 bug, still there on iOS 18.
+- **Frameworks adopted for one feature:** a reactive library, an architecture framework or a dependency injection container where a few initialisers would do.
+- **Copies of state,** as above.
+
+A useful test: explain the design to a new teammate. The parts you'd explain by describing the *problem* ("bookings can span a daylight-saving change, so…") are essential. The parts you'd explain by apologising ("we have two image caches because…") are accidental.
+
+## Trade-offs
+
+Some accidental complexity is worth paying for, because it buys something the team needs. The question is always whether you're getting that something:
+
+| Choice | Complexity it adds | What it buys | Worth it when |
+| --- | --- | --- | --- |
+| A reactive framework (Combine) | A new mental model; long chains that are hard to debug | Composing streams of events over time | Many live streams: search as you type, sockets, sensors |
+| A dependency injection container | Indirection; wiring errors at runtime instead of compile time | Wiring dozens of modules in one place | A very large app; otherwise pass dependencies to initialisers |
+| A strict architecture (VIPER, TCA) | Several types and files per screen | The same shape everywhere; testable by construction | Large teams that need consistency; not five screens |
+| Caching derived state | Keeping copies in step | Speed | A measured hot path, with one place that updates it |
+| Code generation (OpenAPI, asset catalogues) | A build step and generated code to understand | No hand-written boilerplate drifting from the source | Large APIs or many assets |
+
+<Callout kind="interview">
+
+**Say where the essential complexity is, and keep the rest simple:** "The hard part of this booking app is time zones and availability rules, so that lives in one well-tested module. The screens around it are plain SwiftUI views and view models." When you do add structure, say what it buys: "I'd use a coordinator here because the flow branches five ways, not because every screen needs one."
+
+**Ask:** "What's the hardest part of this domain?" The answer is where the essential complexity is.
+
+**Red flags:** patterns for their own sake ("I'd use VIPER" for a settings screen); a layer per buzzword; calling complexity essential to avoid simplifying it; or the opposite, waving away genuinely hard parts like sync conflicts as "just merge them".
+
+</Callout>
+
+<Callout kind="gotcha" title="iOS gotcha: @State copies are a second source of truth">
+
+`@State` takes its initial value once, when the view's identity is created. A child view that copies a value from its parent into `@State` in its initialiser keeps the first value and silently ignores every later change from the parent. That's derived state again, with SwiftUI as the cache. Pass a `Binding`, read the parent's `@Observable` model directly, or keep the state in one place and pass it down.
+
+</Callout>
+
+## Practice
+
+The architecture review *A workout streak that nobody can test* has accidental state at its heart: the streak lives in memory *and* in `UserDefaults`, but only one copy is ever read. As you review it, sort each problem into essential (calendars really are hard) or accidental (nobody needed two copies).
+
+```cards
+- id: essential-vs-accidental
+  front: "What's the difference between essential and accidental complexity?"
+  back: "Essential complexity belongs to the problem and any solution must handle it (time zones, sync conflicts). Accidental complexity comes from how we solved it (wrappers, duplicated state, unneeded frameworks) and can be removed."
+- id: ousterhout-symptoms
+  front: "What are Ousterhout's three symptoms of complexity?"
+  back: "Change amplification (one change, many edits), cognitive load (much to know before changing), and unknown unknowns (not obvious what to change). Caused by dependencies and obscurity."
+- id: derived-state
+  front: "Why is stored derived state accidental complexity, and what's the fix?"
+  back: "Every copy must be kept in step by hand, and eventually one path forgets. Compute derived values from one source of truth; cache only measured hot paths, updated in one place."
+- id: where-essential-lives
+  front: "If you can't remove essential complexity, what can you do with it?"
+  back: "Decide where it lives: concentrate it in one module behind a simple interface, with thorough tests, instead of spreading it through every layer."
+```
+
+```quiz
+- id: q1
+  type: sort
+  prompt: "In a calendar app, is each source of complexity essential or accidental?"
+  buckets: [Essential, Accidental]
+  items:
+    - ["An event at 01:30 on the night clocks go back happens twice", 0]
+    - ["Recurring events with exceptions, such as \"every Monday except bank holidays\"", 0]
+    - ["The same event model defined separately in the app, the widget and the watch app", 1]
+    - ["Invitations from people in other time zones", 0]
+    - ["Event lists cached in three places that disagree after an edit", 1]
+    - ["A custom date-formatting library wrapped around `DateFormatter`", 1]
+  explain: "Daylight saving, recurrence rules and time zones are the problem itself: any calendar must handle them. Duplicated models, inconsistent caches and an unneeded wrapper are choices that can be undone."
+- id: q2
+  type: match
+  prompt: "Match each symptom to the example that shows it."
+  pairs:
+    - ["Change amplification", "Renaming a field means editing the model, the API mapper, three views and the cache"]
+    - ["Cognitive load", "Fixing a label needs an understanding of Combine, the cache layer and the Core Data schema"]
+    - ["Unknown unknowns", "Changing a date format breaks the widget, which parsed the label text"]
+  explain: "Many edits for one change, much to know before changing, and dependencies you couldn't see. The last is the most dangerous, because nothing warns you."
+- id: q3
+  type: bug
+  prompt: "This view model keeps a derived value as stored state. Click the line where it goes out of step."
+  code: |
+    @Observable final class InboxModel {
+        var messages: [Message] = []
+        var unreadCount = 0
+
+        func receive(_ message: Message) {
+            messages.append(message)
+            if !message.isRead { unreadCount += 1 }
+        }
+
+        func markRead(_ id: Message.ID) {
+            guard let index = messages.firstIndex(where: { $0.id == id }) else { return }
+            messages[index].isRead = true
+        }
+    }
+  answer: 12
+  explain: "Marking a message read changes the messages but not `unreadCount`, so the badge stays high. Make it computed, `var unreadCount: Int { messages.filter { !$0.isRead }.count }`, and the bug can't exist."
+- id: q4
+  type: mcq
+  prompt: "A booking app converts between the venue's time zone and the user's in several views, two view models and the API client. Bookings near midnight keep showing the wrong day. What's the best structural fix?"
+  options:
+    - "Add more unit tests to each view"
+    - "Concentrate all time-zone and calendar rules in one tested type, and have everything else ask it plain questions"
+    - "Store every date as a string in the venue's local time"
+    - "Show all times in UTC"
+  answer: 1
+  explain: "The complexity is essential (time zones are hard), but its spread is accidental. One deep module with a simple interface and thorough tests makes it manageable. Strings and UTC only move the problem onto users or other code."
+- id: q5
+  type: mcq
+  prompt: "In an interview you propose plain view models for a five-screen app. The interviewer asks: \"Wouldn't VIPER be more scalable?\" What's the strongest answer?"
+  options:
+    - "Yes, let's switch to VIPER to be safe"
+    - "VIPER is outdated, so no"
+    - "For five screens and a small team, VIPER's extra types per screen are accidental complexity; I'd keep view models with injected dependencies, and revisit if the team or flows grow"
+    - "Scalability doesn't matter for mobile apps"
+  answer: 2
+  explain: "It names what the structure costs, what the situation needs and the condition that would change the answer. Switching to look safe, or dismissing a pattern by fashion, shows no reasoning."
+```

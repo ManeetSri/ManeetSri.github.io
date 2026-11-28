@@ -1,0 +1,387 @@
+## Why it matters
+
+A balanced search tree keeps a sorted set fast, but you saw in M38 what that costs: rotations, balance factors or colours, and a delete with a case for every shape. A **skip list** gets the same expected O(log n) search, insert and delete from a sorted linked list and a coin. There are no rotations at all. Redis builds its sorted sets (the structure behind leaderboards and rate limiters on countless servers) from skip lists, and so do the in-memory tables of the LevelDB and RocksDB storage engines. It's also the first structure in this module whose speed comes from **randomness**, so it's where you'll learn to make randomised code testable.
+
+## A sorted list with express lanes
+
+Searching a sorted array is O(log n) because you can jump to the middle. A sorted **linked list** can't jump: to find 70 you walk past every smaller value, one node at a time. That's O(n), however sorted the list is.
+
+Now imagine a second list above it, holding every other node, and a third holding every fourth, like the express lines on a metro map:
+
+```text
+level 3:  head -------------------> 40 -------------------> 80 -------> nil
+level 2:  head -------> 20 -------> 40 -------> 60 -------> 80 -------> nil
+level 1:  head -> 10 -> 20 -> 30 -> 40 -> 50 -> 60 -> 70 -> 80 -> 90 -> nil
+```
+
+To find 70, start on the top level: 40 is less than 70, so ride the express to 40. The next stop on level 3 is 80, too far, so drop to level 2 and ride on to 60. The next stop, 80, is too far again, so drop to level 1, where the very next node is 70: found, after two hops and two drops, where level 1 alone would have walked past six smaller values. Each level skips about half the nodes of the level below, so the search drops through about log₂ n levels and makes a step or two on each: O(log n), as with binary search.
+
+The trouble is keeping that perfect every-other-node pattern. Insert 35 and, to keep it exact, half the nodes would have to change level. That's O(n) work per insert, which is no better than a sorted array.
+
+## Let a coin decide
+
+The fix is the clever part. Don't maintain the pattern at all. When a new node is created, **flip a coin** to decide its height:
+
+- Every node is on level 1.
+- Flip: heads, it also goes on level 2. Flip again: heads, level 3. Stop at the first tails.
+
+So a node reaches level 2 with probability 1/2, level 3 with probability 1/4, and level h with probability 1/2^(h−1). No single node knows about any other, yet on average half the nodes reach level 2, a quarter reach level 3, and so on: the same shape as the perfect pattern, without ever enforcing it.
+
+Randomness makes programs hard to test, so here it comes from a **seeded generator**: a small function that produces random-looking 64-bit numbers from a starting value, the seed. The same seed gives the same numbers every run. It's the SplitMix64 generator from [Treaps: split and merge](/dsa/learn/bal-treap), and the last bit of each number is the coin:
+
+```swift run
+// A seeded generator (SplitMix64): random-looking numbers, but the same ones every run
+struct SeededGenerator: RandomNumberGenerator {
+    var state: UInt64
+    mutating func next() -> UInt64 {
+        state &+= 0x9E37_79B9_7F4A_7C15
+        var z = state
+        z = (z ^ (z >> 30)) &* 0xBF58_476D_1CE4_E5B9
+        z = (z ^ (z >> 27)) &* 0x94D0_49BB_1331_11EB
+        return z ^ (z >> 31)
+    }
+}
+
+// Flip a coin until it comes up tails: the number of flips is the node's height
+func randomHeight(using generator: inout SeededGenerator, maxHeight: Int = 32) -> Int {
+    var height = 1
+    while height < maxHeight && generator.next() & 1 == 1 {   // heads: one more level
+        height += 1
+    }
+    return height
+}
+
+var generator = SeededGenerator(state: 99)
+print((0..<16).map { _ in randomHeight(using: &generator) })
+
+// How many of 100,000 nodes reach each level?
+var reaching = Array(repeating: 0, count: 33)
+for _ in 0..<100_000 {
+    let height = randomHeight(using: &generator)
+    for level in 1...height {
+        reaching[level] += 1
+    }
+}
+for level in 1...6 {
+    print("level \(level): \(reaching[level]) nodes (expected about \(100_000 >> (level - 1)))")
+}
+print("tallest:", reaching.lastIndex { $0 > 0 }!)
+```
+
+```output
+[2, 3, 4, 1, 2, 2, 1, 2, 1, 1, 3, 1, 1, 1, 2, 1]
+level 1: 100000 nodes (expected about 100000)
+level 2: 50107 nodes (expected about 50000)
+level 3: 25098 nodes (expected about 25000)
+level 4: 12544 nodes (expected about 12500)
+level 5: 6248 nodes (expected about 6250)
+level 6: 3110 nodes (expected about 3125)
+tallest: 16
+```
+
+What to notice:
+
+- **Half the heights are 1**, as a fair coin predicts: eight of the first sixteen.
+- **Each level holds about half the level below**, within half a percent or so at this size. Nobody arranged that; it's the law of large numbers.
+- **The tallest node reached level 16.** log₂ 100,000 is about 16.6. With n nodes, the height is about log₂ n, and only very rarely much more.
+- **`maxHeight` caps the height.** 32 levels is plenty for billions of nodes, and it means a node's array of links has a known largest size.
+
+## The node and the search
+
+Each node holds its value and an array `next`, one link per level it's on: `next[0]` is the following node on level 1, `next[1]` the following node on level 2, and so on. A **head** sentinel, as tall as any node can be, starts every level, so no level is ever an empty special case. You met sentinels in [Dummy and sentinel nodes](/dsa/learn/ll-sentinel).
+
+Searching for a value is the express-lane walk:
+
+1. Start at the head, on the highest level in use.
+2. While the next node on this level is **less than** the target, move right.
+3. Otherwise drop down a level, and repeat from step 2.
+4. After level 1, the node you're on is the last one before the target. The target is there if, and only if, it's the very next node on level 1.
+
+The node where the search drops down on each level is that level's **predecessor** of the value: the last node smaller than it. Insert and delete both need exactly those nodes, so one function finds them all.
+
+## Insert and delete
+
+**Insert** finds the predecessors, gives the new node a random height h, and splices it in on levels 1 to h: on each level, the new node points at what the predecessor pointed at, and the predecessor points at the new node. That's the linked-list insert from [Build `LinkedList<T>`](/dsa/learn/ll-build-singly), done h times.
+
+**Delete** finds the predecessors and, on every level the node is on, makes the predecessor skip over it. If it was the only node on the top level, the list's height shrinks.
+
+Neither one moves any other node or changes any other node's height. That locality is the whole point.
+
+```swift run
+struct SeededGenerator: RandomNumberGenerator {
+    var state: UInt64
+    mutating func next() -> UInt64 {
+        state &+= 0x9E37_79B9_7F4A_7C15
+        var z = state
+        z = (z ^ (z >> 30)) &* 0xBF58_476D_1CE4_E5B9
+        z = (z ^ (z >> 27)) &* 0x94D0_49BB_1331_11EB
+        return z ^ (z >> 31)
+    }
+}
+
+final class SkipList {
+    final class Node {
+        let value: Int
+        var next: [Node?]                        // next[level]: the following node on that level
+
+        init(_ value: Int, height: Int) {
+            self.value = value
+            next = Array(repeating: nil, count: height)
+        }
+    }
+
+    let maxHeight = 32
+    private let head: Node                       // a sentinel as tall as any node can be
+    private var height = 1                       // levels in use
+    private var generator: SeededGenerator
+    private(set) var count = 0
+    var steps = 0                                // moves made by searches, to measure the cost
+
+    init(seed: UInt64) {
+        head = Node(Int.min, height: maxHeight)
+        generator = SeededGenerator(state: seed)
+    }
+
+    private func randomHeight() -> Int {
+        var height = 1
+        while height < maxHeight && generator.next() & 1 == 1 {
+            height += 1
+        }
+        return height
+    }
+
+    // The last node before value on every level: where the search dropped down
+    private func predecessors(of value: Int) -> [Node] {
+        var result = Array(repeating: head, count: maxHeight)
+        var current = head
+        for level in stride(from: height - 1, through: 0, by: -1) {
+            while let next = current.next[level], next.value < value {
+                current = next                   // move right on this level
+                steps += 1
+            }
+            result[level] = current              // then drop down a level
+            steps += 1
+        }
+        return result
+    }
+
+    func contains(_ value: Int) -> Bool {
+        predecessors(of: value)[0].next[0]?.value == value
+    }
+
+    @discardableResult
+    func insert(_ value: Int) -> Bool {
+        let before = predecessors(of: value)
+        if before[0].next[0]?.value == value { return false }
+        let node = Node(value, height: randomHeight())
+        height = max(height, node.next.count)
+        for level in 0..<node.next.count {       // splice it in on each of its levels
+            node.next[level] = before[level].next[level]
+            before[level].next[level] = node
+        }
+        count += 1
+        return true
+    }
+
+    @discardableResult
+    func remove(_ value: Int) -> Bool {
+        let before = predecessors(of: value)
+        guard let node = before[0].next[0], node.value == value else { return false }
+        for level in 0..<node.next.count {       // unlink it from each of its levels
+            before[level].next[level] = node.next[level]
+        }
+        while height > 1 && head.next[height - 1] == nil {
+            height -= 1                          // the tallest node may have gone
+        }
+        count -= 1
+        return true
+    }
+
+    // Each level as a list of values, top level first
+    func levels() -> [[Int]] {
+        (0..<height).reversed().map { level in
+            var values: [Int] = []
+            var current = head.next[level]
+            while let node = current {
+                values.append(node.value)
+                current = node.next[level]
+            }
+            return values
+        }
+    }
+}
+
+let list = SkipList(seed: 99)
+for value in [30, 10, 50, 20, 60, 40, 70, 90, 80] {
+    list.insert(value)
+}
+let levels = list.levels()
+for (index, level) in levels.enumerated() {
+    print("level \(levels.count - index):", level)
+}
+print("contains 40?", list.contains(40), " contains 45?", list.contains(45))
+list.remove(40)
+print("after removing 40:", list.levels().last!, "count:", list.count)
+
+// Sorted input, the worst case for a plain BST: average moves per search
+for n in [1_000, 10_000, 100_000] {
+    let big = SkipList(seed: 7)
+    for value in 0..<n {
+        big.insert(value)
+    }
+    big.steps = 0
+    for value in stride(from: 0, to: n, by: 7) {
+        _ = big.contains(value)
+    }
+    let searches = (n + 6) / 7
+    print("n = \(n): \(big.steps / searches) moves per search")
+}
+```
+
+```output
+level 4: [50]
+level 3: [10, 50]
+level 2: [10, 30, 40, 50, 60, 90]
+level 1: [10, 20, 30, 40, 50, 60, 70, 80, 90]
+contains 40? true  contains 45? false
+after removing 40: [10, 20, 30, 50, 60, 70, 80, 90] count: 8
+n = 1000: 20 moves per search
+n = 10000: 28 moves per search
+n = 100000: 33 moves per search
+```
+
+What to notice:
+
+- **Level 1 is a plain sorted linked list** holding everything. The values arrived scrambled, but every splice put each one in order.
+- **The upper levels are random subsets**, not neat halves: 6 of 9 values reached level 2, and only 50 reached level 4. Searching still works, because the walk never assumes any particular pattern; it only moves right while the next value is smaller.
+- **Searching for 45** walks to 40 on level 1 and finds 50 next, so it answers false without visiting anything beyond.
+- **Sorted input doesn't hurt.** A plain BST fed 0, 1, 2, … becomes a chain, as you saw in [Why unbalanced BSTs degrade to O(n)](/dsa/learn/bst-degenerate). The skip list's heights come from the coin, not from the values, so the order values arrive in can't unbalance it.
+- **The moves grow by a constant per tenfold increase**: 20, 28, 33. That's logarithmic growth: about 2 log₂ n moves (counting the drops), since log₂ 1,000 ≈ 10 and log₂ 100,000 ≈ 17.
+
+## Why it's O(log n) on average
+
+Picture a search **backwards**, from where it ends on level 1, retracing its steps to the head. At each node on the way back, either the path came down to this node from the level above, or it came along this level from the left. The path came down exactly when the node was taller than the current level: a coin flip that came up heads. So, walking backwards, each step goes **up** with probability 1/2 and **left** with probability 1/2.
+
+You need to go up about log₂ n levels to reach the top, and each level takes on average two steps (one up, plus on average one sideways step before it). That's about 2 log₂ n steps, matching the measurements. Insert and delete do the same search plus O(height) splicing.
+
+Two more numbers complete the picture:
+
+- **Memory.** A node has on average 1 + 1/2 + 1/4 + … = **2 links**. A BST node has 2 child links too, so the skip list costs about the same.
+- **Bad luck.** The height exceeds c · log₂ n with probability about 1/n^(c−1): for a million nodes, the chance of more than 60 levels is around one in a trillion. The O(log n) is an expectation over the coin flips, **for every input**: no input order is bad, only bad luck is, and big bad luck is vanishingly rare.
+
+Redis uses a biased coin: heads with probability 1/4 instead of 1/2. Levels then thin out four times at a time, so nodes average 1 1/3 links, at the cost of a few more steps per level. The probability is a dial between memory and speed.
+
+## Skip lists and balanced trees side by side
+
+| | Skip list | AVL or red-black tree |
+| --- | --- | --- |
+| Search, insert, delete | O(log n) **expected** | O(log n) **worst case** |
+| What keeps it fast | random heights | rotations and balance rules |
+| Code | short; delete is easy | long, especially delete |
+| Sorted iteration | walk level 1: trivial | an inorder walk with a stack |
+| Range of values | find the first, then walk level 1 | find the first, then an inorder walk |
+| Memory per element | about 2 links (or fewer with p = 1/4) | 2 children, plus balance data |
+| Locality | pointer chasing | pointer chasing |
+
+The skip list wins on simplicity and on cheap sorted walks: "every value from 100 to 200" is one search plus a stroll along level 1. Balanced trees win when you need a guarantee rather than an expectation, and when you need augmentation, such as the interval data later in this module, which is simpler to maintain in a tree. (Skip lists can carry some augmentation too: Redis stores how many nodes each link skips over, to find a value's rank.)
+
+Skip lists have one more advantage you'll meet in Part IX: an insert changes only a few links next to the new node, never a rotation that rearranges a whole subtree. That locality makes it much easier to let several threads use one skip list at once, and Java's standard library has a concurrent sorted map built on one for that reason.
+
+## DSAKit's SkipList
+
+DSAKit has a finished `SkipList`, a sorted set with the same API as `SortedSet` from [Build an ordered set and map in Swift](/dsa/learn/bal-ordered-map): `insert`, `remove`, `contains`, `first`, `last`, `floor`, `ceiling` and `elements(in:)`, iterating in increasing order. It takes a seed, so tests and examples behave the same every run. Its nodes live in arrays inside a struct, linked by index instead of by reference, which gives it value semantics through the arrays' own copy-on-write.
+
+```swift
+import DSAKit
+
+var scores = SkipList<Int>(seed: 42)
+for score in [70, 85, 60, 92, 85] {
+    scores.insert(score)
+}
+print(Array(scores))                     // [60, 70, 85, 92]
+print(scores.ceiling(80) ?? -1)          // 85
+print(scores.elements(in: 65...90))      // [70, 85]
+```
+
+<Callout kind="gotcha" title="Seed for tests, not for strangers">
+A fixed seed makes every run identical, which is what tests need. In production, it lets anyone who knows the seed predict every node's height, and choose an insertion order that puts the tall nodes where they do no good, slowing every search. Inject the generator: pass a seeded one in tests, and use `SystemRandomNumberGenerator`, which can't be predicted, everywhere else.
+</Callout>
+
+<Callout kind="gotcha" title="Common mistakes">
+- **Comparing with `<=` while moving right.** The walk must stop **before** a node equal to the target, so the predecessor is the last node strictly smaller. With `<=`, a search for a value that's present walks past it.
+- **Splicing only level 1.** A node must be linked into every level up to its height, or the upper levels skip it and searches miss it.
+- **Forgetting to raise or lower the height.** A new node taller than the list must raise `height`, or searches never use its top levels; deleting the only node on the top level should lower it.
+- **Using `Bool.random()` inside the structure.** It draws from the system generator, so tests can't reproduce a failure. Take the generator as a parameter.
+- **Freeing a long list recursively.** When the last reference to the first node goes, Swift frees it, which frees the node its `next` array points to, and so on: one nested call per node. With links stored in arrays, a test thread's small stack overflows after a few tens of thousands of nodes. Give the list a `deinit` that walks level 1 with a loop, emptying each node's links, or store the nodes in arrays linked by index, as DSAKit does.
+</Callout>
+
+## Practice
+
+**Skip list from scratch** asks you to build a sorted set of integers as a skip list whose coin flips come from a closure the tests supply. With a scripted coin, the tests can check not only which values are in the set but how many nodes sit on each level, and a run of 100,000 sorted inserts makes sure nothing walks level 1 from the start.
+
+```cards
+- id: skip-list-height
+  front: "How does a skip list choose a new node's height?"
+  back: "By coin flips: start at 1 and add a level for each heads, stopping at the first tails (or a maximum). About half the nodes reach level 2, a quarter level 3, and so on."
+- id: skip-list-search
+  front: "How does a skip list search for a value?"
+  back: "Start at the head on the top level. Move right while the next value is smaller than the target; otherwise drop a level. After level 1, the target is present only if it's the next node."
+- id: skip-list-expected
+  front: "Is a skip list's O(log n) a worst-case bound?"
+  back: "No, it's expected: an average over the coin flips, true for every input order. A very unlucky set of heights could be slow, but large deviations are vanishingly rare."
+- id: skip-list-vs-tree
+  front: "Name two advantages of a skip list over a balanced BST."
+  back: "Much simpler code, with no rotations, and trivial sorted iteration and range walks along level 1. Inserts also touch only nearby links, which helps concurrent versions."
+```
+
+```quiz
+- id: q1
+  type: trace
+  prompt: "In the skip list printed above (level 4: 50; level 3: 10, 50; level 2: 10, 30, 40, 50, 60, 90; level 1: every value), which nodes does a search for 80 move onto, in order?"
+  answer: "50, 60, 70"
+  explain: "Level 4: 50 is less than 80, so move to 50; nothing follows. Level 3: nothing after 50, drop. Level 2: 60 is less than 80, move; 90 isn't, drop. Level 1: 70 is less than 80, move; the next node, 80, isn't less, so stop. The target is the next node: found."
+- id: q2
+  type: mcq
+  prompt: "With a fair coin, what fraction of nodes do you expect on level 3 or higher?"
+  options:
+    - "1/2"
+    - "1/3"
+    - "1/4"
+    - "1/8"
+  answer: 2
+  explain: "A node reaches level 3 only if its first two flips are both heads: 1/2 × 1/2 = 1/4."
+- id: q3
+  type: output
+  prompt: "This counts the links in a set of skip list nodes with these heights. What does it print?"
+  code: |
+    let heights = [1, 3, 1, 2, 1, 1, 4, 1]
+    let links = heights.reduce(0, +)
+    let onLevelTwo = heights.filter { $0 >= 2 }.count
+    print(links, onLevelTwo, Double(links) / Double(heights.count))
+  answer: "14 3 1.75"
+  explain: "Each node has one link per level it's on, so the links are the sum of the heights: 14. Three nodes (heights 3, 2 and 4) reach level 2. The average, 1.75 links per node, is close to the expected 2."
+- id: q4
+  type: bug
+  prompt: "This search sometimes walks past the value it's looking for. Which line is wrong?"
+  code: |
+    func contains(_ value: Int) -> Bool {
+        var current = head
+        for level in stride(from: height - 1, through: 0, by: -1) {
+            while let next = current.next[level], next.value <= value {
+                current = next
+            }
+        }
+        return current.next[0]?.value == value
+    }
+  answer: 4
+  explain: "With `<=`, the walk moves onto a node equal to the target, so at the end `current` is the target itself and `current.next[0]` is the node after it. Use `<` so the walk stops immediately before the target."
+- id: q5
+  type: bigo
+  prompt: "What is the expected cost of inserting into a skip list of n values?"
+  answer: "O(log n)"
+  explain: "Finding the predecessors is an expected O(log n) walk, and splicing touches one link per level of the new node, which is 2 levels on average."
+- id: q6
+  type: truefalse
+  prompt: "Inserting the values 1, 2, 3, … in sorted order makes a skip list degrade to O(n) searches, like a plain BST."
+  answer: false
+  explain: "Heights come from coin flips, not from the values or their order, so sorted input builds the same kind of random structure as any other order."

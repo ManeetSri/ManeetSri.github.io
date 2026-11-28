@@ -1,0 +1,43 @@
+// Problems for the elementary-sorts module. Fields are described in ../problems.js.
+export default [
+    {
+        id: 'bubble-pass-count',
+        title: "Bubble sort's busy passes",
+        difficulty: 'medium',
+        patterns: ['sorting'],
+        lessons: ['sort-bubble'],
+        swiftTest: 'BubblePassCountTests',
+        lists: ['patterns150'],
+        minutes: 35,
+    },
+    {
+        id: 'partial-selection-sort',
+        title: 'The k smallest, in place',
+        difficulty: 'easy',
+        patterns: ['sorting'],
+        lessons: ['sort-selection'],
+        swiftTest: 'PartialSelectionSortTests',
+        lists: [],
+        minutes: 20,
+    },
+    {
+        id: 'nearly-sorted-array',
+        title: 'Sort a nearly sorted array',
+        difficulty: 'medium',
+        patterns: ['sorting'],
+        lessons: ['sort-insertion', 'sort-elementary-comparison'],
+        swiftTest: 'NearlySortedArrayTests',
+        lists: ['patterns150'],
+        minutes: 25,
+    },
+    {
+        id: 'generic-insertion-sort',
+        title: 'Insertion sort for any collection',
+        difficulty: 'easy',
+        patterns: ['sorting'],
+        lessons: ['sort-generic', 'sort-properties'],
+        swiftTest: 'GenericInsertionSortTests',
+        lists: ['patterns150', 'swift'],
+        minutes: 30,
+    },
+];

@@ -1,0 +1,78 @@
+Build a memo cache that many tasks can share. It's an actor that stores one value per key, computing each key's value **at most once**, even when several tasks ask for the same key at the same time: requests that arrive while a key is being computed wait for that computation instead of starting another. It also reports how many finished values it holds, and can forget a stored value.
+
+`CoalescingMemoCache.Store<Key, Value>` with `init()`, `value(for: Key, compute: @escaping @Sendable (Key) async -> Value) async -> Value`, `storedCount: Int` and `forget(_ key: Key)`
+
+## Examples
+
+`compute` below squares its key, records each call, and suspends a few times before answering, the way a slow computation or a download would.
+
+| Steps | Result |
+| --- | --- |
+| `value(for: 7)`, then `value(for: 7)` again | both `49`; `compute` ran once; `storedCount` is 1 |
+| 50 child tasks call `value(for: 12)` at the same time | all get `144`; `compute` ran once |
+| 10 keys, each requested by 5 tasks at the same time | `compute` ran 10 times; `storedCount` is 10 |
+| `value(for: 5)`, `forget(5)`, then `value(for: 5)` twice | `storedCount` is 0 right after `forget`; `compute` ran twice in all |
+| `value(for: "swift")` with a reversing `compute`, then `value(for: "swift")` with a different closure | both return the first result: a stored value wins |
+
+## Constraints
+
+- `Key` is `Hashable & Sendable` and `Value` is `Sendable`.
+- `compute` may suspend, and it must run outside the actor so that other requests aren't held up while it works.
+- `storedCount` counts only finished values, not computations still running.
+- `forget` removes a finished value. A computation still in progress isn't affected; it stores its result when it finishes. Forgetting a key that isn't stored does nothing.
+
+<Hints>
+<Hint>
+A first attempt checks the dictionary, awaits `compute`, then stores. That's the check-then-act bug from [Actors as thread-safe caches](/dsa/learn/cc-actors): while the first request is suspended, the actor serves the next request, which also misses.
+</Hint>
+<Hint>
+Keep two dictionaries: finished values, and computations in progress as `Task<Value, Never>`. On a miss, create the `Task` and record it **before** the first `await`; a request that finds a running task awaits its `value`.
+</Hint>
+<Hint>
+When the first requester's `await task.value` returns, move the result from "in progress" to "finished". Requests that arrive after that hit the finished dictionary directly, and `storedCount` is its count.
+</Hint>
+</Hints>
+
+## Solutions
+
+<Approach title="Finished values plus tasks in progress" time="O(1) average per request" space="O(keys)">
+
+Everything between two `await`s in an actor method runs without interruption, so checking both dictionaries and recording the new task happen as one step: no second request can slip in between. Each key therefore gets exactly one `Task`, whatever the timing.
+
+```swift
+public enum CoalescingMemoCache {
+    public actor Store<Key: Hashable & Sendable, Value: Sendable> {
+        private var stored: [Key: Value] = [:]
+        private var running: [Key: Task<Value, Never>] = [:]
+
+        public init() {}
+
+        public func value(for key: Key, compute: @escaping @Sendable (Key) async -> Value) async -> Value {
+            if let value = stored[key] {
+                return value
+            }
+            if let task = running[key] {
+                return await task.value
+            }
+            let task = Task { await compute(key) }
+            running[key] = task                         // recorded before the first await
+            let value = await task.value
+            stored[key] = value
+            running[key] = nil
+            return value
+        }
+
+        public var storedCount: Int {
+            stored.count
+        }
+
+        public func forget(_ key: Key) {
+            stored[key] = nil
+        }
+    }
+}
+```
+
+Why each `Sendable` requirement is there: the key is captured by the `Task` that runs `compute` outside the actor, so it crosses an isolation boundary; the value comes back from that task and is handed to every waiting caller; and `compute` itself is captured by a task that runs concurrently with the actor, so it must be `@Sendable` and, since it outlives the call, `@escaping`.
+
+</Approach>

@@ -1,0 +1,218 @@
+## Why it matters
+
+You've built a chained hash map. Swift's own `Dictionary` and `Set` make different choices, and knowing them explains behaviour that otherwise looks random: why the order changes every run, why two dictionaries with the same contents can list them differently, and why some ways of updating a dictionary are much slower than others. None of this is needed to *use* a dictionary, which is why it's a deep dive, but it turns a black box into something you can reason about.
+
+## The layout: open addressing with linear probing
+
+A native Swift dictionary keeps everything in one block of memory with three parts:
+
+- a **bitmap**, one bit per bucket, saying whether the bucket is occupied;
+- an array of **keys**, one per bucket;
+- an array of **values**, one per bucket, in the same positions.
+
+A `Set` is the same without the values. The number of buckets is always a power of two, and the table grows when it would pass three quarters full, which is the 0.75 you saw in [Load factor and rehashing](/dsa/learn/hash-load-factor).
+
+Collisions use **open addressing with linear probing**, from [Collisions: chaining vs open addressing](/dsa/learn/hash-collisions). A lookup goes like this:
+
+1. Hash the key with `Hasher`, seeded as described below, and mask the result to get its home bucket.
+2. If the bitmap says the bucket is empty, the key isn't there.
+3. Otherwise compare the stored key with `==`. If they're equal, the value is at the same position in the values array.
+4. If not, move to the next bucket, wrapping at the end, and go back to step 2.
+
+Linear probing suffers from clustering, but Swift's hasher spreads keys so evenly, and the 0.75 limit keeps runs so short, that the clustering costs little. In return, a probe reads neighbouring memory, which processors are very fast at. Keeping keys and values in separate arrays also helps: a lookup scans only keys and touches the values array once, at the end.
+
+## Deleting without tombstones
+
+The collisions lesson showed that emptying a slot can cut a probe sequence in two, and that tombstones fix it at the cost of clutter. Swift avoids tombstones with **backward-shift deletion**. After removing an entry, it walks forward through the rest of the run and moves back any entry that would be happier in the hole: one whose home bucket is at or before the hole. When it reaches an empty bucket, the run is repaired.
+
+```swift run
+var slots: [Int?] = Array(repeating: nil, count: 8)
+
+func home(_ key: Int) -> Int {
+    key % slots.count
+}
+
+func insert(_ key: Int) {
+    var index = home(key)
+    while slots[index] != nil {
+        index = (index + 1) % slots.count
+    }
+    slots[index] = key
+}
+
+func find(_ key: Int) -> Int? {
+    var index = home(key)
+    while let stored = slots[index] {
+        if stored == key {
+            return index
+        }
+        index = (index + 1) % slots.count
+    }
+    return nil
+}
+
+func remove(_ key: Int) {
+    guard var hole = find(key) else {
+        return
+    }
+    slots[hole] = nil
+    var next = (hole + 1) % slots.count
+    while let candidate = slots[next] {              // stop at the end of the run
+        let fromHome = (next - home(candidate) + slots.count) % slots.count
+        let fromHole = (next - hole + slots.count) % slots.count
+        if fromHome >= fromHole {                    // its home is at or before the hole
+            slots[hole] = candidate
+            slots[next] = nil
+            hole = next
+        }
+        next = (next + 1) % slots.count
+    }
+}
+
+func show() -> String {
+    slots.map { $0.map(String.init) ?? "-" }.joined(separator: " ")
+}
+
+for key in [8, 16, 1, 24] {
+    insert(key)
+}
+print(show())
+remove(16)
+print(show())
+print(find(24) ?? -1, find(1) ?? -1, find(16) ?? -1)
+```
+
+```output
+8 16 1 24 - - - -
+8 1 24 - - - - -
+2 1 -1
+```
+
+8, 16 and 24 all have home 0, and 1 has home 1, so they formed one run. Removing 16 left a hole in slot 1. Key 1 (home 1) moved back into it, then 24 (home 0) moved into the new hole at slot 2. Every remaining key is still reachable from its home, and no tombstone was needed. The `fromHome` and `fromHole` distances are measured going forwards with wrap-around, which is why they add `slots.count` before taking the remainder.
+
+## Seeding, twice over
+
+You know from [Hash functions](/dsa/learn/hash-functions) that `Hasher` mixes in a random seed chosen when the program starts. Swift goes one step further. Each dictionary's storage also mixes in its **own** seed, derived from where that storage lives in memory, and it changes whenever the table is resized. So two dictionaries with exactly the same contents, built the same way in the same run, usually list their keys in different orders:
+
+```swift
+let fruit = ["apple", "banana", "cherry", "date", "fig"]
+var first: [String: Int] = [:]
+var second: [String: Int] = [:]
+for name in fruit {
+    first[name] = 1
+    second[name] = 1
+}
+print(Array(first.keys))
+print(Array(second.keys))
+```
+
+```text title="What you'll see (one run; yours will differ)"
+["cherry", "date", "fig", "apple", "banana"]
+["apple", "fig", "cherry", "banana", "date"]
+```
+
+Why bother with a per-table seed? Without it, copying the entries of a big table into a smaller one *in iteration order* would insert keys in the same order as their buckets. In the smaller table, those keys pile into long runs at the start, and the copy can become quadratic. Giving every table its own seed scrambles the order between tables, so that pattern can't happen.
+
+For debugging, you can switch all of this off. Run a program with the environment variable `SWIFT_DETERMINISTIC_HASHING=1` and every hash, and every dictionary order, is the same each run:
+
+```bash
+SWIFT_DETERMINISTIC_HASHING=1 swift Fruit.swift
+```
+
+Never ship code that depends on it. It exists so that a failing test can be reproduced.
+
+## What you can rely on about order
+
+- The order is **arbitrary**. It's the order of the buckets, which depends on the seeds.
+- It changes between **runs**, between **dictionaries**, and after a **resize**, which any insert can trigger.
+- Iterating the **same** dictionary twice without changing it gives the same order, and `keys` and `values` line up with each other.
+- Iterating visits every bucket, so it costs O(capacity), not O(count). A dictionary that grew large and then had most entries removed is slow to iterate.
+
+When order matters, impose it yourself: `for key in scores.keys.sorted()`, or keep an array of keys in insertion order next to the dictionary. Apple's open-source Swift Collections package also offers an `OrderedDictionary`, though it isn't part of the standard library.
+
+## Value semantics and updating in place
+
+`Dictionary` is a value type with copy-on-write. Assigning it to another variable is O(1); the first change to either copy duplicates the storage. The same rule applies to the **values** inside: a dictionary of arrays holds arrays that share storage until changed. That makes the way you update them matter:
+
+```swift
+var groups: [String: [Int]] = [:]
+
+// Slow: copies the array out, changes the copy, and stores it back.
+// While `list` exists, the array has two owners, so append must copy it: O(k) for k items.
+var list = groups["evens"] ?? []
+list.append(4)
+groups["evens"] = list
+
+// Fast: the default: subscript modifies the array inside the dictionary, in place
+groups["evens", default: []].append(6)
+```
+
+Both give the same result, but in a loop that builds groups of thousands of items, the first pattern copies each group on every append and turns an O(n) job into O(n²). The `default:` subscript from [Counting with default: and grouping(by:)](/dsa/learn/swift-counting-grouping) gives the dictionary's storage direct access to the array, so `append` happens in place.
+
+## A few more facts worth knowing
+
+- `updateValue(_:forKey:)` stores a value and returns the old one, or `nil` for a new key, in a single hash and probe. It's the tool for "insert, and tell me if it was there".
+- `mapValues(_:)` keeps every key in the same bucket and only transforms values, so it never rehashes. `filter` returns a new `Dictionary`, rebuilding the table.
+- Indices (`Dictionary.Index`) are bucket positions. Any insertion or removal may move entries or resize, so never keep an index across a mutation.
+- `Set` and `Dictionary` share the same machinery, so everything here applies to sets too.
+
+<Callout kind="note" title="Why not chaining?">
+Chaining needs a separate list per bucket, which means extra memory and a jump to another part of memory on every lookup. Open addressing keeps everything in a few flat arrays. With a strong, well-mixed hash and a 0.75 limit, linear probing's runs stay short, so Swift gets the speed of flat arrays without the clustering penalty.
+</Callout>
+
+```cards
+- id: swift-dict-layout
+  front: "How does Swift's native `Dictionary` store its entries?"
+  back: "Open addressing with linear probing: a bitmap of occupied buckets plus separate key and value arrays, with a power-of-two bucket count and a maximum load factor of 0.75."
+- id: backward-shift
+  front: "How does Swift delete from a linear-probing table without tombstones?"
+  back: "Backward-shift deletion: after emptying the slot, it walks the rest of the run and moves back every entry whose home is at or before the hole, until it reaches an empty slot."
+- id: per-instance-seed
+  front: "Why can two dictionaries with the same contents iterate in different orders in one run?"
+  back: "Each table mixes in its own seed, based on its storage, so that copying one table into another in iteration order can't create long clusters."
+- id: default-in-place
+  front: "Why prefer `groups[key, default: []].append(x)` over reading, appending and writing back?"
+  back: "The `default:` subscript modifies the array in place. Copying it out gives it two owners, so `append` copies the whole array: O(k) per append."
+```
+
+```quiz
+- id: q1
+  type: mcq
+  prompt: "Which collision strategy does Swift's native `Dictionary` use?"
+  options:
+    - "Separate chaining with linked lists"
+    - "Open addressing with linear probing"
+    - "Open addressing with double hashing"
+    - "A balanced binary tree per bucket"
+  answer: 1
+  explain: "Swift uses linear probing over flat arrays, with a well-mixed hash and a maximum load factor of 0.75 to keep runs short."
+- id: q2
+  type: truefalse
+  prompt: "If you insert the same keys in the same order into two empty dictionaries in one run, iterating them always gives the same order."
+  answer: false
+  explain: "Each dictionary's storage mixes in its own seed, so their bucket orders usually differ. Only `SWIFT_DETERMINISTIC_HASHING=1` makes orders repeatable."
+- id: q3
+  type: trace
+  prompt: "A table of 5 slots uses `key % 5` and linear probing. After inserting 10, 20, 1 and 4, its slots hold `10 20 1 - 4`. With backward-shift deletion, what do the slots hold after removing 10? Use - for an empty slot."
+  answer: "20, 1, -, -, 4"
+  explain: "Removing 10 leaves a hole in slot 0. 20 (home 0) moves back into it, leaving the hole at slot 1. Key 1 (home 1) moves back into slot 1. Slot 3 is empty, so the run has ended; 4 sits in its home slot and is untouched."
+- id: q4
+  type: multi
+  prompt: "Which of these can change the order in which a dictionary's keys are iterated? Choose all that apply."
+  options:
+    - "Running the program again"
+    - "Inserting enough keys to trigger a resize"
+    - "Copying the dictionary to another variable without changing it"
+    - "Building another dictionary with the same contents"
+  answer: [0, 1, 3]
+  explain: "The process seed changes per run, a resize re-seeds and rehashes, and each table has its own seed. A plain copy shares the same storage until one of them changes, so it iterates identically."
+- id: q5
+  type: bigo
+  prompt: "A dictionary grew to n entries, then had all but 10 of them removed one by one. What does iterating over it cost?"
+  answer: "O(n)"
+  explain: "Iteration visits every bucket, and removing entries doesn't shrink the capacity, which is still about n. So the loop walks around n buckets to find 10 entries."
+- id: q6
+  type: recall
+  prompt: "Explain why linear probing is a good fit for Swift's Dictionary despite primary clustering."
+  model: "Swift's hasher (SipHash) spreads keys evenly, and the table grows at 75% full, so runs stay short on average. Probing then reads neighbouring buckets in flat arrays, which is very cache-friendly, and keys are stored separately from values so a probe only scans keys. Backward-shift deletion removes the usual drawback of open addressing, tombstones."
+```

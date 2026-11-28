@@ -1,0 +1,263 @@
+## Why it matters
+
+Open a 50 MB log file in a text editor, click in the middle and type a letter. If the text lives in one contiguous buffer, every byte after the cursor moves along by one: 25 million bytes, for one keystroke, and again for the next. A **rope** stores text as a balanced tree of short pieces instead, so inserting or deleting anywhere touches only O(log n) nodes. Ropes, and their close relatives, are how serious editors handle huge files, and they show a pattern that goes well beyond text: **a sequence stored as a tree, indexed by position instead of by key.**
+
+## Why String doesn't work this way
+
+Swift's `String` keeps its text as UTF-8 in **one contiguous buffer**. Inserting into the middle shifts every byte after the insertion point, so it's O(n). Finding the insertion point costs O(n) too: as you saw in [String.Index and why s[i] does not exist](/dsa/learn/swift-string-index), characters vary in size, so reaching the 5,000,000th one means walking from the start. Foundation's `NSString` and `NSMutableString` don't promise anything better for edits in the middle either.
+
+That's a deliberate choice, not an oversight. Nearly all strings in an app are short: names, labels, JSON keys, messages. For them, contiguous storage is the fastest thing there is. Reading is a straight walk through memory, the whole buffer can be handed to C code or the operating system in one piece, and Swift even stores strings of up to 15 UTF-8 bytes inside the `String` value itself, with no allocation at all. A rope would make every one of those strings slower to read and bigger in memory, to speed up an operation most of them never need. So the standard types stay simple, and editors bring their own structure.
+
+## The shape of a rope
+
+A rope is a binary tree:
+
+- **Leaves** hold short runs of text: a few characters here, typically hundreds of bytes in real editors.
+- **Inner nodes** hold no text. Each joins its left rope and its right rope: its text is the left's text followed by the right's. It stores its total length, and the length of its left side, called its **weight**.
+
+```text
+                     (13 chars, weight 6)
+                    /                    \
+          (6, weight 3)                (7, weight 4)
+          /           \                /           \
+      "Hel"          "lo,"         " wor"         "ld!"
+```
+
+Everything else follows from the weights:
+
+- **The character at index i:** at each inner node, if `i < weight` go left; otherwise subtract the weight and go right. In a leaf, read position i of its chunk. One path: O(depth).
+- **Concatenate** two ropes: make a new inner node with them as children. **O(1)**, however long they are.
+- **Split** at index i into "the first i characters" and "the rest": walk down the path to i, splitting the leaf there, and on the way back up rebuild only the nodes on that path. O(depth).
+- **Insert** text at i: split at i, then concatenate the left part, the new text and the right part.
+- **Delete** a range: split at its start, split the remainder at its length, and concatenate the outer two pieces.
+
+Insert and delete are built from splits and concatenations, so they're O(depth) too, which is O(log n) while the tree is balanced.
+
+## Building one
+
+This rope is **immutable**: every node's properties are `let`, and an edit returns a new rope that shares every untouched node with the old one. That keeps the code short, and it gives a bonus you'll see in the output. Leaves hold at most 8 characters, to keep the example small.
+
+```swift run
+// An immutable rope: leaves hold short runs of characters, and inner nodes join two ropes
+final class Rope {
+    static let leafSize = 8
+    static var created = 0                       // nodes made, to measure the cost of edits
+
+    let left: Rope?
+    let right: Rope?
+    let chunk: [Character]                       // only leaves hold characters
+    let count: Int                               // characters in this whole rope
+    let depth: Int
+
+    init(chunk: ArraySlice<Character>) {         // a leaf
+        left = nil
+        right = nil
+        self.chunk = Array(chunk)
+        count = chunk.count
+        depth = 0
+        Rope.created += 1
+    }
+
+    init(_ left: Rope, _ right: Rope) {          // an inner node: left's text, then right's
+        self.left = left
+        self.right = right
+        chunk = []
+        count = left.count + right.count
+        depth = 1 + max(left.depth, right.depth)
+        Rope.created += 1
+    }
+
+    // A balanced rope from an array of characters: halve it until the pieces fit in a leaf
+    static func build(_ characters: ArraySlice<Character>) -> Rope {
+        if characters.count <= leafSize { return Rope(chunk: characters) }
+        let middle = characters.startIndex + characters.count / 2
+        return Rope(build(characters[..<middle]), build(characters[middle...]))
+    }
+
+    // Join two ropes in O(1), skipping empty ones
+    static func concat(_ a: Rope, _ b: Rope) -> Rope {
+        if a.count == 0 { return b }
+        if b.count == 0 { return a }
+        return Rope(a, b)
+    }
+
+    // The character at index: go left if it's among the left's characters, otherwise go right
+    func character(at index: Int) -> Character {
+        var node = self
+        var index = index
+        while let left = node.left, let right = node.right {
+            if index < left.count {
+                node = left
+            } else {
+                index -= left.count                  // skip the left's characters
+                node = right
+            }
+        }
+        return node.chunk[index]
+    }
+
+    // Two ropes: the first index characters, and the rest. Only the nodes on one path are rebuilt.
+    func split(at index: Int) -> (Rope, Rope) {
+        guard let left, let right else {
+            return (Rope(chunk: chunk[..<index]), Rope(chunk: chunk[index...]))
+        }
+        if index <= left.count {
+            let (a, b) = left.split(at: index)
+            return (a, Rope.concat(b, right))
+        }
+        let (a, b) = right.split(at: index - left.count)
+        return (Rope.concat(left, a), b)
+    }
+
+    func inserting(_ text: String, at index: Int) -> Rope {
+        let (before, after) = split(at: index)
+        return Rope.concat(Rope.concat(before, Rope.build(ArraySlice(Array(text)))), after)
+    }
+
+    func removing(from start: Int, count: Int) -> Rope {
+        let (before, rest) = split(at: start)
+        let (_, after) = rest.split(at: count)
+        return Rope.concat(before, after)
+    }
+
+    var leaves: [[Character]] {
+        if let left, let right { return left.leaves + right.leaves }
+        return chunk.isEmpty ? [] : [chunk]
+    }
+
+    var text: String {
+        String(leaves.joined())
+    }
+}
+
+let original = Rope.build(ArraySlice(Array("Hello, world!")))
+let edited = original.inserting("brave new ", at: 7)
+let trimmed = edited.removing(from: 5, count: 1)
+print(original.text, "|", edited.text, "|", trimmed.text)
+print("character 7 of each:", original.character(at: 7), edited.character(at: 7), trimmed.character(at: 7))
+
+// Type 1,000 characters into the middle of a 100,000-character document
+var flat = Array(repeating: Character("."), count: 100_000)
+var rope = Rope.build(ArraySlice(flat))
+var shifted = 0
+Rope.created = 0
+for k in 0..<1_000 {
+    let position = 50_000 + k
+    shifted += flat.count - position             // what insert(_:at:) moves along
+    flat.insert("x", at: position)
+    rope = rope.inserting("x", at: position)
+}
+print("array: \(shifted) characters shifted")
+print("rope: \(Rope.created) nodes created, depth now \(rope.depth)")
+print("same text:", rope.text == String(flat))
+
+let rebalanced = Rope.build(ArraySlice(Array(rope.leaves.joined())))
+print("depth after rebalancing:", rebalanced.depth, " character 50,500:", rebalanced.character(at: 50_500))
+```
+
+```output
+Hello, world! | Hello, brave new world! | Hello brave new world!
+character 7 of each: w b r
+array: 50000000 characters shifted
+rope: 6012 nodes created, depth now 1014
+same text: true
+depth after rebalancing: 14  character 50,500: x
+```
+
+What to notice:
+
+- **All three versions still exist.** `edited` and `trimmed` were made from `original` without changing it, so an editor's undo history can be a plain array of ropes, each sharing almost everything with its neighbours. You'll see this idea, called persistence, in its own lesson later in this module.
+- **Typing 1,000 characters** moved 50 million characters in the array, and created about 6 nodes per keystroke in the rope. Each node is a small allocation, so a rope edit isn't free, but its cost doesn't grow with the length of the document.
+- **But the depth grew to 1,014.** Every insert put two new nodes on top of the tree and never rebalanced it, so the keystrokes stacked up into a long chain. Each edit stayed cheap only because the typing point happened to stay near the top; reading character 0 now walks over a thousand nodes.
+- **Rebuilding from the leaves** brought the depth back to 14, about log₂ of the number of leaves.
+
+## Keeping a rope balanced
+
+An unbalanced rope is a linked list with extra steps, so real ropes rebalance. There are two common strategies:
+
+- **Rebuild when it gets too deep.** The original rope paper (Boehm, Atkinson and Plass, 1995) lets the tree go out of shape and rebuilds it from its leaves, as above, when its depth passes a limit. Rebuilding is O(n), but it happens rarely, so the cost per edit stays small on average.
+- **Stay balanced all the time.** Store the leaves in a balanced tree that rebalances on every edit, using the rotations from AVL or red-black trees, or a B-tree with many leaves per node, which also suits the cache. The implicit treap from [Treaps: split and merge](/dsa/learn/bal-treap) is a rope with one character per node: its split and merge are exactly the rope's split and concatenate, and its random priorities keep it balanced.
+
+Real editors also store more than lengths in each node. The Xi editor, an open-source project from Google engineers, used a B-tree rope whose nodes also counted **line breaks**, so "go to line 40,000" walks one path, like "go to character 40,000" does. Any quantity that adds up over a concatenation, such as characters, bytes, UTF-16 units or lines, can be stored this way.
+
+## Other ways to store text for editing
+
+| Structure | Insert at the cursor | Insert far from the last edit | Notes |
+| --- | --- | --- | --- |
+| One array (`String`) | O(n) | O(n) | simplest; fine for small text |
+| Gap buffer | O(1) | O(distance moved) | an array with a gap at the cursor; used by Emacs |
+| Rope | O(log n) | O(log n) | a balanced tree of chunks |
+| Piece table | O(log n) with a tree | O(log n) with a tree | the original file plus an append-only buffer of added text; VS Code uses a tree of pieces |
+
+A **gap buffer** keeps the free space of the array at the cursor, so typing fills the gap in O(1); moving the cursor far away means moving the gap, which costs the distance moved. It's excellent for one person typing in one place. Ropes and piece tables cost O(log n) everywhere, which matters for multiple cursors, find-and-replace across a file, and huge files.
+
+<Callout kind="gotcha" title="Swift gotcha: which kind of index?">
+This rope counts `Character`s. UIKit's text APIs, such as `NSRange` in `UITextView`, count **UTF-16 units**, and a file on disk is **UTF-8 bytes**. "é" is one Character but may be two Unicode scalars, and an emoji can be one Character, two UTF-16 units and four bytes. An editor's rope usually stores bytes in its leaves and keeps the other counts in its nodes, converting between them on the way down. Mixing up the units gives positions that are slightly off, and only for text with non-ASCII characters, which is exactly the text you forgot to test.
+</Callout>
+
+<Callout kind="gotcha" title="Common mistakes">
+- **Never rebalancing.** As the output shows, edits in one area build a chain. Rebalance, or use a self-balancing tree.
+- **Off-by-one in split.** Decide what `split(at: i)` means and stick to it: here, the first part has exactly i characters. Then insert is `split(at: i)` and delete of `[start, start + count)` is two splits.
+- **Leaves that are too small.** One character per leaf makes the tree as large as the text, with a node's overhead per character. Leaves of hundreds of bytes keep the tree small; leaves of megabytes bring back the shifting problem.
+</Callout>
+
+## Practice
+
+**Rope text buffer** asks for an editable text buffer with insert, delete, character and slice lookups, and **undo**. The tests compare it with a simple array on thousands of random edits, then make 10,000 edits to a 50,000-character document and undo every one of them. An immutable rope makes undo almost free, but any design that passes is fine.
+
+```cards
+- id: rope-shape
+  front: "What do a rope's leaves and inner nodes hold?"
+  back: "Leaves hold short runs of text. Inner nodes hold no text: each joins a left and a right rope, and stores the length of its left side (its weight) and its total length."
+- id: rope-index
+  front: "How does a rope find the character at index i?"
+  back: "At each inner node, go left if i is less than the weight; otherwise subtract the weight and go right. In the leaf, read position i. O(depth)."
+- id: rope-insert
+  front: "How does a rope insert text at index i?"
+  back: "Split the rope at i into two ropes, then concatenate the left part, a rope of the new text, and the right part. Split is O(depth) and concatenation is O(1)."
+- id: rope-why-not-string
+  front: "Why doesn't Swift's String use a rope?"
+  back: "Most strings are short and read far more than edited. Contiguous UTF-8 storage makes reading fast, is easy to pass to C and the OS, and avoids allocation for small strings. A rope would slow all of that down."
+```
+
+```quiz
+- id: q1
+  type: trace
+  prompt: "A rope's root has weight 6. Its left child (\"Hel\" then \"lo,\") has weight 3, and its right child (\" wor\" then \"ld!\") has weight 4. Finding the character at index 11, write the index carried at each node visited: root, then the inner node, then the leaf."
+  answer: "11, 5, 1"
+  explain: "At the root, 11 ≥ 6, so subtract 6 and go right with 5. At the right child, 5 ≥ 4, so subtract 4 and go right with 1. In the leaf \"ld!\", index 1 is \"d\"."
+- id: q2
+  type: mcq
+  prompt: "Which operation is O(1) on a rope, whatever its length?"
+  options:
+    - "Finding the character at index i"
+    - "Concatenating two ropes"
+    - "Splitting at index i"
+    - "Deleting a range"
+  answer: 1
+  explain: "Concatenation creates one new inner node pointing at both ropes. The others walk a path from the root, so they cost O(depth)."
+- id: q3
+  type: output
+  prompt: "This mimics how a rope's split defines insert. What does it print?"
+  code: |
+    let text = Array("rope")
+    let index = 2
+    let before = text[..<index]
+    let after = text[index...]
+    print(String(before + Array("xx") + after), before.count, after.count)
+  answer: "roxxpe 2 2"
+  explain: "Splitting at 2 gives the first two characters, \"ro\", and the rest, \"pe\". Insert is split, then concatenate the left part, the new text and the right part."
+- id: q4
+  type: truefalse
+  prompt: "Inserting into the middle of a long Swift String is O(log n), because Swift uses a rope for long strings."
+  answer: false
+  explain: "Swift's String is one contiguous UTF-8 buffer. Inserting into the middle moves every byte after the insertion point, and finding a Character position walks from the start: O(n)."
+- id: q5
+  type: bigo
+  prompt: "What does inserting one character cost in a rope that is kept balanced, holding n characters?"
+  answer: "O(log n)"
+  explain: "Split walks one root-to-leaf path and rebuilds the nodes on it, the concatenations are O(1) each, and rebalancing a balanced tree after the edit is O(log n)."
+- id: q6
+  type: recall
+  prompt: "Why does an immutable rope make undo cheap?"
+  model: "An edit builds a new rope that shares every untouched node with the old one; only the O(log n) nodes on the edited path are new. The old rope is unchanged, so keeping every version in an array costs little memory, and undo means going back to the previous root."

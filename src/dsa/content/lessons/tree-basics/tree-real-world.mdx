@@ -1,0 +1,266 @@
+## Why it matters
+
+You use trees every day as an iOS developer, usually without calling them that. The file system is a tree. Every screen is a tree of views. SwiftUI rebuilds and compares a tree of views each time state changes. JSON from a server is a tree. Recognising the tree, and which walk a task needs, turns "how do I find every button on this screen?" or "how big is this folder?" into problems you've already solved in this module.
+
+## The file system
+
+Folders contain files and folders: an N-ary tree whose root is the folder you start from. Foundation's `FileManager` can walk it for you with a **directory enumerator**, which visits each folder before its contents: a preorder walk. Its `level` property is the depth below the starting folder, and `skipDescendants()` prunes the subtree of the folder it just returned:
+
+```swift
+import Foundation
+
+let start = URL(fileURLWithPath: NSHomeDirectory()).appendingPathComponent("Developer")
+if let walker = FileManager.default.enumerator(at: start, includingPropertiesForKeys: [.fileSizeKey]) {
+    for case let url as URL in walker {
+        if url.lastPathComponent == ".build" || url.lastPathComponent == "DerivedData" {
+            walker.skipDescendants()                    // don't descend into build products
+            continue
+        }
+        print(String(repeating: "  ", count: walker.level - 1) + url.lastPathComponent)
+    }
+}
+```
+
+Items directly inside `start` have level 1, their contents level 2, and so on. The enumerator promises preorder, but not alphabetical order within a folder, so sort the names yourself if you need them sorted.
+
+Some jobs need **postorder** instead. A folder's size is the sum of everything inside it, so you can't know it until all of its contents have been measured. The `du` command in Terminal works exactly this way, and you can see it in its output: every subfolder is listed **before** the folder that contains it. Here's a tiny `du` over an in-memory folder tree:
+
+```swift run
+struct FileItem {
+    let name: String
+    var bytes = 0                 // a file's own size; folders hold nothing directly here
+    var children: [FileItem] = []
+    var isFolder: Bool { !children.isEmpty }
+}
+
+// Postorder: measure every child, then report the folder's total
+func du(_ item: FileItem, path: String) -> Int {
+    var total = item.bytes
+    for child in item.children {
+        total += du(child, path: path + "/" + child.name)
+    }
+    if item.isFolder {
+        print("\(total)\t\(path)")
+    }
+    return total
+}
+
+let project = FileItem(name: "Project", children: [
+    FileItem(name: "README.md", bytes: 2_000),
+    FileItem(name: "Sources", children: [
+        FileItem(name: "App.swift", bytes: 12_000),
+        FileItem(name: "Model.swift", bytes: 8_000),
+    ]),
+    FileItem(name: "Tests", children: [FileItem(name: "AppTests.swift", bytes: 5_000)]),
+    FileItem(name: "Assets", children: [FileItem(name: "icon.png", bytes: 150_000)]),
+])
+_ = du(project, path: project.name)
+```
+
+```output
+20000	Project/Sources
+5000	Project/Tests
+150000	Project/Assets
+177000	Project
+```
+
+What to notice:
+
+- `FileItem` is a **struct** holding an array of itself, the value-semantics N-ary tree from [N-ary trees](/dsa/learn/tree-nary). It's built once and only read, so a struct is a good fit.
+- Each total is computed once, from the children's totals, and reported on the way back up. That's what makes the walk O(n). Calling a separate `size(of:)` for every folder would re-measure deep folders once for each ancestor.
+- The empty-folder case is simplified here: a folder with no children looks like a file. A real tool would store the kind explicitly.
+
+## UIKit view hierarchies
+
+Every UIKit screen is a tree of `UIView`s. The window is the root. `subviews` is a view's children, ordered back to front, and `superview` points to its parent without keeping it alive. View controllers form their own tree through `children` and `parent`, and Core Animation layers through `sublayers` and `superlayer`. Xcode's **Debug View Hierarchy** button draws this tree in 3D while your app runs.
+
+Searching a view tree is a traversal like any other. Here's a preorder search for every button on a screen:
+
+```swift
+import UIKit
+
+func allButtons(in view: UIView) -> [UIButton] {
+    var found: [UIButton] = []
+    if let button = view as? UIButton {
+        found.append(button)
+    }
+    for subview in view.subviews {
+        found += allButtons(in: subview)
+    }
+    return found
+}
+```
+
+UIKit itself walks this tree constantly. `viewWithTag(_:)` searches a view and its descendants. **Hit-testing** decides which view a tap lands on: `hitTest(_:with:)` checks a view's subviews from front to back, recursing into the first one that contains the point, so the deepest, front-most view under your finger wins. **Layout** passes go down the tree too: a view lays out its subviews, which lay out theirs.
+
+## SwiftUI
+
+In SwiftUI, a view's `body` returns more views, which have bodies of their own: the result is a **view tree**. Whenever state changes, SwiftUI produces a new tree and compares it with the old one to decide what actually needs to change on screen. Data moves along the tree's edges in both directions: **environment** values flow down to every descendant, and **preferences** flow up to ancestors.
+
+SwiftUI can also show tree-shaped data directly. Give `List` (or `OutlineGroup`) a key path to each item's children, with `nil` for an item that has none, and it draws an expandable outline:
+
+```swift
+import SwiftUI
+
+struct Item: Identifiable {
+    let id = UUID()
+    let name: String
+    var children: [Item]? = nil        // nil for a leaf, an array for a folder
+}
+
+struct OutlineView: View {
+    let items: [Item]
+
+    var body: some View {
+        List(items, children: \.children) { item in
+            Text(item.name)
+        }
+    }
+}
+```
+
+## JSON
+
+A JSON document is an N-ary tree: objects and arrays are internal nodes, and strings, numbers, booleans and `null` are leaves. Decoding with `Codable` walks that tree for you, but when the shape isn't fixed, an enum models it directly. It doesn't even need `indirect`: the arrays and dictionaries already store their elements elsewhere, which gives the indirection that recursion needs.
+
+```swift run
+enum JSON {
+    case null
+    case bool(Bool)
+    case number(Double)
+    case string(String)
+    case array([JSON])
+    case object([String: JSON])
+}
+
+func depth(_ json: JSON) -> Int {
+    switch json {
+    case .array(let items):
+        return 1 + (items.map(depth).max() ?? 0)
+    case .object(let fields):
+        return 1 + (fields.values.map(depth).max() ?? 0)
+    default:
+        return 1                                     // a leaf
+    }
+}
+
+// The path to every leaf. Object keys are sorted, so the output is the same on every run.
+func leafPaths(_ json: JSON, _ path: String = "$") -> [String] {
+    switch json {
+    case .array(let items):
+        return items.indices.flatMap { leafPaths(items[$0], "\(path)[\($0)]") }
+    case .object(let fields):
+        return fields.keys.sorted().flatMap { leafPaths(fields[$0]!, "\(path).\($0)") }
+    default:
+        return [path]
+    }
+}
+
+let order = JSON.object([
+    "id": .number(1042),
+    "customer": .object(["name": .string("Asha"), "vip": .bool(true)]),
+    "items": .array([
+        .object(["sku": .string("A1"), "quantity": .number(2)]),
+        .object(["sku": .string("B7"), "quantity": .number(1)]),
+    ]),
+    "note": .null,
+])
+print("depth", depth(order))
+for path in leafPaths(order) {
+    print(path)
+}
+```
+
+```output
+depth 4
+$.customer.name
+$.customer.vip
+$.id
+$.items[0].quantity
+$.items[0].sku
+$.items[1].quantity
+$.items[1].sku
+$.note
+```
+
+The depth-4 path is the order object, then the `items` array, then an item object, then a leaf. `leafPaths` is a preorder walk that passes the path so far down to each child, the same "information travels down" idea as depth in [Tree terminology](/dsa/learn/tree-terminology). Sorting the keys matters: a dictionary's order changes between runs, so the paths would too.
+
+## Trees everywhere else
+
+Once you start looking, they're everywhere:
+
+- **The Swift compiler** parses your code into a syntax tree before it type-checks it, like the expression trees in [Indirect enums for recursive data](/dsa/learn/swift-indirect-enums).
+- **SpriteKit and SceneKit** scenes are trees of nodes with `children` and `parent`; moving a node moves its whole subtree.
+- **Accessibility**: VoiceOver reads the screen by walking a tree of accessibility elements.
+- **Web pages** in a `WKWebView` are a DOM tree.
+- **Undo history** with branches, **comment threads** and **org charts** are all N-ary trees, often stored as rows with a parent id, the parent array from the last lesson.
+
+<Callout kind="tip" title="Which walk?">
+Ask what each node needs to know. If a node's answer depends on its **children** (folder sizes, layout sizes, "does this subtree contain a button?"), walk in postorder. If it depends on its **ancestors** (depth, the path so far, inherited settings like SwiftUI's environment), pass information down in preorder. If it's about **distance from the root** (the nearest match, everything at depth 2), go level by level. M35 makes this choice precise.
+</Callout>
+
+## Practice
+
+**Folder sizes** is the `du` problem in full: compute folder totals once on the way up, but report the big folders in preorder, the order a file browser shows them.
+
+```cards
+- id: real-du-postorder
+  front: "Why does computing folder sizes need a postorder walk?"
+  back: "A folder's total is the sum of its contents, so every child must be measured before the folder. That's why `du` lists subfolders before their parent."
+- id: real-view-tree
+  front: "Which UIKit properties make the view hierarchy a tree?"
+  back: "`subviews` (a view's children, back to front) and `superview` (its parent). The window is the root."
+- id: real-json-indirect
+  front: "Why doesn't a JSON enum with `case array([JSON])` need the `indirect` keyword?"
+  back: "Arrays and dictionaries store their elements in separate heap storage, which already provides the indirection a recursive enum needs."
+```
+
+```quiz
+- id: q1
+  type: mcq
+  prompt: "A FileManager directory enumerator returns a folder, then everything inside it, before moving on. Which traversal is that?"
+  options:
+    - "Preorder"
+    - "Inorder"
+    - "Postorder"
+    - "Level order"
+  answer: 0
+  explain: "Visiting a node before its descendants is preorder. That's also what makes `skipDescendants()` possible: the enumerator hands you the folder before it has looked inside."
+- id: q2
+  type: multi
+  prompt: "Which of these tasks naturally need information from a node's children before the node can be handled (postorder)?"
+  options:
+    - "The total size of each folder"
+    - "Indenting each file name by its depth"
+    - "Whether a view's subtree contains any text field"
+    - "Each node's distance from the root"
+  answer: [0, 2]
+  explain: "Sizes and 'does this subtree contain…' are built from the children's answers. Depth and distance from the root come from the ancestors, so they're passed down in preorder or found level by level."
+- id: q3
+  type: output
+  prompt: "What does this print?"
+  code: |
+    enum JSON {
+        case number(Double)
+        case array([JSON])
+    }
+
+    func count(_ json: JSON) -> Int {
+        switch json {
+        case .number:
+            return 1
+        case .array(let items):
+            return items.reduce(0) { $0 + count($1) }
+        }
+    }
+
+    let value = JSON.array([.number(1), .array([.number(2), .number(3)]), .array([])])
+    print(count(value))
+  answer: "3"
+  explain: "Only the numbers are counted: 1 at the top level and 2 and 3 in the nested array. An empty array contributes 0."
+- id: q4
+  type: truefalse
+  prompt: "In UIKit hit-testing, a view's subviews are checked starting with the last one in the `subviews` array."
+  answer: true
+  explain: "`subviews` is ordered back to front, so the last subview is drawn on top. Hit-testing checks front to back, so the front-most view that contains the touch wins."
+```

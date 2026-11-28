@@ -1,0 +1,563 @@
+## Why it matters
+
+Multiplying two n-digit numbers the way you learned at school takes n² single-digit products. For two numbers with 100,000 digits, that's 10¹⁰ steps. [Karatsuba multiplication](/dsa/learn/dc-karatsuba) got this down to about n^1.585 with a clever split. The **fast Fourier transform** (FFT) goes all the way to **O(n log n)**: a few million steps for the same numbers. It's one of the most important algorithms ever found. It runs every time your phone processes audio or compresses an image, and on Apple platforms the Accelerate framework's vDSP module provides it ready-made. In DSA, the same transform counts pair sums, matches strings with wildcards and multiplies polynomials. This lesson builds it up from the idea, then implements the exact, integer-only version contest programmers use: the **number-theoretic transform** (NTT) modulo 998,244,353.
+
+## Multiplying polynomials is a convolution
+
+Multiply (1 + 2x + 3x²) by (4 + 5x). Each coefficient of the answer collects every pair of terms whose powers add up to its own:
+
+```text
+x⁰:  1·4                 =  4
+x¹:  1·5 + 2·4           = 13
+x²:  2·5 + 3·4           = 22
+x³:  3·5                 = 15
+```
+
+In general, if a and b are the coefficient lists, the product's coefficients are
+
+```text
+c[k] = Σ a[i] × b[k − i]      over every i where both indices exist
+```
+
+That operation is called a **convolution**. A number is a polynomial in disguise: 123 is 3 + 2x + 1x² at x = 10, with its digits as coefficients, lowest first. So multiplying numbers is a convolution of their digits followed by carrying:
+
+```swift run
+// Schoolbook polynomial multiplication: every coefficient of a meets every coefficient of b
+func naiveMultiply(_ a: [Int], _ b: [Int]) -> [Int] {
+    var c = Array(repeating: 0, count: a.count + b.count - 1)
+    for i in a.indices {
+        for j in b.indices {
+            c[i + j] += a[i] * b[j]
+        }
+    }
+    return c
+}
+
+print(naiveMultiply([1, 2, 3], [4, 5]))         // (1 + 2x + 3x²)(4 + 5x)
+print(naiveMultiply([3, 2, 1], [5, 4]))         // 123 × 45, digits lowest first
+print(123 * 45)
+```
+
+```output
+[4, 13, 22, 15]
+[15, 22, 13, 4]
+5535
+```
+
+The digit product [15, 22, 13, 4] isn't a number yet. Carrying from the lowest place: 15 → 5 carry 1; 22 + 1 = 23 → 3 carry 2; 13 + 2 = 15 → 5 carry 1; 4 + 1 = 5. Read from the top, that's 5535.
+
+### Convolutions are everywhere
+
+Any time you combine two independent choices and care about a *total*, you're convolving. Put a 1 at position s for each way one die can show s; multiply that list by itself, and position s of the result counts the ways two dice can total s:
+
+```swift run
+func naiveMultiply(_ a: [Int], _ b: [Int]) -> [Int] {
+    var c = Array(repeating: 0, count: a.count + b.count - 1)
+    for i in a.indices {
+        for j in b.indices {
+            c[i + j] += a[i] * b[j]
+        }
+    }
+    return c
+}
+
+// One die: one way to roll each of 1…6, so the coefficient of xˢ counts the ways to make s
+let die = [0, 1, 1, 1, 1, 1, 1]
+let twoDice = naiveMultiply(die, die)
+print(twoDice)
+print(twoDice.firstIndex(of: twoDice.max()!)!, twoDice.reduce(0, +))
+let threeDice = naiveMultiply(twoDice, die)
+print(threeDice[10], threeDice.reduce(0, +))
+```
+
+```output
+[0, 0, 1, 2, 3, 4, 5, 6, 5, 4, 3, 2, 1]
+7 36
+27 216
+```
+
+7 is the most likely total, in 6 of the 36 outcomes, and three dice make 10 in 27 of 216 ways. Replace "die faces" with "values in an array", and the same convolution answers "how many pairs (i, j) have a[i] + b[j] = s, for every s at once". With values up to 10⁵ that's two lists of length 10⁵, and the n² loop is too slow. So: how do you convolve faster?
+
+## Another way to describe a polynomial
+
+Two points fix a line; three points fix a parabola. In general, **a polynomial with n coefficients is fixed by its values at any n different points**. So there are two ways to describe the same polynomial:
+
+- **coefficient form**: the list a[0], a[1], …, a[n − 1];
+- **value form**: A(x₀), A(x₁), …, A(xₙ₋₁) at n chosen points.
+
+In value form, multiplication is trivial. If C = A × B, then C(x) = A(x) × B(x) at every point: n multiplications, O(n). The product has a.count + b.count − 1 coefficients, so you need at least that many points. That suggests a plan:
+
+1. **Evaluate** A and B at enough points.
+2. **Multiply** the values pointwise.
+3. **Interpolate**: turn C's values back into coefficients.
+
+Step 2 is O(n). But evaluating a polynomial with n coefficients at n arbitrary points costs n² operations, so steps 1 and 3 are the whole problem. The trick is to choose very special points.
+
+## Roots of unity
+
+The special points are the **nth roots of unity**: the n numbers whose nth power is 1. Among ordinary numbers, only 1 and −1 qualify, so the classic FFT uses complex numbers: ω = e^(2πi/n) is a point on the unit circle a fraction 1/n of the way round, and its powers ω⁰, ω¹, …, ω^(n−1) are n points spaced evenly around the circle. Two properties make them special, for n a power of two:
+
+- **Squaring halves them.** The squares of the n nth roots are exactly the n / 2 roots of order n / 2, each appearing twice. (Doubling every angle on the circle wraps it round twice.)
+- **Opposite points are negatives.** ω^(k + n/2) = −ωᵏ: going half way round the circle flips the sign.
+
+Don't worry about complex numbers, though. The version you'll implement uses roots of unity in modular arithmetic instead, and the only properties it needs are these two.
+
+## Divide and conquer: the FFT
+
+Split A's coefficients into the even-indexed ones and the odd-indexed ones:
+
+```text
+A(x) = a₀ + a₁x + a₂x² + a₃x³ + …
+     = (a₀ + a₂x² + a₄x⁴ + …) + x × (a₁ + a₃x² + a₅x⁴ + …)
+     = E(x²) + x × O(x²)
+```
+
+E and O each have half as many coefficients. Now evaluate A at all n roots ωᵏ. Each needs E and O at ω^(2k), and by the halving property, those are just the n / 2 roots of order n / 2: half as many points, for polynomials half the size. That's the same problem at half the size, so solve it recursively. Then combine, using the "opposite points" property for the second half:
+
+```text
+A(ωᵏ)         = E(ω²ᵏ) + ωᵏ × O(ω²ᵏ)
+A(ωᵏ⁺ⁿᐟ²)   = E(ω²ᵏ) − ωᵏ × O(ω²ᵏ)          for k from 0 to n/2 − 1
+```
+
+Each pair of outputs costs one multiplication, an addition and a subtraction. The cost satisfies T(n) = 2T(n / 2) + O(n), the same recurrence as merge sort, so by [The Master theorem](/dsa/learn/bigo-master-theorem) the transform is **O(n log n)**.
+
+**Going back.** The inverse transform, from values to coefficients, turns out to be the same algorithm with ω replaced by ω⁻¹, followed by dividing every result by n. (The reason: summing the powers ω^(jk) over all k gives n when j is 0 and 0 otherwise, so applying the transform twice, once with ω and once with ω⁻¹, gives back n times the input.) So one function does both directions.
+
+```visual growthChart
+classes: ['O(n log n)', 'O(n²)']
+n: 64
+max: 4096
+```
+
+Slide n up and watch the gap open. At n = 10⁵ it's the difference between about 1.7 million steps and 10 billion.
+
+## Roots of unity modulo a prime: the NTT
+
+A complex FFT works in floating point, so every value carries a little rounding error, and the final coefficients have to be rounded to whole numbers. For big inputs the error can grow past 0.5, and the rounding gives a wrong answer with no warning. Contest programmers usually avoid that entirely by doing the same algorithm in **modular arithmetic**, where every operation is exact.
+
+Modulo a prime p, the nonzero remainders behave enough like the unit circle for this to work. By Fermat's little theorem, from [Fermat's little theorem and CRT](/dsa/learn/nt-fermat-crt), every nonzero a has a^(p − 1) ≡ 1. A **primitive root** g is one whose powers g¹, g², …, g^(p − 1) run through every nonzero remainder before returning to 1. If n divides p − 1, then w = g^((p − 1) / n) satisfies wⁿ ≡ 1, and no smaller positive power of w is 1: it's a **primitive nth root of unity** modulo p, with both properties the FFT needs.
+
+The FFT needs n to be a power of two, so p − 1 must be divisible by a large power of two. That's what makes this prime famous:
+
+```text
+998,244,353 = 119 × 2²³ + 1,      with primitive root 3
+```
+
+So any power-of-two size up to 2²³ ≈ 8.4 million works. That's why [Modular arithmetic](/dsa/learn/math-modular-arithmetic) singled out this prime alongside 1,000,000,007.
+
+```swift run
+let mod = 998_244_353          // 119 · 2²³ + 1, with primitive root 3
+
+func power(_ base: Int, _ exponent: Int) -> Int {
+    var result = 1
+    var square = base % mod
+    var e = exponent
+    while e > 0 {
+        if e & 1 == 1 { result = result * square % mod }
+        square = square * square % mod
+        e >>= 1
+    }
+    return result
+}
+
+let n = 8
+let w = power(3, (mod - 1) / n)                     // a primitive 8th root of unity modulo the prime
+print(w)
+print((0...8).map { power(w, $0) })
+print((0...4).map { power(w, 2 * $0) } == (0...4).map { power(power(3, (mod - 1) / 4), $0) })
+print(power(w, 4), mod - 1)
+```
+
+```output
+372528824
+[1, 372528824, 911660635, 488723995, 998244352, 625715529, 86583718, 509520358, 1]
+true
+998244352 998244352
+```
+
+The powers of w cycle back to 1 after exactly 8 steps. The third line checks the halving property: the squares of w's powers are the powers of a 4th root of unity. The last line checks the opposite-points property: w⁴ is p − 1, which is −1 modulo p.
+
+**Exactness.** The NTT computes the convolution modulo p. If every true coefficient of the product is below p, the result *is* the true answer. For multiplying decimal digits, each coefficient is at most 9 × 9 × (the length of the shorter number), which stays below 998,244,353 for every size this prime allows.
+
+## The recursive NTT
+
+Here's the divide-and-conquer exactly as described, with modular arithmetic in place of complex numbers. `transform` evaluates a polynomial at the powers of w; `multiply` pads both inputs to a power of two, transforms, multiplies pointwise, and transforms back with w⁻¹:
+
+```swift run
+let mod = 998_244_353
+
+func power(_ base: Int, _ exponent: Int) -> Int {
+    var result = 1
+    var square = base % mod
+    var e = exponent
+    while e > 0 {
+        if e & 1 == 1 { result = result * square % mod }
+        square = square * square % mod
+        e >>= 1
+    }
+    return result
+}
+
+// Recursive NTT: the values of polynomial a at w⁰, w¹, …, w^(n-1), where w is a primitive nth root of unity
+func transform(_ a: [Int], _ w: Int) -> [Int] {
+    let n = a.count
+    if n == 1 { return a }
+    let even = transform(stride(from: 0, to: n, by: 2).map { a[$0] }, w * w % mod)
+    let odd = transform(stride(from: 1, to: n, by: 2).map { a[$0] }, w * w % mod)
+    var values = Array(repeating: 0, count: n)
+    var x = 1                                         // x = wᵏ
+    for k in 0..<(n / 2) {
+        let t = x * odd[k] % mod
+        values[k] = (even[k] + t) % mod               // A(wᵏ)         = E(w²ᵏ) + wᵏ·O(w²ᵏ)
+        values[k + n / 2] = (even[k] - t + mod) % mod // A(wᵏ⁺ⁿᐟ²)   = E(w²ᵏ) − wᵏ·O(w²ᵏ)
+        x = x * w % mod
+    }
+    return values
+}
+
+func multiply(_ a: [Int], _ b: [Int]) -> [Int] {
+    let resultSize = a.count + b.count - 1
+    var n = 1
+    while n < resultSize { n <<= 1 }
+    let w = power(3, (mod - 1) / n)
+    let fa = transform(a + Array(repeating: 0, count: n - a.count), w)
+    let fb = transform(b + Array(repeating: 0, count: n - b.count), w)
+    let product = (0..<n).map { fa[$0] * fb[$0] % mod }          // multiply the values pointwise
+    let back = transform(product, power(w, mod - 2))             // the same transform with w⁻¹…
+    let nInverse = power(n, mod - 2)
+    return (0..<resultSize).map { back[$0] * nInverse % mod }     // …then divide by n
+}
+
+print(multiply([1, 2, 3], [4, 5]))
+print(multiply([3, 2, 1], [5, 4]))
+print(transform([1, 2, 3, 4], power(3, (mod - 1) / 4)))
+```
+
+```output
+[4, 13, 22, 15]
+[15, 22, 13, 4]
+[10, 173167434, 998244351, 825076915]
+```
+
+What to notice:
+
+- **The same answers as the schoolbook loop**, through a completely different route.
+- **The last line shows value form.** 1 + 2x + 3x² + 4x³ at x = 1 is 10, and at x = −1 (the 4th root of unity w², which is p − 1) it's 1 − 2 + 3 − 4 = −2, printed as 998,244,351.
+- **The padded size is a power of two at least a.count + b.count − 1.** If it were smaller, the high coefficients would wrap around and add onto the low ones, because wⁿ = 1 makes xⁿ indistinguishable from x⁰.
+- **Dividing by n is a multiplication by n⁻¹**, from Fermat again, because n is a power of two below p.
+- **Overflow is safe.** Every value is below p, so a product is below p² ≈ 9.96 × 10¹⁷, under `Int.max`.
+
+## The iterative NTT
+
+The recursive version allocates new arrays at every level. Fast implementations do the whole thing **in place**. Watch where the recursion sends each coefficient: the first split separates them by their lowest bit (even and odd), the next split by the second-lowest bit, and so on. By the bottom, coefficient i has landed at position **reverse(i)**, its index with the bits written backwards. For n = 8:
+
+| index | 0 | 1 | 2 | 3 | 4 | 5 | 6 | 7 |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| binary | 000 | 001 | 010 | 011 | 100 | 101 | 110 | 111 |
+| reversed | 000 | 100 | 010 | 110 | 001 | 101 | 011 | 111 |
+| goes to | 0 | 4 | 2 | 6 | 1 | 5 | 3 | 7 |
+
+So the iterative version first swaps every coefficient into its bit-reversed position, then runs the combining step from the bottom up: blocks of length 2, then 4, then 8, up to n, each block merging two halves with the "plus and minus" step, called a **butterfly**.
+
+```swift run
+let mod = 998_244_353
+
+func power(_ base: Int, _ exponent: Int) -> Int {
+    var result = 1
+    var square = base % mod
+    var e = exponent
+    while e > 0 {
+        if e & 1 == 1 { result = result * square % mod }
+        square = square * square % mod
+        e >>= 1
+    }
+    return result
+}
+
+// In-place iterative NTT. a.count must be a power of two, at most 2²³.
+func ntt(_ a: inout [Int], invert: Bool) {
+    let n = a.count
+    // 1. Bit-reversal permutation: put each coefficient where the recursion would leave it
+    var j = 0
+    for i in 1..<n {
+        var bit = n >> 1
+        while j & bit != 0 {
+            j ^= bit
+            bit >>= 1
+        }
+        j ^= bit
+        if i < j { a.swapAt(i, j) }
+    }
+    // 2. Butterflies: merge blocks of length 2, 4, 8, … up to n
+    var length = 2
+    while length <= n {
+        var root = power(3, (mod - 1) / length)          // a primitive root of unity of order `length`
+        if invert { root = power(root, mod - 2) }
+        let half = length / 2
+        for start in stride(from: 0, to: n, by: length) {
+            var x = 1
+            for k in 0..<half {
+                let u = a[start + k]
+                let v = a[start + k + half] * x % mod
+                a[start + k] = u + v < mod ? u + v : u + v - mod
+                a[start + k + half] = u - v >= 0 ? u - v : u - v + mod
+                x = x * root % mod
+            }
+        }
+        length <<= 1
+    }
+    // 3. The inverse transform divides by n
+    if invert {
+        let nInverse = power(n, mod - 2)
+        for i in 0..<n { a[i] = a[i] * nInverse % mod }
+    }
+}
+
+func multiply(_ a: [Int], _ b: [Int]) -> [Int] {
+    let resultSize = a.count + b.count - 1
+    var n = 1
+    while n < resultSize { n <<= 1 }
+    var fa = a + Array(repeating: 0, count: n - a.count)
+    var fb = b + Array(repeating: 0, count: n - b.count)
+    ntt(&fa, invert: false)
+    ntt(&fb, invert: false)
+    for i in 0..<n { fa[i] = fa[i] * fb[i] % mod }
+    ntt(&fa, invert: true)
+    return Array(fa[0..<resultSize])
+}
+
+func naiveMultiply(_ a: [Int], _ b: [Int]) -> [Int] {
+    var c = Array(repeating: 0, count: a.count + b.count - 1)
+    for i in a.indices {
+        for j in b.indices { c[i + j] += a[i] * b[j] }
+    }
+    return c
+}
+
+// A tiny deterministic generator, so the test inputs are the same every run
+var state: UInt64 = 2024
+func nextRandom(_ upper: Int) -> Int {
+    state = state &* 6_364_136_223_846_793_005 &+ 1_442_695_040_888_963_407
+    return Int(state >> 33) % upper
+}
+
+print(multiply([1, 2, 3], [4, 5]))
+var agree = 0
+for _ in 0..<200 {
+    let a = (0..<(1 + nextRandom(40))).map { _ in nextRandom(1000) }
+    let b = (0..<(1 + nextRandom(40))).map { _ in nextRandom(1000) }
+    if multiply(a, b) == naiveMultiply(a, b) { agree += 1 }
+}
+print("agree on \(agree) of 200 random pairs")
+```
+
+```output
+[4, 13, 22, 15]
+agree on 200 of 200 random pairs
+```
+
+What to notice:
+
+- **The bit-reversal loop** keeps j equal to reverse(i) as i counts up. Adding 1 to a reversed number means propagating a carry from the *top* bit downwards: clear 1 bits from the top while they're set, then set the first 0. Swapping only when `i < j` swaps each pair once.
+- **`root` is a primitive root of unity of order `length`**, recomputed for each level, and inverted for the inverse transform.
+- **The butterfly avoids `%` on additions.** u + v is below 2p, so one subtraction reduces it; u − v is above −p, so one addition fixes it.
+- **Always test against the naive version.** A tiny generator makes the random inputs the same every run. NTT bugs (a wrong root, a missing division, a bad swap) produce plausible-looking garbage, and only a comparison catches them.
+
+The `&*` and `&+` in the generator are deliberate: a random number generator *wants* arithmetic that wraps modulo 2⁶⁴, as in [Overflow traps and overflow operators](/dsa/learn/swift-overflow). Everywhere else, values stay below p and plain operators are right.
+
+## Multiplying big numbers
+
+With the convolution in place, multiplying huge numbers is digits in, convolve, carry out:
+
+```swift run
+let mod = 998_244_353
+
+func power(_ base: Int, _ exponent: Int) -> Int {
+    var result = 1
+    var square = base % mod
+    var e = exponent
+    while e > 0 {
+        if e & 1 == 1 { result = result * square % mod }
+        square = square * square % mod
+        e >>= 1
+    }
+    return result
+}
+
+func ntt(_ a: inout [Int], invert: Bool) {
+    let n = a.count
+    var j = 0
+    for i in 1..<n {
+        var bit = n >> 1
+        while j & bit != 0 {
+            j ^= bit
+            bit >>= 1
+        }
+        j ^= bit
+        if i < j { a.swapAt(i, j) }
+    }
+    var length = 2
+    while length <= n {
+        var root = power(3, (mod - 1) / length)
+        if invert { root = power(root, mod - 2) }
+        let half = length / 2
+        for start in stride(from: 0, to: n, by: length) {
+            var x = 1
+            for k in 0..<half {
+                let u = a[start + k]
+                let v = a[start + k + half] * x % mod
+                a[start + k] = u + v < mod ? u + v : u + v - mod
+                a[start + k + half] = u - v >= 0 ? u - v : u - v + mod
+                x = x * root % mod
+            }
+        }
+        length <<= 1
+    }
+    if invert {
+        let nInverse = power(n, mod - 2)
+        for i in 0..<n { a[i] = a[i] * nInverse % mod }
+    }
+}
+
+func multiply(_ a: [Int], _ b: [Int]) -> [Int] {
+    let resultSize = a.count + b.count - 1
+    var n = 1
+    while n < resultSize { n <<= 1 }
+    var fa = a + Array(repeating: 0, count: n - a.count)
+    var fb = b + Array(repeating: 0, count: n - b.count)
+    ntt(&fa, invert: false)
+    ntt(&fb, invert: false)
+    for i in 0..<n { fa[i] = fa[i] * fb[i] % mod }
+    ntt(&fa, invert: true)
+    return Array(fa[0..<resultSize])
+}
+
+// Big numbers: digits are coefficients, lowest first. Convolve, then carry.
+func multiplyNumbers(_ x: String, _ y: String) -> String {
+    let a = x.reversed().map { Int(String($0))! }
+    let b = y.reversed().map { Int(String($0))! }
+    var digits = multiply(a, b)          // each entry can be far above 9 before carrying
+    var carry = 0
+    for i in digits.indices {
+        let value = digits[i] + carry
+        digits[i] = value % 10
+        carry = value / 10
+    }
+    while carry > 0 {
+        digits.append(carry % 10)
+        carry /= 10
+    }
+    while digits.count > 1 && digits.last == 0 { digits.removeLast() }
+    return digits.reversed().map(String.init).joined()
+}
+
+print(multiplyNumbers("123", "45"))
+print(multiplyNumbers("123456789", "987654321"), 123_456_789 * 987_654_321)
+print(multiplyNumbers("18446744073709551616", "18446744073709551616"))
+let nines = String(repeating: "9", count: 30)
+print(multiplyNumbers(nines, nines))
+print(multiplyNumbers("0", "12345"))
+```
+
+```output
+5535
+121932631112635269 121932631112635269
+340282366920938463463374607431768211456
+999999999999999999999999999998000000000000000000000000000001
+0
+```
+
+The third line squares 2⁶⁴ to get 2¹²⁸, far beyond any built-in integer. The fourth is (10³⁰ − 1)², whose pattern of 9s, an 8, 0s and a 1 makes a good test at any size. Stripping leading zeros matters for products with a zero factor: without it, "0" × "12345" would come out as "00000".
+
+## Limits and variants
+
+- **Size.** With 998,244,353, the padded length can be at most 2²³. Bigger inputs need a prime with a larger power of two in p − 1.
+- **Big coefficients.** If the true coefficients can exceed p, for example when convolving arbitrary values modulo 10⁹ + 7, run the NTT modulo three different NTT-friendly primes and rebuild each coefficient with the Chinese remainder theorem from [Fermat's little theorem and CRT](/dsa/learn/nt-fermat-crt).
+- **Fewer, bigger digits.** Grouping digits in pairs (base 100) halves the length of each input, and every coefficient stays below p for numbers up to about 100,000 digits. Base 1000 would overflow p.
+- **The complex FFT** with `Double` is fine when the answers are small enough for rounding to be safe, and it's what signal processing uses. Contest code prefers the NTT because it's exact.
+
+<Callout kind="gotcha" title="Common mistakes">
+- **Padding to the wrong size.** The length must be a power of two **at least a.count + b.count − 1**, not just the larger input's length. Too short and the product wraps around onto itself.
+- **Forgetting to divide by n.** The inverse transform alone gives n times the answer.
+- **Using w instead of w⁻¹ for the inverse.** The forward and inverse transforms differ only in the root. Mixing them up gives scrambled output.
+- **Coefficients that reach p.** The answer is only correct modulo p. Check that 9 × 9 × length, or whatever your largest true coefficient is, stays below 998,244,353.
+- **Slow tests in debug builds.** `swift test` compiles without optimisation, so an NTT of a million elements takes seconds rather than milliseconds. `while` loops and precomputed powers of the root help; so does `swift test -c release` when you only want the result.
+</Callout>
+
+## Practice
+
+**Multiply two huge numbers** gives you two decimal strings of up to 100,000 digits each. Schoolbook multiplication would need 10¹⁰ steps; the NTT needs a few million. Its tests compare with long multiplication on small inputs and check the huge products through their remainders, so a wrong root or a missing carry shows up.
+
+```cards
+- id: convolution
+  front: "What is the convolution of coefficient lists a and b?"
+  back: "c[k] = Σ a[i]·b[k − i]. It's polynomial multiplication, and with carrying it's multiplying numbers digit by digit."
+- id: fft-idea
+  front: "What's the idea behind the FFT?"
+  back: "Evaluate both polynomials at the nth roots of unity, multiply the values pointwise, and interpolate back. Splitting into even and odd coefficients makes evaluation O(n log n)."
+- id: ntt-prime
+  front: "Why is 998,244,353 used for the NTT?"
+  back: "It's 119 × 2²³ + 1 with primitive root 3, so 3^((p − 1)/n) is an nth root of unity for every power of two n up to 2²³."
+- id: ntt-size
+  front: "How big must the NTT be to multiply polynomials with a and b coefficients?"
+  back: "A power of two at least a + b − 1. Any smaller and the high coefficients wrap around onto the low ones."
+```
+
+```quiz
+- id: q1
+  type: output
+  prompt: "What does this print?"
+  code: |
+    func naiveMultiply(_ a: [Int], _ b: [Int]) -> [Int] {
+        var c = Array(repeating: 0, count: a.count + b.count - 1)
+        for i in a.indices {
+            for j in b.indices { c[i + j] += a[i] * b[j] }
+        }
+        return c
+    }
+    print(naiveMultiply([1, 1], [1, 2, 1]))
+  answer: "[1, 3, 3, 1]"
+  explain: "(1 + x)(1 + 2x + x²) = (1 + x)³ = 1 + 3x + 3x² + x³: row 3 of Pascal's triangle."
+- id: q2
+  type: mcq
+  prompt: "You multiply a polynomial with 5 coefficients by one with 4. What is the smallest NTT size that works?"
+  options:
+    - "4"
+    - "8"
+    - "9"
+    - "16"
+  answer: 1
+  explain: "The product has 5 + 4 − 1 = 8 coefficients, and 8 is already a power of two. A size of 4 would wrap coefficients around; 9 isn't a power of two; 16 works but is bigger than needed."
+- id: q3
+  type: trace
+  prompt: "For n = 8, list where the bit-reversal permutation sends indices 0 to 7, in order, separated by commas."
+  answer: "0, 4, 2, 6, 1, 5, 3, 7"
+  explain: "Write each index in 3 bits and reverse them: 001 becomes 100 = 4, 011 becomes 110 = 6, and so on. That's the order the recursion's even/odd splits leave the coefficients in."
+- id: q4
+  type: truefalse
+  prompt: "The prime 998,244,353 supports an NTT of size 2²⁴."
+  answer: false
+  explain: "998,244,352 = 119 × 2²³, so the largest power of two dividing p − 1 is 2²³. A primitive root of unity of order 2²⁴ doesn't exist modulo this prime."
+- id: q5
+  type: bug
+  prompt: "This multiply sometimes returns wrong coefficients. Which line is the bug?"
+  code: |
+    func multiply(_ a: [Int], _ b: [Int]) -> [Int] {
+        var n = 1
+        while n < max(a.count, b.count) { n <<= 1 }
+        var fa = a + Array(repeating: 0, count: n - a.count)
+        var fb = b + Array(repeating: 0, count: n - b.count)
+        ntt(&fa, invert: false)
+        ntt(&fb, invert: false)
+        for i in 0..<n { fa[i] = fa[i] * fb[i] % mod }
+        ntt(&fa, invert: true)
+        return fa
+    }
+  answer: 3
+  explain: "The size must cover the whole product, a.count + b.count − 1 coefficients. With only max(a.count, b.count), the high coefficients wrap around and add onto the low ones."
+- id: q6
+  type: bigo
+  prompt: "What is the time complexity of multiplying two n-digit numbers with the NTT?"
+  answer: "O(n log n)"
+  explain: "Three transforms of size about 2n, each O(n log n), plus O(n) for the pointwise products and the carrying."
+```

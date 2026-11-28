@@ -1,0 +1,284 @@
+## Why it matters
+
+The last lesson's queue was slow because every dequeue moved every waiting item. This lesson's fix is one integer: instead of moving the items to the front, remember **where the front is**. It's the most common queue in Swift DSA code, the one you'll write for breadth-first search, and it takes about ten lines. You'll also see the catch, memory that's never given back, and fix it with an amortised trick you already know from M14.
+
+## Move the sign, not the people
+
+Think of a deli counter with a "now serving" display. Nobody shuffles forward when a customer is served; the display changes from 41 to 42. The queue is the same line of people, and only the number moves.
+
+<Callout kind="analogy">
+An array with a head index is that deli line. The array is the line of tickets, and `head` is the "now serving" number. Serving someone is `head += 1`.
+</Callout>
+
+So the queue keeps two things:
+
+- `items`, an ordinary array: enqueue appends to it, as before;
+- `head`, the position of the front item. Dequeue reads `items[head]` and adds 1 to `head`.
+
+Nothing ever shifts, so both operations are O(1) (enqueue amortised, like any append). The items still waiting are `items[head...]`, and there are `items.count - head` of them.
+
+```swift run
+struct IndexQueue<Element> {
+    private var items: [Element] = []
+    private var head = 0           // the position of the front element
+
+    var count: Int { items.count - head }
+    var isEmpty: Bool { head == items.count }
+
+    mutating func enqueue(_ element: Element) {
+        items.append(element)
+    }
+
+    mutating func dequeue() -> Element? {
+        guard head < items.count else { return nil }
+        let element = items[head]
+        head += 1                  // nothing moves: the front is now one place on
+        return element
+    }
+
+    func peek() -> Element? {
+        head < items.count ? items[head] : nil
+    }
+
+    var debugState: String { "items \(items), head \(head)" }
+}
+
+var queue = IndexQueue<String>()
+queue.enqueue("Ana")
+queue.enqueue("Ben")
+queue.enqueue("Cleo")
+print(queue.debugState)
+print(queue.dequeue() ?? "-", "|", queue.debugState)
+queue.enqueue("Dev")
+print(queue.dequeue() ?? "-", "|", queue.debugState)
+print("peek:", queue.peek() ?? "-", "count:", queue.count)
+```
+
+```output
+items ["Ana", "Ben", "Cleo"], head 0
+Ana | items ["Ana", "Ben", "Cleo"], head 1
+Ben | items ["Ana", "Ben", "Cleo", "Dev"], head 2
+peek: Cleo count: 2
+```
+
+What to notice:
+
+- `"Ana"` and `"Ben"` are still in the array after they've been served. They're **dead slots**: before `head`, so no operation will ever look at them again.
+- The `guard` compares `head` with `items.count`, never with 0. The queue is empty when the front has caught up with the back.
+- `isEmpty` and `count` are worked out from the two numbers, so they stay O(1).
+
+## The catch: dead slots pile up
+
+Dead slots cost memory, and they never go away. Picture a busy counter where one customer joins and one is served, over and over. The queue never holds more than a few people, but the array keeps growing:
+
+```swift run
+struct IndexQueue {
+    var items: [Int] = []
+    var head = 0
+    var count: Int { items.count - head }
+
+    mutating func enqueue(_ element: Int) { items.append(element) }
+
+    mutating func dequeue() -> Int? {
+        guard head < items.count else { return nil }
+        let element = items[head]
+        head += 1
+        return element
+    }
+}
+
+var queue = IndexQueue()
+for ticket in 1...3 { queue.enqueue(ticket) }
+// A busy counter: one customer joins and one is served, 1,000 times over
+for ticket in 4...1_003 {
+    queue.enqueue(ticket)
+    _ = queue.dequeue()
+}
+print("waiting:", queue.count)
+print("slots in the array:", queue.items.count)
+print("dead slots:", queue.head)
+```
+
+```output
+waiting: 3
+slots in the array: 1003
+dead slots: 1000
+```
+
+Three people waiting, 1,003 slots in memory. For a queue inside one BFS that empties and is thrown away, that's fine: the memory goes when the queue does. For a queue that lives as long as your app, such as one feeding network requests or log messages, it's a leak that grows with every item ever processed.
+
+## Fix 1: start afresh when the queue empties
+
+When `head` reaches `items.count`, every slot is dead. Remove them all and set `head` back to 0:
+
+```swift
+if head == items.count {
+    items.removeAll(keepingCapacity: true)
+    head = 0
+}
+```
+
+`keepingCapacity: true` keeps the memory block for the next items, so later appends don't have to grow it again. No live item moves, because there aren't any, and the dead elements had to be released at some point anyway. This fixes every queue that regularly drains. It doesn't fix the busy counter above, which never empties.
+
+## Fix 2: compact when half the slots are dead
+
+The second fix is **compaction**: once the dead slots make up at least half the array, remove them in one go with `removeFirst(head)`, which moves the live items to the start, and reset `head` to 0.
+
+```swift run
+struct CompactingQueue {
+    var items: [Int] = []
+    var head = 0
+    var moves = 0                  // elements moved by compaction, for counting
+    var compactions = 0
+
+    var count: Int { items.count - head }
+
+    mutating func enqueue(_ element: Int) { items.append(element) }
+
+    mutating func dequeue() -> Int? {
+        guard head < items.count else { return nil }
+        let element = items[head]
+        head += 1
+        if head == items.count {
+            items.removeAll(keepingCapacity: true)   // empty: start afresh, for free
+            head = 0
+        } else if head >= 16 && head * 2 >= items.count {
+            moves += items.count - head              // the live elements move to the front
+            compactions += 1
+            items.removeFirst(head)
+            head = 0
+        }
+        return element
+    }
+}
+
+for waiting in [3, 100, 5_000] {
+    var queue = CompactingQueue()
+    for ticket in 0..<waiting { queue.enqueue(ticket) }
+    var largest = 0
+    var ticket = waiting
+    for _ in 0..<100_000 {
+        queue.enqueue(ticket)
+        ticket += 1
+        _ = queue.dequeue()
+        largest = max(largest, queue.items.count)
+    }
+    print("\(waiting) waiting: largest array \(largest), \(queue.moves) moves, removeFirst would move \(waiting * 100_000)")
+}
+```
+
+```output
+3 waiting: largest array 18, 18750 moves, removeFirst would move 300000
+100 waiting: largest array 199, 100000 moves, removeFirst would move 10000000
+5000 waiting: largest array 9999, 100000 moves, removeFirst would move 500000000
+```
+
+Two things to notice. The array never grows past about twice the number of people waiting (plus the 16-slot minimum). And for 100,000 dequeues, compaction never moved more than 100,000 elements in total, whatever the queue's size, while `removeFirst()` would have moved up to 500 million.
+
+### Why compaction is amortised O(1)
+
+Here's the [aggregate argument](/dsa/learn/bigo-amortised), the same style you used for a growing array:
+
+1. A compaction happens when the dead slots are at least half the array, so the live items it moves are **no more than** the dead slots: `items.count - head ≤ head`.
+2. Every dead slot was made by one dequeue since the last compaction, because `head` started again from 0 then.
+3. So each compaction moves at most as many items as there were dequeues since the previous one. Add them all up: the total moves over any sequence of operations are **at most the number of dequeues**.
+
+Each dequeue does O(1) work of its own and pays for at most one future move: O(1) amortised. The occasional dequeue that compacts is O(n) on its own, exactly like the occasional `append` that grows an array.
+
+The `head >= 16` condition isn't needed for the argument. It stops a tiny queue from compacting every other dequeue, which would be correct but pointless work.
+
+<Callout kind="gotcha" title="Dead slots keep objects alive">
+If the elements are class instances, a dead slot still holds a strong reference, so a dequeued object isn't freed until a compaction or a reset removes its slot ([Automatic Reference Counting](/dsa/learn/swift-arc) explains why). Usually that delay doesn't matter. When it does, for example with large images, store `[Element?]` and set the slot to `nil` as you dequeue.
+</Callout>
+
+## DSAKit's Queue
+
+Your companion package now has a finished version: `Queue<Element>` in `dsa-swift/Sources/DSAKit/Queue.swift`. It's this lesson's design, a head index with both fixes, plus the conformances you met in Part I:
+
+```swift
+import DSAKit
+
+var tasks: Queue = ["download", "resize"]   // ExpressibleByArrayLiteral
+tasks.enqueue("upload")
+print(tasks)                                // Queue(["download", "resize", "upload"])
+print(tasks.dequeue() ?? "-")               // download
+print(tasks.peek() ?? "-", tasks.count)     // resize 2
+for task in tasks {                         // Sequence: front to back, removes nothing
+    print(task)
+}
+```
+
+Read the file: every public member has a doc comment stating its cost, and `Tests/DSAKitTests/QueueTests.swift` checks it against a plain array over 20,000 mixed operations. From here on, any problem that needs a queue can `import DSAKit` and use it.
+
+```cards
+- id: head-index
+  front: "How does a head index make dequeue O(1)?"
+  back: "Instead of shifting the items, keep the position of the front in `head`. Dequeue reads `items[head]` and adds 1 to `head`; nothing moves."
+- id: dead-slots
+  front: "What's the problem with a plain head-index queue that never empties?"
+  back: "The slots before `head` are dead but never freed, so the array grows with every item ever enqueued, not with the number waiting."
+- id: compaction
+  front: "When does a compacting queue compact, and why is that amortised O(1)?"
+  back: "When at least half the slots are dead. It moves at most as many live items as there were dequeues since the last compaction, so total moves never exceed total dequeues."
+- id: reset-when-empty
+  front: "What should a head-index queue do when `head` reaches `items.count`?"
+  back: "Remove everything (keeping the capacity) and set `head` to 0. Every slot is dead, so no live item has to move, and the dead slots stop holding memory."
+```
+
+```quiz
+- id: q1
+  type: output
+  prompt: "This queue uses a head index. What does it print?"
+  code: |
+    var items = [10, 20, 30]
+    var head = 0
+    head += 1
+    items.append(40)
+    head += 1
+    print(items[head], items.count - head, items.count)
+  answer: "30 2 4"
+  explain: "Two dequeues moved `head` to 2, so the front is `items[2]`, which is 30. Two items are waiting (30 and 40), but the array still has all 4 slots: the first two are dead."
+- id: q2
+  type: bug
+  prompt: "This dequeue sometimes reads past the end of the array. Click the faulty line."
+  code: |
+    mutating func dequeue() -> Element? {
+        guard !items.isEmpty else { return nil }
+        let element = items[head]
+        head += 1
+        return element
+    }
+  answer: 2
+  explain: "Dead slots stay in the array, so `items` isn't empty even when the queue is. The queue is empty when `head == items.count`, so the guard must be `head < items.count`."
+- id: q3
+  type: mcq
+  prompt: "A compacting queue compacts when dead slots are at least half the array. About how large can the array get when 1,000 items are waiting?"
+  options:
+    - "About 1,000 slots"
+    - "About 2,000 slots"
+    - "It grows without limit"
+    - "Exactly 16 slots"
+  answer: 1
+  explain: "As soon as the dead slots catch up with the live ones, they're removed. So the array holds at most about as many dead slots as live ones: roughly twice the number waiting."
+- id: q4
+  type: truefalse
+  prompt: "In a compacting head-index queue, the total number of elements moved by compaction never exceeds the number of dequeues."
+  answer: true
+  explain: "Each compaction moves no more live items than there are dead slots, and each dead slot came from a different dequeue since the last compaction. Summing over all compactions gives at most one move per dequeue."
+- id: q5
+  type: blank
+  prompt: "Complete the reset that runs when every slot is dead."
+  code: |
+    if head == items.count {
+        items.removeAll(keepingCapacity: ___)
+        head = ___
+    }
+  answers:
+    - "true"
+    - "0"
+  explain: "Keeping the capacity means later appends reuse the same memory block, and the front of an empty array is position 0."
+- id: q6
+  type: recall
+  prompt: "Explain why a head-index queue with compaction has amortised O(1) dequeue."
+  model: "Dequeue itself only reads `items[head]` and increments `head`. Compaction happens when dead slots are at least half the array, so it moves at most as many live items as there are dead slots, and each dead slot was created by one dequeue since the last compaction. So total compaction work is at most the number of dequeues, which averages to O(1) per dequeue."
+```

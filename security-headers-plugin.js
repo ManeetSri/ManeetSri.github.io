@@ -1,6 +1,7 @@
 import { createHash } from 'node:crypto';
 import { readFileSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
+import { CONSOLE_BASES } from './src/utils/privatePaths.js';
 
 // Everything the site is allowed to load or talk to. A new third-party service has to be added here.
 const SOURCES = {
@@ -24,8 +25,16 @@ const SOURCES = {
         'https://firebaseremoteconfig.googleapis.com',
         'https://firebaselogging-pa.googleapis.com',
         'https://ingesteer.services-prod.nsvcs.net',
+        // Sign-in and progress sync for the private learning console
+        'https://identitytoolkit.googleapis.com',
+        'https://securetoken.googleapis.com',
+        'https://firestore.googleapis.com',
     ],
 };
+
+// The learning console and its code chunks are never indexed. These blocks only add a header:
+// repeating the CSP here would make Netlify join two policies into one header.
+const PRIVATE_PATHS = [...CONSOLE_BASES.flatMap((base) => [base, `${base}/*`]), '/assets/dsa/*'];
 
 const hashesOf = (html, pattern) => [...html.matchAll(pattern)]
     .map((match) => `'sha256-${createHash('sha256').update(match[1]).digest('base64')}'`);
@@ -60,9 +69,12 @@ const headersFile = (html) => `/*
   Permissions-Policy: accelerometer=(), camera=(), geolocation=(), gyroscope=(), magnetometer=(), microphone=(), payment=(), usb=(), browsing-topics=()
   Cross-Origin-Opener-Policy: same-origin
   Cross-Origin-Resource-Policy: same-site
-`;
+/assets/*
+  Cache-Control: public, max-age=31536000, immutable
+${PRIVATE_PATHS.map((path) => `${path}\n  X-Robots-Tag: noindex, nofollow, noarchive\n`).join('')}`;
 
-// Writes Netlify's _headers file after the build, because the hashes depend on the final HTML
+// Writes Netlify's _headers file after the build, because the hashes depend on the final HTML.
+// Everything under /assets has a content hash in its name, so browsers can keep it for a year.
 export const securityHeaders = () => {
     let outDir = 'dist';
 

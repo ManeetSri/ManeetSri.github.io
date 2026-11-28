@@ -1,0 +1,246 @@
+## Why it matters
+
+A monitoring service sees a million requests a minute and must show the median latency, the ten slowest endpoints and the most common error codes, live. A fitness app tracks your median pace over the last five minutes of a run. A phone uploads analytics without storing every event. These are **streaming** problems: items arrive one at a time, you can't go back, and there are too many to keep. The questions are familiar (median, top K, most frequent), but the cost that matters changes: not only time per item, but **memory per item seen**. This lesson collects the streaming tools you already have, adds two new ones, and shows where exact answers stop being affordable.
+
+## The streaming model
+
+A streaming algorithm:
+
+- sees each item **once**, in order, and must deal with it before the next arrives;
+- should use memory that's much smaller than the number of items seen, n: ideally O(1), O(k) for a parameter k you choose, or O(log n);
+- should do little work per item, ideally O(1) or O(log k);
+- can be asked for its answer **at any moment**.
+
+You've met several already: the running sum and maximum (O(1) memory), the [moving average with a queue](/dsa/learn/queue-streams) (O(window)), [reservoir sampling](/dsa/learn/rand-reservoir) (O(k)), and the two-heaps median (O(n), as you'll see in a moment).
+
+| Question | Exact method | Memory | Time per item |
+| --- | --- | --- | --- |
+| Sum, count, max | running totals | O(1) | O(1) |
+| Uniform sample of k | reservoir sampling | O(k) | O(1) |
+| k largest values | min-heap of size k | O(k) | O(log k) |
+| Median of everything | two heaps | O(n) | O(log n) |
+| Median of the last w | two heaps with lazy deletion | O(w), plus stale entries | O(log w) amortised |
+| Items more frequent than n/k | Misra–Gries, then a check | O(k) | O(k) at worst, usually O(1) |
+| Exact count of every item | dictionary | O(distinct items) | O(1) on average |
+
+## Top K: a heap that stays small
+
+To keep the k **largest** values of a stream, hold them in a **min**-heap, so the smallest of the k, the weakest member, is on top. Each new value is compared with the top: if it's bigger, it replaces the top and sifts down; otherwise it's discarded. You built this in [Top K, kth largest and K closest](/dsa/learn/heap-top-k). In stream terms:
+
+```swift run
+// The k slowest responses in a stream, with a min-heap that never holds more than k values
+struct MinHeap {
+    private(set) var items: [Int] = []
+    var count: Int { items.count }
+    var top: Int? { items.first }
+
+    mutating func insert(_ value: Int) {
+        items.append(value)
+        var child = items.count - 1
+        while child > 0 && items[child] < items[(child - 1) / 2] {
+            items.swapAt(child, (child - 1) / 2)
+            child = (child - 1) / 2
+        }
+    }
+
+    /// Replaces the smallest value with `value` and sifts it down
+    mutating func replaceTop(with value: Int) {
+        items[0] = value
+        var parent = 0
+        while true {
+            let left = 2 * parent + 1, right = left + 1
+            var smallest = parent
+            if left < items.count && items[left] < items[smallest] { smallest = left }
+            if right < items.count && items[right] < items[smallest] { smallest = right }
+            if smallest == parent { return }
+            items.swapAt(parent, smallest)
+            parent = smallest
+        }
+    }
+}
+
+struct SlowestK {
+    let k: Int
+    private var heap = MinHeap()                  // the k largest so far; the smallest of them on top
+    private(set) var seen = 0
+
+    init(k: Int) { self.k = k }
+
+    mutating func add(_ milliseconds: Int) {
+        seen += 1
+        if heap.count < k {
+            heap.insert(milliseconds)
+        } else if milliseconds > heap.top! {
+            heap.replaceTop(with: milliseconds)   // the new value beats the weakest of the k
+        }
+    }
+
+    var slowest: [Int] { heap.items.sorted(by: >) }
+    var stored: Int { heap.count }
+}
+
+var tracker = SlowestK(k: 3)
+for i in 1...100_000 {
+    tracker.add(i * 7_919 % 1_000_003)            // a deterministic stand-in for response times
+}
+print("seen \(tracker.seen), stored \(tracker.stored)")
+print("slowest three:", tracker.slowest)
+```
+
+```output
+seen 100000, stored 3
+slowest three: [1000000, 999997, 999994]
+```
+
+A hundred thousand values in, three stored. The memory is **O(k)** no matter how long the stream runs, and each value costs O(log k) at worst, O(1) when it's too small to matter, which for a long random stream is almost always: after the first few thousand values, a new one only gets in if it beats the current third-slowest.
+
+## The median: why exact costs O(n)
+
+The [two-heaps tracker](/dsa/learn/heap-two-heaps) keeps the median of everything seen so far with O(log n) per value. But it stores **every** value. Could a cleverer structure use less?
+
+Not for an **exact** median. Think of it this way: after half the stream, any of the values seen so far could still end up as the final median, depending on what comes next. If the algorithm forgot one, an adversary could send exactly the values that make the forgotten one the median, and the algorithm couldn't report it. So any exact one-pass median must remember essentially everything: Θ(n) memory. The same holds for any exact quantile, such as the 99th percentile.
+
+That's why real monitoring systems use **approximate** quantile sketches, such as t-digest or the Greenwald–Khanna summary. They keep a few hundred numbers and report, say, the 99th percentile to within 0.1%. "p99 latency" on a dashboard is almost always an estimate.
+
+### The median of a sliding window
+
+For the median of the **last w values**, memory drops back to O(w): everything older can be forgotten. The two-heaps tracker needs one more operation, **removing** the value that leaves the window, which could be anywhere in either heap. The answer is the lazy deletion from M39, with a twist that suits windows:
+
+- store `(value, index)` pairs, so an entry is **stale** exactly when its index has left the window: no dictionary of pending removals needed, and duplicates can't be confused;
+- when a value leaves, compare its pair with the lower half's top to learn which half holds it, and decrement that half's **live** size;
+- rebalance using the live sizes, not the heaps' raw counts, and before using either top, pop it while it's stale.
+
+Each value is pushed once and popped at most once, so the whole stream costs O(n log w). The catch is memory: stale values sit in a heap until they surface, so a heap can briefly hold more than w entries. In the worst case that's O(n) stale entries; in practice it stays close to w. When the bound matters, a balanced tree with removal by value keeps exactly w entries, at the same O(log w) per step.
+
+## Frequent items with k counters
+
+"Which error codes make up more than 10% of all errors?" An exact answer needs a counter per **distinct** item, which can be millions. The **Misra–Gries** algorithm uses just **k − 1 counters** and guarantees that every item making up more than **1/k** of the stream survives:
+
+- If the item already has a counter, add 1.
+- Otherwise, if a counter is free, give the item one, set to 1.
+- Otherwise, **subtract 1 from every counter** (removing any that hit 0), and discard the item.
+
+Each subtraction step cancels k different items at once: the new one and one of each of the k − 1 counted ones. A stream of n items can only afford n/k such steps, so an item that appears more than n/k times can't be cancelled out completely. Its counter is an **underestimate** by at most n/k.
+
+```swift run
+// Misra–Gries: every item that makes up more than 1/k of a stream, with only k - 1 counters
+func frequentCandidates(_ stream: [String], k: Int) -> [String: Int] {
+    var counters: [String: Int] = [:]
+    for item in stream {
+        if counters[item] != nil {
+            counters[item]! += 1                  // already counted: one more
+        } else if counters.count < k - 1 {
+            counters[item] = 1                    // a free counter
+        } else {
+            for key in Array(counters.keys) {     // no room: every counter loses one,
+                counters[key]! -= 1               // and the new item is cancelled out too
+                if counters[key] == 0 { counters[key] = nil }
+            }
+        }
+    }
+    return counters
+}
+
+let base = ["swift", "rust", "swift", "go", "swift", "kotlin", "rust", "swift", "zig", "rust", "swift", "c"]
+var stream: [String] = []
+for _ in 0..<1_000 { stream += base }              // 12,000 words: swift 5/12, rust 3/12
+
+let candidates = frequentCandidates(stream, k: 5)   // at most 4 counters
+for word in candidates.keys.sorted() {
+    let exact = stream.filter { $0 == word }.count  // a second pass confirms the real count
+    let verdict = exact * 5 > stream.count ? "more than 1/5" : "not frequent"
+    print(word, "counter \(candidates[word]!), exact \(exact): \(verdict)")
+}
+```
+
+```output
+c counter 1, exact 1000: not frequent
+rust counter 1667, exact 3000: more than 1/5
+swift counter 3667, exact 5000: more than 1/5
+```
+
+What to notice:
+
+- With four counters, both words above 1/5 of the stream, swift (5/12) and rust (3/12), survived, as promised. Their counters are under the true counts, but by less than n/k = 2,400.
+- "c" also holds a counter at the end, with a count of 1: Misra–Gries can report **false candidates**, never miss a true one. A second pass over the data (when it's stored somewhere, such as a log file) confirms or rejects each candidate exactly.
+- The keys are printed sorted, because a dictionary's order changes from run to run.
+- With k = 2 (one counter), this is the **Boyer–Moore majority vote**: it finds the item that makes up more than half the stream, if there is one, with O(1) memory.
+
+For "the K most frequent" over a huge stream with bounded memory, the **count-min sketch** from [Bloom filters and count-min sketches](/dsa/learn/as-bloom-sketch) estimates any item's count from a small table, and [HyperLogLog](/dsa/learn/as-hyperloglog) estimates how many distinct items there are with a few kilobytes. Both trade exactness for memory, exactly as Misra–Gries does.
+
+<Callout kind="analogy" title="A bouncer with a small guest list">
+Misra–Gries is a bouncer with room for k − 1 names on a clipboard. Regulars get a tally mark. When the clipboard is full and a stranger arrives, the bouncer crosses one mark off every name and turns the stranger away. Occasional visitors keep getting crossed off; anyone who comes more often than one visit in k keeps their place.
+</Callout>
+
+<Callout kind="gotcha" title="Common mistakes">
+- **A max-heap for the k largest.** The heap's top must be the value you'd throw away, the smallest of the k, so it's a **min**-heap.
+- **Trusting Misra–Gries counts.** They're lower bounds, and the survivors may include items that aren't frequent. Verify with a second pass when you can.
+- **Rebalancing a lazy heap by `count`.** Stale entries inflate the raw counts; balance by the live sizes you track yourself.
+- **Promising an exact streaming median in small memory.** It needs every value. Say "approximate" or "windowed".
+</Callout>
+
+## Practice
+
+**Rolling window median** asks for the median of every window of k readings in a stream of up to 100,000, with windows of tens of thousands. Sorting each window is far too slow; two heaps with lazy deletion, balanced by live sizes, fit comfortably.
+
+```cards
+- id: streaming-model
+  front: "What makes an algorithm a streaming algorithm?"
+  back: "It sees each item once, in order, uses memory much smaller than the number of items, does little work per item, and can report its answer at any moment."
+- id: stream-top-k
+  front: "How do you keep the k largest values of a stream, and at what cost?"
+  back: "A min-heap of at most k values: a new value replaces the top if it's bigger. O(k) memory and O(log k) per value."
+- id: exact-median-memory
+  front: "Why does an exact running median need O(n) memory?"
+  back: "Any value seen so far could still become the median, depending on what arrives later, so none can be forgotten. Real systems use approximate quantile sketches instead."
+- id: misra-gries
+  front: "What does Misra–Gries guarantee with k − 1 counters?"
+  back: "Every item that makes up more than n/k of the stream keeps a counter, which underestimates its count by at most n/k. Some survivors may be false candidates."
+```
+
+```quiz
+- id: q1
+  type: mcq
+  prompt: "To keep the 10 largest values of a stream, which structure should hold them?"
+  options:
+    - "A min-heap of size 10"
+    - "A max-heap of all values"
+    - "A max-heap of size 10"
+    - "A sorted array of all values"
+  answer: 0
+  explain: "The top of a min-heap is the smallest of the 10, the one a new, larger value should replace. That keeps memory at 10 values and each step at O(log 10)."
+- id: q2
+  type: trace
+  prompt: "Run Misra–Gries with k = 3 (2 counters) on the stream a, b, a, c, a, b, d. Write the counters after the whole stream, as item:count pairs in alphabetical order."
+  answer: "a:1"
+  explain: "a:1, then b takes the free counter (a:1, b:1), then a:2. c finds no room, so every counter drops: a:1, and b reaches 0 and is removed. a:2. b takes the free counter again: a:2, b:1. d finds no room: a:1, b removed. Only a survives, and a (3 of 7) is the only item above 1/3."
+- id: q3
+  type: truefalse
+  prompt: "Misra–Gries never reports an item that is not frequent."
+  answer: false
+  explain: "It can keep false candidates, like 'c' in the lesson's example. Its guarantee goes the other way: it never misses an item above n/k. A second pass confirms which candidates are real."
+- id: q4
+  type: bigo
+  prompt: "How much memory does the two-heaps running median use after n values?"
+  answer: "O(n)"
+  explain: "It stores every value, and an exact one-pass median can't do better: any stored value might still become the median."
+- id: q5
+  type: output
+  prompt: "Boyer–Moore majority vote is Misra–Gries with one counter. What does this print?"
+  code: |
+    var candidate = ""
+    var count = 0
+    for item in ["x", "y", "x", "z", "x", "x", "y"] {
+        if count == 0 {
+            candidate = item
+            count = 1
+        } else if item == candidate {
+            count += 1
+        } else {
+            count -= 1
+        }
+    }
+    print(candidate, count)
+  answer: "x 1"
+  explain: "x 1; y cancels it to 0; x 1; z cancels to 0; x 1; x 2; y cancels to 1. x makes up 4 of 7 items, more than half, so it must survive."
+```

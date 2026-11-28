@@ -1,0 +1,271 @@
+## Why it matters
+
+Every time an iOS app runs a Core Data fetch against an SQLite store, the answer comes out of a **B-tree**. SQLite stores every table and every index in its database file as a B-tree. So do most other databases, and many file systems, including Apple's HFS+ and APFS, which keep their records of files in B-trees. A B-tree is a balanced search tree whose nodes are wide: each holds dozens or hundreds of keys instead of one. That sounds like a small change, but it's designed around a fact about hardware that binary trees ignore, and it makes lookups in a table of a billion rows cost three or four reads.
+
+## Disks read pages, not keys
+
+Memory and storage don't hand you one value at a time. An SSD reads and writes in **pages** of a few kilobytes; SQLite's default page size is 4,096 bytes. A random read from an SSD takes tens of microseconds, hundreds of times longer than a read from RAM. Once a page has arrived, though, comparing the keys inside it is almost free by comparison.
+
+So for data on disk, the cost that matters isn't the number of comparisons. It's the number of **pages read**. A binary search tree reads one node per level, and each node holds one key: a million keys take about 20 reads. If each node filled a whole page, holding hundreds of keys with a child pointer between each pair, every read would narrow the search by a factor of hundreds instead of two:
+
+```swift run
+// How many levels does a tree need to hold n keys, if each node has `fanOut` children?
+func levelsNeeded(_ n: Int, fanOut: Int) -> Int {
+    var levels = 0
+    var reach = 1                       // how many keys' worth of leaves `levels` levels can address
+    while reach < n {
+        reach *= fanOut
+        levels += 1
+    }
+    return levels
+}
+
+for n in [1_000_000, 1_000_000_000] {
+    let row = [2, 16, 128, 512].map { "fan-out \($0): \(levelsNeeded(n, fanOut: $0))" }
+    print("\(n) keys →", row.joined(separator: ", "))
+}
+```
+
+```output
+1000000 keys → fan-out 2: 20, fan-out 16: 5, fan-out 128: 3, fan-out 512: 3
+1000000000 keys → fan-out 2: 30, fan-out 16: 8, fan-out 128: 5, fan-out 512: 4
+```
+
+With 512 children per node, a billion keys need only 4 levels. Better still, the top level or two are read so often that they stay cached in memory, so a lookup typically costs one or two actual disk reads. A binary tree would need 30. The **fan-out**, the number of children per node, is the base of the logarithm, and making it big makes the tree short.
+
+## What a B-tree is
+
+A **B-tree of order m** is a search tree where:
+
+1. Each node holds up to m − 1 keys, **in sorted order**.
+2. A node with k keys that isn't a leaf has exactly k + 1 children. The keys separate them: everything in child 0 is less than key 0, everything in child 1 is between key 0 and key 1, and so on, with everything in the last child greater than the last key.
+3. Every node except the root is **at least half full**: at least ⌈m/2⌉ − 1 keys.
+4. **All leaves are at the same depth.**
+
+Rule 4 is the balance rule, and it's strict: not "roughly the same depth", but exactly. Rule 3 stops nodes from being nearly empty, which would waste the page and make the tree taller.
+
+```text
+                       [ 30 | 60 ]
+              /             |              \
+     [ 10 | 20 ]       [ 40 | 50 ]       [ 70 | 80 | 90 ]
+```
+
+Searching works like a binary search tree, generalised: in each node, find the first key ≥ the target (with binary search inside a big node, or a short scan in a small one). If it equals the target, you've found it. Otherwise, follow the child pointer immediately to its left, which leads to keys between its neighbours. Searching for 45 above: in the root, 45 is between 30 and 60, so take the middle child; there, 45 is between 40 and 50, and the node is a leaf, so 45 isn't in the tree. Two nodes read.
+
+Textbooks describe the size limits in different ways. Some use the order m (the most children a node may have), others the **minimum degree** t (every node except the root has at least t children and at most 2t). The ideas are the same; check which convention a source uses before trusting its off-by-ones.
+
+## Inserting: split and grow at the top
+
+A new key always goes into a **leaf**: search for it, and add it in sorted position to the leaf where the search ends. If the leaf still has at most m − 1 keys, you're done.
+
+If it now has too many, **split** it. The middle key moves **up** into the parent, between the two child pointers, and the keys on either side of it become two separate nodes, each about half full. The parent has gained a key, so it might overflow too, and split in turn, and so on up the path.
+
+If the **root** splits, there's no parent to take the middle key, so it becomes a brand-new root with two children. That's the only way a B-tree ever gets taller: it **grows at the top**, not at the bottom. Every leaf moves down one level at the same moment, which is why all leaves always stay at the same depth.
+
+Here's a small B-tree whose nodes hold at most 3 keys, so a split happens when a node reaches 4:
+
+```swift run
+// A B-tree where a node holds at most 3 keys, so it has at most 4 children
+final class BNode {
+    var keys: [Int] = []                // sorted
+    var children: [BNode] = []          // empty for a leaf; otherwise keys.count + 1 of them
+    var isLeaf: Bool { children.isEmpty }
+}
+
+struct BTree {
+    static let maxKeys = 3
+    var root = BNode()
+
+    mutating func insert(_ key: Int) {
+        guard let (median, right) = Self.insert(key, into: root) else { return }
+        let newRoot = BNode()           // the root split: the tree grows one level, at the top
+        newRoot.keys = [median]
+        newRoot.children = [root, right]
+        root = newRoot
+    }
+
+    // Inserts key below node. If node ends up too full, it splits, returning its median key and
+    // its new right half for the parent to take in.
+    static func insert(_ key: Int, into node: BNode) -> (median: Int, right: BNode)? {
+        var i = 0
+        while i < node.keys.count && node.keys[i] < key {
+            i += 1                      // now keys[i] is the first key ≥ key, and child i is key's way down
+        }
+        if i < node.keys.count && node.keys[i] == key { return nil }   // already there
+        if node.isLeaf {
+            node.keys.insert(key, at: i)
+        } else if let (median, right) = insert(key, into: node.children[i]) {
+            node.keys.insert(median, at: i)             // the child split: take in its median…
+            node.children.insert(right, at: i + 1)      // …and its new right half
+        }
+        guard node.keys.count > maxKeys else { return nil }
+        // Too full: keep the left half, pass the middle key up, move the right half to a new node
+        let mid = node.keys.count / 2
+        let median = node.keys[mid]
+        let right = BNode()
+        right.keys = Array(node.keys[(mid + 1)...])
+        node.keys.removeSubrange(mid...)
+        if !node.isLeaf {
+            right.children = Array(node.children[(mid + 1)...])
+            node.children.removeSubrange((mid + 1)...)
+        }
+        return (median, right)
+    }
+
+    // How many nodes a search reads, or nil if key isn't there
+    func nodesRead(searchingFor key: Int) -> Int? {
+        var node = root
+        var reads = 1
+        while true {
+            var i = 0
+            while i < node.keys.count && node.keys[i] < key { i += 1 }
+            if i < node.keys.count && node.keys[i] == key { return reads }
+            if node.isLeaf { return nil }
+            node = node.children[i]
+            reads += 1
+        }
+    }
+
+    // Each level's nodes, top first, such as [4] / [2] [6 8] / …
+    var levels: String {
+        var lines: [String] = []
+        var level = [root]
+        while !level.isEmpty {
+            lines.append(level.map { "[" + $0.keys.map(String.init).joined(separator: " ") + "]" }.joined(separator: " "))
+            level = level.flatMap { $0.children }
+        }
+        return lines.joined(separator: " / ")
+    }
+}
+
+var tree = BTree()
+for key in 1...13 {
+    tree.insert(key)
+    print("insert \(key): \(tree.levels)")
+}
+print("a search for 11 reads \(tree.nodesRead(searchingFor: 11) ?? 0) nodes")
+```
+
+```output
+insert 1: [1]
+insert 2: [1 2]
+insert 3: [1 2 3]
+insert 4: [3] / [1 2] [4]
+insert 5: [3] / [1 2] [4 5]
+insert 6: [3] / [1 2] [4 5 6]
+insert 7: [3 6] / [1 2] [4 5] [7]
+insert 8: [3 6] / [1 2] [4 5] [7 8]
+insert 9: [3 6] / [1 2] [4 5] [7 8 9]
+insert 10: [3 6 9] / [1 2] [4 5] [7 8] [10]
+insert 11: [3 6 9] / [1 2] [4 5] [7 8] [10 11]
+insert 12: [3 6 9] / [1 2] [4 5] [7 8] [10 11 12]
+insert 13: [9] / [3 6] [12] / [1 2] [4 5] [7 8] [10 11] [13]
+a search for 11 reads 3 nodes
+```
+
+What to notice:
+
+- Inserting 4 overflows the root leaf [1 2 3 4]. Its middle key, 3, moves up into a new root. The tree is now two levels tall, and both leaves are at depth 2.
+- Inserting 13 overflows the leaf [10 11 12 13], which sends 12 up into the root, [3 6 9 12]. That overflows too, so the root splits and 9 becomes a new root. One insert, two splits, one new level.
+- Even with sorted input, the worst case for a plain BST, every leaf stays at the same depth. Sorted inserts do leave most nodes only half full, though, because the left half of every split never receives another key. Real databases notice this pattern and split unevenly when keys arrive in order.
+- Searching for 11 reads one node per level: [9], then [12], then the leaf [10 11].
+- `insert` is recursive, but its depth is the tree's height, which for real B-trees is three or four.
+
+Every insert reads one path, O(log n) nodes, and may split some of them. Each split is O(m) work, and splits are rare: most inserts only add a key to a leaf.
+
+## Deleting, briefly
+
+Deleting reverses the process. To delete a key from an internal node, swap it with its predecessor or successor, which is always in a leaf, so the actual removal always happens at a leaf. If that leaves the leaf less than half full, repair it in one of two ways:
+
+- **Borrow** from a sibling that has a key to spare: the separator key in the parent moves down into the short node, and the sibling's nearest key moves up to replace it. It's a rotation, done with keys.
+- **Merge** with a sibling that has none to spare: the two nodes and the separator between them become one node. The parent lost a key, so it might now be short too, and the repair continues upward. If the root ends up with no keys, its only child becomes the new root, and the tree shrinks by a level, again at the top.
+
+## B+ trees: data in the leaves, leaves in a list
+
+Most databases use a variant called the **B+ tree**, with two changes:
+
+1. **Only the leaves hold data.** Internal nodes hold copies of keys purely as signposts. Without data inside them, more keys fit in each internal page, so the fan-out is even higher and the tree even shorter. When a leaf splits, the first key of the new right leaf is **copied** up into the parent, not moved, because the key and its data must stay in a leaf.
+2. **The leaves are linked**, each to the next in key order, forming a sorted linked list along the bottom of the tree.
+
+```text
+                    [ 40 | 70 ]                     ← signposts only
+              /          |          \
+   [10 20 30] → [40 50 60] → [70 80 90]             ← every key and its data, linked left to right
+```
+
+The links make **range queries** fast. To find every order placed between two dates, descend once to the leaf holding the first date, then walk along the leaf list, reading pages in order, until you pass the second date. A query that returns k rows costs one descent plus about k / (keys per leaf) page reads. Many database engines link their leaves exactly like this; the idea is the same as the BST floor and range walk from [Floor, ceiling and a BST iterator](/dsa/learn/bst-floor-ceil-iterator), but with pages instead of nodes.
+
+In SQLite, each table is stored as a B-tree keyed by the row's id, with the row data in the leaves (the B+ tree arrangement), and each index is a separate B-tree whose keys are the indexed columns plus the row id. Looking a row up through an index means one descent through the index's tree, then one through the table's.
+
+## What this means in an iOS app
+
+In Core Data's model editor you can add **fetch indexes** to an entity. With an SQLite store, each one becomes an SQLite index: another B-tree, sorted by the attributes you chose. A fetch whose predicate filters or sorts on those attributes can then descend the index in a few page reads instead of scanning every row of the table. The cost is paid on writes: every insert, update or delete must update each index's B-tree as well. So index the attributes you search and sort by, and not the rest.
+
+The same reasoning applies in memory, at a smaller scale. A processor reads RAM in **cache lines** of 64 bytes or more, and a cache miss costs far more than a comparison. That's why some languages' standard ordered maps are B-trees rather than red-black trees: Rust's `BTreeMap`, for example, keeps several keys per node to cut down on cache misses.
+
+<Callout kind="gotcha" title="Move up, or copy up?">
+In a B-tree, a split **moves** the middle key up: it's no longer in either half. In a B+ tree, a leaf split **copies** the first key of the right half up, because every key must stay in a leaf with its data. (An internal-node split in a B+ tree moves its middle key, like a B-tree.) Mixing the two up loses keys or duplicates them.
+</Callout>
+
+```cards
+- id: btree-why-wide
+  front: "Why do databases and file systems use wide B-tree nodes instead of binary trees?"
+  back: "Storage is read a page at a time, and reading a page costs far more than comparing keys in it. Filling each node with hundreds of keys makes the fan-out, and so the base of the logarithm, huge: a billion keys fit in 4 levels."
+- id: btree-rules
+  front: "What keeps a B-tree balanced?"
+  back: "All leaves are at exactly the same depth, and every node except the root is at least half full. Nodes hold sorted keys, with one more child than keys."
+- id: btree-insert
+  front: "How does a B-tree insert handle a full node, and how does the tree get taller?"
+  back: "An overfull node splits in two and moves its middle key up into the parent, which may split in turn. When the root splits, a new root is created: the tree grows at the top."
+- id: bplus-tree
+  front: "How does a B+ tree differ from a B-tree, and why?"
+  back: "Only the leaves hold data, and they're linked in key order. Internal nodes become pure signposts with higher fan-out, and range queries become one descent plus a walk along the leaves."
+```
+
+```quiz
+- id: q1
+  type: mcq
+  prompt: "Why is a B-tree's height so much smaller than a binary search tree's for the same keys?"
+  options:
+    - "It stores fewer keys"
+    - "Each node has many children, so the height is log base m of n instead of log base 2"
+    - "It keeps only the most recently used keys"
+    - "It rebalances more often"
+  answer: 1
+  explain: "With m children per node, each level multiplies the reach by m. With m in the hundreds, a billion keys need about 4 levels instead of 30."
+- id: q2
+  type: truefalse
+  prompt: "When a B-tree's root splits, every leaf moves one level deeper at the same time."
+  answer: true
+  explain: "A root split creates a new root above the old one, so every path gains one node. That's why all leaves always stay at the same depth: the tree only grows at the top."
+- id: q3
+  type: trace
+  prompt: "A B-tree whose nodes hold at most 3 keys has the root [5] with children [1 3] and [7 8 9]. Nodes split as in the lesson's code: when a node reaches four keys, the third one moves up. You insert 10. What are the root's keys afterwards?"
+  answer: "5, 9"
+  explain: "10 joins the leaf [7 8 9], making [7 8 9 10]: one key too many. It splits, sending its third key, 9, up into the parent and leaving [7 8] and [10]. The root becomes [5 9], with three children."
+- id: q4
+  type: output
+  prompt: "What does this print?"
+  code: |
+    func levelsNeeded(_ n: Int, fanOut: Int) -> Int {
+        var levels = 0
+        var reach = 1
+        while reach < n {
+            reach *= fanOut
+            levels += 1
+        }
+        return levels
+    }
+    print(levelsNeeded(1_000, fanOut: 10), levelsNeeded(1_001, fanOut: 10), levelsNeeded(1_000, fanOut: 2))
+  answer: "3 4 10"
+  explain: "10³ = 1,000 reaches exactly 1,000 keys in 3 levels, but 1,001 needs a fourth. With fan-out 2, it takes 10 levels, since 2¹⁰ = 1,024."
+- id: q5
+  type: multi
+  prompt: "Which are true of B+ trees? Choose all that apply."
+  options:
+    - "Every key's data lives in a leaf"
+    - "Internal nodes hold copies of keys as signposts"
+    - "Leaves can be linked in key order to speed up range scans"
+    - "Each key appears in exactly one node"
+  answer: [0, 1, 2]
+  explain: "A key used as a signpost appears in an internal node and again in its leaf, so keys can appear more than once. Data only lives in the leaves, and linking them turns a range query into one descent plus a sequential walk."

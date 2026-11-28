@@ -1,0 +1,356 @@
+## Why it matters
+
+A design that only exists in prose never meets a compiler. The course's katas turn the components you design (retry policies, caches, token refreshers, coordinators, outboxes) into real Swift with real tests, in a package called `design-swift`. It also holds a small library, DesignKit, that makes code with clocks, randomness and networks testable. That habit of injecting the outside world is a design skill in its own right, and interviewers listen for it.
+
+## What's in the package
+
+The package is the `design-swift` folder at the root of this portfolio's repository. Open the folder in Xcode, or work from Terminal:
+
+```text title="design-swift/"
+Package.swift          Swift 6 language mode; macOS 15 and iOS 18
+Sources/
+  DesignKit/           helpers every kata can use
+  Exercises/           ← your code: a stub for every kata
+  Solutions/           reference solutions
+Tests/
+  DesignTests/         one test suite per kata
+  DesignKitTests/      tests for DesignKit itself
+Examples/              every runnable example from the lessons
+```
+
+Inside `Exercises`, `Solutions` and `Tests/DesignTests`, each folder is named after a module id, so the backoff kata from D14 lives at `Sources/Exercises/sd-resilience-patterns/BackoffSchedule.swift`.
+
+Every kata is one **namespace**: a `public enum` that holds the kata's types as nested declarations, so hundreds of katas never collide. Katas use only Foundation and Swift Concurrency, so `swift test` runs on a Mac with no simulator. Code that needs UIKit or SwiftUI stays in the lessons, where it's type-checked against the iOS SDK.
+
+Here's a stub exactly as you'll find it. It compiles, but returns an empty schedule, so its tests fail until you write it:
+
+```swift check title="Sources/Exercises/sd-resilience-patterns/BackoffSchedule.swift"
+// Kata: Backoff schedule (D14 · Retry with exponential backoff and jitter)
+import Foundation
+
+public enum BackoffSchedule {
+    /// How randomness spreads retries out, so many clients that failed together don't retry together
+    public enum Jitter: Sendable {
+        /// Exactly the exponential delay
+        case none
+        /// Anywhere from zero up to the exponential delay
+        case full
+        /// Half the exponential delay, plus up to another half at random
+        case equal
+    }
+
+    /// The delay in seconds before each of `retries` retries. The first waits `base`, each one after
+    /// `factor` times longer than the one before, and none longer than `cap`; then jitter is applied.
+    public static func delays<G: RandomNumberGenerator>(retries: Int, base: Double, factor: Double = 2, cap: Double, jitter: Jitter, using generator: inout G) -> [Double] {
+        // Write your solution here, then run:
+        // swift test --filter BackoffScheduleTests
+        return []
+    }
+}
+```
+
+## Swift 6 language mode, and why
+
+`Package.swift` sets `swiftLanguageModes: [.v6]`. In Swift 6 mode the compiler checks for **data races**: two pieces of code touching the same mutable state at the same time, with at least one of them writing. A race that would be an occasional crash in production becomes a compile error at your desk.
+
+That matters here because so many katas are concurrent: caches shared between tasks, retries that sleep, a token refresher that a dozen requests wait on. This prefetcher compiles silently in Swift 5 mode:
+
+```swift title="Prefetcher.swift"
+import Foundation
+
+final class ImageCache {
+    var images: [URL: Data] = [:]
+}
+
+func prefetch(_ urls: [URL], into cache: ImageCache) {
+    for url in urls {
+        Task.detached {
+            cache.images[url] = try? Data(contentsOf: url)
+        }
+    }
+}
+```
+
+In Swift 6 mode it doesn't compile, because every task writes to the same dictionary at once:
+
+```text title="What you'll see"
+error: passing closure as a 'sending' parameter risks causing data races between code
+       in the current isolation context and concurrent execution of the closure
+note: closure captures 'cache' which is accessible to code in the current isolation context
+```
+
+The fix is a design decision, not a workaround: make `ImageCache` an `actor`, so it owns its state and callers take turns. Swift 6 mode keeps asking you the questions a concurrent design must answer: who owns this state, and what is allowed to cross between tasks? You'll study the rules properly in D22.
+
+## Running a kata
+
+From the `design-swift` folder:
+
+```bash
+swift test --filter BackoffScheduleTests
+```
+
+The first build takes a minute or two; after that only what changed is rebuilt. Before you've written anything, the run ends with failures like these (an excerpt):
+
+```text title="What you'll see"
+✘ Test "Without jitter the delays double, then stop at the cap" recorded an issue
+  at BackoffScheduleTests.swift:17:9: Expectation failed: schedule(.none) == [0.5, 1, 2, 4, 4, 4]
+    schedule(.none) → []
+✘ Suite BackoffScheduleTests failed after 0.001 seconds with 6 issues.
+```
+
+Each issue names the check that failed, what was expected and what your code returned. Fix, run, repeat until the suite passes.
+
+To run the same tests against the reference solution, add one flag:
+
+```bash
+swift test -Xswiftc -DSOLUTIONS --filter BackoffScheduleTests
+```
+
+`-Xswiftc -DSOLUTIONS` hands the compiler a condition named `SOLUTIONS`, and every test file starts like this, so one set of tests checks either your code or the reference:
+
+```swift title="Tests/DesignTests/sd-resilience-patterns/BackoffScheduleTests.swift"
+import DesignKit
+import Testing
+#if SOLUTIONS
+import Solutions
+#else
+import Exercises
+#endif
+```
+
+From the repository root, `npm run design:swift` runs every kata against your code, and `npm run design:solutions` against the solutions. As with DSA: try a kata properly before you open its solution, then close it and write your own.
+
+Runnable lesson examples are copied into `Examples/`. A code block's **Run in design-swift** button copies a command like `swift Examples/sd-orientation/sd-orientation-companion-1.swift`.
+
+## DesignKit: inject the world
+
+Code that reads the clock, generates random numbers, calls the network or writes to storage is hard to test: the result changes from run to run, and a test that waits for a 30-second retry takes 30 seconds. The fix is to **inject** those things: the code takes them as parameters, production passes the real ones, and tests pass fakes. DesignKit supplies the fakes.
+
+This complete program shows the idea with small copies of two DesignKit types, so it runs on its own. `ForecastLoader` never mentions `URLSession`; it's handed a client, and the "server" here is a script:
+
+```swift run title="ForecastLoader.swift"
+import Foundation
+
+/// The same shape as DesignKit's `HTTPClient`: all a networking layer needs from the network
+protocol HTTPClient: Sendable {
+    func send(_ request: URLRequest) async throws -> (Data, HTTPURLResponse)
+}
+
+/// A small `StubHTTPClient`: answers from a script and records every path it was sent
+actor StubClient: HTTPClient {
+    private var script: [(status: Int, body: String)]
+    private(set) var paths: [String] = []
+
+    init(_ script: [(status: Int, body: String)]) {
+        self.script = script
+    }
+
+    func send(_ request: URLRequest) async throws -> (Data, HTTPURLResponse) {
+        paths.append(request.url?.path() ?? "")
+        let (status, body) = script.count > 1 ? script.removeFirst() : script[0]
+        let response = HTTPURLResponse(url: request.url!, statusCode: status, httpVersion: nil, headerFields: nil)!
+        return (Data(body.utf8), response)
+    }
+}
+
+struct Forecast: Decodable {
+    let place: String
+    let celsius: Int
+}
+
+enum ForecastError: Error {
+    case unavailable(status: Int)
+}
+
+/// The code under test never mentions URLSession: it's handed a client
+struct ForecastLoader {
+    let client: any HTTPClient
+
+    func forecast(for place: String) async throws -> Forecast {
+        let request = URLRequest(url: URL(string: "https://api.example.com/forecast/\(place)")!)
+        var (data, response) = try await client.send(request)
+        if response.statusCode >= 500 {
+            // One retry for a server error. A real policy waits first: you'll build one in D14.
+            (data, response) = try await client.send(request)
+        }
+        guard response.statusCode == 200 else { throw ForecastError.unavailable(status: response.statusCode) }
+        return try JSONDecoder().decode(Forecast.self, from: data)
+    }
+}
+
+let flaky = StubClient([
+    (status: 503, body: ""),
+    (status: 200, body: #"{"place": "London", "celsius": 14}"#),
+])
+let forecast = try await ForecastLoader(client: flaky).forecast(for: "london")
+print("\(forecast.place): \(forecast.celsius)°C")
+print("Sent:", await flaky.paths)
+
+let down = StubClient([(status: 503, body: "")])
+do {
+    _ = try await ForecastLoader(client: down).forecast(for: "paris")
+} catch {
+    print("Failed:", error)
+}
+print("Sent:", await down.paths)
+```
+
+```output
+London: 14°C
+Sent: ["/forecast/london", "/forecast/london"]
+Failed: unavailable(status: 503)
+Sent: ["/forecast/paris", "/forecast/paris"]
+```
+
+Two scenarios, a server error that recovers and one that doesn't, each tested in microseconds with no network. In katas you `import DesignKit` and use its real `HTTPClient` and `StubHTTPClient`; production code passes `URLSession.shared`, which DesignKit makes conform to `HTTPClient`.
+
+### TestClock: time that only moves when you say
+
+Code that waits takes `any Clock<Duration>` and calls `clock.sleep(for:)`. Tests pass a `TestClock` and move it forward by hand:
+
+```swift
+let clock = TestClock()
+let task = Task {
+    try await clock.sleep(for: .seconds(30))
+    return "woke"
+}
+while clock.sleeperCount == 0 { await Task.yield() }   // wait until the task is asleep
+clock.advance(by: .seconds(30))                        // 30 seconds pass instantly
+#expect(try await task.value == "woke")
+```
+
+After advancing, `await settle()` lets other tasks run until they've caught up, so a test can check what happened next.
+
+### SeededGenerator: randomness you can repeat
+
+Anything with jitter or shuffling takes `inout some RandomNumberGenerator`. A `SeededGenerator` gives the same sequence for the same seed, so a test can check exact values:
+
+```swift
+var generator = SeededGenerator(seed: 42)
+let delay = Double.random(in: 0...2, using: &generator)   // the same number on every run
+```
+
+### HTTPClient and StubHTTPClient: a network you script
+
+`HTTPClient` is a one-method protocol, and `StubHTTPClient` answers each request with the next responder in its list (the last one answers everything after it) and records every request:
+
+```swift
+let client = StubHTTPClient([
+    { _ in (Data(), 503) },
+    { _ in (Data(#"{"place":"London","celsius":14}"#.utf8), 200) },
+])
+// …run the code under test with `client`, then:
+#expect(await client.requests.count == 2)
+```
+
+### InMemoryKeyValueStore and Recorder
+
+`InMemoryKeyValueStore` is an actor that stands in for `UserDefaults`, the Keychain or a disk cache. `Recorder` collects values from any task, in the order they arrive: analytics events, log lines, state changes.
+
+```swift
+let store = InMemoryKeyValueStore()
+await store.set(Data("abc123".utf8), for: "token")
+#expect(await store.keys == ["token"])
+
+let events = Recorder<String>()
+await events.record("opened")
+#expect(await events.values == ["opened"])
+```
+
+### Unimplemented: stubs that fail fast
+
+A stub that has nothing sensible to return throws `Unimplemented()`, which describes itself with the function's name ("refresh() isn't written yet"). Stubs never use `fatalError`, never loop forever and never sleep, so one unwritten kata can't crash or hang the whole test run.
+
+## The editor in the console
+
+Every kata page has an editor that starts from the stub. What you type autosaves with the rest of your progress, so it follows you between devices; **Reset** goes back to the stub, and **Download** saves the file under the right name.
+
+On the dev server (`npm run dev`) there's one more button, **Save to package**. It writes your code over the stub in `Sources/Exercises`, so `swift test --filter` checks it straight away; the page shows that command with a Copy button. It works only on your own machine and can only overwrite files that already exist there. On the published site, download the file and put it in the matching folder instead.
+
+## Trade-offs
+
+| How you test code that waits or calls out | Speed | Flaky? | What it proves | When it wins |
+| --- | --- | --- | --- | --- |
+| Real sleeps and the real network | Seconds per test | Often | The whole stack works together | A few end-to-end checks, never unit tests |
+| Injected clock, generator and client | Milliseconds | No | Your logic, exactly | Katas and nearly all app logic |
+| Very short real delays | Fast-ish | Sometimes, on a busy machine | Not much: timing bugs hide | Rarely; it postpones the problem |
+
+<Callout kind="interview">
+
+When you design a component in an interview, such as a retry policy, an image cache or a token refresher, say how you'd test it: "The refresher takes a clock and an HTTP client, so tests can trigger expiry and failures instantly." **Red flags:** "I'd add a sleep to the test", and components that reach for `Date()`, `URLSession.shared` or a singleton from deep inside, which leaves no seam to test through.
+
+</Callout>
+
+<Callout kind="gotcha" title="Swift gotcha: Task.sleep ignores your test clock">
+
+`Task.sleep(for:)` always sleeps on the real continuous clock. If code under test calls it instead of `clock.sleep(for:)` on the clock it was given, advancing a `TestClock` does nothing: the test either waits in real time or hangs. Every wait in a kata goes through the injected clock.
+
+</Callout>
+
+```cards
+- id: run-a-kata
+  front: "How do you check a kata, and how do you check its reference solution?"
+  back: "From `design-swift`, `swift test --filter <Kata>Tests` tests your Exercises. Adding `-Xswiftc -DSOLUTIONS` compiles the same tests against Solutions."
+- id: inject-the-world
+  front: "Why do katas take a clock, a random generator and an HTTP client as parameters?"
+  back: "So tests can pass `TestClock`, `SeededGenerator` and `StubHTTPClient`: no real waiting, the same random numbers on every run, and no network. Tests become fast and deterministic."
+- id: swift-6-mode
+  front: "What does Swift 6 language mode add?"
+  back: "Full data-race checking: sharing unprotected mutable state between concurrent tasks is a compile error instead of an occasional crash in production."
+```
+
+```quiz
+- id: q1
+  type: mcq
+  prompt: "You're working on the backoff kata. Which folder holds the file you edit?"
+  options:
+    - "`Sources/Solutions`"
+    - "`Sources/Exercises`"
+    - "`Tests/DesignTests`"
+    - "`Sources/DesignKit`"
+  answer: 1
+  explain: "Your code goes in `Sources/Exercises`, inside the folder named after the kata's module, `sd-resilience-patterns`. The tests in `Tests/DesignTests` check it, and `Sources/Solutions` holds the reference."
+- id: q2
+  type: blank
+  prompt: "Complete the command that runs the backoff kata's tests against the reference solution."
+  code: |
+    swift test -Xswiftc ___ --filter BackoffScheduleTests
+  answers:
+    - "-DSOLUTIONS"
+  explain: "`-Xswiftc` passes the next argument to the compiler, and `-DSOLUTIONS` defines the `SOLUTIONS` condition that makes the tests `import Solutions` instead of `Exercises`."
+- id: q3
+  type: bug
+  prompt: "This test should check that a retrier tries again after two seconds, but it hangs. Which line is wrong?"
+  code: |
+    @Test func retriesAfterTwoSeconds() async throws {
+        let clock = TestClock()
+        let client = StubHTTPClient([{ _ in (Data(), 503) }, { _ in (Data(), 200) }])
+        let retrier = Retrier(client: client, clock: clock, delay: .seconds(2))
+        let task = Task { try await retrier.send(URLRequest(url: URL(string: "https://example.com")!)) }
+        try await Task.sleep(for: .seconds(2))
+        #expect(try await task.value.statusCode == 200)
+    }
+  answer: 6
+  explain: "The retrier waits on the `TestClock`, which only moves when the test advances it. A real two-second sleep never moves it, so the retrier waits forever. Wait until `clock.sleeperCount` is 1, then call `clock.advance(by: .seconds(2))`."
+- id: q4
+  type: multi
+  prompt: "Which of these keep a kata's tests deterministic? Choose all that apply."
+  options:
+    - "Taking `any Clock<Duration>` and passing a `TestClock` in tests"
+    - "Drawing random numbers from a `SeededGenerator`"
+    - "Calling `Date()` inside the function under test"
+    - "Sending requests through `URLSession.shared`"
+    - "Answering requests from a `StubHTTPClient`"
+  answer: [0, 1, 4]
+  explain: "Injected time, randomness and network give the same result on every run. `Date()` and the real network change between runs, so tests that rely on them become slow and flaky."
+- id: q5
+  type: mcq
+  prompt: "Why does `design-swift` use Swift 6 language mode?"
+  options:
+    - "Swift Testing only works in Swift 6 mode"
+    - "Data races become compile errors, so the compiler checks how a design shares state between tasks"
+    - "It makes debug builds faster"
+    - "It's needed to import Foundation on macOS"
+  answer: 1
+  explain: "Swift Testing works in either mode. Swift 6 mode's data-race checking is the point: concurrent katas only compile once their isolation, meaning who owns which state, is sound."
+```

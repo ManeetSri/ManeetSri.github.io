@@ -1,0 +1,323 @@
+## Why it matters
+
+The [LRU cache](/dsa/learn/ll-lru-cache) throws out whatever was used least **recently**. That's usually right, but it has a blind spot: one long scan through items you'll never need again, such as a user flicking once through an entire photo library, pushes out everything that was genuinely popular. An **LFU cache** (least **frequently** used) evicts the entry used the fewest times instead, so a favourite that's been used fifty times survives any number of one-off visitors. Think of a keyboard's "frequently used" emoji row, or a map app keeping the tiles of your home town. "Design an LFU cache with O(1) operations" is also LRU's harder sibling in interviews, and the answer is a neat combination of structures you already know.
+
+## The rules
+
+An LFU cache holds at most `capacity` entries. Each entry has a **use count**, its frequency:
+
+- Setting a **new** key stores it with a count of 1.
+- **Reading** a key, or **setting** a key that's already there, adds 1 to its count.
+- When a new key arrives and the cache is full, evict the entry with the **lowest count**. If several entries share the lowest count, evict the **least recently used** of them.
+
+That tie-break matters more than it looks. Without it, a cache full of entries used once each would have no rule for choosing; with it, LFU behaves like LRU among equals.
+
+## Why the obvious designs are slow
+
+| Design | Use a key | Find the victim |
+| --- | --- | --- |
+| Dictionary of (value, count, last use) | O(1) | O(n): scan for the lowest count |
+| Heap ordered by (count, last use) | O(log n): the key's entry must sift | O(log n) |
+| Dictionary + one list sorted by count | O(n): a key may pass many others | O(1): the end of the list |
+| Dictionary + **one list per count** | **O(1)** | **O(1)** |
+
+The heap works and is a fine answer when O(log n) is allowed: it needs an indexed heap, which can find a key's position to sift it, as in [d-ary heaps and indexed priority queues](/dsa/learn/heap-variants). The O(1) design rests on one observation: **a use only ever moves a key from count c to count c + 1**. It never jumps further. So keep a separate list for each count, and a use moves a node from one list to the next.
+
+## The design
+
+```text
+nodes:    "smile" -> node   "heart" -> node   "thumbs" -> node
+
+buckets:  1 -> [head] <-> thumbs <-> [tail]
+          2 -> [head] <-> heart  <-> [tail]
+          3 -> [head] <-> smile  <-> [tail]
+
+minFrequency = 1
+```
+
+- **`nodes`**: a dictionary from each key to its node. A node stores its key, value and count, plus `next` and `previous` links.
+- **`buckets`**: a dictionary from each count to a **doubly linked list** of the nodes with that count, most recently used at the front: exactly the list from the LRU cache, one per count.
+- **`minFrequency`**: the lowest count in the cache. The victim is always at the back of `buckets[minFrequency]`.
+
+Every operation is now a handful of O(1) steps:
+
+- **Use a key** (read, or update): unlink its node from `buckets[c]`, add 1 to its count, and insert it at the front of `buckets[c + 1]`.
+- **Evict**: take the back node of `buckets[minFrequency]`, unlink it, and remove its key from `nodes`.
+- **Insert a new key**: create a node with count 1, put it at the front of `buckets[1]`, and set `minFrequency` to 1.
+
+### Keeping minFrequency right without searching
+
+Finding the smallest count by scanning the dictionary's keys would be O(n). It's never needed, because `minFrequency` can only change in two ways:
+
+1. **A new key arrives.** Its count is 1, the lowest possible, so `minFrequency` becomes 1.
+2. **A use empties the lowest bucket.** If the key being used had count `minFrequency` and was the last one there, every key now has a higher count, and the moved key itself has count `minFrequency + 1`. So the new minimum is exactly one more.
+
+Eviction can empty the lowest bucket too, but eviction is always followed by an insert, which resets `minFrequency` to 1 anyway.
+
+## Building it
+
+Here's a cache of capacity 3 for an emoji keyboard's "frequently used" row. Values stand in for the emoji images, and `summary` lists each bucket, most recent first:
+
+```swift run
+final class LFUCache {
+    final class Node {
+        let key: String
+        var value: Int
+        var frequency = 1
+        var next: Node?
+        weak var previous: Node?
+
+        init(key: String, value: Int) {
+            self.key = key
+            self.value = value
+        }
+    }
+
+    // One frequency's keys: a doubly linked list with sentinels, most recently used first
+    final class Bucket {
+        let head = Node(key: "", value: 0)
+        let tail = Node(key: "", value: 0)
+
+        init() {
+            head.next = tail
+            tail.previous = head
+        }
+
+        var isEmpty: Bool { head.next === tail }
+
+        func insertAtFront(_ node: Node) {
+            let first = head.next!
+            node.previous = head
+            node.next = first
+            head.next = node
+            first.previous = node
+        }
+
+        func unlink(_ node: Node) {
+            node.previous!.next = node.next
+            node.next!.previous = node.previous
+        }
+
+        var keys: [String] {
+            var result: [String] = []
+            var current = head.next!
+            while current !== tail {
+                result.append(current.key)
+                current = current.next!
+            }
+            return result
+        }
+    }
+
+    let capacity: Int
+    private var nodes: [String: Node] = [:]       // key → its node
+    private var buckets: [Int: Bucket] = [:]      // frequency → the keys used that often
+    private var minFrequency = 0                  // the lowest frequency in the cache
+
+    init(capacity: Int) {
+        self.capacity = capacity
+    }
+
+    private func bucket(for frequency: Int) -> Bucket {
+        if let bucket = buckets[frequency] { return bucket }
+        let bucket = Bucket()
+        buckets[frequency] = bucket
+        return bucket
+    }
+
+    // A use: move the node from its frequency's list to the front of the next one
+    private func touch(_ node: Node) {
+        let old = buckets[node.frequency]!
+        old.unlink(node)
+        if old.isEmpty {
+            buckets[node.frequency] = nil
+            if minFrequency == node.frequency { minFrequency += 1 }
+        }
+        node.frequency += 1
+        bucket(for: node.frequency).insertAtFront(node)
+    }
+
+    func value(for key: String) -> Int? {
+        guard let node = nodes[key] else { return nil }
+        touch(node)
+        return node.value
+    }
+
+    func setValue(_ value: Int, for key: String) {
+        guard capacity > 0 else { return }
+        if let node = nodes[key] {                // an update is a use; nothing is evicted
+            node.value = value
+            touch(node)
+            return
+        }
+        if nodes.count == capacity {              // evict: lowest frequency, least recent of those
+            let bucket = buckets[minFrequency]!
+            let victim = bucket.tail.previous!
+            bucket.unlink(victim)
+            if bucket.isEmpty { buckets[minFrequency] = nil }
+            nodes[victim.key] = nil
+            print("  evicted \(victim.key) (used \(victim.frequency)x)")
+        }
+        let node = Node(key: key, value: value)
+        nodes[key] = node
+        bucket(for: 1).insertAtFront(node)
+        minFrequency = 1                          // a new key is always the least used
+    }
+
+    var summary: String {
+        buckets.keys.sorted().map { "\($0)x: \(buckets[$0]!.keys)" }.joined(separator: "  ")
+    }
+}
+
+let recent = LFUCache(capacity: 3)          // an emoji keyboard's "frequently used" row
+recent.setValue(1, for: "smile")
+recent.setValue(2, for: "heart")
+recent.setValue(3, for: "thumbs")
+_ = recent.value(for: "smile")
+_ = recent.value(for: "smile")
+_ = recent.value(for: "heart")
+print(recent.summary)
+
+print("set fire")
+recent.setValue(4, for: "fire")
+_ = recent.value(for: "fire")
+print(recent.summary)
+
+print("set star")
+recent.setValue(5, for: "star")
+print(recent.summary)
+print("heart:", recent.value(for: "heart") ?? 0, "smile:", recent.value(for: "smile") ?? 0)
+print(recent.summary)
+```
+
+```output
+1x: ["thumbs"]  2x: ["heart"]  3x: ["smile"]
+set fire
+  evicted thumbs (used 1x)
+2x: ["fire", "heart"]  3x: ["smile"]
+set star
+  evicted heart (used 2x)
+1x: ["star"]  2x: ["fire"]  3x: ["smile"]
+heart: 0 smile: 1
+1x: ["star"]  2x: ["fire"]  4x: ["smile"]
+```
+
+Follow it step by step:
+
+| Step | Counts afterwards | What happened |
+| --- | --- | --- |
+| set smile, heart, thumbs | smile 1, heart 1, thumbs 1 | full |
+| read smile twice, heart once | smile 3, heart 2, thumbs 1 | each read moves a node up one bucket |
+| set fire | smile 3, heart 2, fire 1 | thumbs had the lowest count: evicted |
+| read fire | smile 3, heart 2, fire 2 | bucket 1 empties, so `minFrequency` goes from 1 to 2 |
+| set star | smile 3, fire 2, star 1 | heart and fire tie at 2; heart was used less recently: evicted |
+
+An LRU cache given the same requests would have evicted **smile** at the last step: it had gone longest without a use, even though it was the favourite. That's exactly the difference between the two policies.
+
+### Why each piece is there
+
+- **`frequency` lives in the node**, so a use knows which bucket the node is in without searching.
+- **The node stores its key**, so eviction, which only has the node at the back of a list, can remove the dictionary entry. It's the same reason as in the LRU cache.
+- **Empty buckets are removed** from `buckets`. Otherwise a long-running cache would collect an empty list for every count ever reached.
+- **`previous` is weak**, so neighbouring nodes don't keep each other alive, as you saw in [weak and unowned references](/dsa/learn/swift-weak-unowned).
+- **A capacity of 0** stores nothing. Without the guard, the first insert would look for a victim in an empty cache and crash on `buckets[minFrequency]!`.
+
+### How fast is it?
+
+Each operation does a constant number of dictionary operations (O(1) on average) and link changes, so `value(for:)` and `setValue(_:for:)` are **O(1) on average**. Memory is O(capacity): one node and one dictionary entry per key, plus at most one bucket per distinct count, which is never more than the number of keys.
+
+## LFU's own weakness, and the fixes
+
+Pure LFU remembers too well. An emoji you used two hundred times last year still outranks this month's new favourite, which keeps getting evicted before it can catch up. Real caches soften this:
+
+- **Ageing.** Periodically halve every count, so old popularity fades. Halving all counts at once is O(n), but it's rare.
+- **Count, but forget evicted keys.** The design above already does this: an evicted key that returns starts again at 1.
+- **Approximate counts for everything.** Some high-performance caches estimate how often each key has been requested, including keys not currently cached, with a compact probabilistic counter called a count-min sketch, and admit a new key only if it's requested more often than the victim. You'll build a count-min sketch later in this module.
+
+Which policy wins depends on the workload, and [Cache policies: LRU, LFU and FIFO](/dsa/learn/rand-cache-policies) measures them against each other.
+
+## In an iOS app
+
+Foundation's `NSCache` evicts automatically under memory pressure, but it doesn't promise LRU, LFU or any particular order. When the order matters, as with a "frequently used" row that must show the right items, you build the policy yourself. Two refinements from the LRU lesson apply unchanged: limit by **cost** (such as bytes) rather than count, and empty the cache when the system warns that memory is low. And as with any cache shared between threads, protect it with a lock or an actor, which is a Part IX topic.
+
+<Callout kind="gotcha" title="Common mistakes">
+- **Evicting on update.** Setting a key that's already cached is a use, not an insert. Check for the key before checking whether the cache is full.
+- **Forgetting the tie-break.** Within the lowest count, evict the **least recently used**: the back of that bucket's list. Evicting the front, or an arbitrary key, fails the tests that check ties.
+- **Searching for the new minimum.** After a use empties the lowest bucket, the minimum is exactly one more. No scan is needed.
+- **Treating a miss as a use.** Reading a key that isn't cached changes nothing.
+</Callout>
+
+## Practice
+
+**LFU cache** asks for a generic `Cache<Key: Hashable, Value>` with `frequency(of:)` and an `evictionOrder` that lists every key from first to last to be evicted. The tests compare it with a slow but obvious model over thousands of operations, check that evicted values are really freed, and run more than 100,000 operations on a cache of 50,000 entries, where an O(n) scan for each eviction would take billions of steps.
+
+```cards
+- id: lfu-structures
+  front: "Which structures make an LFU cache O(1)?"
+  back: "A dictionary from key to node, a dictionary from count to a doubly linked list of nodes with that count (most recent first), and a variable holding the lowest count."
+- id: lfu-tie-break
+  front: "In an LFU cache, which entry is evicted when several share the lowest count?"
+  back: "The least recently used of them: the node at the back of the lowest count's list."
+- id: lfu-min-frequency
+  front: "How does an LFU cache keep minFrequency correct in O(1)?"
+  back: "A new key sets it to 1. A use that empties the lowest bucket raises it by exactly 1, because the moved key now has that count. Nothing else changes it."
+- id: lfu-vs-lru
+  front: "What workload does LFU handle better than LRU, and what does it handle worse?"
+  back: "Better: a one-off scan of many items, which flushes an LRU cache but can't outvote popular items. Worse: popularity that shifts over time, since old counts linger unless they're aged."
+```
+
+```quiz
+- id: q1
+  type: trace
+  prompt: "An LFU cache with capacity 2 runs: set a, set b, read a, set c, read c, set d. Which keys are left? List them in alphabetical order, separated by commas."
+  answer: "c, d"
+  explain: "After read a, the counts are a 2, b 1. Set c evicts b (lowest count). Read c makes c 2, so a and c tie at 2, with a used less recently. Set d evicts a. Left: c and d."
+- id: q2
+  type: mcq
+  prompt: "This version of `touch` never changes `minFrequency`. What goes wrong?"
+  code: |
+    private func touch(_ node: Node) {
+        let old = buckets[node.frequency]!
+        old.unlink(node)
+        if old.isEmpty {
+            buckets[node.frequency] = nil
+        }
+        node.frequency += 1
+        bucket(for: node.frequency).insertAtFront(node)
+    }
+  options:
+    - "Nothing: minFrequency is only needed for inserts"
+    - "Reads become O(n)"
+    - "After a use empties the lowest bucket, the next eviction looks up a bucket that no longer exists"
+    - "Updates evict the wrong key"
+  answer: 2
+  explain: "When the only key with the lowest count is used, its bucket is removed but `minFrequency` still names it. The next eviction does `buckets[minFrequency]!` on a missing bucket and crashes."
+- id: q3
+  type: truefalse
+  prompt: "In an LFU cache, setting a new value for a key that's already cached adds 1 to its count."
+  answer: true
+  explain: "An update counts as a use, like a read. It also never evicts anything, because the number of keys doesn't change."
+- id: q4
+  type: bigo
+  prompt: "With the bucket design, what is the average time of one `setValue(_:for:)` that has to evict?"
+  answer: "O(1)"
+  explain: "The victim is the back node of `buckets[minFrequency]`: one dictionary lookup and a few link changes, then an O(1) insert into bucket 1."
+- id: q5
+  type: output
+  prompt: "This counts uses with a dictionary and picks a victim by scanning: the slow O(n) way. Ties go to the smaller last-use time. What does it print?"
+  code: |
+    let uses = ["a", "b", "a", "c", "b", "c", "d"]
+    var count: [String: Int] = [:]
+    var lastUse: [String: Int] = [:]
+    for (time, key) in uses.enumerated() {
+        count[key, default: 0] += 1
+        lastUse[key] = time
+    }
+    let victim = count.keys.min { (count[$0]!, lastUse[$0]!) < (count[$1]!, lastUse[$1]!) }!
+    print(victim, count[victim]!, lastUse[victim]!)
+  answer: "d 1 6"
+  explain: "a, b and c were used twice each; d once. The lowest count wins outright, so d is the victim even though it's the most recent. The bucket design finds the same victim in O(1)."
+- id: q6
+  type: recall
+  prompt: "Why can a use move a node between buckets in O(1), and why is that the key to the whole design?"
+  model: "A use changes a count from c to exactly c + 1, so the node moves from bucket c to bucket c + 1, which the dictionary finds in O(1). Unlinking from a doubly linked list and inserting at the front are O(1). A single sorted list would need the node to walk past every other node with count c + 1; separate buckets make the move one step."

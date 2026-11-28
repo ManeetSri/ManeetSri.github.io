@@ -1,0 +1,137 @@
+// Part VI: Backend & distributed systems for mobile engineers (D41–D48). The server side an app
+// depends on: how requests travel, estimation, scaling, data at scale, async systems, push, identity
+// and reliability. The part is on the backend track, except lessons about code that runs in the app
+// (push on the device, OAuth in the app, tracing from the device), which are core.
+//
+// A lesson is ['id', 'Title', { options }]. Options default to the module's level and tracks, and
+// 20 minutes. Lesson ids are permanent: progress is stored against them.
+
+export default [
+    {
+        id: 'sd-backend-basics', code: 'D41', part: 6, title: 'How the backend side works', level: 'beginner', tracks: ['backend'], requires: ['sd-networking', 'sd-api-design'],
+        summary: 'A request\'s path from the app to the database, the shapes backends take, and how to read their diagrams.',
+        lessons: [
+            ['sd-backend-why', 'Why mobile engineers need the backend picture', { minutes: 10 }],
+            ['sd-backend-request-journey', 'A request\'s journey: DNS to database', { minutes: 25 }],
+            ['sd-backend-where-code-runs', 'Where server code runs: machines, containers, regions'],
+            ['sd-backend-monolith-microservices', 'Monoliths and microservices', { minutes: 25, level: 'intermediate' }],
+            ['sd-backend-serverless', 'Serverless and backend-as-a-service'],
+            ['sd-backend-stateless', 'Stateless services and where state lives'],
+            ['sd-backend-sessions-tokens', 'Sessions vs tokens at a glance', { minutes: 15 }],
+            ['sd-backend-environments', 'Environments: development, staging and production', { minutes: 15 }],
+            ['sd-backend-reading-diagrams', 'Reading a backend diagram as a client engineer', { level: 'intermediate' }],
+        ],
+    },
+    {
+        id: 'sd-estimation', code: 'D42', part: 6, title: 'Estimation & capacity planning', level: 'intermediate', tracks: ['interview', 'backend'], requires: ['sd-backend-basics'],
+        summary: 'Back-of-the-envelope numbers for traffic, storage, bandwidth and latency, on the server and on the device, plus service levels.',
+        lessons: [
+            ['sd-est-envelope-maths', 'Back-of-the-envelope maths', { minutes: 15 }],
+            ['sd-est-dau-qps', 'From DAU and MAU to peak QPS', { minutes: 25 }],
+            ['sd-est-storage-growth', 'Storage and growth over time'],
+            ['sd-est-bandwidth', 'Bandwidth, egress and what it costs'],
+            ['sd-est-capacity', 'From load to capacity: servers and headroom'],
+            ['sd-est-latency-numbers', 'Latency numbers to know', { minutes: 15 }],
+            ['sd-est-mobile-payloads', 'Mobile estimates: payloads and data plans', { tracks: ['core'] }],
+            ['sd-est-mobile-device', 'Mobile estimates: battery and cache sizes', { tracks: ['core'] }],
+            ['sd-est-sla-slo-sli', 'SLAs, SLOs and SLIs'],
+            ['sd-est-drills', 'Estimation drills', { minutes: 30, tracks: ['interview'] }],
+        ],
+    },
+    {
+        id: 'sd-scaling', code: 'D43', part: 6, title: 'Scaling building blocks', level: 'intermediate', tracks: ['backend'], requires: ['sd-backend-basics', 'sd-estimation'],
+        summary: 'Scaling out behind load balancers and gateways, caching at the edge and in the middle, rate limiting and consistent hashing.',
+        lessons: [
+            ['sd-scale-vertical-horizontal', 'Vertical vs horizontal scaling', { minutes: 15 }],
+            ['sd-scale-load-balancers', 'Load balancers: L4 vs L7'],
+            ['sd-scale-lb-algorithms', 'Balancing algorithms and health checks'],
+            ['sd-scale-gateways', 'Reverse proxies and API gateways'],
+            ['sd-scale-autoscaling', 'Autoscaling: signals, lag and cold starts'],
+            ['sd-scale-cdn', 'CDNs and edge caching'],
+            ['sd-scale-cache-patterns', 'Cache-aside, read-through and write-through', { minutes: 25 }],
+            ['sd-scale-write-back-redis', 'Write-back caching and Redis in practice'],
+            ['sd-scale-rate-limiting', 'Rate limiting: token bucket, leaky bucket, sliding window', { minutes: 25 }],
+            ['sd-scale-consistent-hashing', 'Consistent hashing', { minutes: 25, level: 'advanced' }],
+        ],
+    },
+    {
+        id: 'sd-data-at-scale', code: 'D44', part: 6, title: 'Data storage at scale', level: 'advanced', tracks: ['backend'], requires: ['sd-scaling', 'sd-persistence-arch'],
+        summary: 'Choosing a database, replicating and sharding it, the consistency an app actually sees, and the special-purpose stores.',
+        lessons: [
+            ['sd-dbscale-sql-nosql', 'SQL vs NoSQL: key-value, document, wide-column, graph', { minutes: 30, level: 'intermediate' }],
+            ['sd-dbscale-indexes', 'Indexes on the server: B-trees and LSM trees', { level: 'intermediate' }],
+            ['sd-dbscale-replication', 'Replication: leader–follower, multi-leader, leaderless', { minutes: 30 }],
+            ['sd-dbscale-sharding', 'Partitioning and sharding', { minutes: 25 }],
+            ['sd-dbscale-cap-pacelc', 'CAP and PACELC'],
+            ['sd-dbscale-consistency', 'Consistency models as the app sees them', { minutes: 30 }],
+            ['sd-dbscale-transactions', 'Transactions and isolation basics', { minutes: 25 }],
+            ['sd-dbscale-object-storage', 'Object storage and presigned URLs', { level: 'intermediate' }],
+            ['sd-dbscale-search', 'Search indexes'],
+            ['sd-dbscale-analytics-stores', 'Time-series and analytics stores', { minutes: 15 }],
+        ],
+    },
+    {
+        id: 'sd-async-systems', code: 'D45', part: 6, title: 'Asynchronous systems', level: 'intermediate', tracks: ['backend'], requires: ['sd-backend-basics', 'sd-data-at-scale'],
+        summary: 'Queues, logs and events: delivery guarantees, background jobs, fan-out, webhooks, sagas and backpressure.',
+        lessons: [
+            ['sd-asys-sync-vs-async', 'Synchronous vs asynchronous work, seen from the app'],
+            ['sd-asys-queues-logs', 'Queues vs logs: SQS and Kafka', { minutes: 25 }],
+            ['sd-asys-pubsub', 'Publish–subscribe and topics'],
+            ['sd-asys-event-driven', 'Event-driven architecture'],
+            ['sd-asys-delivery-idempotency', 'Delivery semantics and idempotent consumers', { minutes: 25 }],
+            ['sd-asys-background-jobs', 'Background jobs, retries and dead-letter queues'],
+            ['sd-asys-fan-out', 'Fan-out on write vs fan-out on read', { minutes: 25 }],
+            ['sd-asys-webhooks', 'Webhooks', { minutes: 15 }],
+            ['sd-asys-sagas-outbox', 'Sagas and the server-side outbox', { minutes: 30, level: 'advanced' }],
+            ['sd-asys-backpressure', 'Backpressure and load shedding'],
+        ],
+    },
+    {
+        id: 'sd-push', code: 'D46', part: 6, title: 'Push & messaging infrastructure', level: 'intermediate', tracks: ['backend'], requires: ['sd-async-systems', 'sd-realtime'],
+        summary: 'APNs end to end, FCM, notification extensions, silent and Live Activity pushes, and building a notification service.',
+        lessons: [
+            ['sd-push-apns-overview', 'How APNs delivers a notification', { minutes: 15, tracks: ['core'] }],
+            ['sd-push-device-tokens', 'Device tokens: registering, rotating, storing', { tracks: ['core'] }],
+            ['sd-push-sending', 'Sending pushes: HTTP/2, JWT provider auth and FCM', { minutes: 25 }],
+            ['sd-push-payloads', 'Payloads, priorities, collapse ids and push types', { minutes: 25 }],
+            ['sd-push-extensions', 'Notification service and content extensions', { minutes: 25, tracks: ['core'] }],
+            ['sd-push-silent', 'Silent pushes and their limits', { minutes: 15, tracks: ['core'] }],
+            ['sd-push-live-activities', 'Live Activity push updates', { tracks: ['core'] }],
+            ['sd-push-service-design', 'Designing a notification service: fan-out and templates', { minutes: 30, level: 'advanced' }],
+            ['sd-push-preferences', 'Preferences, quiet hours and rate limits'],
+            ['sd-push-guarantees', 'Delivery tracking and what APNs doesn\'t guarantee'],
+        ],
+    },
+    {
+        id: 'sd-auth', code: 'D47', part: 6, title: 'Auth & identity', level: 'intermediate', tracks: ['backend'], requires: ['sd-backend-basics', 'sd-network-layer'],
+        summary: 'Sessions and tokens, OAuth with PKCE and OpenID Connect, Apple sign-in, passkeys, MFA, and the account lifecycle.',
+        lessons: [
+            ['sd-auth-authn-authz', 'Authentication vs authorisation', { minutes: 15 }],
+            ['sd-auth-sessions-jwts', 'Sessions vs JWTs: signing, expiry and trade-offs', { minutes: 25 }],
+            ['sd-auth-oauth-pkce', 'OAuth 2.0 with PKCE and ASWebAuthenticationSession', { minutes: 30, tracks: ['core'] }],
+            ['sd-auth-oidc-sso', 'OpenID Connect and single sign-on', { minutes: 25 }],
+            ['sd-auth-refresh-rotation', 'Refresh tokens and rotation'],
+            ['sd-auth-siwa', 'Sign in with Apple', { tracks: ['core'] }],
+            ['sd-auth-passkeys', 'Passkeys and passwordless sign-in', { tracks: ['core'] }],
+            ['sd-auth-mfa-otp', 'MFA and one-time code autofill', { tracks: ['core'] }],
+            ['sd-auth-token-storage', 'Storing and revoking tokens', { tracks: ['core'] }],
+            ['sd-auth-account-lifecycle', 'Account linking and deletion'],
+        ],
+    },
+    {
+        id: 'sd-observability', code: 'D48', part: 6, title: 'Observability & reliability', level: 'intermediate', tracks: ['backend'], requires: ['sd-diagnostics', 'sd-estimation', 'sd-scaling'],
+        summary: 'Seeing a system through logs, metrics and traces, running it to SLOs, degrading gracefully, and learning from incidents.',
+        lessons: [
+            ['sd-o11y-signals', 'Logs, metrics and traces'],
+            ['sd-o11y-golden-signals', 'What to measure: golden signals, RED and USE'],
+            ['sd-o11y-device-tracing', 'Distributed tracing from the device', { minutes: 25, tracks: ['core'] }],
+            ['sd-o11y-dashboards-alerting', 'Dashboards and alerting'],
+            ['sd-o11y-error-budgets', 'SLOs and error budgets', { minutes: 25 }],
+            ['sd-o11y-degradation', 'Graceful degradation and fallbacks', { tracks: ['core'] }],
+            ['sd-o11y-kill-switches', 'Server-side kill switches', { minutes: 15 }],
+            ['sd-o11y-incidents', 'Incident response and on-call'],
+            ['sd-o11y-postmortems', 'Blameless postmortems', { minutes: 15 }],
+            ['sd-o11y-chaos', 'Chaos testing basics', { minutes: 15, level: 'advanced' }],
+        ],
+    },
+];

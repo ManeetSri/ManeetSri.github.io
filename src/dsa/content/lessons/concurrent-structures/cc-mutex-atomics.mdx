@@ -1,0 +1,238 @@
+## Why it matters
+
+Actors are Swift's default tool for shared state, but they come with two costs. Every caller has to be `async` and `await`, which doesn't fit a synchronous API such as a property UIKit reads or a protocol method that can't be `async`. And every call queues for the actor, which is heavy for a counter bumped a million times. Swift 6 added a **Synchronization** module with two lower-level tools for these cases: **`Mutex`**, a lock that owns the data it protects, and **`Atomic`**, a single value updated by indivisible processor instructions. Both are synchronous, and both are checked by the compiler, unlike the `@unchecked Sendable` lock from [Sendable](/dsa/learn/cc-sendable).
+
+## Availability
+
+The module ships with the Swift 6 toolchain, so `import Synchronization` always compiles, but the types need a recent operating system at run time: **macOS 15 and iOS 18** (and the matching watchOS, tvOS and visionOS releases) or later, and Linux. On an older deployment target, the compiler stops you:
+
+```text title="What Swift reports for a macOS 14 target"
+error: 'Atomic' is only available in macOS 15.0 or newer
+```
+
+In an app that still supports older systems, guard the code with `if #available(iOS 18, macOS 15, *)` or mark the type `@available(iOS 18, macOS 15, *)`, and keep a fallback such as an actor. The companion package targets macOS 14, so its problems don't use these types. The `run` blocks in this lesson run with `swift file.swift`, which targets the Mac you're using, so they need macOS 15 or later.
+
+## Mutex: the lock owns the data
+
+A `Mutex<Value>` holds a value, and the only way to reach it is `withLock`, which locks, hands your closure the value as an `inout` parameter, and unlocks when the closure returns, even if it throws. You can't forget to unlock, and you can't touch the data without the lock, because the data lives inside the lock.
+
+Here's the hit counter from the Sendable lesson again, rebuilt on a `Mutex`:
+
+```swift run
+import Synchronization
+
+/// The hit counter from the Sendable lesson, rebuilt on Mutex: checked Sendable, no @unchecked
+final class HitCounter: Sendable {
+    private let counts = Mutex<[String: Int]>([:])
+
+    func record(_ page: String) {
+        counts.withLock { counts in
+            counts[page, default: 0] += 1
+        }
+    }
+
+    func count(for page: String) -> Int {
+        counts.withLock { $0[page, default: 0] }
+    }
+
+    /// Several reads in one lock, so they're consistent with each other
+    func topPage() -> (page: String, hits: Int)? {
+        counts.withLock { counts in
+            counts.max { ($0.value, $1.key) < ($1.value, $0.key) }.map { ($0.key, $0.value) }
+        }
+    }
+}
+
+let hits = HitCounter()
+await withTaskGroup(of: Void.self) { group in
+    for visitor in 0..<300 {
+        group.addTask {
+            hits.record(visitor.isMultiple(of: 3) ? "home" : "search")
+        }
+    }
+}
+print(hits.count(for: "home"), hits.count(for: "search"), hits.count(for: "cart"))
+if let top = hits.topPage() {
+    print(top.page, top.hits)
+}
+```
+
+```output
+100 200 0
+search 200
+```
+
+What to notice:
+
+- **`HitCounter` is plain `Sendable`, checked by the compiler.** Its only stored property is a `let` holding a `Mutex`, and `Mutex` is designed to be shared between tasks. There's no `@unchecked` promise to break later.
+- **`withLock` returns whatever the closure returns**, so reads are one line: `counts.withLock { $0[page, default: 0] }`.
+- **`topPage()` does all its reading inside one lock.** Two separate `withLock` calls could see different states if another task recorded a hit in between: the check-then-act problem again, without an actor in sight.
+- **Callers never `await`.** `hits.record(...)` is an ordinary synchronous call.
+
+Two rules come with it, and the compiler enforces both:
+
+- **No `await` inside `withLock`.** The closure must be synchronous; holding a lock while suspended could stall every other task. Trying it gives "cannot pass function of type … async … to parameter expecting synchronous function type".
+- **A `Mutex` can't be copied.** It's a **noncopyable** type (written `~Copyable`), because a copy of a lock would protect nothing. Store it as a `let` in a class, an actor or a global, not in an ordinary struct: "stored property 'm' of 'Copyable'-conforming struct 'Box' has non-Copyable type 'Mutex\<Int\>'".
+
+One rule it can't enforce: **a `Mutex` isn't recursive.** Calling `withLock` on the same mutex from inside its own `withLock` waits forever for itself. Keep the closures short, and don't call other code that might lock again from inside them.
+
+## Atomic: one value, no lock at all
+
+An `Atomic<Value>` wraps a single machine-sized value, such as an `Int`, a `Bool` or a pointer, and updates it with the processor's atomic instructions from [Why shared mutable state breaks](/dsa/learn/cc-data-races). Nothing ever waits for a lock: an update can't be interleaved. The main operations:
+
+| Operation | What it does |
+| --- | --- |
+| `load(ordering:)` | read the value |
+| `store(_:ordering:)` | write a value |
+| `add(_:ordering:)`, `subtract(_:ordering:)` | add or subtract in one indivisible step; returns the old and new values |
+| `exchange(_:ordering:)` | write a value and return the previous one |
+| `compareExchange(expected:desired:ordering:)` | write `desired` only if the value is still `expected`; returns whether it did, and the value it found |
+
+Here are request statistics kept with two atomics, including the compare-and-swap loop for a running maximum:
+
+```swift run
+import Synchronization
+
+/// Request statistics with no lock at all: each figure is one atomic Int
+final class RequestStats: Sendable {
+    private let requests = Atomic<Int>(0)
+    private let slowest = Atomic<Int>(0)
+
+    func record(milliseconds: Int) {
+        requests.add(1, ordering: .relaxed)
+
+        // A lock-free maximum: try to swap in the new value, and retry if another task got there first
+        var current = slowest.load(ordering: .relaxed)
+        while milliseconds > current {
+            let (exchanged, original) = slowest.compareExchange(
+                expected: current, desired: milliseconds, ordering: .relaxed)
+            if exchanged { break }
+            current = original          // someone else changed it: compare against their value
+        }
+    }
+
+    var summary: (requests: Int, slowest: Int) {
+        (requests.load(ordering: .relaxed), slowest.load(ordering: .relaxed))
+    }
+}
+
+let stats = RequestStats()
+await withTaskGroup(of: Void.self) { group in
+    for request in 0..<1_000 {
+        group.addTask {
+            stats.record(milliseconds: (request * 37) % 500)    // made-up durations, from 0 to 499
+        }
+    }
+}
+let summary = stats.summary
+print(summary.requests, summary.slowest)
+```
+
+```output
+1000 499
+```
+
+The `compareExchange` loop is the lock-free pattern from the first lesson, now in real Swift. If another task raised `slowest` between the load and the swap, the swap fails, returns the value that task stored, and the loop compares against that instead. It ends either when the swap succeeds or when the current maximum is already at least as large.
+
+### What the ordering parameter means
+
+Every atomic operation names a **memory ordering**. It answers a subtle question: when one task writes this atomic, what does another task that reads it learn about **other** memory?
+
+- **`.relaxed`** promises only that this one value is updated atomically. That's enough for counters and statistics, where the number itself is all you care about.
+- **`.releasing`** on a write and **`.acquiring`** on the matching read, or **`.acquiringAndReleasing`** on a read-modify-write, also make everything the writer did **before** the write visible to the reader **after** the read. You need this when an atomic flag announces "the data is ready".
+- **`.sequentiallyConsistent`** is the strongest: all such operations appear in one global order. If you're unsure, use it, and relax it only when you can explain why it's safe.
+
+Orderings are a deep topic, and getting them wrong produces bugs that appear on one processor and not another. For anything more than a counter or a flag, use a `Mutex`.
+
+## Actor, Mutex or Atomic?
+
+| | Actor | Mutex | Atomic |
+| --- | --- | --- | --- |
+| Callers | must `await` | call synchronously | call synchronously |
+| Protects | any state, any operations | any state, short sections | one value: an `Int`, a `Bool`, a pointer |
+| Can wait inside (`await`) | yes, but watch for reentrancy | no | no |
+| A busy caller | queues as a suspended task | blocks its thread briefly | never waits; a compare-and-swap may retry |
+| Best for | caches that fetch, subsystems that own their state | small synchronous shared state behind a class | counters, flags, statistics, id generators |
+
+Prefer a `Mutex` or an `Atomic` over an actor when:
+
+- **The API must stay synchronous**: a property getter, a protocol requirement that isn't `async`, or a callback from code that can't `await`.
+- **The work inside is tiny and very frequent.** Taking an uncontended lock, or doing one atomic add, is cheaper than a hop onto an actor.
+- **You need a `Sendable` class with mutable state** without resorting to `@unchecked Sendable`.
+
+Prefer an actor when operations need to `await` something (a network fetch, another actor), when the state and its rules are large enough to deserve their own isolated type, or when you're not sure. Isolation by default is the safer starting point; reach for locks when measurement or API shape says so.
+
+## Older tools you'll still see
+
+Code written before Swift 6 protects state with tools you should recognise: `NSLock` (from Foundation, used in the Sendable lesson), `OSAllocatedUnfairLock` (iOS 16 and later, from the `os` module), serial `DispatchQueue`s, and `DispatchSemaphore`. For new code on iOS 18 and later, `Mutex` replaces the locks. And never use a semaphore to make a task wait for async work: it blocks one of the few threads Swift's concurrency pool has, which can freeze it entirely.
+
+<Callout kind="gotcha" title="Swift gotchas with Mutex and Atomic">
+- **They need iOS 18 or macOS 15** at run time. Guard with `#available` when your app supports older systems.
+- **They're noncopyable.** Keep them as `let` properties of a class or an actor, never in a struct you copy.
+- **A `Mutex` isn't recursive**, and its closure can't `await`. Short, synchronous critical sections only.
+- **Several atomics don't make a consistent snapshot.** Reading `requests` and then `slowest` can mix values from different moments. If two numbers must agree with each other, put them in one `Mutex`.
+</Callout>
+
+```cards
+- id: mutex-owns-data
+  front: "How does Swift's Mutex stop you from touching data without the lock?"
+  back: "The Mutex owns the value; the only access is `withLock`, which hands the closure the value as inout and unlocks afterwards. The closure can't await."
+- id: atomic-ops
+  front: "What does `compareExchange(expected:desired:ordering:)` do?"
+  back: "Stores `desired` only if the value still equals `expected`, and returns whether it did and the value it found. In a loop, it builds lock-free updates such as a running maximum."
+- id: sync-availability
+  front: "Where can you use Mutex and Atomic?"
+  back: "Swift 6's Synchronization module, at run time on macOS 15, iOS 18 and the matching releases or later (and Linux). Guard with #available on older targets."
+- id: sync-vs-actor
+  front: "When would you choose a Mutex over an actor?"
+  back: "When callers must stay synchronous, when the critical section is tiny and very frequent, or when you need a checked Sendable class with mutable state."
+```
+
+```quiz
+- id: q1
+  type: mcq
+  prompt: "A `Settings` class must offer a synchronous `var theme: String { get }` that many tasks read and occasionally change. Which protection fits best?"
+  options:
+    - "An actor, with `await` at every read"
+    - "A `Mutex<String>` stored as a `let` property"
+    - "An `Atomic<String>`"
+    - "No protection: strings are value types"
+  answer: 1
+  explain: "The getter must stay synchronous, which rules out an actor, and `String` isn't a type `Atomic` can hold. A Mutex keeps the API synchronous and the class checked Sendable. A string being a value type doesn't stop two tasks racing on the property that stores it."
+- id: q2
+  type: truefalse
+  prompt: "You can `await` inside a `Mutex`'s `withLock` closure, as long as the awaited work is quick."
+  answer: false
+  explain: "The closure must be synchronous, and the compiler rejects an async one. Suspending while holding a lock could leave every other task stuck behind it."
+- id: q3
+  type: order
+  prompt: "Put the steps of a lock-free \"raise the maximum\" update in order."
+  lines:
+    - "Load the current maximum"
+    - "If the new value isn't larger, stop"
+    - "Try compareExchange from the loaded value to the new value"
+    - "If it failed, take the value it found as the current maximum and go back to the comparison"
+  explain: "The swap only succeeds if nobody changed the maximum since it was loaded. On failure, compareExchange hands back the value another task stored, and the loop compares against that."
+- id: q4
+  type: match
+  prompt: "Match each memory ordering to when it's enough."
+  pairs:
+    - ["`.relaxed`", "A counter where only the number itself matters"]
+    - ["`.releasing` write with an `.acquiring` read", "A flag announcing that other data is ready"]
+    - ["`.sequentiallyConsistent`", "The safe default when you're unsure"]
+  explain: "Relaxed orders only the atomic itself. Release and acquire also publish the writer's earlier memory writes to the reader. Sequential consistency adds one global order on top."
+- id: q5
+  type: multi
+  prompt: "Which statements about Swift's `Mutex` are true? Choose all that apply."
+  options:
+    - "It's noncopyable, so it can't be a stored property of an ordinary struct"
+    - "Locking it again from inside its own withLock is safe"
+    - "A final class whose only stored property is a let Mutex can be Sendable without @unchecked"
+    - "It's available on every iOS version that runs Swift 6 apps"
+  answer: [0, 2]
+  explain: "A copied lock would protect nothing, so Mutex is noncopyable. It isn't recursive: relocking from inside waits forever. It's Sendable, so the class needs no @unchecked. It needs iOS 18 or later."
+- id: q6
+  type: recall
+  prompt: "Why can reading two separate atomics, such as a request count and a slowest time, give an inconsistent pair, and what would you do instead?"
+  model: "Each atomic is updated independently, so another task can record a request between the two loads, and you get a count from one moment and a maximum from another. If the two values must agree with each other, keep them together in one Mutex and read both inside a single withLock."
+```

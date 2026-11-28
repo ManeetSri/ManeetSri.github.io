@@ -1,0 +1,369 @@
+## Why it matters
+
+Apple's open-source **swift-collections** package fills gaps in the standard library, and you've already used two of its types' ideas: `Deque` in M27 and `Heap` in [swift-collections Heap](/dsa/learn/heap-swift-collections). Four more come up constantly in app code, and their names mislead almost everyone at first. `OrderedSet` and `OrderedDictionary` are **not** sorted: they remember **insertion order**, which is exactly what a "recent searches" list or an ordered form needs. `TreeSet` and `TreeDictionary` are **not** sorted trees either: they're hash-based **persistent** collections, built for keeping many versions of app state cheaply. This lesson explains what each one really is, using the ideas of this module, so you'll pick the right one and know what each operation costs.
+
+## Adding the package
+
+As with `Heap`, add `https://github.com/apple/swift-collections.git` as a package dependency, then import the module you need:
+
+```swift
+import OrderedCollections       // OrderedSet, OrderedDictionary
+import HashTreeCollections      // TreeSet, TreeDictionary
+import BitCollections           // BitSet, BitArray
+import Collections              // all of the stable modules at once
+```
+
+The lesson's `run` blocks are single files run with `swift file.swift`, which can't use packages. So the package code below isn't run; the runnable examples build small versions of the same ideas instead. The package's documentation is the authority on details, and newer releases keep adding types, so check its README for the version you use.
+
+## OrderedSet: a set that remembers order
+
+An `OrderedSet<Element: Hashable>` is a set, so each element appears at most once and `contains` is O(1) on average, and it's also an ordered, random-access collection, like an array. Its elements stay in the order you added them.
+
+The implementation is the combination you'd guess from [LRU cache](/dsa/learn/ll-lru-cache): an **array** holding the elements in order, plus a **hash table** mapping each element to its index in the array. That explains every cost:
+
+| Operation | Cost | Why |
+| --- | --- | --- |
+| `contains(_:)`, `firstIndex(of:)` | O(1) average | a hash table lookup |
+| `append(_:)` | O(1) amortised | append to the array, record the index |
+| `insert(_:at:)` in the middle | O(n) | later elements shift, and their indices change |
+| `remove(_:)`, `remove(at:)` in the middle | O(n) | the same shifting, plus renumbering |
+| `set[i]` | O(1) | read the array |
+
+Here's a tiny version of the idea, running a "recent searches" list:
+
+```swift run
+// The idea behind OrderedSet: an array for the order, plus a dictionary from element to index
+struct TinyOrderedSet<Element: Hashable> {
+    private(set) var elements: [Element] = []
+    private var indexOf: [Element: Int] = [:]
+
+    // Like OrderedSet.append: adds at the end unless it's already there, and says where it is
+    @discardableResult
+    mutating func append(_ element: Element) -> (inserted: Bool, index: Int) {
+        if let index = indexOf[element] { return (false, index) }
+        indexOf[element] = elements.count
+        elements.append(element)
+        return (true, elements.count - 1)
+    }
+
+    func contains(_ element: Element) -> Bool {
+        indexOf[element] != nil                  // O(1): a dictionary lookup, not a scan
+    }
+
+    func firstIndex(of element: Element) -> Int? {
+        indexOf[element]
+    }
+
+    // O(n): everything after the removed element moves down, and its stored index must too
+    @discardableResult
+    mutating func remove(_ element: Element) -> Element? {
+        guard let index = indexOf.removeValue(forKey: element) else { return nil }
+        elements.remove(at: index)
+        for i in index..<elements.count {
+            indexOf[elements[i]] = i
+        }
+        return element
+    }
+}
+
+// Recent searches: no duplicates, oldest first
+var recent = TinyOrderedSet<String>()
+for query in ["heap", "trie", "swift", "heap", "graph"] {
+    let result = recent.append(query)
+    print(query, result.inserted ? "added at \(result.index)" : "already at \(result.index)")
+}
+print(recent.elements, recent.contains("trie"), recent.firstIndex(of: "graph")!)
+recent.remove("trie")
+print(recent.elements, recent.firstIndex(of: "graph")!)
+```
+
+```output
+heap added at 0
+trie added at 1
+swift added at 2
+heap already at 0
+graph added at 3
+["heap", "trie", "swift", "graph"] true 3
+["heap", "swift", "graph"] 2
+```
+
+What to notice:
+
+- **Appending an element that's already there changes nothing** and reports where it is, as the real `append(_:)` returns `(inserted: Bool, index: Int)`.
+- **Removing "trie" renumbered "swift" and "graph".** That loop is why removal from the middle is O(n). The real type is far more careful about memory, but it can't escape the shifting.
+- **The order is the order of first insertion**, not alphabetical. Sorting is something you do to it, with `sort()`, not something it maintains.
+
+The real type has a few deliberate quirks:
+
+- **It isn't a `SetAlgebra`**, though it has `union`, `intersection` and friends. Its `==` is **order-sensitive**: two ordered sets with the same members in different orders are different, like arrays. For set-style comparison, use its `unordered` view, which is a `SetAlgebra`.
+- **It isn't a full `MutableCollection` or `RangeReplaceableCollection`**, because assigning `set[i] = x` or inserting a range could create duplicates. It offers the safe parts instead: `swapAt`, `sort()`, `shuffle()`, `reverse()`, `remove(at:)` and `removeAll(where:)`.
+- **`elements`** gives you its contents as a plain `Array`, in O(1).
+
+```swift
+import OrderedCollections
+
+var recent: OrderedSet = ["heap", "trie"]
+recent.append("swift")              // (inserted: true, index: 2)
+recent.append("heap")               // (inserted: false, index: 0): already there, stays put
+recent.contains("trie")             // true, in O(1)
+recent.remove("trie")               // O(n): "swift" moves to index 1
+let asArray: [String] = recent.elements
+```
+
+## OrderedDictionary: a dictionary that remembers order
+
+`OrderedDictionary<Key: Hashable, Value>` works the same way for key-value pairs: its keys form an `OrderedSet`, and its values sit in a parallel array. A **new** key goes to the end. **Updating** an existing key changes its value **in place**: the key keeps its position.
+
+```swift
+import OrderedCollections
+
+var settings: OrderedDictionary<String, Int> = ["volume": 7, "brightness": 50]
+settings["contrast"] = 3            // a new key: added at the end
+settings["volume"] = 9              // an existing key: new value, same position
+// settings.keys is now volume, brightness, contrast; iteration visits them in that order
+
+let second = settings.elements[1]   // by position: (key: "brightness", value: 50)
+settings.removeValue(forKey: "volume")   // O(n): the later entries shift down
+```
+
+Typical uses: JSON objects whose key order should survive a round trip, a form's fields in display order, and the "most recent first" lists in an app where items also need fast lookup by id. Lookups and appends are O(1) on average; `removeValue(forKey:)` and inserting at a position are O(n), for the same reason as `OrderedSet`.
+
+Notice `settings.elements[1]`. Subscripting the dictionary itself with an `Int` would be ambiguous whenever the keys are `Int`s, so the dictionary's subscript is **always** by key, and access by position goes through the `elements` view. For the same reason, `OrderedDictionary` is a `Sequence` of pairs but not a `Collection` itself.
+
+## TreeSet and TreeDictionary: persistent hashed collections
+
+`TreeSet<Element: Hashable>` and `TreeDictionary<Key: Hashable, Value>` have the same API flavour as `Set` and `Dictionary`, and like them they're **unordered**: iteration follows the hash values, not insertion order and not sorted order. The "tree" in the name is about **how they store elements**: a tree of nodes, chosen by the bits of each element's hash. The package describes them as implementing **CHAMP** (Compressed Hash-Array Mapped Prefix-trees), a refined form of the hash array mapped trie mentioned in [Persistent and immutable structures](/dsa/learn/as-persistent).
+
+Why would you want that instead of a `Dictionary`? Because of what happens when you **copy and then change** one:
+
+- A `Dictionary` is one big hash table. `var b = a; b[k] = v` copies the **whole table** at the first write, O(n), as copy-on-write always does.
+- A `TreeDictionary` shares its nodes between copies. The same write copies only the nodes on the path to `k`, about log of n of them, and the two versions keep sharing everything else.
+
+That's path copying, applied to hashing. Here's a simplified version: each node has 16 slots, and each level of the tree uses the next 4 bits of the key's hash to choose a slot. (The real CHAMP nodes use 32 slots and store only the occupied ones, compactly; that compression is the "C" in its name.)
+
+```swift run
+// A fixed hash with well-mixed bits (SplitMix64's steps)
+func hash(_ key: Int) -> UInt64 {
+    var z = UInt64(bitPattern: Int64(key)) &+ 0x9E37_79B9_7F4A_7C15
+    z = (z ^ (z >> 30)) &* 0xBF58_476D_1CE4_E5B9
+    z = (z ^ (z >> 27)) &* 0x94D0_49BB_1331_11EB
+    return z ^ (z >> 31)
+}
+
+// One of a node's 16 slots: empty, a single entry, or a child node one level down
+enum Slot {
+    case empty
+    case entry(key: Int, value: String)
+    case node(TrieNode)
+}
+
+// An immutable node. Each level uses the next 4 bits of the key's hash to choose a slot.
+final class TrieNode {
+    static var created = 0
+    let slots: [Slot]
+
+    init(_ slots: [Slot]) {
+        self.slots = slots
+        TrieNode.created += 1
+    }
+}
+
+// A simplified persistent hash trie: the idea behind TreeDictionary, without its compression
+struct HashTrieMap {
+    private(set) var root = TrieNode(Array(repeating: .empty, count: 16))
+
+    subscript(key: Int) -> String? {
+        var node = root
+        var bits = hash(key)
+        while true {
+            switch node.slots[Int(bits & 15)] {
+            case .empty: return nil
+            case .entry(let k, let v): return k == key ? v : nil
+            case .node(let child): node = child
+            }
+            bits >>= 4                           // the next level uses the next 4 bits
+        }
+    }
+
+    // A new version with key set to value: copies the nodes on one path, shares the rest
+    func updating(_ key: Int, to value: String) -> HashTrieMap {
+        var result = self
+        result.root = Self.insert(key, value, hash(key), into: root, shift: 0)
+        return result
+    }
+
+    private static func insert(_ key: Int, _ value: String, _ h: UInt64, into node: TrieNode, shift: UInt64) -> TrieNode {
+        let index = Int((h >> shift) & 15)
+        var slots = node.slots                   // the copy: one node's 16 slots
+        switch slots[index] {
+        case .empty:
+            slots[index] = .entry(key: key, value: value)
+        case .entry(let k, _) where k == key:    // the same key: replace its value
+            slots[index] = .entry(key: key, value: value)
+        case .entry(let k, let v):               // two keys share these bits: push both a level down
+            let empty = TrieNode(Array(repeating: .empty, count: 16))
+            let withOld = insert(k, v, hash(k), into: empty, shift: shift + 4)
+            slots[index] = .node(insert(key, value, h, into: withOld, shift: shift + 4))
+        case .node(let child):
+            slots[index] = .node(insert(key, value, h, into: child, shift: shift + 4))
+        }
+        return TrieNode(slots)
+    }
+}
+
+var map = HashTrieMap()
+for key in 0..<1_000 {
+    map = map.updating(key, to: "v\(key)")
+}
+TrieNode.created = 0
+let edited = map.updating(42, to: "changed")
+print("old 42:", map[42]!, " new 42:", edited[42]!, " missing:", edited[5_000] ?? "nil")
+print("nodes created by one update:", TrieNode.created)
+
+var sharedSlots = 0
+for i in 0..<16 {
+    if case .node(let a) = map.root.slots[i], case .node(let b) = edited.root.slots[i], a === b {
+        sharedSlots += 1
+    }
+}
+print("top-level children shared by both versions:", sharedSlots, "of 16")
+
+// A Dictionary keeps old versions too, but the first write to a shared copy copies every entry
+let before: [Int: String] = Dictionary(uniqueKeysWithValues: (0..<1_000).map { ($0, "v\($0)") })
+var after = before
+after[42] = "changed"                            // copies all 1,000 entries, then changes one
+print("Dictionary versions:", before[42]!, after[42]!)
+```
+
+```output
+old 42: v42  new 42: changed  missing: nil
+nodes created by one update: 3
+top-level children shared by both versions: 15 of 16
+Dictionary versions: v42 changed
+```
+
+What to notice:
+
+- **One update created 3 nodes** in a map of 1,000 keys: the path from the root to key 42's slot. The two versions share every other node: 15 of the root's 16 children are the very same objects (`===`).
+- **Both versions answer correctly**, so the old map is still a complete, usable snapshot.
+- **A lookup reads one slot per level**, using 4 more bits of the hash each time. With 1,000 keys the tree is about 3 levels deep; with a million, about 5.
+- **The `Dictionary` gave the same answers**, but `after[42] = "changed"` copied all 1,000 entries first.
+
+So `TreeDictionary` shines when you **keep versions**: an undo stack of a large model, snapshots of app state for a time-travel debugger, or a "before" copy you diff against after a batch of edits. Its documentation also notes that comparing or combining two collections that share structure can skip the shared parts, so diffing a snapshot against a lightly edited copy is fast. For a single dictionary that you only read and write, a plain `Dictionary` is faster: one flat table beats a tree of nodes, a constant factor the package's documentation itself points out.
+
+```swift
+import HashTreeCollections
+
+var model: TreeDictionary<String, Int> = [:]
+for i in 0..<100_000 {
+    model["item\(i)"] = i
+}
+var history = [model]
+model["item42"] = -1                // copies one path of nodes; shares everything else
+history.append(model)
+print(history[0]["item42"]!, history[1]["item42"]!)   // 42 -1
+```
+
+## And sorted collections?
+
+None of the four types above keeps elements **sorted**. When this lesson was written, the package's stable releases still had no sorted set or dictionary: B-tree-based `SortedSet` and `SortedDictionary` existed only as an experimental, opt-in part of the package, not covered by its stability promise. Check the current README before relying on that either way. Until then, a sorted collection means DSAKit's `SortedSet` and `SortedMap` from [Build an ordered set and map in Swift](/dsa/learn/bal-ordered-map), its `SkipList` from [Skip lists](/dsa/learn/as-skip-list), or a sorted array when changes are rare.
+
+## Choosing a collection
+
+| You need | Use |
+| --- | --- |
+| Fast membership, no order | `Set` |
+| Fast membership **and** the order things were added | `OrderedSet` |
+| Key lookup, no order | `Dictionary` |
+| Key lookup **and** insertion order | `OrderedDictionary` |
+| Many versions of a large set or dictionary, cheap copies and diffs | `TreeSet`, `TreeDictionary` |
+| Keys in **sorted** order, floor and ceiling | a balanced tree or skip list (DSAKit's `SortedSet`, `SortedMap`, `SkipList`) |
+| A set of small non-negative integers | a bitset (the package's `BitSet`, or your own) |
+| Both ends of a queue in O(1) | `Deque` |
+| Smallest and largest in O(1) | `Heap` |
+
+Part IX has a lesson on swift-collections as a whole, and on when interviews and contest judges let you use packages at all.
+
+<Callout kind="gotcha" title="Swift gotcha: an Int subscript on OrderedDictionary is a key">
+With `var scores: OrderedDictionary<Int, String>`, `scores[0]` looks up the **key** 0, not the first entry, and returns `nil` if there's no such key. Use `scores.elements[0]` for the first entry. The same expression means different things on an `Array` and an `OrderedDictionary`, so read it carefully in code reviews.
+</Callout>
+
+<Callout kind="gotcha" title="Common mistakes">
+- **Expecting "Tree" to mean sorted.** `TreeSet` and `TreeDictionary` iterate in hash order, which looks random. If you print one in a test and expect sorted output, the test fails.
+- **Expecting "Ordered" to mean sorted.** `OrderedSet` keeps the order you appended, until you call `sort()`.
+- **Removing from the front in a loop.** `OrderedSet` and `OrderedDictionary` removals from the front or middle are O(n), so draining one from the front is O(n²). Iterate instead, or use a `Deque` if it's really a queue.
+- **Comparing ordered sets with `==` when order doesn't matter.** Their `==` compares order too; compare `a.unordered == b.unordered` instead.
+</Callout>
+
+```cards
+- id: orderedset-what
+  front: "What is an OrderedSet, and how is it built?"
+  back: "A set that keeps insertion order: an array of elements plus a hash table from element to index. contains and append are O(1) on average; removing from the middle is O(n)."
+- id: ordereddictionary-update
+  front: "In an OrderedDictionary, what happens to a key's position when you assign a new value to it?"
+  back: "Nothing: an existing key keeps its position and only its value changes. A new key is added at the end."
+- id: treedictionary-what
+  front: "Are TreeSet and TreeDictionary sorted?"
+  back: "No. They're unordered, hash-based persistent collections (CHAMP tries). Copies share nodes, so changing a copy copies only one path instead of the whole table."
+- id: treedictionary-when
+  front: "When is TreeDictionary a better choice than Dictionary?"
+  back: "When you keep many versions or copies of a large dictionary, such as undo history or state snapshots, or compare versions often. For one dictionary that's only read and written, Dictionary is faster."
+```
+
+```quiz
+- id: q1
+  type: output
+  prompt: "This mimics OrderedDictionary's rules with an array of keys and a dictionary of values: a new key is appended, an existing key keeps its place. What does it print?"
+  code: |
+    var keys: [String] = []
+    var values: [String: Int] = [:]
+    func set(_ key: String, _ value: Int) {
+        if values[key] == nil { keys.append(key) }
+        values[key] = value
+    }
+    set("volume", 7)
+    set("brightness", 50)
+    set("contrast", 3)
+    set("volume", 9)
+    print(keys, values["volume"]!)
+  answer: "[\"volume\", \"brightness\", \"contrast\"] 9"
+  explain: "Updating volume changed its value to 9 but not its position, so it stays first. OrderedDictionary behaves the same way."
+- id: q2
+  type: mcq
+  prompt: "Which collection keeps elements in the order they were added, with no duplicates and O(1) membership tests?"
+  options:
+    - "TreeSet"
+    - "OrderedSet"
+    - "Set"
+    - "SortedSet"
+  answer: 1
+  explain: "OrderedSet pairs an array (the order) with a hash table (fast membership). Set and TreeSet have no meaningful order, and a sorted set orders by value, not by insertion."
+- id: q3
+  type: truefalse
+  prompt: "Iterating over a TreeSet<Int> visits its elements in increasing order."
+  answer: false
+  explain: "TreeSet is a hashed collection: its tree is organised by hash bits, so iteration follows hash order, which looks random. It's not a sorted tree."
+- id: q4
+  type: bigo
+  prompt: "What does removing an element from the middle of an OrderedSet of n elements cost?"
+  answer: "O(n)"
+  explain: "The elements after it shift down in the array, and their stored indices in the hash table must be updated."
+- id: q5
+  type: mcq
+  prompt: "An app keeps an undo history of 200 versions of a 50,000-entry model, each differing from the last in a few entries. Which storage keeps memory and copying lowest?"
+  options:
+    - "An array of 200 Dictionary values"
+    - "An array of 200 TreeDictionary values"
+    - "An array of 200 OrderedDictionary values"
+    - "One Dictionary, overwritten each time"
+  answer: 1
+  explain: "Each new TreeDictionary version copies only the paths to the changed keys and shares everything else. Each Dictionary or OrderedDictionary version copies all 50,000 entries on its first write. Overwriting one dictionary keeps no history at all."
+- id: q6
+  type: match
+  prompt: "Match each type to what it really is."
+  pairs:
+    - ["OrderedSet", "An array plus a hash table of indices"]
+    - ["OrderedDictionary", "Keys in insertion order, with values alongside"]
+    - ["TreeDictionary", "A persistent hash trie whose copies share nodes"]
+    - ["SortedMap (DSAKit)", "A balanced search tree in key order"]
+  explain: "Only the last one is sorted. The ordered types keep insertion order, and the tree types organise their nodes by hash bits so that copies can share them."

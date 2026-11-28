@@ -1,0 +1,367 @@
+## Why it matters
+
+The last lesson's leaks all had the same cause: a loop of strong references. Swift's fix is to make one direction of the relationship **not count**. `weak` and `unowned` references let an object point at another without keeping it alive. You'll use them for the parent pointer in a tree, the `previous` pointer in a doubly linked list, and, all over iOS code, for delegates and `[weak self]` in closures.
+
+## A weak reference doesn't count
+
+Mark a property or variable `weak` and it points at an object **without adding to its reference count**. Two things follow:
+
+1. A weak reference can't keep an object alive. If only weak references are left, ARC frees the object.
+2. When that happens, Swift sets every weak reference to the object to `nil` automatically. That's why a weak reference must have an **optional** type.
+
+```swift run
+final class Player {
+    let name: String
+    init(name: String) { self.name = name }
+    deinit { print("\(name) freed") }
+}
+
+var strong: Player? = Player(name: "Ada")
+weak var observer = strong
+
+print(observer?.name ?? "nobody")
+strong = nil
+print(observer?.name ?? "nobody")
+```
+
+```output
+Ada
+Ada freed
+nobody
+```
+
+`observer` could read the player while `strong` kept it alive. Once `strong` let go, the count hit zero even though `observer` still pointed at it, and `observer` became `nil` by itself.
+
+<Callout kind="analogy" title="A contact in your phone">
+A strong reference is a lease on a flat: while you hold it, the flat stays yours. A weak reference is a friend's address in your contacts. It helps you find them, but it doesn't stop them moving out, and when they do, the address is cleared.
+</Callout>
+
+## The rule: owners are strong, back-references are weak
+
+In a relationship that points both ways, decide which side **owns** the other. The owner holds a strong reference. The other side points back weakly.
+
+| Relationship | Strong (owns) | Weak (points back) |
+| --- | --- | --- |
+| Tree | parent's `children` | child's `parent` |
+| Doubly linked list | `next` | `previous` |
+| iOS screen and helper | screen holds the helper | helper's `delegate` |
+
+## Fixing the tree with a weak parent
+
+Here's the leaking tree from the last lesson with one word changed: `parent` is now `weak`.
+
+```swift run
+final class TreeNode {
+    let name: String
+    var children: [TreeNode] = []
+    weak var parent: TreeNode?
+
+    init(_ name: String) { self.name = name }
+    deinit { print("\(name) freed") }
+
+    func add(_ child: TreeNode) {
+        children.append(child)
+        child.parent = self
+    }
+}
+
+do {
+    let root = TreeNode("root")
+    let child = TreeNode("child")
+    root.add(child)
+    print(child.parent?.name ?? "no parent")
+}
+print("scope ended")
+
+let leaf = TreeNode("leaf")
+do {
+    let root = TreeNode("root")
+    root.add(leaf)
+    print(leaf.parent?.name ?? "no parent")
+}
+print(leaf.parent?.name ?? "no parent")
+```
+
+```output
+root
+root freed
+child freed
+scope ended
+root
+root freed
+no parent
+```
+
+What to notice:
+
+- **The cycle is gone.** The child's `parent` doesn't count, so when `root` goes out of scope its count reaches zero and it's freed. Freeing it releases its `children` array, which frees the child.
+- **Walking upwards still works** while the parent is alive: `child.parent?.name` gave `root`.
+- **The pointer clears itself.** `leaf` outlived its parent, so its `parent` turned into `nil`. Nothing dangles.
+
+## A doubly linked list with a weak previous
+
+In a doubly linked list, each node points to the `next` node and back to the `previous` one. `next` owns the rest of the list; `previous` is weak:
+
+```swift run
+final class ListNode {
+    let value: Int
+    var next: ListNode?
+    weak var previous: ListNode?
+
+    init(_ value: Int) { self.value = value }
+    deinit { print("freed \(value)") }
+}
+
+func makeList(_ values: [Int]) -> ListNode? {
+    var head: ListNode? = nil
+    var tail: ListNode? = nil
+    for value in values {
+        let node = ListNode(value)
+        if let tail {
+            tail.next = node
+            node.previous = tail
+        } else {
+            head = node
+        }
+        tail = node
+    }
+    return head
+}
+
+var head = makeList([1, 2, 3])
+
+// Walk forwards to the last node, then backwards using previous
+var node = head
+while let next = node?.next {
+    node = next
+}
+var backwards: [Int] = []
+while let current = node {
+    backwards.append(current.value)
+    node = current.previous
+}
+print(backwards)
+
+head = nil
+print("list cleared")
+```
+
+```output
+[3, 2, 1]
+freed 1
+freed 2
+freed 3
+list cleared
+```
+
+The list can be walked both ways, and setting `head` to `nil` frees every node, because the only strong references run forwards. With a strong `previous`, every neighbouring pair would form a cycle and nothing would be freed. You'll build the full doubly linked list in Part III.
+
+## Weak self in closures
+
+A closure that captures `self` strongly, stored in a property of `self`, is a cycle. A **capture list**, written in square brackets before the closure's parameters, changes how the closure captures things. `[weak self]` captures `self` weakly, so inside the closure `self` is optional:
+
+```swift run
+final class Counter {
+    var count = 0
+    var onTap: (() -> Void)?
+
+    init() { print("Counter created") }
+    deinit { print("Counter freed") }
+
+    func setUp() {
+        onTap = { [weak self] in
+            guard let self else { return }
+            self.count += 1
+        }
+    }
+}
+
+do {
+    let counter = Counter()
+    counter.setUp()
+    counter.onTap?()
+    counter.onTap?()
+    print(counter.count)
+}
+print("done")
+```
+
+```output
+Counter created
+2
+Counter freed
+done
+```
+
+`guard let self else { return }` unwraps the weak `self` for the rest of the closure: if the counter has already been freed, the closure does nothing. This `[weak self]` plus `guard let self` pattern is one of the most common lines in iOS code.
+
+## unowned: no count, and no safety net
+
+An `unowned` reference also doesn't add to the count, but it isn't optional and is **not** set to `nil` when the object is freed. You're promising Swift that the object will always outlive the reference.
+
+Use it when one object can't exist without the other. A page always belongs to a book and never outlives it:
+
+```swift run
+final class Book {
+    let title: String
+    var pages: [Page] = []
+
+    init(title: String) { self.title = title }
+    deinit { print("\(title) freed") }
+
+    func addPage(number: Int) {
+        pages.append(Page(number: number, book: self))
+    }
+}
+
+final class Page {
+    let number: Int
+    unowned let book: Book
+
+    init(number: Int, book: Book) {
+        self.number = number
+        self.book = book
+    }
+    deinit { print("page \(number) freed") }
+}
+
+do {
+    let book = Book(title: "Swift Notes")
+    book.addPage(number: 1)
+    book.addPage(number: 2)
+    print("page 2 belongs to \(book.pages[1].book.title)")
+}
+print("done")
+```
+
+```output
+page 2 belongs to Swift Notes
+Swift Notes freed
+page 1 freed
+page 2 freed
+done
+```
+
+`page.book` reads like a normal property, with no unwrapping. But if you break the promise and use an unowned reference after its object is freed, the program crashes:
+
+```swift
+var book: Book? = Book(title: "Draft")
+let page = Page(number: 1, book: book!)
+book = nil                  // the book is freed; page.book now refers to nothing
+print(page.book.title)      // crash
+```
+
+```text title="What you'll see"
+Fatal error: Attempted to read an unowned reference but object 0x600000c04000 was already destroyed
+```
+
+That's what Swift reports (the address differs each run). The crash is deliberate: reading freed memory silently would be far worse.
+
+## Choosing between strong, weak and unowned
+
+| Use | When | Type |
+| --- | --- | --- |
+| strong (default) | this side owns the object | `Node` or `Node?` |
+| `weak` | the object might be freed first; you need to check | always optional |
+| `unowned` | the object is guaranteed to outlive this reference | non-optional |
+
+When in doubt, choose `weak`. A `nil` you forgot to handle shows up as a quiet "nothing happened"; an `unowned` mistake is a crash.
+
+<Callout kind="gotcha" title="Swift gotchas with weak">
+- **Only for classes.** `weak var point: Point?` on a struct fails with "'weak' may only be applied to class and class-bound protocol types". Structs have no reference count.
+- **Must be optional.** `weak var node: Node` fails with "'weak' variable should have optional type". You'll usually see weak references declared with `var`, since they can change to `nil`; recent Swift versions also accept `weak let`.
+- **A weak-only object dies at once.** `weak var node = Node()` creates a node that nothing holds strongly, so it's freed immediately and `node` is `nil`. Swift warns: "instance will be immediately deallocated".
+- **Don't make both directions weak.** Someone has to own the object, or it's freed too early.
+</Callout>
+
+The problems below ask you to break a parent–child cycle and to walk a tree through weak parent pointers.
+
+```cards
+- id: weak-reference
+  front: "What does a `weak` reference do?"
+  back: "Points at an object without adding to its reference count, and becomes `nil` automatically when the object is freed. It must be optional."
+- id: weak-direction
+  front: "In a tree or doubly linked list, which references should be weak?"
+  back: "The back-references: a child's `parent` and a node's `previous`. The owning direction (`children`, `next`) stays strong."
+- id: unowned-reference
+  front: "How does `unowned` differ from `weak`?"
+  back: "`unowned` is non-optional and never set to `nil`; using it after the object is freed crashes. Use it only when the object always outlives the reference."
+- id: weak-self
+  front: "How do you stop a stored closure from keeping `self` alive?"
+  back: "Capture it weakly with `[weak self]`, then unwrap with `guard let self else { return }` inside the closure."
+```
+
+```quiz
+- id: q1
+  type: output
+  prompt: "What does this print?"
+  code: |
+    final class Note {
+        let text: String
+        init(text: String) { self.text = text }
+        deinit { print("freed") }
+    }
+
+    var original: Note? = Note(text: "hi")
+    weak var copy = original
+    print(copy?.text ?? "gone")
+    original = nil
+    print(copy?.text ?? "gone")
+  answer: |
+    hi
+    freed
+    gone
+  explain: "`copy` is weak, so it doesn't keep the note alive. Setting `original` to `nil` drops the count to zero, `deinit` prints, and `copy` becomes `nil`."
+- id: q2
+  type: mcq
+  prompt: "In a tree where each node stores `children` and `parent`, which should be weak?"
+  options:
+    - "`children`"
+    - "`parent`"
+    - "Both"
+    - "Neither: ARC handles trees"
+  answer: 1
+  explain: "The parent owns its children, so `children` stays strong. The child's `parent` is a back-reference and should be weak, which breaks the cycle."
+- id: q3
+  type: blank
+  prompt: "Complete the doubly linked list node so it doesn't create retain cycles."
+  code: |
+    final class ListNode {
+        let value: Int
+        var next: ListNode?
+        ___ var previous: ___
+        init(_ value: Int) { self.value = value }
+    }
+  answers:
+    - "weak"
+    - ["ListNode?", "Optional<ListNode>"]
+  explain: "`previous` points back to the node that owns this one through its `next`, so it must be `weak`, and a weak reference must be optional."
+- id: q4
+  type: truefalse
+  prompt: "Reading an `unowned` reference after its object has been freed returns `nil`."
+  answer: false
+  explain: "Only `weak` references become `nil`. An `unowned` reference is non-optional, so reading it after the object is freed crashes with \"Attempted to read an unowned reference\"."
+- id: q5
+  type: match
+  prompt: "Match each situation to the best kind of reference."
+  pairs:
+    - ["A screen holds the helper it created", "strong"]
+    - ["A helper's delegate pointing back at its screen", "weak"]
+    - ["A page pointing at the book it always belongs to", "unowned"]
+  explain: "The owner holds a strong reference. A back-reference to something that might go away first is weak. A back-reference to something guaranteed to outlive it can be unowned."
+- id: q6
+  type: bug
+  prompt: "This closure still leaks the `Ticker` object. Which line is the problem?"
+  code: |
+    final class Ticker {
+        var ticks = 0
+        var onTick: (() -> Void)?
+        func start() {
+            onTick = {
+                self.ticks += 1
+            }
+        }
+    }
+  answer: 5
+  explain: "The closure on line 5 captures `self` strongly and is stored in `self.onTick`: a cycle. Writing `onTick = { [weak self] in` (then unwrapping `self`) fixes it."
+```

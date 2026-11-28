@@ -1,0 +1,241 @@
+## Why it matters
+
+Files and folders are the most familiar tree there is. An in-memory file system shows up in real code more than you'd think: as a fake `FileManager` in unit tests, as the storage behind a document-based app's package, in sandboxed playgrounds and game mods. As an interview question, "design an in-memory file system" checks whether you can parse input carefully, pick a structure that matches the shape of the data, and keep several operations consistent with each other. It's less about clever algorithms and more about clean design.
+
+## Requirements
+
+The usual core is four operations on absolute paths like `/notes/swift/heaps.txt`:
+
+| Operation | Meaning |
+| --- | --- |
+| `mkdir(path)` | create a directory, and any missing directories above it |
+| `addContent(text, to: path)` | append text to a file, creating it if needed |
+| `readContent(path)` | a file's text |
+| `ls(path)` | a directory's entries in sorted order; for a file, only its own name |
+
+Questions that change the code:
+
+- Does `mkdir` create missing parents (like `mkdir -p`)? Does `addContent`? (Usually yes to both.)
+- Does `addContent` append or overwrite? (Append.)
+- What does `ls` return for a path that doesn't exist? (An empty list, or an error: pick one and say it.)
+- Can paths contain `.` or `..`, double slashes or a trailing slash? (Usually no, but parse defensively.)
+- Which operations are most frequent? If `ls` is called constantly on huge directories, sorting each time matters.
+
+## Parsing paths
+
+Every operation starts by turning the path into a list of names. `split(separator:)` does it, and its default behaviour is exactly right here: it drops the empty pieces before the first slash, between double slashes and after a trailing slash:
+
+```swift run
+for path in ["/", "/notes", "/notes/swift/heaps.txt", "//odd//path/"] {
+    print(path.split(separator: "/"))
+}
+print("/a//b".split(separator: "/", omittingEmptySubsequences: false))
+```
+
+```output
+[]
+["notes"]
+["notes", "swift", "heaps.txt"]
+["odd", "path"]
+["", "a", "", "b"]
+```
+
+The root, `/`, becomes no names at all, which turns out to be exactly what the code below needs: walking zero steps from the root leaves you at the root. Paths with `.` and `..` need a stack, as in [Decode string and simplify path](/dsa/learn/stack-decode-simplify).
+
+## Choosing the structure
+
+Two designs come to mind.
+
+**A flat dictionary of full paths**: `["/notes/swift/heaps.txt": "…", …]`, plus a set of directory paths. Reading and appending are one lookup each. But `ls("/notes")` has to scan **every** path in the system to find those whose parent is `/notes`, and renaming a directory means rewriting every path inside it.
+
+**A tree of nodes**, one per file or directory, each directory holding a dictionary from name to child. This matches the shape of the data: every operation walks one path, touching only the directories on it.
+
+| Operation | Flat dictionary | Tree |
+| --- | --- | --- |
+| `readContent`, `addContent` | O(1) average (plus hashing the path) | O(depth) |
+| `mkdir` | O(depth) | O(depth) |
+| `ls` of a directory with k entries | O(every path in the system) | O(depth + k log k) |
+| delete or move a directory | O(every path in the system) | O(depth) |
+
+The tree wins everywhere that matters. Here it is, with a single node type: a directory has children, and a file has `content`. `content` being `nil` is what marks a directory.
+
+```swift run
+final class FileSystem {
+    private final class Node {
+        var children: [String: Node] = [:]          // what a directory contains, by name
+        var content: String?                        // nil for a directory, the text for a file
+
+        init(content: String? = nil) {
+            self.content = content
+        }
+    }
+
+    private let root = Node()
+
+    /// Follows `names` from the root, making missing directories if asked.
+    private func walk(_ names: [Substring], creating: Bool) -> Node? {
+        var node = root
+        for name in names {
+            if let next = node.children[String(name)] {
+                node = next
+            } else if creating {
+                let made = Node()
+                node.children[String(name)] = made
+                node = made
+            } else {
+                return nil
+            }
+        }
+        return node
+    }
+
+    func mkdir(_ path: String) {
+        _ = walk(path.split(separator: "/"), creating: true)
+    }
+
+    func addContent(_ text: String, to path: String) {
+        let names = path.split(separator: "/")
+        let folder = walk(Array(names.dropLast()), creating: true)!
+        let name = String(names.last!)
+        let file = folder.children[name] ?? Node(content: "")   // reuse the file if it exists
+        folder.children[name] = file
+        file.content! += text
+    }
+
+    func readContent(_ path: String) -> String? {
+        walk(path.split(separator: "/"), creating: false)?.content
+    }
+
+    func ls(_ path: String) -> [String] {
+        let names = path.split(separator: "/")
+        guard let node = walk(names, creating: false) else { return [] }
+        if node.content != nil {
+            return [String(names.last!)]                         // a file lists only itself
+        }
+        return node.children.keys.sorted()                       // O(k log k) for k entries
+    }
+}
+
+let disk = FileSystem()
+disk.mkdir("/notes/swift")
+disk.addContent("Heaps keep the smallest on top.", to: "/notes/swift/heaps.txt")
+disk.addContent(" Tries share prefixes.", to: "/notes/swift/heaps.txt")
+disk.addContent("milk, eggs", to: "/todo.txt")
+disk.mkdir("/photos")
+print(disk.ls("/"))
+print(disk.ls("/notes/swift"))
+print(disk.ls("/notes/swift/heaps.txt"))
+print(disk.readContent("/notes/swift/heaps.txt") ?? "no such file")
+print(disk.readContent("/notes") ?? "no such file")
+print(disk.ls("/missing"))
+```
+
+```output
+["notes", "photos", "todo.txt"]
+["heaps.txt"]
+["heaps.txt"]
+Heaps keep the smallest on top. Tries share prefixes.
+no such file
+[]
+```
+
+What to notice:
+
+- **One helper does the walking.** `walk(_:creating:)` serves every operation: `mkdir` and `addContent` create as they go; `ls` and `readContent` stop at the first missing name.
+- **"Walk to the parent, then look at the last name"** is the pattern for files: `names.dropLast()` reaches the folder, and `names.last` is the file's name.
+- **`file.content! += text` appends in place.** The node is a class, so `file` and the dictionary refer to the same object, and the string is changed where it lives rather than copied.
+- `ls("/")` and `ls` on a file both fall out of the same code, thanks to the root being "no names".
+
+### Why classes?
+
+A directory is shared: its parent's dictionary holds it, and `walk` holds it while changing something inside it. With classes, `walk` returns a reference and changes made through it land in the tree. If `Node` were a struct, `walk` would return a **copy**, and adding a file to the copy would change nothing; you'd have to write every change back up the path, level by level, with `inout` recursion. Trees that are edited in place are where reference types earn their keep.
+
+### Another way to shape the nodes
+
+Instead of one node type with an optional `content`, a directory can hold two dictionaries: `directories: [String: Directory]` and `files: [String: String]`. Files are then plain strings rather than objects, and "is this a file?" is "which dictionary is it in?". Both shapes are fine; pick one and keep it consistent.
+
+## Extending the design
+
+Interviewers often follow up with one more operation, and the tree makes most of them small:
+
+- **Delete** (`rm -r`): walk to the parent and remove one dictionary entry. Everything inside goes with it, freed by ARC.
+- **Move or rename** (`mv`): remove the entry from the old parent and insert the same node into the new one. O(depth), however much the directory contains. In the flat design, every path inside would have to be rewritten.
+- **Sorted listings without sorting**: keep each directory's names in an ordered structure such as DSAKit's `SortedMap`, so `ls` is O(k), at the cost of O(log k) inserts.
+- **Directory sizes**: store each directory's total size and update it on every node along the path when a file grows.
+
+<Callout kind="gotcha" title="Common mistakes">
+- **Replacing a file instead of appending.** Creating a new file node on every `addContent` throws away what was there. Look the file up first.
+- **The root as a special case everywhere.** If splitting `/` gives no names, the general code handles it. Special cases for the root are where bugs hide.
+- **Splitting with empty pieces.** `split(separator:omittingEmptySubsequences: false)` keeps the empty strings around slashes, and then you'd create a directory called `""`.
+- **Structs for nodes in a tree you edit.** Changes land on copies and silently vanish.
+</Callout>
+
+## Practice
+
+**In-memory file system** asks for `makeDirectory`, `list`, `append`, `read` and a recursive `remove`, and tests them against a flat-dictionary model over thousands of random operations, then with 20,000 files in one directory and paths 200 levels deep.
+
+```cards
+- id: fs-tree
+  front: "Why does an in-memory file system use a tree of directory nodes rather than one dictionary of full paths?"
+  back: "Each operation then walks only one path. With a flat dictionary, listing, deleting or moving a directory has to scan every path in the system."
+- id: fs-split
+  front: "What does `\"/\".split(separator: \"/\")` return, and why is that useful?"
+  back: "An empty array. Walking zero names from the root leaves you at the root, so the root needs no special case."
+- id: fs-parent-pattern
+  front: "What's the pattern for file operations on a path?"
+  back: "Walk to the parent directory with all names but the last (`dropLast()`), then look up the last name there."
+- id: fs-classes
+  front: "Why are a file system's directory nodes classes rather than structs?"
+  back: "The tree is edited in place through shared references. With structs, the walk would return copies and changes would vanish unless written back up the whole path."
+```
+
+```quiz
+- id: q1
+  type: output
+  prompt: "What does this print?"
+  code: |
+    print("/a//b/".split(separator: "/"))
+  answer: "[\"a\", \"b\"]"
+  explain: "By default, `split` drops empty pieces: the one before the first slash, the one between the two slashes, and the one after the trailing slash."
+- id: q2
+  type: mcq
+  prompt: "In the tree design, how long does moving a directory that contains 10,000 files take?"
+  options:
+    - "O(1)"
+    - "O(depth of the old and new paths)"
+    - "O(10,000)"
+    - "O(10,000 × depth)"
+  answer: 1
+  explain: "Walk to the old parent, remove the entry, walk to the new parent, insert the same node. The 10,000 files come along inside it without being touched."
+- id: q3
+  type: truefalse
+  prompt: "With a flat dictionary from full paths to contents, listing one directory only looks at that directory's own entries."
+  answer: false
+  explain: "A flat dictionary has no idea which paths are inside which directory. Listing has to check every path in the system to find those whose parent is the one being listed."
+- id: q4
+  type: bug
+  prompt: "After two calls to `addContent` on the same file, only the second text is there. Which line is the bug?"
+  code: |
+    func addContent(_ text: String, to path: String) {
+        let names = path.split(separator: "/")
+        let folder = walk(Array(names.dropLast()), creating: true)!
+        let name = String(names.last!)
+        let file = Node(content: "")
+        folder.children[name] = file
+        file.content! += text
+    }
+  answer: 5
+  explain: "Line 5 always makes a new, empty file node, and line 6 replaces the existing file with it. Reuse the file if it's there: `folder.children[name] ?? Node(content: \"\")`."
+- id: q5
+  type: match
+  prompt: "Match each operation with its cost in the tree design, for a path of depth d and a directory with k entries."
+  pairs:
+    - ["readContent", "O(d)"]
+    - ["ls of that directory", "O(d + k log k)"]
+    - ["delete that directory", "O(d)"]
+  explain: "Every operation walks d names. Listing also sorts the k names; deleting is a single dictionary removal at the end of the walk, whatever the directory holds."
+- id: q6
+  type: recall
+  prompt: "Why would directory nodes written as structs make `mkdir` and `addContent` go wrong?"
+  model: "Walking the tree would hand back copies of the directories rather than the directories themselves. Adding a child or appending text would change the copy, and the tree stored in the root would never see it, unless every change were written back level by level up the path."
+```

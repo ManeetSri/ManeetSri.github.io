@@ -1,0 +1,191 @@
+## Why it matters
+
+Arrays are value types, so `let b = a` gives you an independent copy. If `a` holds a million numbers, did Swift just copy a million numbers? No, and the trick it uses, **copy-on-write**, explains when copying collections is free and when it suddenly costs O(n). Knowing that keeps accidental slowdowns out of your algorithms.
+
+## The puzzle
+
+Value semantics promise that copies are independent. The simplest way to keep that promise would be to copy every element on every assignment. That would make this tiny function painfully slow for large arrays:
+
+```swift
+func total(of numbers: [Int]) -> Int {
+    numbers.reduce(0, +)
+}
+```
+
+Passing `numbers` in is a copy, in principle. Swift would be copying the whole array just to read it. Yet passing arrays to functions is fast in practice. Something smarter is going on.
+
+## Share until somebody writes
+
+Behind the scenes, an array keeps its elements in a separate block of memory called its **storage** (or buffer). The array value itself is small: little more than a reference to that storage.
+
+When you copy an array, Swift copies only that small reference. Both arrays now **share** one storage. That's safe as long as nobody changes anything, because reading shared data can't hurt anyone.
+
+The moment one of them is about to **change**, Swift checks: "is my storage shared?" If it is, that array first makes its own private copy of the storage, then changes the copy. The other array never notices. Copy-on-write means exactly that: the real copy happens *on* the first *write*, and only if it's needed.
+
+| Step | `a`'s storage | `b`'s storage | Elements copied |
+| --- | --- | --- | --- |
+| `var a = [1, 2, 3]` | storage A: 1, 2, 3 | (not yet created) | 0 |
+| `var b = a` | storage A | storage A, shared | 0 |
+| `b.append(4)` | storage A: 1, 2, 3 | storage B: 1, 2, 3, 4 | 3 |
+| `b.append(5)` | storage A | storage B: 1, 2, 3, 4, 5, not shared | 0 |
+
+The second append copies nothing: `b` already owns storage B outright.
+
+<Callout kind="analogy">
+Two flatmates share one copy of a cookbook. Nobody minds while they're both only reading it. The day one of them wants to scribble notes in the margins, they buy their own copy first, and from then on they each scribble in their own.
+</Callout>
+
+## Seeing it happen
+
+You can't normally see the storage, but a small helper can peek. `sharesStorage` asks whether two arrays use the very same block of memory. Don't worry about how it works: it uses unsafe pointers, which M11 introduces. Focus on what it prints:
+
+```swift run
+func sharesStorage(_ first: [Int], _ second: [Int]) -> Bool {
+    first.withUnsafeBufferPointer { one in
+        second.withUnsafeBufferPointer { two in
+            one.baseAddress == two.baseAddress
+        }
+    }
+}
+
+let original = [1, 2, 3]
+var copy = original
+print("After copying:", sharesStorage(original, copy))
+
+copy.append(4)
+print("After a write:", sharesStorage(original, copy))
+print(original)
+print(copy)
+```
+
+```output
+After copying: true
+After a write: false
+[1, 2, 3]
+[1, 2, 3, 4]
+```
+
+Right after `var copy = original`, the two share storage: nothing was copied. The append forced a real copy, and from then on they're separate. As far as your program's *behaviour* goes, nothing surprising happened: `original` is unchanged, exactly as value semantics promise. Copy-on-write is a speed optimisation, invisible except in timing.
+
+## What a write costs
+
+This gives you a simple cost model for collections:
+
+| Operation | Cost |
+| --- | --- |
+| Copying an array (assigning, passing to a function, returning) | O(1): only a reference is copied |
+| Reading from any copy | normal cost, no copying |
+| First write to storage that's **shared** | O(n): every element is copied once |
+| Later writes when the storage is **not shared** | normal cost, no copying |
+
+Most of the time the expensive row never happens, because the original copy isn't kept around. For example, when a function takes an array, reads it and returns, nothing is ever written, so nothing is ever copied.
+
+## Which types do this
+
+- **`Array`, `String`, `Dictionary` and `Set`** all use copy-on-write.
+- **Your own structs get it for free when they contain these.** A `struct Playlist { var songs: [String] }` copies cheaply, because copying it copies the small array reference inside.
+- **Small structs don't need it.** Copying a `Point` with two `Int`s is already about as cheap as copying two numbers.
+- **Classes don't need it.** They're never copied at all; only references are.
+
+Your own struct doesn't magically gain copy-on-write for data it stores directly, such as a class reference inside it. Building copy-on-write into your own types, with a check called `isKnownUniquelyReferenced`, is a lesson in M11.
+
+## A performance trap: keeping copies alive
+
+Copy-on-write is fast as long as an array's storage is unshared when you write to it. Keep another copy alive and every write after that pays the O(n) price once. Watch the helper in a loop that saves snapshots:
+
+```swift run
+func sharesStorage(_ first: [Int], _ second: [Int]) -> Bool {
+    first.withUnsafeBufferPointer { one in
+        second.withUnsafeBufferPointer { two in
+            one.baseAddress == two.baseAddress
+        }
+    }
+}
+
+var board = [0, 0, 0, 0]
+var history: [[Int]] = []
+
+for step in 0..<3 {
+    history.append(board)
+    let sharedBeforeWrite = sharesStorage(board, history[step])
+    board[step] = step + 1
+    print("Step \(step): shared before write? \(sharedBeforeWrite). Board is now \(board)")
+}
+print(history)
+```
+
+```output
+Step 0: shared before write? true. Board is now [1, 0, 0, 0]
+Step 1: shared before write? true. Board is now [1, 2, 0, 0]
+Step 2: shared before write? true. Board is now [1, 2, 3, 0]
+[[0, 0, 0, 0], [1, 0, 0, 0], [1, 2, 0, 0]]
+```
+
+Every snapshot shares the board's storage, so every write copies the whole board. Here that's correct and intended: you *want* each snapshot frozen. But the same pattern appears by accident, for example by keeping an old copy of an array "just in case" while modifying it in a loop. With a large array, an O(1) write per step quietly becomes O(n), and the loop goes from O(n) to O(n²).
+
+<Callout kind="gotcha" title="Swift gotcha: a local var copy of a parameter">
+Inside a function, `var copy = numbers` followed by changes to `copy` always copies the whole array on the first change, because the caller still holds the original. That's fine when you need a separate copy. When you meant to change the caller's array in place, take an `inout` parameter instead, as you saw in M05. In-place algorithms such as sorting rely on that.
+</Callout>
+
+## How Swift knows it's shared
+
+You may wonder how an array knows whether its storage is shared. The storage is a class instance, and Swift keeps a count of how many references point at every class instance. If the count is one, the storage is unique and safe to change in place. If it's more than one, copy first. That reference count is the heart of **Automatic Reference Counting**, the M11 topic that also explains when `deinit` runs.
+
+```cards
+- id: cow-what
+  front: "What is copy-on-write?"
+  back: "Copies of an array (or string, set, dictionary) share storage. The real copy happens only when one of them is first changed while the storage is shared."
+- id: cow-cost
+  front: "What does copying an array cost, and when does it get expensive?"
+  back: "Copying is O(1). The first write to storage that's still shared costs O(n), because every element is copied then."
+- id: cow-trap
+  front: "How can copy-on-write turn an O(n) loop into O(n²)?"
+  back: "By keeping another copy of an array alive while writing to it in a loop, so each write finds the storage shared and copies the whole array."
+```
+
+```quiz
+- id: q1
+  type: mcq
+  prompt: "`var b = a`, where `a` is an array of a million elements. How many elements are copied by this line?"
+  options:
+    - "A million"
+    - "None: `a` and `b` share storage until one changes"
+    - "Half"
+    - "It depends on whether `a` is a `let`"
+  answer: 1
+  explain: "Copying an array only copies a reference to its storage. Elements are copied later, and only if one of the arrays is changed while the storage is shared."
+- id: q2
+  type: output
+  prompt: "What does this print?"
+  code: |
+    var first = [1, 2, 3]
+    var second = first
+    second[0] = 99
+    first.append(4)
+    print(first)
+    print(second)
+  answer: |
+    [1, 2, 3, 4]
+    [99, 2, 3]
+  explain: "Copy-on-write never changes behaviour. Arrays are still values, so each one changes on its own. The sharing is an invisible optimisation."
+- id: q3
+  type: bigo
+  prompt: "Inside a loop that runs n times, an array of n elements is written to once per step, while a separate copy of it is kept alive. What's the total cost of the writes?"
+  answer: "O(n²)"
+  explain: "Each write finds the storage shared and copies all n elements, so n steps cost n × n. Without the extra copy, each write would be O(1) and the loop O(n)."
+- id: q4
+  type: truefalse
+  prompt: "Copy-on-write means that changing a copied array can sometimes change the original."
+  answer: false
+  explain: "Never. Before writing to shared storage, the array makes its own copy, so the original is untouched. Value semantics are fully preserved."
+- id: q5
+  type: multi
+  prompt: "Which of these use copy-on-write? Choose all that apply."
+  options:
+    - "`Array`"
+    - "`String`"
+    - "`Dictionary`"
+    - "`Int`"
+  answer: [0, 1, 2]
+  explain: "Collections and strings keep their contents in shared storage. An `Int` is a small value copied directly, so it doesn't need the trick."
+```

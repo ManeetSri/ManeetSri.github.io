@@ -1,0 +1,230 @@
+## Why it matters
+
+Version history in a document editor, "restore this photo to how it was yesterday", replaying a game from any turn, a database answering a query as of a moment in the past: all of these keep **snapshots** of changing data. The obvious way, copying everything at each snapshot, is simple and quickly becomes enormous. The snapshot array is the interview version of the problem, small enough to code in 30 minutes, and its answer (record only what changed, then binary search the changes) is the same idea real version-control systems and databases use.
+
+## Requirements and API
+
+An array of `Int`s, all 0 to begin with, with three operations:
+
+| Operation | Meaning |
+| --- | --- |
+| `set(value, at: index)` | change the current value at an index |
+| `snapshot() -> Int` | take a snapshot and return its id: 0, then 1, 2… |
+| `value(at: index, snapshot: id)` | the value the index had when snapshot `id` was taken |
+
+Questions worth asking: How big is the array, and how many snapshots? (Tens of thousands of each.) Do most indexes change between snapshots? (Usually very few do.) Are lookups or snapshots more frequent? The answers decide which design wins.
+
+## Design 1: copy everything
+
+Keep the current array, and on every snapshot append a copy of it to a list of snapshots. A lookup is two subscripts. Here a cinema with 10,000 seats takes a snapshot every hour, with one seat booked per hour:
+
+```swift run
+struct CopyingSnapshotArray {
+    private var current: [Int]
+    private var snapshots: [[Int]] = []
+    private(set) var copied = 0                    // elements copied so far, to see the cost
+
+    init(count: Int) {
+        current = Array(repeating: 0, count: count)
+    }
+
+    mutating func set(_ value: Int, at index: Int) {
+        current[index] = value
+    }
+
+    mutating func snapshot() -> Int {
+        snapshots.append(current)                  // the whole array, every time
+        copied += current.count
+        return snapshots.count - 1
+    }
+
+    func value(at index: Int, snapshot id: Int) -> Int {
+        snapshots[id][index]
+    }
+}
+
+var seats = CopyingSnapshotArray(count: 10_000)
+for hour in 0..<24 {
+    seats.set(hour, at: hour)                      // one seat changes per hour...
+    _ = seats.snapshot()
+}
+print(seats.value(at: 5, snapshot: 3), seats.value(at: 5, snapshot: 5))
+print("elements copied:", seats.copied)            // ...but every snapshot copies all 10,000
+```
+
+```output
+0 5
+elements copied: 240000
+```
+
+Twenty-four changes cost 240,000 copied elements. With 50,000 seats and 50,000 snapshots, that's 2.5 billion: far too slow and far too much memory. The waste is that almost all of each copy is identical to the copy before it.
+
+<Callout kind="gotcha" title="Swift gotcha: copy-on-write delays the copy, it doesn't remove it">
+`snapshots.append(current)` doesn't copy the elements straight away: arrays are copy-on-write, so the snapshot and `current` share one buffer. But the very next `set` writes to a shared buffer, and Swift copies all of it first. So each snapshot still costs O(n), paid at the next write instead of at the snapshot. (The counter above charges it at the snapshot, which comes to the same total.)
+</Callout>
+
+## Design 2: record only the changes
+
+Flip the storage around. Instead of one full array per snapshot, keep one short **history per index**: the list of `(snapshot, value)` pairs for the times that index changed.
+
+The one subtle part is numbering. Keep a counter, `snapshotsTaken`. A change made **now** will first be seen by the next snapshot to be taken, whose id is `snapshotsTaken`. So:
+
+- `set` appends `(snapshotsTaken, value)` to the index's history, or, if the last pair already has that snapshot number, overwrites its value: nobody will ever see the earlier value.
+- `snapshot()` only increments the counter. Nothing is copied.
+- `value(at: i, snapshot: id)` wants the **last** pair in history `i` with `snapshot ≤ id`. Each history is sorted by snapshot number, because the counter only grows, so that's the binary search from the previous lesson: find the first pair with `snapshot > id`, and take the one before it. If there's none before it, the index was never set by then, so the answer is 0.
+
+```swift run
+struct SnapshotArray {
+    private var history: [[(snapshot: Int, value: Int)]]   // per index: its changes, oldest first
+    private var snapshotsTaken = 0
+
+    init(count: Int) {
+        history = Array(repeating: [], count: count)
+    }
+
+    mutating func set(_ value: Int, at index: Int) {
+        // A change now belongs to snapshot number snapshotsTaken: the next one to be taken
+        if let last = history[index].last, last.snapshot == snapshotsTaken {
+            history[index][history[index].count - 1].value = value   // changed again: overwrite
+        } else {
+            history[index].append((snapshotsTaken, value))
+        }
+    }
+
+    mutating func snapshot() -> Int {
+        snapshotsTaken += 1                        // O(1): nothing is copied
+        return snapshotsTaken - 1
+    }
+
+    func value(at index: Int, snapshot id: Int) -> Int {
+        let changes = history[index]
+        var low = 0
+        var high = changes.count                   // find the first change after snapshot `id`
+        while low < high {
+            let middle = low + (high - low) / 2
+            if changes[middle].snapshot <= id { low = middle + 1 } else { high = middle }
+        }
+        return low == 0 ? 0 : changes[low - 1].value   // the change before it, or never set
+    }
+
+    func changes(at index: Int) -> [(snapshot: Int, value: Int)] {
+        history[index]
+    }
+}
+
+var seats = SnapshotArray(count: 4)
+seats.set(7, at: 0)
+seats.set(9, at: 2)
+print("snapshot", seats.snapshot())
+seats.set(8, at: 0)
+seats.set(5, at: 0)                                // replaces 8: no snapshot ever saw it
+print("snapshot", seats.snapshot())
+print("snapshot", seats.snapshot())                // nothing changed: costs nothing
+seats.set(0, at: 2)                                // belongs to snapshot 3, not taken yet
+print(seats.changes(at: 0))
+print(seats.changes(at: 2))
+print((0..<3).map { seats.value(at: 0, snapshot: $0) })
+print((0..<3).map { seats.value(at: 2, snapshot: $0) })
+print(seats.value(at: 3, snapshot: 2))
+```
+
+```output
+snapshot 0
+snapshot 1
+snapshot 2
+[(snapshot: 0, value: 7), (snapshot: 1, value: 5)]
+[(snapshot: 0, value: 9), (snapshot: 3, value: 0)]
+[7, 5, 5]
+[9, 9, 9]
+0
+```
+
+Follow index 0: it was 7 when snapshot 0 was taken, then changed twice before snapshot 1, so only the 5 was kept. Snapshot 2 saw no change, so it finds the pair from snapshot 1. Index 2's change to 0 is labelled 3, so every snapshot taken so far still sees 9. Index 3 was never set: its history is empty, and the answer is 0.
+
+## Space against time
+
+| Design | `set` | `snapshot()` | `value(at:snapshot:)` | Memory |
+| --- | --- | --- | --- | --- |
+| Copy everything | O(1) | O(n) | O(1) | O(n × snapshots) |
+| Per-index change histories | O(1) amortised | O(1) | O(log c), c = changes to that index | O(n + number of sets) |
+| Histories + a full copy every k snapshots | O(1) amortised | O(1), or O(n) every k-th | O(log c) within one stretch of k | between the two |
+
+The change log moves the cost from snapshots and memory, which were enormous, onto lookups, which become a binary search over a short list. That's the right trade when snapshots are frequent and each changes little, which is the usual case.
+
+The third row is how video works. A video file stores a full picture now and then (a **keyframe**) and only the differences in between, so a player can jump to any moment by starting from the nearest keyframe instead of the very beginning. Databases and backup tools use the same mix of full copies and change logs.
+
+<Callout kind="analogy" title="A notebook per seat">
+Instead of photographing the whole cinema every hour, give each seat a little notebook. Whenever the seat's booking changes, write the hour and the new booking on the next line. To know who had seat 5 at 3 o'clock, open seat 5's notebook and find the last line written at or before 3. Seats nobody touched have empty notebooks, and cost nothing.
+</Callout>
+
+Structures that keep every old version cheaply, by sharing everything that didn't change, are called **persistent**. You met the idea with lists in [Copy-on-write and persistent lists](/dsa/learn/ll-persistent), and [Persistent and immutable structures](/dsa/learn/as-persistent) takes it to trees, where one change copies only the path from the root.
+
+<Callout kind="gotcha" title="Common mistakes">
+- **Labelling a change with the last snapshot's id.** Changes made after snapshot 2 belong to snapshot 3. Using `snapshotsTaken - 1` makes snapshot 2 see changes made after it.
+- **Searching for "first ≥ id".** You want the last change **at or before** the snapshot, which is one before the first change **after** it.
+- **Appending every change.** Ten changes to one index between two snapshots should leave one pair, not ten: overwrite when the last pair has the current number.
+- **Forgetting the default.** An index with no change at or before the snapshot is still 0.
+</Callout>
+
+## Practice
+
+**Snapshot array** asks for this design with the current value as a subscript too, and tests it with 50,000 elements and 50,000 snapshots, so copying the array per snapshot runs out of time.
+
+```cards
+- id: snapshot-change-log
+  front: "How does a snapshot array avoid copying the whole array at each snapshot?"
+  back: "Each index keeps a history of (snapshot, value) pairs, recorded only when it changes. A snapshot only increments a counter."
+- id: snapshot-numbering
+  front: "In a snapshot array, which snapshot number does a change belong to?"
+  back: "The next one to be taken: `snapshotsTaken`, the count of snapshots taken so far."
+- id: snapshot-lookup
+  front: "How do you read index i at snapshot id from its change history?"
+  back: "Binary search for the first pair with snapshot > id and take the pair before it; if there isn't one, the value is still 0."
+- id: keyframes
+  front: "How do full copies every k snapshots help a change log?"
+  back: "A lookup can start from the nearest full copy instead of the beginning, bounding the work, at the cost of an O(n) copy every k snapshots. Video keyframes work this way."
+```
+
+```quiz
+- id: q1
+  type: trace
+  prompt: "On `SnapshotArray(count: 2)`: set(4, at: 0), snapshot(), set(6, at: 0), snapshot(), set(1, at: 1). Give `value(at: 0, snapshot: 0)`, `value(at: 0, snapshot: 1)` and `value(at: 1, snapshot: 1)`, separated by commas."
+  answer: "4, 6, 0"
+  explain: "Snapshot 0 saw index 0 as 4; snapshot 1 saw it as 6. The change to index 1 came after snapshot 1, so it belongs to snapshot 2, and snapshot 1 still sees 0."
+- id: q2
+  type: bigo
+  prompt: "How much memory does the copy-everything design use for an array of n elements after s snapshots?"
+  options: ["O(n)", "O(s)", "O(n + s)", "O(n × s)"]
+  answer: "O(n × s)"
+  explain: "Every snapshot stores a full copy of all n elements, however few of them changed."
+- id: q3
+  type: mcq
+  prompt: "Three snapshots have been taken (ids 0, 1 and 2). Which snapshot number should a `set` made now be recorded under?"
+  options: ["0", "2", "3", "It depends on the index"]
+  answer: 2
+  explain: "The change will first be visible to the next snapshot to be taken, id 3, which is `snapshotsTaken`. Recording it under 2 would let snapshot 2 see a change made after it."
+- id: q4
+  type: bug
+  prompt: "This lookup gives the wrong value whenever an index changed exactly in the snapshot being asked about. Which line is the bug?"
+  code: |
+    func value(at index: Int, snapshot id: Int) -> Int {
+        let changes = history[index]
+        var low = 0, high = changes.count
+        while low < high {
+            let middle = low + (high - low) / 2
+            if changes[middle].snapshot < id { low = middle + 1 } else { high = middle }
+        }
+        return low == 0 ? 0 : changes[low - 1].value
+    }
+  answer: 6
+  explain: "With `<`, the search finds the first change at or after `id`, so a change labelled exactly `id` is skipped and the older value is returned. It must be `<=`, to find the first change strictly after `id`."
+- id: q5
+  type: truefalse
+  prompt: "Because Swift arrays are copy-on-write, `snapshots.append(current)` makes copy-everything snapshots cost O(1) in total."
+  answer: false
+  explain: "Copy-on-write only delays the copy. The next `set` writes to the buffer the snapshot shares, so Swift copies all n elements then. Each snapshot followed by a change still costs O(n)."
+- id: q6
+  type: recall
+  prompt: "When would the copy-everything design be the better choice?"
+  model: "When the array is small, snapshots are rare, and lookups into old snapshots are very frequent: a lookup is then O(1) instead of a binary search, and the total memory is still small. It's also simpler to get right."
+```

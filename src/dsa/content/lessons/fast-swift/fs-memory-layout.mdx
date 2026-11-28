@@ -1,0 +1,288 @@
+## Why it matters
+
+Once your algorithm has the right complexity and makes no accidental copies, the next costs are memory costs: how often you ask the heap for a new buffer, how many bytes each loop has to pull through the processor, and how many checks run per element. This lesson covers the three standard tools for those costs: `reserveCapacity` and buffer reuse to avoid reallocating, `ContiguousArray` for the one case where `Array` does extra work, and buffer pointers for the rare hot loop that needs every check gone. They matter in apps (decoding a large JSON array, processing image pixels, a game's per-frame update) and in competitive programming, where the same buffers are filled thousands of times.
+
+## Every reallocation copies everything
+
+You built a growing array in [Build your own DynamicArray](/dsa/learn/arrays-dynamic-array): when the buffer is full, allocate one about twice the size, copy every element across, free the old one. [Amortised analysis](/dsa/learn/bigo-amortised) showed that this keeps `append` O(1) on average. Average isn't free, though. Appending 100,000 elements one by one still allocates around 17 buffers and copies nearly 100,000 elements an extra time, and each allocation is real work for the system's memory allocator ([Stack vs heap](/dsa/learn/swift-stack-heap)).
+
+When you know the final size, or a good upper bound, `reserveCapacity` allocates once, up front. You can watch reallocations by noticing when `capacity` changes:
+
+```swift run
+func reallocations(appending count: Int, reserving: Bool) -> Int {
+    var items: [Int] = []
+    if reserving {
+        items.reserveCapacity(count)
+    }
+    var changes = 0
+    var capacity = items.capacity
+    for value in 0..<count {
+        items.append(value)
+        if items.capacity != capacity {      // a new, bigger buffer: everything was copied
+            changes += 1
+            capacity = items.capacity
+        }
+    }
+    return changes
+}
+
+print("reserved first:", reallocations(appending: 100_000, reserving: true))
+print("not reserved, more than 10:", reallocations(appending: 100_000, reserving: false) > 10)
+```
+
+```output
+reserved first: 0
+not reserved, more than 10: true
+```
+
+The example prints a comparison rather than the exact count because capacities depend on the platform's allocator, which may round a request up: on one Mac the capacities ran 2, 4, 8, 16, 36, 76, … and the count was 17. What's guaranteed is the first line: after `reserveCapacity(n)`, the first n appends never reallocate.
+
+Where it pays off:
+
+- **Building a result of known size in a loop.** `result.reserveCapacity(n)` before the loop. (`map` on an array already does this for you.)
+- **Strings.** `String` has `reserveCapacity` too, counted in UTF-8 bytes. The practice problem **List every folder's path** builds tens of megabytes of text; computing the exact size first and reserving it once removes every reallocation.
+- **Dictionaries and sets.** Each time a hash table grows, it **rehashes** every key into the bigger table ([Load factor and rehashing](/dsa/learn/hash-load-factor)). `Dictionary(minimumCapacity:)`, `Set(minimumCapacity:)` or `reserveCapacity` avoid that.
+
+<Callout kind="gotcha" title="Swift gotcha: reserve once, not before every append">
+`items.reserveCapacity(items.count + 1)` before each append looks careful, but it asks for exactly one more slot each time, which can defeat the doubling. On a Mac the allocator's rounding hides much of the damage (85 reallocations instead of 17 for 100,000 appends); on platforms that round less, every append can copy the whole array, and the loop becomes O(n²). Reserve once, for the final size, or let `append` grow on its own.
+</Callout>
+
+## Reusing buffers
+
+The cheapest allocation is the one you don't make. When the same kind of work repeats, such as a BFS per query, a scratch array per test case, or a buffer per frame, keep the buffer and reuse it. `removeAll(keepingCapacity: true)` empties an array but keeps its memory:
+
+```swift run
+var queue: [Int] = []
+for round in 1...3 {
+    queue.removeAll(keepingCapacity: true)
+    let before = queue.capacity
+    for cell in 0..<1_000 {
+        queue.append(cell)
+    }
+    print("round \(round): needed a bigger buffer?", queue.capacity != before)
+}
+
+queue.removeAll()        // keepingCapacity defaults to false
+print(queue.capacity)
+```
+
+```output
+round 1: needed a bigger buffer? true
+round 2: needed a bigger buffer? false
+round 3: needed a bigger buffer? false
+0
+```
+
+Only the first round paid for growing. Plain `removeAll()` gives the memory back, which is what you want when you're done, and what you don't want in a loop.
+
+Reuse goes further than keeping capacity. A BFS needs a "visited" mark per cell, and clearing a million-cell array before each of 20,000 searches is 20 billion writes, even when each search only explores a few dozen cells. The standard trick is a **visit stamp**: keep an `[Int]` of stamps, give each search a new number, and treat a cell as visited only if its stamp equals the current number. Starting a new search is `stamp += 1`, which is O(1), and nothing is ever cleared:
+
+```swift
+currentStamp += 1                          // a fresh search: every old mark is now stale
+seen[start] = currentStamp
+// …
+if seen[neighbour] != currentStamp {       // not visited in *this* search
+    seen[neighbour] = currentStamp
+    queue[tail] = neighbour                // a preallocated queue, reset with head = 0, tail = 1
+    tail += 1
+}
+```
+
+That's the heart of the practice problem **Many short routes on one grid**: each query must cost what it explores, not the size of the grid. Its queue is a preallocated array with head and tail indices, the idea from [A queue with a head index](/dsa/learn/queue-head-index), so it needs no clearing either.
+
+## ContiguousArray
+
+On Apple platforms, Swift arrays can talk to Objective-C, where `NSArray` lives. An `Array` whose elements are classes (or `@objc` protocols) may be backed by an `NSArray`, for example when it came from a UIKit or Foundation API. So for class elements, `Array`'s code must allow for two kinds of storage, and some operations include a check of which kind it has.
+
+`ContiguousArray` always uses Swift's own contiguous storage, so that check never happens. Everything else is the same API:
+
+```swift run
+final class Particle {
+    var x: Double
+    init(x: Double) { self.x = x }
+}
+
+var particles = ContiguousArray<Particle>()
+particles.reserveCapacity(4)
+for i in 0..<4 {
+    particles.append(Particle(x: Double(i)))
+}
+for particle in particles {
+    particle.x *= 2
+}
+
+let positions = particles.map { $0.x }
+print(positions)
+print(type(of: positions))
+print(type(of: ContiguousArray(positions)))
+```
+
+```output
+[0.0, 2.0, 4.0, 6.0]
+Array<Double>
+ContiguousArray<Double>
+```
+
+When does it matter?
+
+| Elements | `Array` vs `ContiguousArray` |
+| --- | --- |
+| value types: `Int`, `Double`, structs, enums, `String` | identical: `Array` is never `NSArray`-backed for these |
+| classes, on Apple platforms | `ContiguousArray` can be measurably faster in hot loops |
+| anything, on Linux | identical: there's no Objective-C |
+
+So almost all DSA code, which stores `Int`s and structs, gains nothing. Reach for `ContiguousArray` when a hot loop walks an array of class instances, and measure. Notice the gotcha in the output: `map` on a `ContiguousArray` returns a plain `Array`. Wrap the result if you want to stay contiguous, which costs a copy.
+
+## Fewer bytes per element
+
+The processor doesn't read memory one value at a time. It pulls in 64-byte chunks called **cache lines**, and keeps recently used ones in a small, very fast memory called the **cache**. A loop that walks an array in order is fast because each chunk brings in the next several elements. That makes the stride from [MemoryLayout: size, stride and alignment](/dsa/learn/swift-memory-layout) a performance number, not only a memory number:
+
+```swift run
+struct Particle {
+    var x: Double
+    var y: Double
+    var z: Double
+    var alive: Bool
+}
+
+let count = 1_000_000
+print(MemoryLayout<Particle>.stride)
+print("sum of x over [Particle] reads", count * MemoryLayout<Particle>.stride / 1_000_000, "MB")
+print("sum of x over [Double] reads", count * MemoryLayout<Double>.stride / 1_000_000, "MB")
+```
+
+```output
+32
+sum of x over [Particle] reads 32 MB
+sum of x over [Double] reads 8 MB
+```
+
+A loop that only needs `x` still drags every particle's `y`, `z` and `alive` through the cache, four times the bytes. Two fixes:
+
+- **Smaller fields.** If indices fit in 32 bits, `Int32` halves an index array. The next lesson stores a whole trie's children as `Int32`.
+- **Separate arrays for hot fields.** Keeping `xs: [Double]`, `ys: [Double]` and so on side by side (a "structure of arrays") lets a loop read only what it uses. Do this only where profiling says the loop matters; one array of structs is clearer.
+
+## Buffer pointers for one hot loop
+
+[Unsafe pointers](/dsa/learn/swift-unsafe-pointers) showed you how to read code like this. Here's when to write it. In an optimised build, `array[i]` checks that `i` is in range, and the optimiser removes that check only when it can prove it unnecessary. Inside `withUnsafeMutableBufferPointer`, release builds skip the check entirely. A sieve's inner loop jumps around in a way the optimiser can't always reason about, so it's a classic candidate:
+
+```swift run
+func countPrimes(below limit: Int) -> Int {
+    var isComposite = [Bool](repeating: false, count: limit)
+    var count = 0
+    isComposite.withUnsafeMutableBufferPointer { flags in
+        for n in 2..<limit where !flags[n] {
+            count += 1
+            var multiple = n * n
+            while multiple < limit {
+                flags[multiple] = true
+                multiple += n
+            }
+        }
+    }
+    return count
+}
+
+print(countPrimes(below: 1_000))
+print(countPrimes(below: 100_000))
+```
+
+```output
+168
+9592
+```
+
+The rules that keep this safe enough to use:
+
+1. **Measure first, and again after.** Often the optimiser had already removed the checks, and the unsafe version gains nothing. The next-but-one lesson shows how to measure properly.
+2. **Keep the closure small**, around one loop, and get your indices right: debug builds still check buffer-pointer indices, so run your tests in debug.
+3. **Never let the pointer escape** the closure. Return a value computed from it, never the pointer itself.
+4. **Don't touch the array inside.** While the closure runs, the array is lent out. Writing `isComposite.append(true)` inside it fails to compile:
+
+```text title="What you'll see"
+error: overlapping accesses to 'isComposite', but modification requires exclusive access; consider copying to a local variable
+```
+
+5. **The buffer can't grow.** It's a fixed window onto the array's elements; you can change elements but not add any.
+
+Swift 6.2 added `Span` and `MutableSpan`, views of contiguous memory that are bounds-checked but can't escape, and `InlineArray`, a fixed-size array stored inline with no heap allocation at all. As they spread, they replace many buffer-pointer loops and small scratch arrays. Treat buffer pointers as a last step you take for one measured loop.
+
+<Callout kind="gotcha" title="Swift gotchas: memory tools">
+- **`reserveCapacity` reserves, it doesn't create elements.** After `items.reserveCapacity(10)`, `items[0]` still crashes: `count` is 0. Use `Array(repeating:count:)` when you want elements to assign by index.
+- **Capacities differ between platforms.** Never write code or tests that depend on an exact `capacity` value; only that it's at least what you reserved.
+- **`ContiguousArray(someArray)` and `Array(someContiguousArray)` copy.** Converting back and forth in a loop undoes any gain.
+</Callout>
+
+## Practice
+
+**Many short routes on one grid** answers 20,000 BFS queries on a million-cell grid. Allocate or clear grid-sized arrays per query and it's far too slow; set everything up once, reuse it, and stamp instead of clearing. **List every folder's path** rewards working out the output's size first and reserving it once.
+
+```cards
+- id: reserve-capacity
+  front: "What does `reserveCapacity(n)` guarantee, and when should you call it?"
+  back: "The next appends up to n elements in total won't reallocate. Call it once, before a loop whose final size you know, not before every append."
+- id: keeping-capacity
+  front: "How do you empty an array but keep its buffer for the next round?"
+  back: "`removeAll(keepingCapacity: true)`. Plain `removeAll()` frees the buffer, so the next round has to grow it again."
+- id: visit-stamp
+  front: "How can a BFS reuse its visited array without clearing it for every search?"
+  back: "Store a stamp per cell and give each search a new stamp number. A cell counts as visited only if its stamp equals the current number."
+- id: contiguous-array-when
+  front: "When can `ContiguousArray` beat `Array`?"
+  back: "On Apple platforms, when the elements are classes or `@objc` protocols, because such an `Array` might be backed by an `NSArray`. For value types and on Linux, they're identical."
+```
+
+```quiz
+- id: q1
+  type: output
+  prompt: "What does this print?"
+  code: |
+    var buffer: [Int] = []
+    buffer.reserveCapacity(100)
+    print(buffer.count, buffer.capacity >= 100)
+    buffer.append(contentsOf: 1...5)
+    buffer.removeAll(keepingCapacity: true)
+    print(buffer.count, buffer.capacity >= 100)
+    buffer.removeAll()
+    print(buffer.count, buffer.capacity)
+  answer: |
+    0 true
+    0 true
+    0 0
+  explain: "Reserving adds capacity but no elements, so `count` stays 0. `removeAll(keepingCapacity: true)` keeps the reserved buffer. Plain `removeAll()` gives the memory back, leaving an empty array with no capacity."
+- id: q2
+  type: mcq
+  prompt: "For which array does switching to `ContiguousArray` have a chance of helping?"
+  options:
+    - "`[Int]` in a sieve on macOS"
+    - "`[Point]`, where `Point` is a struct, on iOS"
+    - "`[NodeView]`, where `NodeView` is a class, walked in a hot loop on iOS"
+    - "`[String]` on Linux"
+  answer: 2
+  explain: "Only arrays of classes (or `@objc` protocols) on Apple platforms can be backed by an `NSArray`, which is the extra work `ContiguousArray` avoids. Value-type elements, and every array on Linux, behave identically."
+- id: q3
+  type: bigo
+  prompt: "A grid has C cells. Each of Q BFS queries first runs `visited = Array(repeating: false, count: C)` and then explores at most k cells. What's the total time?"
+  options:
+    - "O(Q · k)"
+    - "O(Q · C)"
+    - "O(C + Q · k)"
+    - "O(C · k)"
+  answer: "O(Q · C)"
+  explain: "Creating and filling a C-element array costs O(C) per query, however few cells the search explores, so Q queries cost O(Q · C) (plus O(Q · k) for the searching, which is smaller). Visit stamps make it O(C + Q · k): one setup, then only the explored cells."
+- id: q4
+  type: multi
+  prompt: "Which are safe inside `numbers.withUnsafeMutableBufferPointer { buffer in … }`?"
+  options:
+    - "`buffer[i] += 1` for `i` in `buffer.indices`"
+    - "`numbers.append(0)`"
+    - "Returning `buffer.reduce(0, +)` from the closure"
+    - "Saving `buffer` in a property to use later"
+  answer: [0, 2]
+  explain: "Changing elements and returning a computed value are fine. Touching `numbers` itself overlaps with the access the closure has, so it doesn't compile, and a saved buffer pointer dangles as soon as the closure returns."
+- id: q5
+  type: truefalse
+  prompt: "Calling `items.reserveCapacity(items.count + 1)` before every append guarantees the loop is O(n)."
+  answer: false
+  explain: "It asks for exactly one more slot each time, which can defeat the doubling strategy. Depending on the allocator, many appends then copy the whole array, up to O(n²) in total. Reserve once for the final size instead."
+```

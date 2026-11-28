@@ -1,0 +1,309 @@
+## Why it matters
+
+Undo is what lets people experiment. Notes, Photos, Freeform and Keynote all have it, iPad keyboards expect ⌘Z to work, and iOS has offered shake to undo since iPhone OS 3. [Command and UndoManager](/design/learn/sd-behavioural-command) showed the API. This lesson is about designing it in: undo is a **history of state**, so where your state lives and how it changes decide whether undo is easy, exact, and scoped to the right window. In interviews for editors and creative apps, it's often the deep dive.
+
+## Undo is two stacks
+
+Every undo system, however it's built, follows the same rules:
+
+- A **change** saves what's needed to reverse it on the undo stack, and **clears the redo stack**.
+- **Undo** reverses the newest change and moves it to the redo stack.
+- **Redo** reapplies the newest undone change and moves it back.
+
+```visual flow
+title: Edits, undos and a new edit that clears redo
+nodes:
+  - { id: undo, label: Undo stack, kind: store, at: [0, 0] }
+  - { id: doc, label: Document, kind: view, at: [2, 0] }
+  - { id: redo, label: Redo stack, kind: store, at: [4, 0] }
+edges:
+  - [doc, undo, save]
+  - [undo, doc, restore]
+  - [doc, redo, save]
+  - [redo, doc, restore]
+steps:
+  - say: "The document starts as **A**, with nothing to undo or redo."
+    label: { doc: A, undo: empty, redo: empty }
+  - say: "An edit makes **B**. The version before it, A, goes on the undo stack."
+    send: doc->undo
+    label: { doc: B, undo: A }
+  - say: "Another edit makes **C**, and B goes on the stack."
+    send: doc->undo
+    label: { doc: C, undo: "A, B" }
+  - say: "**Undo**: C moves to the redo stack, and B comes back."
+    send: [doc->redo, undo->doc]
+    label: { doc: B, undo: A, redo: C }
+  - say: "**Undo** again: back to A. Redo would bring back B, then C."
+    send: [doc->redo, undo->doc]
+    label: { doc: A, undo: empty, redo: "C, B" }
+  - say: "**Redo**: B returns, and A goes back on the undo stack."
+    send: [doc->undo, redo->doc]
+    label: { doc: B, undo: A, redo: C }
+  - say: "A **new** edit, D, starts a different future. C can't be redone any more, so the redo stack is cleared."
+    send: doc->undo
+    state: { redo: error }
+    label: { doc: D, undo: "A, B", redo: cleared }
+```
+
+The design question is what goes on the stacks: a way to *reverse* each change, or a *copy* of the state before it.
+
+## Two ways to record history
+
+### Commands: how to reverse each change
+
+`UndoManager`'s model is the command pattern: for each change you register a closure that reverses it, and when that closure runs during an undo it registers the opposite, which becomes the redo. Inserting a shape registers "remove this shape"; removing registers "insert it back".
+
+Commands are compact (a change to one shape stores one shape, not the drawing) and they suit large documents and changes with obvious inverses. Their cost is exactness: every inverse must undo *precisely* what its change did, and refer to things in a way that's still right later. Inverses that use array indices break as soon as other edits shift the indices; use ids.
+
+### Snapshots: the whole state before each change
+
+If your state is a value type, there's a simpler way: save a copy of the state before each change, and undo by putting it back. Undo can't be inexact, because it restores what was there. It's also where [Reducers: state changes as pure functions](/design/learn/sd-functional-reducers) pay off: if every change goes through one function, every change can be recorded in that one place.
+
+Copies are cheaper than they sound. Swift's arrays, dictionaries and strings are **copy-on-write**: saving a snapshot shares the storage, and the next change copies only the top level it touches, while unchanged nested values stay shared. So a snapshot of a drawing costs one copy of its shapes array (about the number of shapes × the size of a shape), not a deep copy of everything. That's fine for thousands of items; for a 50 MB image, store commands or diffs instead.
+
+You can have both: keep snapshots as your history, and register each one with `UndoManager`, so the system's gestures, keyboard shortcuts and Edit menu drive it.
+
+```swift run title="Snapshots, recorded with UndoManager"
+import Foundation
+
+/// A drawing, as a value: a snapshot is a copy of it
+struct Drawing: Equatable {
+    var shapes: [String] = []
+}
+
+@MainActor
+final class DrawingModel {
+    private(set) var drawing = Drawing()
+    let undoManager = UndoManager()
+
+    /// Every change goes through here, so every change can be undone
+    func change(_ actionName: String, _ edit: (inout Drawing) -> Void) {
+        let before = drawing
+        edit(&drawing)
+        guard drawing != before else { return }
+        registerRestore(of: before, actionName: actionName)
+    }
+
+    private func registerRestore(of snapshot: Drawing, actionName: String) {
+        undoManager.registerUndo(withTarget: self) { model in
+            let current = model.drawing
+            model.drawing = snapshot
+            // Registering while undoing records the redo, and the other way round
+            model.registerRestore(of: current, actionName: actionName)
+        }
+        undoManager.setActionName(actionName)
+    }
+}
+
+let model = DrawingModel()
+// In an app, everything registered while handling one event is one group. A script has no
+// events, so it opens and closes its groups itself.
+model.undoManager.groupsByEvent = false
+
+model.undoManager.beginUndoGrouping()
+model.change("Add Circle") { $0.shapes.append("circle") }
+model.undoManager.endUndoGrouping()
+
+model.undoManager.beginUndoGrouping()
+model.change("Add Shapes") { $0.shapes.append("square") }
+model.change("Add Shapes") { $0.shapes.append("star") }
+model.undoManager.endUndoGrouping()
+
+print(model.drawing.shapes, "· undo:", model.undoManager.undoActionName)
+model.undoManager.undo()
+print(model.drawing.shapes, "· redo:", model.undoManager.redoActionName)
+model.undoManager.undo()
+print(model.drawing.shapes, "·", model.undoManager.canUndo ? "can undo" : "nothing to undo")
+model.undoManager.redo()
+print(model.drawing.shapes, "· undo:", model.undoManager.undoActionName)
+```
+
+```output
+["circle", "square", "star"] · undo: Add Shapes
+["circle"] · redo: Add Shapes
+[] · nothing to undo
+["circle"] · undo: Add Circle
+```
+
+Two changes inside one group undo together, which is the next topic. Note too that in current SDKs `UndoManager` is isolated to the main actor, and so is the closure you register, which suits UI state that lives there anyway.
+
+## Groups: what counts as one step
+
+What the user thinks of as one action is often many changes. `UndoManager` handles this with **groups**: everything registered inside a group is undone together.
+
+- **By event, by default.** `groupsByEvent` is `true`, so everything registered while handling one event (one tap, one key press) is one step. That's why tapping a button that changes three things undoes in one go.
+- **Gestures need care.** A drag delivers dozens of events, and registering on each makes dozens of undo steps. Remember the state when the gesture starts and register **once**, when it ends. Or wrap the gesture in `beginUndoGrouping()` and `endUndoGrouping()`.
+- **Typing is coalesced.** `UITextView` and `TextField` coalesce keystrokes into a few undo steps themselves. A custom editor must do it: consecutive changes of the same kind ("Typing") join the open step until something else happens.
+- **Name every step.** `setActionName("Move Shape")` produces "Undo Move Shape" in the Edit menu and in the shake-to-undo alert.
+
+```swift check ios title="A canvas whose drags undo in one step"
+import SwiftUI
+
+struct CanvasItem: Identifiable, Equatable {
+    let id: UUID
+    var position: CGPoint
+}
+
+@MainActor @Observable
+final class CanvasModel {
+    var items: [CanvasItem] = []
+
+    /// Records the items as they were, so one undo puts them back
+    func registerUndo(restoring snapshot: [CanvasItem], named name: String, with undoManager: UndoManager?) {
+        undoManager?.registerUndo(withTarget: self) { model in
+            let current = model.items
+            model.items = snapshot
+            model.registerUndo(restoring: current, named: name, with: undoManager)
+        }
+        undoManager?.setActionName(name)
+    }
+}
+
+struct CanvasView: View {
+    @State private var model = CanvasModel()
+    @State private var beforeDrag: [CanvasItem]?
+    @Environment(\.undoManager) private var undoManager   // this window's
+
+    var body: some View {
+        ZStack {
+            ForEach(model.items) { item in
+                Circle()
+                    .frame(width: 60, height: 60)
+                    .position(item.position)
+                    .gesture(drag(item.id))
+            }
+        }
+        .toolbar {
+            Button("Add", systemImage: "plus") {
+                let before = model.items
+                model.items.append(CanvasItem(id: UUID(), position: CGPoint(x: 120, y: 120)))
+                model.registerUndo(restoring: before, named: "Add Shape", with: undoManager)
+            }
+        }
+    }
+
+    /// A drag makes dozens of changes but registers one undo step, when it ends
+    private func drag(_ id: CanvasItem.ID) -> some Gesture {
+        DragGesture()
+            .onChanged { value in
+                if beforeDrag == nil { beforeDrag = model.items }
+                if let index = model.items.firstIndex(where: { $0.id == id }) {
+                    model.items[index].position = value.location
+                }
+            }
+            .onEnded { _ in
+                if let beforeDrag {
+                    model.registerUndo(restoring: beforeDrag, named: "Move Shape", with: undoManager)
+                }
+                beforeDrag = nil
+            }
+    }
+}
+```
+
+## What undo should and shouldn't cover
+
+Undo is for **the user's edits to their content**: adding, moving, deleting, formatting. Usually it isn't for navigation, selection, scrolling or view settings; undoing a scroll would surprise everyone.
+
+The hard cases are changes that leave the device. You can't un-send a message or un-charge a card, so those don't belong on the undo stack. Three patterns give users a way back anyway:
+
+- **Delay the effect.** Mail's Undo Send holds the message for a few seconds before it really goes. The undo cancels a pending job, not a sent message.
+- **Soft delete with a grace window.** Mark the item deleted locally, hide it, and show "Deleted · Undo". Commit the delete to the server when the window passes, or restore it if the user taps Undo.
+- **A compensating action.** If the server supports restoring (a trash folder, an "unarchive" endpoint), undo sends that request, and must handle it failing.
+
+When something irreversible does happen (Save to a server, Send, Publish), clear the history that led up to it with `removeAllActions()`, or the user can "undo" into a state the server no longer agrees with.
+
+## Where the history lives
+
+Undo history belongs to a **document or a window**, not to the app. Two iPad windows editing two documents must undo independently, and ⌘Z must act on the window in front.
+
+- **SwiftUI:** `@Environment(\.undoManager)` gives you the window's undo manager. Register there and shake, the three-finger gestures and the keyboard shortcuts all work.
+- **UIKit:** `undoManager` comes from the responder chain; by default it's the window's. A view controller that edits its own document can override `undoManager` to return one it owns.
+- **Clean up.** When an editor closes, call `removeAllActions(withTarget:)` for its model. Otherwise the next screen's shake can undo an edit in a document that's no longer on screen.
+- **Persistence frameworks can do it for you.** SwiftData registers undo for model changes when the container is created with `isUndoEnabled: true` (for example `.modelContainer(for: Note.self, isUndoEnabled: true)`), using the window's undo manager. Core Data contexts have an `undoManager` property, which is `nil` by default on iOS; assign one to turn it on.
+
+## Trade-offs
+
+| | Commands (inverse operations) | Snapshots of value state | Framework undo (SwiftData, Core Data) |
+| --- | --- | --- | --- |
+| Exactness | only as exact as each inverse | exact by construction | exact for model changes |
+| Memory | small: one change each | one shallow copy per step | managed for you |
+| Code | an inverse for every change | one place records every change | a flag, plus grouping and names |
+| Fits | huge documents, image edits | value-type state, reducers | apps whose state is the database |
+| Watch out for | indices that shift; inverses that drift from their changes | large state; set `levelsOfUndo` | changes outside the store aren't covered |
+
+<Callout kind="interview">
+
+**What to say:** "All edits go through one function on the document model, so each is recorded in one place, as a snapshot of value-type state registered with the window's UndoManager. Drags and typing are coalesced into one step, every step is named, and history is per document. Deleting or sending is soft or delayed, so 'undo' cancels a pending effect rather than pretending to reverse the server."
+
+**What to ask:** how large can a document get (snapshots or commands)? Is there collaboration? With other people editing, undo must reverse only *your* changes, which is much harder.
+
+**Red flags:** one app-wide undo stack; inverses written against array indices; putting server-side effects on the undo stack.
+
+</Callout>
+
+<Callout kind="gotcha" title="iOS gotcha: UndoManager isn't observable">
+
+`undoManager.canUndo` isn't an `@Observable` property, so `.disabled(!(undoManager?.canUndo ?? false))` doesn't update on its own: SwiftUI isn't told when it changes. It looks right only when something else re-renders the view. Re-read it whenever your own state changes, or listen for `.NSUndoManagerDidCloseUndoGroup`, `.NSUndoManagerDidUndoChange` and `.NSUndoManagerDidRedoChange`, and keep the two flags in your model.
+
+</Callout>
+
+## Practice
+
+The kata **Undo and redo history** builds the two stacks as a generic value type: action names for the menu, a limit on how far back you can go, and coalescing, so a burst of typing undoes in one step.
+
+```cards
+- id: two-stacks
+  front: "What happens to the redo stack when the user makes a new edit after undoing?"
+  back: "It's cleared. The new edit starts a different future, so the undone changes can't be redone."
+- id: snapshot-vs-command
+  front: "When do snapshots beat commands for undo?"
+  back: "When state is a value type of moderate size: undo restores exactly what was there, and copy-on-write keeps each snapshot to a shallow copy. Commands win for huge documents."
+- id: one-step-drag
+  front: "How do you make a drag undo in one step?"
+  back: "Remember the state when the gesture starts and register one undo when it ends, or wrap the gesture in beginUndoGrouping and endUndoGrouping."
+- id: irreversible
+  front: "How do you offer undo for a delete that reaches the server?"
+  back: "Delay or soften it: hide the item and commit the delete after a grace window, or call a restore endpoint. Don't put server effects on the undo stack."
+```
+
+```quiz
+- id: q1
+  type: trace
+  prompt: "A document starts as `A`. The user edits to `B`, edits to `C`, undoes, undoes, redoes, then edits to `D`. List the document's value after each of the six steps, separated by commas."
+  answer: "B, C, B, A, B, D"
+  explain: "Undo walks back C → B → A, redo brings back B, and the new edit D clears the redo stack, so C is gone for good."
+- id: q2
+  type: estimate
+  prompt: "A canvas keeps its shapes as an array of 2,000 structs of about 100 bytes each, and records a snapshot before every change. Roughly how many megabytes do 100 undo steps hold?"
+  answer: 20
+  unit: MB
+  within: { factor: 2 }
+  explain: "Copy-on-write makes each change copy the array once: 2,000 × 100 B = 200 KB per step, × 100 steps = 20 MB. That's fine, but it's why `levelsOfUndo` (or a limit in your own history) matters as documents grow."
+- id: q3
+  type: mcq
+  prompt: "Users complain that undoing a drag moves the shape back a few pixels at a time. What's the fix?"
+  options:
+    - "Set `groupsByEvent` to `false` for the whole app"
+    - "Register one undo when the drag ends, restoring the state from when it began"
+    - "Call `removeAllActions()` after every drag"
+    - "Use a larger `levelsOfUndo`"
+  answer: 1
+  explain: "Each drag event was registering its own step. One registration at the end, with the state from the start, makes the whole drag one undo."
+- id: q4
+  type: multi
+  prompt: "Which should normally be on a note-taking app's undo stack?"
+  options:
+    - "Deleting a paragraph"
+    - "Making text bold"
+    - "Scrolling to the end of the note"
+    - "Sharing the note to another app"
+    - "Moving a checklist item"
+  answer: [0, 1, 4]
+  explain: "Undo covers edits to the user's content. Scrolling isn't an edit, and sharing has left the app: it can't be reversed by restoring local state."
+- id: q5
+  type: truefalse
+  prompt: "An iPad app with two document windows should share one `UndoManager`, so ⌘Z works the same everywhere."
+  answer: false
+  explain: "History belongs to a document or window. With one shared manager, ⌘Z in one window could undo an edit in the other. SwiftUI's environment gives each window its own."
+```

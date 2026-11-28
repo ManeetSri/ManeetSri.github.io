@@ -1,0 +1,355 @@
+## Why it matters
+
+`Array`, `Dictionary`, `Set` and `String` all use **copy-on-write**: copying one is cheap because the copies share a buffer, and the buffer is only duplicated when one of them changes. [Copy-on-write explained](/dsa/learn/swift-copy-on-write-intro) showed you this from the outside. In this lesson you build it yourself. You'll need it whenever you write a data structure as a struct that keeps its data in a class, which is how Swift's own collections are made, and how you'll build structures such as a dynamic array, a ring buffer or a heap later in the course.
+
+## The problem: a struct with class storage
+
+Suppose you want a `ScoreList` type that behaves like a value, and you keep its data in a class so that copies can share it. Here's the naive version:
+
+```swift run
+final class ScoreStorage {
+    var scores: [Int] = []
+}
+
+struct ScoreList {
+    private var storage = ScoreStorage()
+
+    var scores: [Int] { storage.scores }
+
+    mutating func add(_ score: Int) {
+        storage.scores.append(score)
+    }
+}
+
+var a = ScoreList()
+a.add(10)
+var b = a          // a "copy"...
+b.add(20)          // ...changed through b
+print(a.scores)
+print(b.scores)
+```
+
+```output
+[10, 20]
+[10, 20]
+```
+
+`b = a` copied the struct, but the struct only contains a reference, so both copies point at the same `ScoreStorage` object. Adding to `b` changed `a` as well. That breaks the promise every Swift value type makes: **changing one copy never affects another**.
+
+There's a hint in the code that something's off. `add` doesn't really need `mutating`: it never changes the struct's own stored property, only the object that property points at. Swift would compile it without `mutating`, which is exactly the problem.
+
+<Callout kind="note" title="Why not use an array directly?">
+A struct whose only stored property is an `Array` is already copy-on-write, because the array is. We wrap the array in a class here only to see the mechanism clearly. In real code you write your own copy-on-write when the storage genuinely has to be a class: a linked structure of nodes, a fixed-capacity buffer you manage yourself, or a buffer with extra bookkeeping.
+</Callout>
+
+## The fix: copy before you write, if shared
+
+The solution is to check, at the start of every mutating method, whether the storage is shared. If it is, give this copy its own storage first, then make the change.
+
+Swift has a function for exactly this check: `isKnownUniquelyReferenced(&storage)`. It returns `true` when there's exactly one strong reference to the object, meaning no other copy can see it, and `false` otherwise. You pass the stored property with `&`, like an `inout` argument (M05).
+
+```swift run
+final class ScoreStorage {
+    var scores: [Int]
+    init(scores: [Int]) { self.scores = scores }
+}
+
+struct ScoreList {
+    private var storage = ScoreStorage(scores: [])
+
+    var scores: [Int] { storage.scores }
+
+    private mutating func makeUnique() {
+        if !isKnownUniquelyReferenced(&storage) {
+            print("  copying storage")
+            storage = ScoreStorage(scores: storage.scores)
+        }
+    }
+
+    mutating func add(_ score: Int) {
+        makeUnique()
+        storage.scores.append(score)
+    }
+}
+
+var a = ScoreList()
+print("a.add(10)")
+a.add(10)
+var b = a
+print("b = a, then read b")
+print(b.scores)
+print("b.add(20)")
+b.add(20)
+print("b.add(30)")
+b.add(30)
+print("a.add(40)")
+a.add(40)
+print(a.scores, b.scores)
+```
+
+```output
+a.add(10)
+b = a, then read b
+[10]
+b.add(20)
+  copying storage
+b.add(30)
+a.add(40)
+[10, 40] [10, 20, 30]
+```
+
+## Step by step
+
+| Step | References to the first storage | Unique? | What happens |
+| --- | --- | --- | --- |
+| `a.add(10)` | `a` | yes | append in place |
+| `b = a` | `a`, `b` | | nothing is copied yet |
+| read `b.scores` | `a`, `b` | | reading never copies |
+| `b.add(20)` | `a`, `b` | **no** | `b` gets new storage, then appends |
+| `b.add(30)` | (`b` has its own now) | yes | append in place |
+| `a.add(40)` | `a` | yes | append in place |
+
+What to notice:
+
+- **Copying is lazy.** `b = a` cost almost nothing. The real copy happened only when `b` was first changed.
+- **It happens once.** After `b` has its own storage, its next change is in place again.
+- **The other side benefits too.** When `b` moved to new storage, `a` became the only owner of the original, so `a.add(40)` didn't copy either.
+- **Values stay independent.** `a` and `b` ended up different, as values should.
+
+## Proving that storage is shared
+
+To test copy-on-write, you need to ask "do these two values share storage right now?". `ObjectIdentifier` gives a class instance an identity you can compare: two identifiers are equal exactly when they come from the same object. (Comparing with `===`, from [Identity with ===](/dsa/learn/swift-identity), works too; `ObjectIdentifier` is also `Hashable`, so it can go in a `Set` or be a dictionary key.)
+
+```swift run
+final class ScoreStorage {
+    var scores: [Int]
+    init(scores: [Int]) { self.scores = scores }
+}
+
+struct ScoreList {
+    private var storage = ScoreStorage(scores: [])
+
+    var scores: [Int] { storage.scores }
+
+    func isSharingStorage(with other: ScoreList) -> Bool {
+        ObjectIdentifier(storage) == ObjectIdentifier(other.storage)
+    }
+
+    private mutating func makeUnique() {
+        if !isKnownUniquelyReferenced(&storage) {
+            storage = ScoreStorage(scores: storage.scores)
+        }
+    }
+
+    mutating func add(_ score: Int) {
+        makeUnique()
+        storage.scores.append(score)
+    }
+
+    mutating func removeLast() -> Int? {
+        makeUnique()
+        return storage.scores.popLast()
+    }
+}
+
+var a = ScoreList()
+a.add(1)
+a.add(2)
+var b = a
+print("after b = a:", a.isSharingStorage(with: b))
+let last = b.removeLast()
+print("after b.removeLast():", a.isSharingStorage(with: b))
+print(a.scores, b.scores, last ?? -1)
+```
+
+```output
+after b = a: true
+after b.removeLast(): false
+[1, 2] [1] 2
+```
+
+`isSharingStorage(with:)` can read `other.storage` even though it's `private`, because `private` allows access from anywhere inside the type's own declaration. A method like this is how the tests for this lesson's problem check your implementation.
+
+## The recipe
+
+Every copy-on-write type follows the same five steps:
+
+1. **Keep the data in a `final class`.** `final` (M09) says it has no subclasses, which keeps it simple and lets the compiler call its methods directly.
+2. **Store it in a `private var`** in your struct. Private, so nothing outside can take a second reference behind your back. `var`, so you can replace it with a fresh copy.
+3. **Read through computed properties or methods.** Reading never needs a copy.
+4. **Start every mutating method with `makeUnique()`.** Every one, including subscripts' setters.
+5. **In `makeUnique()`, copy only if `isKnownUniquelyReferenced` says the storage is shared.** The copy creates a new storage object with a copy of the contents.
+
+## Subscripts need it too
+
+Data structures often let you change elements with a subscript, like `row[1] = 9`. A subscript's `set` is a mutating operation, so it needs the same check. (You'll write your own subscripts properly in M10's [Collection conformance and subscripts](/dsa/learn/swift-collection-subscripts); here, `get` reads a value and `set` receives the new one as `newValue`.)
+
+```swift run
+final class RowStorage {
+    var cells: [Int]
+    init(cells: [Int]) { self.cells = cells }
+}
+
+struct Row {
+    private var storage: RowStorage
+
+    init(count: Int) {
+        storage = RowStorage(cells: Array(repeating: 0, count: count))
+    }
+
+    subscript(index: Int) -> Int {
+        get { storage.cells[index] }
+        set {
+            if !isKnownUniquelyReferenced(&storage) {
+                print("  copying storage")
+                storage = RowStorage(cells: storage.cells)
+            }
+            storage.cells[index] = newValue
+        }
+    }
+}
+
+var first = Row(count: 3)
+first[0] = 5
+var second = first
+print(second[0])
+second[1] = 9
+second[2] += 1
+print(first[0], first[1], first[2])
+print(second[0], second[1], second[2])
+```
+
+```output
+5
+  copying storage
+5 0 0
+5 9 1
+```
+
+Reading `second[0]` didn't copy. The first write, `second[1] = 9`, did. And `second[2] += 1`, which reads through `get` and writes through `set`, found the storage already unique, so it changed it in place.
+
+## What it costs
+
+The first change after sharing copies everything in the storage, which takes time in proportion to its size: O(n), in the notation you'll learn in Part II. Every other change is as cheap as it would be without copy-on-write. If you copy a value and then make many changes, you pay for one copy, not one per change. And if you never change the copy, you never pay at all, which is why passing big arrays to functions is cheap in Swift.
+
+## Copying deeply enough
+
+`makeUnique()` must copy everything that the *value* is made of. Here the storage held an `[Int]`, and copying an array of numbers copies the numbers.
+
+If the storage holds class instances, copying the array copies the **references**, not the objects. For a linked structure, where the storage is a chain of nodes, `makeUnique()` must walk the chain and create new nodes. Otherwise the two "independent" values would still share their nodes, and changing a node through one would show up in the other.
+
+<Callout kind="gotcha" title="Swift gotcha: check the stored property itself">
+Always pass the stored property straight to `isKnownUniquelyReferenced(&storage)`. Copying it into a local variable first adds a second reference, so the check reports "shared" and you copy on every write:
+
+```swift
+mutating func makeUnique() {
+    var local = storage                        // now there are two references
+    if !isKnownUniquelyReferenced(&local) {    // false every time
+        storage = ScoreStorage(scores: storage.scores)
+    }
+}
+```
+</Callout>
+
+<Callout kind="gotcha" title="Swift gotcha: one forgotten makeUnique()">
+If a single mutating method skips `makeUnique()`, that method silently changes every copy sharing the storage. Nothing crashes, and tests that never copy the value won't notice. Always test: make a copy, change one, and check that the other didn't change.
+</Callout>
+
+The problem below asks you to turn a stack into a copy-on-write value type and prove, with tests, that copies share storage until one of them changes.
+
+```cards
+- id: cow-check
+  front: "What does `isKnownUniquelyReferenced(&storage)` tell you?"
+  back: "Whether exactly one strong reference points at the object. If so, no other copy can see it, so it's safe to change in place."
+- id: cow-recipe
+  front: "What's the recipe for copy-on-write in your own struct?"
+  back: "Keep data in a `final class`, store it in a `private var`, read through computed properties, and start every mutating method with `makeUnique()`, which copies only when storage is shared."
+- id: cow-when-copy
+  front: "When does a copy-on-write value actually copy its storage?"
+  back: "On the first change after it has been shared. Reading never copies, and later changes happen in place."
+- id: cow-deep-copy
+  front: "What must `makeUnique()` copy if the storage holds class instances or nodes?"
+  back: "The objects themselves, not only references to them. Otherwise the copies would still share those objects."
+```
+
+```quiz
+- id: q1
+  type: output
+  prompt: "`Tally` prints a line whenever it copies its storage. What does this print?"
+  code: |
+    final class TallyStorage {
+        var total: Int
+        init(total: Int) { self.total = total }
+    }
+
+    struct Tally {
+        private var storage = TallyStorage(total: 0)
+        var total: Int { storage.total }
+
+        mutating func add(_ n: Int) {
+            if !isKnownUniquelyReferenced(&storage) {
+                print("copy")
+                storage = TallyStorage(total: storage.total)
+            }
+            storage.total += n
+        }
+    }
+
+    var x = Tally()
+    x.add(1)
+    var y = x
+    y.add(2)
+    y.add(3)
+    x.add(4)
+    print(x.total, y.total)
+  answer: |
+    copy
+    5 6
+  explain: "Only `y.add(2)` finds the storage shared, so it copies once. After that `y` owns its storage and `x` is the sole owner of the original, so the other changes happen in place. `x` is 1 + 4 = 5 and `y` is 1 + 2 + 3 = 6."
+- id: q2
+  type: bug
+  prompt: "Copies of this stack sometimes change each other. Which line is the bug?"
+  code: |
+    struct IntStack {
+        private var storage = StackStorage()
+
+        private mutating func makeUnique() {
+            if !isKnownUniquelyReferenced(&storage) {
+                storage = storage.copy()
+            }
+        }
+        mutating func push(_ value: Int) {
+            makeUnique()
+            storage.items.append(value)
+        }
+        mutating func pop() -> Int? {
+            return storage.items.popLast()
+        }
+    }
+  answer: 14
+  explain: "`pop()` changes the storage without calling `makeUnique()` first, so popping from one copy removes the element from every copy sharing it. Every mutating method must start with `makeUnique()`."
+- id: q3
+  type: truefalse
+  prompt: "Reading a property of a copy-on-write value can trigger a copy of its storage."
+  answer: false
+  explain: "Only changes copy. Reading goes straight to the shared storage, which is safe because nobody is changing it."
+- id: q4
+  type: order
+  prompt: "Put the steps of a mutating method on a copy-on-write type in order."
+  lines:
+    - "Call `isKnownUniquelyReferenced(&storage)`"
+    - "If it returned false, create new storage with a copy of the contents"
+    - "Assign the new storage to the stored property"
+    - "Make the change to the (now unique) storage"
+  explain: "Check uniqueness first, copy and replace the storage only if it's shared, and only then mutate. Mutating before the check would change every sharing copy."
+- id: q5
+  type: mcq
+  prompt: "Why must the storage property be `private`?"
+  options:
+    - "So that `isKnownUniquelyReferenced` compiles"
+    - "So code outside can't hold an extra reference and change the storage behind the struct's back"
+    - "So the storage is placed on the stack"
+    - "Because classes inside structs must be private"
+  answer: 1
+  explain: "If outside code could grab the storage object, it could change data shared by several values without going through `makeUnique()`. Keeping it private means every change goes through your mutating methods."
+```

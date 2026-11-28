@@ -1,0 +1,253 @@
+## Why it matters
+
+"How many different people opened the app today?" sounds like a job for a `Set`: insert every user id, read `count`. With fifty million users, that set holds fifty million ids, and you need one per day, per country, per app version. **HyperLogLog** answers the same question to within a couple of percent using a few kilobytes, whether the true answer is a thousand or a billion. Redis offers it as a built-in type that uses 12 KB per counter for a typical error under 1%, and analytics databases use it for their "approximate distinct count" queries. It's also delightfully mergeable: the sketches from Monday and Tuesday, or from a hundred servers, combine into the count for all of them, without double-counting anyone.
+
+## Counting distinct items is the hard part
+
+Counting **all** events is easy: one integer. Counting **distinct** ones is hard, because when an id arrives you must know whether you've seen it before, and that seems to require remembering every id. Exactly, it does: any exact method needs memory that grows with the number of distinct items. HyperLogLog gives up exactness to escape that.
+
+## The intuition: the longest run of zeros
+
+Suppose a friend has been flipping a coin all afternoon, and tells you only one thing: "the longest run of heads I got at the start of a sequence was 10." A run of 10 happens with probability 1/2^10 per try, so they probably made about 2^10 ≈ 1,000 tries. You've estimated a count from a single remembered number.
+
+HyperLogLog does this with hashes. A good hash turns each item into 64 bits that look like 64 fair coin flips. Look at how many **leading zeros** each hash has:
+
+- About half of all hashes start with 1: no leading zeros.
+- A quarter start with 01, an eighth with 001, and in general a fraction 1/2^(r+1) have exactly r leading zeros.
+- So among n different items, the most leading zeros you'll see is about log₂ n, and 2 to that power estimates n.
+
+The crucial property: **a repeated item has the same hash**, so it can't change the maximum. The estimate counts distinct items, automatically.
+
+```swift run
+// A fixed 64-bit hash for integer ids: SplitMix64's mixing steps
+func hash(_ id: Int) -> UInt64 {
+    var z = UInt64(bitPattern: Int64(id)) &+ 0x9E37_79B9_7F4A_7C15
+    z = (z ^ (z >> 30)) &* 0xBF58_476D_1CE4_E5B9
+    z = (z ^ (z >> 27)) &* 0x94D0_49BB_1331_11EB
+    return z ^ (z >> 31)
+}
+
+// Leading zeros of a few hashes: about half have none, a quarter have one, an eighth two…
+for id in 1...6 {
+    let bits = String(hash(id), radix: 2)
+    let padded = String(repeating: "0", count: 64 - bits.count) + bits
+    print(id, padded.prefix(12) + "…", "leading zeros:", hash(id).leadingZeroBitCount)
+}
+
+// The most leading zeros seen among n distinct ids, and the guess 2^most
+for n in [10, 100, 1_000, 10_000, 100_000, 1_000_000] {
+    var most = 0
+    for id in 0..<n {
+        most = max(most, hash(id).leadingZeroBitCount)
+    }
+    print("n = \(n): most leading zeros \(most), guess 2^\(most) = \(1 << most)")
+}
+```
+
+```output
+1 100100010000… leading zeros: 0
+2 100101110101… leading zeros: 0
+3 000111010000… leading zeros: 3
+4 011011100111… leading zeros: 1
+5 011000110000… leading zeros: 1
+6 101111010110… leading zeros: 0
+n = 10: most leading zeros 3, guess 2^3 = 8
+n = 100: most leading zeros 5, guess 2^5 = 32
+n = 1000: most leading zeros 11, guess 2^11 = 2048
+n = 10000: most leading zeros 14, guess 2^14 = 16384
+n = 100000: most leading zeros 18, guess 2^18 = 262144
+n = 1000000: most leading zeros 19, guess 2^19 = 524288
+```
+
+The guesses grow with n, which is promising, but they're rough: 32 for 100, 2,048 for 1,000, and 262,144 for 100,000. One maximum is at the mercy of one lucky hash, and the guess can only be a power of two. HyperLogLog's job is to turn this into a precise estimate.
+
+## Many registers instead of one
+
+The fix is to run many small estimates at once and combine them:
+
+1. Use the first **b** bits of each hash to pick one of **m = 2^b registers**.
+2. Look at the **remaining** bits, and compute their rank: the number of leading zeros plus 1.
+3. Each register keeps the **largest rank** it has seen. A register is a single byte, and it starts at 0.
+
+Each register is now a small version of the coin-flip estimate, watching about n/m of the items. To combine them, HyperLogLog takes the **harmonic mean** of the values 2^register: m divided by the sum of 2^(−register). An ordinary average would let one register with a lucky, huge value dominate; the harmonic mean is pulled towards the typical registers instead. Multiplying by m (there are m registers sharing the items) and by a correction constant α, about 0.72, gives the estimate:
+
+```text
+estimate = α · m² / (2^(−M[0]) + 2^(−M[1]) + … + 2^(−M[m−1]))
+```
+
+One adjustment remains. When there are few items, many registers are still 0, and the formula overestimates. Then it's more accurate to count the empty registers, V of them, and estimate m · ln(m / V): the same reasoning you'd use to guess how many balls were thrown into m bins from how many bins are still empty. This is called **linear counting**, and it takes over whenever the raw estimate is at most 2.5m.
+
+```swift run
+import Foundation
+
+func hash(_ id: Int) -> UInt64 {
+    var z = UInt64(bitPattern: Int64(id)) &+ 0x9E37_79B9_7F4A_7C15
+    z = (z ^ (z >> 30)) &* 0xBF58_476D_1CE4_E5B9
+    z = (z ^ (z >> 27)) &* 0x94D0_49BB_1331_11EB
+    return z ^ (z >> 31)
+}
+
+struct HyperLogLog {
+    let indexBits: Int                           // b: 2^b registers
+    private(set) var registers: [UInt8]
+
+    init(indexBits: Int) {
+        self.indexBits = indexBits
+        registers = Array(repeating: 0, count: 1 << indexBits)
+    }
+
+    mutating func add(_ id: Int) {
+        let h = hash(id)
+        let index = Int(h >> (64 - indexBits))   // the first b bits choose a register
+        let rest = h << indexBits                // the remaining bits, moved to the top
+        let rank = UInt8(min(rest.leadingZeroBitCount, 64 - indexBits) + 1)
+        registers[index] = max(registers[index], rank)
+    }
+
+    var estimate: Double {
+        let m = Double(registers.count)
+        let alpha = 0.7213 / (1 + 1.079 / m)
+        let sum = registers.reduce(0.0) { $0 + pow(2, -Double($1)) }
+        let raw = alpha * m * m / sum            // a harmonic mean of 2^register, scaled
+        let empty = registers.filter { $0 == 0 }.count
+        if raw <= 2.5 * m && empty > 0 {
+            return m * log(m / Double(empty))    // few items: count the empty registers instead
+        }
+        return raw
+    }
+
+    // The union of two sketches: the larger value in each register
+    func merged(with other: HyperLogLog) -> HyperLogLog {
+        var result = self
+        for i in registers.indices {
+            result.registers[i] = max(registers[i], other.registers[i])
+        }
+        return result
+    }
+}
+
+for n in [100, 1_000, 10_000, 100_000, 1_000_000] {
+    var visitors = HyperLogLog(indexBits: 12)    // 4,096 registers of one byte each
+    for id in 0..<n {
+        visitors.add(id)
+        visitors.add(id)                         // a repeat visit changes nothing
+    }
+    let error = (visitors.estimate - Double(n)) / Double(n) * 100
+    print("distinct \(n): estimate \(Int(visitors.estimate.rounded())), error \(String(format: "%+.1f", error))%")
+}
+
+var monday = HyperLogLog(indexBits: 12)
+var tuesday = HyperLogLog(indexBits: 12)
+for id in 0..<60_000 { monday.add(id) }
+for id in 40_000..<100_000 { tuesday.add(id) }
+let both = monday.merged(with: tuesday)
+print("Monday ≈", Int(monday.estimate.rounded()), " Tuesday ≈", Int(tuesday.estimate.rounded()),
+      " either day ≈", Int(both.estimate.rounded()), "(exactly 100000)")
+```
+
+```output
+distinct 100: estimate 97, error -2.9%
+distinct 1000: estimate 997, error -0.3%
+distinct 10000: estimate 10099, error +1.0%
+distinct 100000: estimate 101737, error +1.7%
+distinct 1000000: estimate 1020719, error +2.1%
+Monday ≈ 60863  Tuesday ≈ 60895  either day ≈ 101737 (exactly 100000)
+```
+
+What to notice:
+
+- **Every estimate is within about 3%,** from a hundred visitors to a million, using the same 4,096 bytes. A `Set<Int>` of a million ids needs over 8 MB for the ids alone.
+- **Each id was added twice**, and the estimates count it once. Duplicates hash to the same register with the same rank, so `max` ignores them.
+- **The estimate for 100 used linear counting**: almost all of the 4,096 registers were still empty, and counting them is more precise than the harmonic mean would be.
+- **The merge is a register-by-register `max`.** Merging Monday's and Tuesday's sketches gives exactly the sketch you'd have built from both days' ids together, so it estimates the 100,000 distinct visitors across both days, counting the 20,000 who came on both days once.
+- **The register values are tiny.** A rank is at most 64 − b + 1, so 6 bits would be enough; Redis packs its registers into 6 bits each.
+
+## How accurate, and at what cost
+
+The typical relative error, the **standard error**, is about 1.04 / √m:
+
+| Registers (m) | Memory at 6 bits each | Standard error |
+| --- | --- | --- |
+| 1,024 | 768 bytes | 3.25% |
+| 4,096 | 3 KB | 1.6% |
+| 16,384 | 12 KB | 0.81% |
+
+Quadrupling the registers halves the error, and none of this depends on how many items you count: the memory is fixed, and the error is a **percentage** of the answer. Each `add` is one hash and one comparison, O(1); computing the estimate is O(m).
+
+The errors are random, not guaranteed: about two estimates in three land within one standard error of the truth, and nearly all within three.
+
+## What HyperLogLog can't do
+
+- **List the items, or test membership.** It keeps no items, only maxima. Combine it with a Bloom filter from [Bloom filters and count-min sketches](/dsa/learn/as-bloom-sketch) if you also need "have I seen this one?".
+- **Remove an item.** A register's maximum can't be "un-maxed": you don't know which item set it.
+- **Intersect reliably.** The union is exact as sketches go, but an intersection must be computed as |A| + |B| − |A ∪ B|, the inclusion–exclusion rule from [Inclusion–exclusion](/dsa/learn/nt-inclusion-exclusion). Each term carries its own error, so a small overlap between big sets can come out wildly wrong, even negative.
+
+<Callout kind="gotcha" title="The hash is everything">
+HyperLogLog assumes every bit of the hash behaves like a fair coin. A weak hash, such as one where similar ids give similar hashes, puts items into the same few registers and wrecks the estimate. Use a hash with strong mixing, like the SplitMix64 steps here. And never use Swift's `hashValue`: it changes every launch, so sketches from different runs, days or servers would be built from different hashes and couldn't be merged.
+</Callout>
+
+<Callout kind="gotcha" title="Common mistakes">
+- **Counting leading zeros of the whole hash.** The first b bits chose the register; the rank must come from the **other** bits, or every item in register 0 looks rare.
+- **Averaging the registers.** An arithmetic mean of 2^register is dominated by its luckiest register. Use the harmonic mean, as in the formula.
+- **Skipping the small-range correction.** Without linear counting, small counts come out far too high.
+- **Comparing sketches with different m or different hashes.** Merging only works register by register, with the same hash.
+</Callout>
+
+```cards
+- id: hll-leading-zeros
+  front: "Why do leading zeros in hashes estimate a count of distinct items?"
+  back: "A hash starts with r zeros with probability 1/2^(r+1), so seeing many leading zeros means many distinct hashes were tried. Repeated items have the same hash, so they can't raise the maximum."
+- id: hll-registers
+  front: "How does HyperLogLog use its registers?"
+  back: "The first b bits of each hash pick one of 2^b registers; the register keeps the largest rank (leading zeros + 1) of the remaining bits. The estimate is α · m² divided by the sum of 2^(−register)."
+- id: hll-error
+  front: "What is HyperLogLog's typical error with m registers?"
+  back: "About 1.04 / √m, as a percentage of the answer: 1.6% for 4,096 registers, 0.81% for 16,384. Memory doesn't depend on the count."
+- id: hll-merge
+  front: "How do you merge two HyperLogLog sketches, and what does the result count?"
+  back: "Take the maximum of each pair of registers. The result estimates the number of distinct items in the union, counting items in both sets once."
+```
+
+```quiz
+- id: q1
+  type: output
+  prompt: "HyperLogLog uses the leading zeros of a hash. What does this print?"
+  code: |
+    let hashes: [UInt8] = [0b1010_0000, 0b0001_1000, 0b0100_0001, 0b0000_0110]
+    print(hashes.map { $0.leadingZeroBitCount }, hashes.map { $0.leadingZeroBitCount }.max()!)
+  answer: "[0, 3, 1, 5] 5"
+  explain: "Count the zeros before the first 1: 1010… has none, 0001… has three, 01… has one, and 00000110 has five. The maximum, 5, would suggest about 2^5 = 32 distinct items."
+- id: q2
+  type: mcq
+  prompt: "Why does adding the same id a thousand times not change a HyperLogLog estimate?"
+  options:
+    - "HyperLogLog keeps a set of ids it has seen"
+    - "The same id always has the same hash, so it updates the same register with the same rank, which max ignores"
+    - "Each register can only be set once"
+    - "Duplicates are removed when the estimate is computed"
+  answer: 1
+  explain: "The hash is fixed, so a repeat goes to the same register with the same rank. A register keeps the maximum, and repeating a value can't raise it."
+- id: q3
+  type: truefalse
+  prompt: "Doubling the number of distinct items counted doubles the memory a HyperLogLog sketch needs."
+  answer: false
+  explain: "The memory is fixed by the number of registers, m. A sketch of 4,096 registers estimates a thousand or a billion distinct items with the same memory and about the same relative error."
+- id: q4
+  type: mcq
+  prompt: "You need a standard error of about 1.6%. Roughly how many registers do you need?"
+  options:
+    - "64"
+    - "1,024"
+    - "4,096"
+    - "65,536"
+  answer: 2
+  explain: "The error is about 1.04 / √m. For 1.6%, √m ≈ 65, so m ≈ 4,096. Each further fourfold increase in m halves the error."
+- id: q5
+  type: trace
+  prompt: "Two sketches with 4 registers each hold [2, 0, 5, 1] and [3, 4, 1, 1]. Write the merged registers."
+  answer: "3, 4, 5, 1"
+  explain: "Merging takes the larger value in each position: max(2, 3) = 3, max(0, 4) = 4, max(5, 1) = 5, max(1, 1) = 1. The result is the sketch of the union of both sets."
+- id: q6
+  type: recall
+  prompt: "Why does HyperLogLog switch to counting empty registers when the estimate is small?"
+  model: "With few items, most registers have never been touched and are still 0, which the harmonic-mean formula handles badly: it overestimates. But the number of empty registers says a lot: throwing n items into m registers leaves about m · e^(−n/m) empty, so n ≈ m · ln(m / V). That linear counting estimate is very accurate while many registers are empty."

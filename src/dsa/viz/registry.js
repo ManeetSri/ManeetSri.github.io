@@ -1,0 +1,34 @@
+// Each visualiser loads only when a lesson shows it. Names must match viz/names.js.
+import { SCRIPT_VISUALS } from './script/views.js';
+import { SIM_VISUALS } from './sims/views.js';
+
+export const VISUALS = {
+    binarySearch: () => import('./views/BinarySearchView.jsx'),
+    answerSearch: () => import('./views/AnswerSearchView.jsx'),
+    recursionTree: () => import('./views/RecursionTreeView.jsx'),
+    traceTable: () => import('./views/TraceTableView.jsx'),
+    growthChart: () => import('./views/GrowthChartView.jsx'),
+    bitPlayground: () => import('./views/BitPlaygroundView.jsx'),
+    arrayTrace: () => import('./views/ArrayTraceView.jsx'),
+    linkedList: () => import('./views/LinkedListView.jsx'),
+    stackQueue: () => import('./views/StackQueueView.jsx'),
+    hashTable: () => import('./views/HashTableView.jsx'),
+    intervals: () => import('./views/IntervalsView.jsx'),
+    matrix: () => import('./views/MatrixView.jsx'),
+    unionFind: () => import('./views/UnionFindView.jsx'),
+    bst: () => import('./views/TreeViews.jsx').then((module) => ({ default: module.BstView })),
+    binaryTree: () => import('./views/TreeViews.jsx').then((module) => ({ default: module.BinaryTreeView })),
+    avl: () => import('./views/TreeViews.jsx').then((module) => ({ default: module.AvlView })),
+    heap: () => import('./views/TreeViews.jsx').then((module) => ({ default: module.HeapView })),
+    trie: () => import('./views/TreeViews.jsx').then((module) => ({ default: module.TrieView })),
+    graph: () => import('./views/GraphViews.jsx').then((module) => ({ default: module.GraphView })),
+    grid: () => import('./views/GraphViews.jsx').then((module) => ({ default: module.GridView })),
+    dpTable: () => import('./views/ParadigmViews.jsx').then((module) => ({ default: module.DpTableView })),
+    nQueens: () => import('./views/ParadigmViews.jsx').then((module) => ({ default: module.QueensView })),
+    subsetsTree: () => import('./views/ParadigmViews.jsx').then((module) => ({ default: module.SubsetsTreeView })),
+    huffman: () => import('./views/ParadigmViews.jsx').then((module) => ({ default: module.HuffmanView })),
+    segmentTree: () => import('./views/RangeTreeViews.jsx').then((module) => ({ default: module.SegmentTreeView })),
+    fenwick: () => import('./views/RangeTreeViews.jsx').then((module) => ({ default: module.FenwickView })),
+    ...SCRIPT_VISUALS,
+    ...SIM_VISUALS,
+};

@@ -1,0 +1,225 @@
+## Why it matters
+
+Shuffle play over a library that changes while it plays. Picking a random server from the ones currently healthy. Choosing a random quiz question that hasn't been answered yet, or a random player waiting for a match. Each needs a collection that can add and remove items **and** hand back a uniformly random one, all fast. "Insert, delete and getRandom in O(1)" is a classic interview question with a small, satisfying answer: two structures, each covering the other's weakness, joined by one trick.
+
+## Requirements
+
+- `insert(x)`: add x if it isn't there; report whether it was added.
+- `remove(x)`: remove x if it's there; report whether it was removed.
+- `randomElement()`: return an element chosen **uniformly at random**: with n elements, each comes back with probability 1/n, whatever was inserted and removed before.
+- All three O(1) on average.
+
+## Why the obvious structures fail
+
+| Structure | insert | remove | random element |
+| --- | --- | --- | --- |
+| `Set` | O(1) | O(1) | O(n) |
+| `Array` | O(1) append, but checking for duplicates is O(n) | O(n): find it, then shift everything after it | O(1) |
+| `Dictionary` | O(1) | O(1) | O(n) |
+
+The surprise is `Set`. It has a `randomElement()` method, so why is it O(n)? Because `Set` is a `Collection` but not a `RandomAccessCollection`: its storage is a table of buckets, some empty, and its indices can only step forward one occupied bucket at a time. `randomElement()` picks a random number k and then steps forward k times. Only a structure with **random access**, an array, can jump straight to the k-th element.
+
+So the array is right for drawing, and a hash structure is right for finding. Use both.
+
+## The design
+
+- `elements: [Element]`, packed with no holes, so any random index in `0..<count` is an element.
+- `positions: [Element: Int]`, the index of each element in the array.
+
+`insert` checks `positions` for the element, then appends it and records its index. `randomElement` picks a random index. That leaves `remove`, where the array's weakness shows: taking an element out of the middle shifts everything after it.
+
+The trick: **a set has no order**, so there's no need to keep the array's order either. To remove x, move the **last** element into x's slot, update the moved element's index, and drop the last slot. Nothing shifts.
+
+| Step | `elements` | `positions` |
+| --- | --- | --- |
+| start | `[A, B, C, D, E]` | A:0, B:1, C:2, D:3, E:4 |
+| remove B: E moves to slot 1 | `[A, E, C, D]` | A:0, E:1, C:2, D:3 |
+| remove E: D moves to slot 1 | `[A, D, C]` | A:0, D:1, C:2 |
+| remove C: it's already last | `[A, D]` | A:0, D:1 |
+
+Here it is, with songs, followed by 30,000 draws:
+
+```swift run
+/// A seeded generator (SplitMix64), so this example draws the same numbers every run
+struct SeededGenerator: RandomNumberGenerator {
+    private var state: UInt64
+    init(seed: UInt64) { state = seed }
+    mutating func next() -> UInt64 {
+        state &+= 0x9E37_79B9_7F4A_7C15
+        var z = state
+        z = (z ^ (z >> 30)) &* 0xBF58_476D_1CE4_E5B9
+        z = (z ^ (z >> 27)) &* 0x94D0_49BB_1331_11EB
+        return z ^ (z >> 31)
+    }
+}
+
+struct RandomizedSet<Element: Hashable> {
+    private(set) var elements: [Element] = []      // packed, no holes: any index is an element
+    private var positions: [Element: Int] = [:]    // where each element sits in `elements`
+
+    @discardableResult
+    mutating func insert(_ element: Element) -> Bool {
+        guard positions[element] == nil else { return false }
+        positions[element] = elements.count
+        elements.append(element)
+        return true
+    }
+
+    @discardableResult
+    mutating func remove(_ element: Element) -> Bool {
+        guard let hole = positions.removeValue(forKey: element) else { return false }
+        let last = elements.removeLast()
+        if hole < elements.count {                 // fill the hole with the old last element
+            elements[hole] = last
+            positions[last] = hole
+        }
+        return true
+    }
+
+    func randomElement<G: RandomNumberGenerator>(using generator: inout G) -> Element? {
+        elements.randomElement(using: &generator)  // O(1): a random index into an array
+    }
+}
+
+var songs = RandomizedSet<String>()
+for song in ["Alpha", "Bravo", "Charlie", "Delta", "Echo"] {
+    songs.insert(song)
+}
+print(songs.elements)
+songs.remove("Bravo")                              // Echo moves into Bravo's slot
+print(songs.elements)
+songs.remove("Echo")                               // now Delta moves into slot 1
+print(songs.elements)
+songs.remove("Charlie")                            // the last slot: nothing moves
+print(songs.elements)
+print(songs.insert("Alpha"), songs.insert("Foxtrot"))
+print(songs.elements)
+
+var generator = SeededGenerator(seed: 42)
+var tally: [String: Int] = [:]
+for _ in 0..<30_000 {
+    if let song = songs.randomElement(using: &generator) {
+        tally[song, default: 0] += 1
+    }
+}
+for song in tally.keys.sorted() {
+    print(song, tally[song]!)
+}
+```
+
+```output
+["Alpha", "Bravo", "Charlie", "Delta", "Echo"]
+["Alpha", "Echo", "Charlie", "Delta"]
+["Alpha", "Delta", "Charlie"]
+["Alpha", "Delta"]
+false true
+["Alpha", "Delta", "Foxtrot"]
+Alpha 9891
+Delta 10096
+Foxtrot 10013
+```
+
+What to notice:
+
+- **The removal order of operations.** Removing the dictionary entry first and then checking `hole < elements.count` handles the tricky case for free: when the removed element was itself the last one, `removeLast()` already took it, `hole` equals the new count, and there's nothing to fill.
+- **Two writes per move.** The moved element goes into the hole **and** its entry in `positions` is updated. Forget the second and a later `remove` of that element empties the wrong slot.
+- **Uniform draws.** Every element owns exactly one slot and there are no holes, so each of the three songs comes up about 10,000 times in 30,000 draws.
+- Every operation is a constant number of array and dictionary steps: O(1) on average.
+
+## Injecting the generator
+
+`randomElement(using: &generator)` takes any `RandomNumberGenerator`. In the app, pass Swift's `SystemRandomNumberGenerator` (or offer a second method without the parameter that does exactly that). In tests, pass a **seeded** generator like the one above, and every run draws the same sequence, so a failing test fails the same way every time. It's the same idea as passing `now` into the TTL store: anything unpredictable becomes an input.
+
+The generator is `inout` because drawing a number changes its state. And let the standard library turn raw random bits into an index (`randomElement(using:)` or `Int.random(in:using:)`) rather than writing `Int(generator.next() % UInt64(count))`: the `%` version is very slightly biased towards small indexes whenever `count` doesn't divide 2⁶⁴ evenly, and the library's version isn't.
+
+<Callout kind="tip" title="Testing randomness">
+You can't test that one draw is "random", but you can test what uniformity promises. Every draw must be an element. And over many draws, each element should come up close to its fair share: with 10 elements and 50,000 draws, each should appear about 5,000 times, so anything outside 4,000 to 6,000 means a bug, not bad luck. Repeat the check after many removals, which is when broken swap-removes show up.
+</Callout>
+
+## Variations
+
+- **Duplicates allowed** (a random multiset): each value can sit in several slots, so `positions` maps each value to a **set** of indexes. Removing takes any one of them and swap-removes as before, updating the moved value's index set.
+- **Weighted random** (pick a server in proportion to its capacity): keep running totals of the weights and binary search for a random number in `0..<total`, combining [1D prefix sums and range queries](/dsa/learn/prefix-1d) with the bounds from [Lower bound, upper bound, first and last occurrence](/dsa/learn/bs-bounds).
+- **Random without repeats** (shuffle play that doesn't repeat a song until all have played): shuffle once and walk the order, as in [Fisher–Yates and shuffle()](/dsa/learn/rand-shuffle).
+
+<Callout kind="gotcha" title="Common mistakes">
+- **Removing from the middle with `remove(at:)`.** It shifts every later element: O(n).
+- **Forgetting to update the moved element's index.** The array looks right, but the dictionary now points at the wrong slot.
+- **Crashing on the last element.** Writing `elements[hole] = last` without checking that `hole` is still inside the array.
+- **Calling `Set.randomElement()` and calling it O(1).** It's O(n), because a set can't jump to its k-th element.
+</Callout>
+
+## Practice
+
+**Constant-time random set** builds `RandomSet<Element: Hashable>` with `insert`, `remove`, `contains`, `count` and `randomElement(using:)`. The tests check membership against `Set`, check that draws are evenly spread, and draw 200,000 times from 100,000 elements, which is far too slow if each draw is O(n).
+
+```cards
+- id: rs-two-structures
+  front: "Which two structures give insert, remove and getRandom in O(1), and what does each do?"
+  back: "An array of the elements, for O(1) random access, and a dictionary from each element to its index, for O(1) finding."
+- id: rs-swap-remove
+  front: "How do you remove an element from the middle of the array in O(1)?"
+  back: "Move the last element into its slot, update the moved element's index in the dictionary, and remove the last slot. Order doesn't matter in a set."
+- id: rs-set-random
+  front: "Why is `Set.randomElement()` O(n)?"
+  back: "A Set isn't a random-access collection: reaching the k-th element means stepping forward k times through its buckets."
+- id: rs-inject
+  front: "Why pass a `RandomNumberGenerator` into `randomElement(using:)`?"
+  back: "Tests can pass a seeded generator and get the same draws every run; the app passes the system generator."
+```
+
+```quiz
+- id: q1
+  type: output
+  prompt: "This is one swap-remove of \"b\". What does it print?"
+  code: |
+    var elements = ["a", "b", "c", "d"]
+    var positions = ["a": 0, "b": 1, "c": 2, "d": 3]
+    let hole = positions.removeValue(forKey: "b")!
+    let last = elements.removeLast()
+    if hole < elements.count {
+        elements[hole] = last
+        positions[last] = hole
+    }
+    print(elements, positions["d"]!)
+  answer: "[\"a\", \"d\", \"c\"] 1"
+  explain: "\"d\", the last element, moves into b's old slot, 1, and its recorded position is updated to match."
+- id: q2
+  type: mcq
+  prompt: "Why can't a `Set` alone give O(1) random elements?"
+  options:
+    - "Sets can't hold duplicates"
+    - "A set can't jump to its k-th element: its indices only step forward one at a time"
+    - "Sets are unordered, so randomness is impossible"
+    - "Set.randomElement() isn't available in Swift"
+  answer: 1
+  explain: "Drawing uniformly means picking a random position k and going there. A set has no random access, so going to position k costs O(k), O(n) on average. Being unordered is fine; the array in the design is effectively unordered too."
+- id: q3
+  type: bug
+  prompt: "This `remove` crashes when the element being removed is in the last slot. Which line is the bug?"
+  code: |
+    mutating func remove(_ element: Element) -> Bool {
+        guard let hole = positions[element] else { return false }
+        let last = elements.removeLast()
+        elements[hole] = last
+        positions[last] = hole
+        positions[element] = nil
+        return true
+    }
+  answer: 4
+  explain: "If the element was last, `hole` is now one past the end of the shortened array, and line 4 writes out of range. Only fill the hole when `hole < elements.count`."
+- id: q4
+  type: truefalse
+  prompt: "Swap-remove changes the order of the array, but that doesn't matter for a set."
+  answer: true
+  explain: "A set promises membership, not order. The array only exists to give every element exactly one slot for random access, and any order does that."
+- id: q5
+  type: trace
+  prompt: "Start with `elements = [A, B, C, D]`. Remove A, then remove C. What's in `elements` afterwards, in order? Separate them with commas."
+  answer: "D, B"
+  explain: "Removing A moves D into slot 0: [D, B, C]. Removing C, which is now last, moves nothing: [D, B]."
+- id: q6
+  type: recall
+  prompt: "How would you test that `randomElement(using:)` is uniform?"
+  model: "Use a seeded generator so the test is repeatable. Insert a known set of elements, draw many times, and check that every draw is a member and that each element's count is close to draws ÷ n, within a generous tolerance (for example 4,000 to 6,000 out of 50,000 with 10 elements). Repeat after many removals, since broken swap-removes show up there."
+```

@@ -1,0 +1,295 @@
+## Why it matters
+
+"Design a…" questions ask you to build a small type with a handful of operations, each with a promised cost: an iterator, a cache, a feed, a store. They test whether you can turn a vague spec into an API, pick the structure that makes each operation fast, and prove it works. This module works through the classics, and it starts with iterators because they're the smallest: one or two methods, a little hidden state, and a real design decision about when to do the work. You'll meet the same idea in apps as paging through a server's results, reading a huge file line by line, or merging several timelines into one.
+
+## How a design question runs
+
+Every lesson in this module follows the same five steps. Saying them out loud in an interview shows the interviewer how you think, and they stop you from coding the wrong thing (more on this in [Clarifying questions](/dsa/learn/int-clarifying)).
+
+| Step | Ask yourself | For a peeking iterator |
+| --- | --- | --- |
+| 1. Requirements | Which operations? How much data? Which edge cases? | `next()` and `peek()`; any iterator underneath; the end of the input |
+| 2. API | The Swift signatures. Value or reference type? | `struct PeekingIterator<Base>`, `mutating func peek() -> Base.Element?` |
+| 3. Structures | Each operation's target cost, and the structure that meets it | one buffered element: O(1) each |
+| 4. Trade-offs | What did you give up? What changes if the requirements do? | it pulls one element early |
+| 5. Tests | A simple model to compare against, random operations, edge cases, one large case | compare with reading an array |
+
+Step 3 is the heart of it. You don't pick "the best data structure"; you list the operations, write the cost each one must have next to it, and find a structure, or two working together, that meets every one.
+
+## IteratorProtocol, briefly
+
+You met this in [Sequence and IteratorProtocol](/dsa/learn/swift-sequence-iterator). An iterator has one requirement:
+
+```swift
+protocol IteratorProtocol {
+    associatedtype Element
+    mutating func next() -> Element?
+}
+```
+
+Each call returns the next element, or `nil` when there are no more. It's `mutating` because the iterator remembers how far it has got. Two rules of good behaviour matter for everything below:
+
+- Once `next()` has returned `nil`, every later call should return `nil` too. Swift's documentation expects this of iterators.
+- An iterator is usually a struct, so **copying it copies its position**. Advancing the copy doesn't move the original.
+
+Iterators are **lazy**: nothing happens until someone calls `next()`. That's their superpower. An iterator over a million-line log file reads one line per call, and stops reading the moment the caller stops asking.
+
+## A peeking iterator
+
+Many algorithms need to look at the next element before deciding whether to take it: a tokenizer checking whether the next character continues a number, a merge comparing two heads, run-length encoding checking whether the next value repeats. `IteratorProtocol` has no "look without taking". So build a wrapper that adds one.
+
+**Requirements:** wrap any iterator; `peek()` returns what `next()` would return, without consuming it; calling `peek()` twice returns the same element; `next()` after `peek()` returns that element.
+
+**Structure:** one buffered element. `peek()` pulls an element from the base iterator only if it hasn't already, and keeps it. `next()` hands out the buffered element if there is one, and otherwise asks the base.
+
+```swift run
+struct PeekingIterator<Base: IteratorProtocol>: IteratorProtocol {
+    private var base: Base
+    private var buffered: Base.Element?     // fetched early by peek(), not yet handed out
+    private var hasBuffered = false
+
+    init(_ base: Base) {
+        self.base = base
+    }
+
+    mutating func peek() -> Base.Element? {
+        if !hasBuffered {
+            buffered = base.next()           // pull one element early, only once
+            hasBuffered = true
+        }
+        return buffered
+    }
+
+    mutating func next() -> Base.Element? {
+        guard hasBuffered else { return base.next() }
+        hasBuffered = false
+        let element = buffered
+        buffered = nil                       // don't keep it alive
+        return element
+    }
+}
+
+// Run-length encoding: peek says whether the next reading continues the current run
+var readings = PeekingIterator([3, 3, 5, 7, 7, 7, 3].makeIterator())
+var runs: [String] = []
+while let value = readings.next() {
+    var length = 1
+    while readings.peek() == value {
+        _ = readings.next()
+        length += 1
+    }
+    runs.append("\(value)×\(length)")
+}
+print(runs.joined(separator: " "))
+
+var letters = PeekingIterator("ab".makeIterator())
+print(letters.peek() ?? "-", letters.peek() ?? "-", letters.next() ?? "-", letters.next() ?? "-", letters.peek() ?? "-")
+```
+
+```output
+3×2 5×1 7×3 3×1
+a a a b -
+```
+
+What to notice:
+
+- **Why a separate `hasBuffered` flag?** `buffered` being `nil` can't tell you whether you haven't peeked yet or peeked and found the end. The flag remembers that you asked. (A double optional, `Base.Element??`, would do the same job in one property, but it's harder to read.)
+- **It's generic over `Base`**, so it wraps an array's iterator, a string's, or any iterator you write. Every operation is O(1), and it never pulls more than one element early.
+- Clearing `buffered` after handing it out means a peeking iterator over large values, such as decoded images, doesn't hold on to the last one.
+
+## Flattening nested lists, lazily
+
+A nested list holds numbers and other nested lists: `[1, [2, [], 3], [[4]]]`. In Swift it's an enum with a recursive case. Flattening it recursively is easy, as you saw in [Base case and recursive case](/dsa/learn/rec-what-is-recursion), but that builds the whole result up front. The design question asks for an **iterator**: creating it does no work, and each `next()` does only what it needs to reach the next number.
+
+The recursive flatten pauses at each nested list to walk it, and the call stack remembers where to continue in the outer list. An iterator can't pause in the middle of a recursive call, so it keeps that memory itself, exactly as in [Turning recursion into an explicit stack](/dsa/learn/rec-explicit-stack). The neat Swift version is a **stack of iterators**, one per list you're currently inside:
+
+```swift run
+enum Item {
+    case number(Int)
+    case list([Item])
+}
+
+struct NestedIterator: IteratorProtocol {
+    private var stack: [IndexingIterator<[Item]>]    // one iterator per list we're inside
+
+    init(_ items: [Item]) {
+        stack = [items.makeIterator()]
+    }
+
+    mutating func next() -> Int? {
+        while !stack.isEmpty {
+            // Advance the innermost iterator in place, inside the array
+            guard let item = stack[stack.count - 1].next() else {
+                stack.removeLast()                    // this list is used up
+                print("  leave a list, depth now \(stack.count)")
+                continue
+            }
+            switch item {
+            case .number(let value):
+                return value
+            case .list(let inner):
+                stack.append(inner.makeIterator())    // go one level deeper
+                print("  enter a list of \(inner.count), depth now \(stack.count)")
+            }
+        }
+        return nil
+    }
+}
+
+let items: [Item] = [.number(1), .list([.number(2), .list([]), .number(3)]), .list([.list([.number(4)])])]
+var numbers = NestedIterator(items)
+print("created")
+while let value = numbers.next() {
+    print("next:", value)
+}
+```
+
+```output
+created
+next: 1
+  enter a list of 3, depth now 2
+next: 2
+  enter a list of 0, depth now 3
+  leave a list, depth now 2
+next: 3
+  leave a list, depth now 1
+  enter a list of 1, depth now 2
+  enter a list of 1, depth now 3
+next: 4
+  leave a list, depth now 2
+  leave a list, depth now 1
+  leave a list, depth now 0
+```
+
+What to notice:
+
+- **"created" comes first, with no other work.** Each list is entered only when `next()` reaches it.
+- `IndexingIterator<[Item]>` is the type `makeIterator()` returns for an array. `stack[stack.count - 1].next()` advances the iterator **inside** the array; copying it out into a `let` first would advance the copy and loop forever.
+- The empty list costs one push and one pop and produces nothing. A list of 10,000 empty lists would be skipped by a single call's `while` loop.
+- **Cost:** each item is visited once in a whole pass, so a full pass is O(total items). The stack never holds more iterators than the nesting depth, so the extra memory is O(depth). An eager flatten would use O(total numbers) for its result.
+
+<Callout kind="tip" title="Peek on top of anything">
+Because `PeekingIterator` wraps any iterator, `PeekingIterator(NestedIterator(items))` is a nested iterator with `peek()`, with no extra code. Composing small iterators is often the cleanest answer to "now add this feature".
+</Callout>
+
+## Zigzag over k lists
+
+The last classic: take one element from each list in turn, round and round, skipping lists that have run out. For `[1, 2, 3]`, `[10]` and `[20, 21, 22, 23]` the output is 1, 10, 20, 2, 21, 3, 22, 23. Apps do this to interleave sponsored posts into a feed, or to share a resource fairly between users (round-robin scheduling).
+
+**Structure:** a queue of iterators, in turn order. Take the front one and ask it for an element. If it gives one, it goes to the back of the queue for its next turn; if it's used up, it's dropped. Each `next()` is O(1) amortised, since each exhausted iterator is dropped once.
+
+```swift run
+struct ZigzagIterator: IteratorProtocol, Sequence {
+    private var turns: [IndexingIterator<[Int]>]    // iterators still running, in turn order
+    private var head = 0                           // a head-index queue, as in M27
+
+    init(_ lists: [[Int]]) {
+        turns = lists.map { $0.makeIterator() }
+    }
+
+    mutating func next() -> Int? {
+        while head < turns.count {
+            var current = turns[head]
+            head += 1
+            if let value = current.next() {
+                turns.append(current)                // back of the line for its next turn
+                return value
+            }
+            // used up: it isn't put back
+        }
+        return nil
+    }
+}
+
+print(Array(ZigzagIterator([[1, 2, 3], [10], [], [20, 21, 22, 23]])))
+for value in ZigzagIterator([[7, 8], [100, 200, 300]]) {
+    print(value, terminator: " ")
+}
+print()
+```
+
+```output
+[1, 10, 20, 2, 21, 3, 22, 23]
+7 100 8 200 300
+```
+
+Here copying the iterator out of the queue is exactly right: `current` is advanced, and that advanced copy is what goes to the back. Conforming to `Sequence` as well costs nothing, because a type that is its own iterator gets `makeIterator()` for free, so `Array(...)` and `for-in` work. For a long-running zigzag, the dead prefix of `turns` should be compacted now and then, as in [A queue with a head index](/dsa/learn/queue-head-index), or replaced with DSAKit's `Deque`.
+
+<Callout kind="gotcha" title="Common mistakes">
+- **Peeking twice pulls twice.** If `peek()` calls `base.next()` every time, the second peek skips an element. Buffer it and remember that you did.
+- **Advancing a copy.** `var top = stack.last!; top.next()` moves a copy; the iterator in the array stays where it was. Mutate it in place with `stack[stack.count - 1].next()`.
+- **Java-style `hasNext()`.** In Swift, `next()` already says "no more" by returning `nil`, and a `hasNext()` that has to skip empty lists must mutate anyway. Offer `peek()` instead.
+- **Doing the work in `init`.** An iterator that flattens or copies everything up front has lost the point of being an iterator.
+</Callout>
+
+## Practice
+
+**Lazy nested-list iterator** asks for the flattening iterator with `peek()` built in, conforming to `Sequence`. One test creates thousands of iterators over 200,000 numbers and takes only two numbers from each, so anything that flattens in `init` runs out of time.
+
+```cards
+- id: design-routine
+  front: "What are the five steps for answering a \"design a…\" question?"
+  back: "Requirements, API, structures (each operation's target cost and the structure that meets it), trade-offs, and tests against a simple model."
+- id: peek-buffer
+  front: "How does a peeking iterator add `peek()` to any iterator?"
+  back: "It buffers one element: `peek()` pulls from the base only if nothing is buffered yet, and `next()` hands out the buffered element before asking the base again."
+- id: flatten-stack
+  front: "How do you flatten a nested list lazily, and what memory does it use?"
+  back: "Keep a stack of iterators, one per list you're inside. Advance the top one: a number is returned, a list is pushed, and an exhausted iterator is popped. Extra memory is O(depth)."
+- id: zigzag-queue
+  front: "Which structure gives a round-robin (zigzag) iterator over k lists?"
+  back: "A queue of iterators in turn order: take the front, get one element, and put it at the back unless it's used up."
+```
+
+```quiz
+- id: q1
+  type: output
+  prompt: "Iterators are usually structs. What does this print?"
+  code: |
+    var it = [4, 8, 15].makeIterator()
+    var copy = it
+    print(it.next()!, it.next()!, copy.next()!)
+  answer: "4 8 4"
+  explain: "`copy` was made before `it` moved, and copying a struct iterator copies its position. Advancing `it` twice doesn't move `copy`, which still starts at 4."
+- id: q2
+  type: bug
+  prompt: "Calling `peek()` twice in a row on this peeking iterator returns two different elements. Which line is the bug?"
+  code: |
+    mutating func peek() -> Base.Element? {
+        buffered = base.next()
+        hasBuffered = true
+        return buffered
+    }
+  answer: 2
+  explain: "Line 2 pulls a new element from the base on every call, so the second peek overwrites (and loses) the first. Only pull when nothing is buffered yet: `if !hasBuffered { … }`."
+- id: q3
+  type: trace
+  prompt: "A zigzag iterator runs over `[1, 2]`, `[5, 6, 7]` and `[9]`. List everything it produces, separated by commas."
+  answer: "1, 5, 9, 2, 6, 7"
+  explain: "Round one takes 1, 5, 9. The third list is now used up and is dropped. Round two takes 2 and 6; then the first list is used up, and 7 comes from the only list left."
+- id: q4
+  type: mcq
+  prompt: "A lazy nested-list iterator uses a stack of iterators. How much extra memory does it need?"
+  options:
+    - "O(1)"
+    - "O(depth of nesting)"
+    - "O(total number of items)"
+    - "O(number of numbers)"
+  answer: 1
+  explain: "The stack holds one iterator per list you're currently inside, and you're never inside more lists than the nesting depth. An eager flatten would need O(number of numbers) for its result array."
+- id: q5
+  type: truefalse
+  prompt: "Creating a `NestedIterator` over a structure of a million numbers takes about a million steps."
+  answer: false
+  explain: "`init` only pushes one iterator for the top-level array: O(1). Work happens in `next()`, a little per call, which is the point of a lazy iterator."
+- id: q6
+  type: multi
+  prompt: "Which of these are good reasons to give an iterator `peek()` rather than `hasNext()`? Choose all that apply."
+  options:
+    - "`next()` returning nil already answers \"is there more?\""
+    - "Callers often need the next value itself to decide what to do"
+    - "`peek()` can be written without ever calling the base iterator"
+    - "Swift's iterators are built around optional results"
+  answer: [0, 1, 3]
+  explain: "Swift iterators signal the end with nil, so a peek that returns an optional fits naturally and also hands over the value, which is what run detection or merging needs. `peek()` does have to call the base iterator, once, to find out what comes next."
+```

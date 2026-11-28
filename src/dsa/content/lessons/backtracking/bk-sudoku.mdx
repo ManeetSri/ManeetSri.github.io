@@ -1,0 +1,322 @@
+## Why it matters
+
+A Sudoku has up to 9⁸¹ ways to fill its empty cells, yet a good program solves even fiendish ones in a few milliseconds. The difference between a solver that finishes instantly and one that runs for minutes is not faster code: it's **which cell you decide next**. That one idea, fill the most constrained cell first, is at the heart of the industrial constraint solvers used for timetables, chip verification and product configurators, and it's the main lesson here. Along the way you'll build the O(1) bookkeeping that makes each check cheap, first with Bool tables and then with bitmasks.
+
+## The rules, and a grid in Swift
+
+A Sudoku is a 9 × 9 grid split into nine 3 × 3 boxes. Fill every empty cell with a digit from 1 to 9 so that each **row**, each **column** and each **box** contains every digit exactly once. A proper puzzle has exactly one solution.
+
+Store the grid as `[[Int]]`, with 0 for an empty cell. Number the boxes 0 to 8, left to right and top to bottom. The box holding a cell is:
+
+```text
+box = (row / 3) * 3 + column / 3
+
+    0 0 0 | 1 1 1 | 2 2 2
+    0 0 0 | 1 1 1 | 2 2 2
+    0 0 0 | 1 1 1 | 2 2 2
+    ------+-------+------
+    3 3 3 | 4 4 4 | 5 5 5
+    ...
+```
+
+Integer division does the work: `row / 3` is 0, 1 or 2 for the band of rows, and `column / 3` is the stack of columns.
+
+## Plain backtracking: the next empty cell, every digit
+
+The simplest solver walks the cells in reading order. At each empty cell it tries the digits 1 to 9, keeps the first that doesn't clash, and moves on. When a cell has no digit left that fits, it backs up:
+
+```swift run
+func parse(_ cells: String) -> [[Int]] {
+    let digits = cells.map { $0.wholeNumberValue ?? 0 }      // "." becomes 0: empty
+    return (0..<9).map { Array(digits[($0 * 9)..<($0 * 9 + 9)]) }
+}
+
+var grid = parse("..53.....8......2..7..1.5..4....53...1..7...6..32...8..6.5....9..4....3......97..")
+var placements = 0
+
+func canPlace(_ digit: Int, _ row: Int, _ column: Int) -> Bool {
+    for i in 0..<9 where grid[row][i] == digit || grid[i][column] == digit {
+        return false                                         // already in the row or column
+    }
+    let top = row / 3 * 3
+    let left = column / 3 * 3
+    for r in top..<(top + 3) {
+        for c in left..<(left + 3) where grid[r][c] == digit {
+            return false                                     // already in the box
+        }
+    }
+    return true
+}
+
+func solve(_ position: Int) -> Bool {
+    if position == 81 { return true }                        // past the last cell: solved
+    let row = position / 9
+    let column = position % 9
+    if grid[row][column] != 0 { return solve(position + 1) } // a given digit: move on
+    for digit in 1...9 where canPlace(digit, row, column) {
+        grid[row][column] = digit                            // choose
+        placements += 1
+        if solve(position + 1) { return true }               // explore; stop at the first solution
+    }
+    grid[row][column] = 0                                    // unchoose: nothing fitted
+    return false
+}
+
+print(solve(0), placements, "placements")
+for row in grid {
+    print(row.map(String.init).joined())
+}
+```
+
+```output
+true 10007 placements
+145327698
+839654127
+672918543
+496185372
+218473956
+753296481
+367542819
+984761235
+521839764
+```
+
+What to notice:
+
+- **`solve` returns a Bool** that means "a solution was found below here". As soon as it's `true`, every level returns at once, **without** undoing its digit, because the filled grid is the answer you want to keep.
+- **The unchoose step happens only on failure.** Inside the loop, each new digit overwrites the last one; after the loop, the cell is reset to 0 so that earlier cells see it as empty again.
+- **Each check scans 27 cells,** the cell's row, column and box. Over 10,007 placements and the failed attempts around them, that adds up.
+
+## O(1) checks: remember what each row, column and box holds
+
+Instead of scanning, keep three tables: `rowHas[r][d]` is true when row r already holds digit d, and likewise `columnHas` and `boxHas`. Placing a digit sets three flags, removing it clears them, and checking whether a digit fits is three lookups.
+
+That makes each step cheaper, but the bigger win comes from using the same tables to **count the candidates** for a cell: the digits that fit there right now. And candidate counts are what you need to choose cells well.
+
+## Fill the most constrained cell first
+
+Reading order is an arbitrary choice. Look at what the counts say instead:
+
+- A cell with **0 candidates** means the current partial grid is already doomed. Reading order might not reach that cell for another 40 levels, and would explore everything in between first. Choosing it now ends the branch at once.
+- A cell with **1 candidate** is forced. Filling it costs nothing, since there's no branching, and it removes options from its neighbours, which may force them in turn.
+- Otherwise, a cell with 2 candidates splits the search into 2 branches, where a cell with 7 splits it into 7.
+
+So at every step, fill the empty cell with the **fewest candidates**. This is called the *most constrained variable* or *minimum remaining values* rule, and also "fail first": find out about dead ends as early as possible, near the top of the tree, where cutting a branch saves the most work. Here's the same search with both rules, on a puzzle where the difference is dramatic:
+
+```swift run
+struct Sudoku {
+    var grid: [[Int]]
+    var rowHas = Array(repeating: Array(repeating: false, count: 10), count: 9)
+    var columnHas = Array(repeating: Array(repeating: false, count: 10), count: 9)
+    var boxHas = Array(repeating: Array(repeating: false, count: 10), count: 9)
+    var placements = 0
+
+    init(_ cells: String) {
+        let digits = cells.map { $0.wholeNumberValue ?? 0 }
+        grid = (0..<9).map { Array(digits[($0 * 9)..<($0 * 9 + 9)]) }
+        for row in 0..<9 {
+            for column in 0..<9 where grid[row][column] != 0 {
+                mark(grid[row][column], row, column, true)
+            }
+        }
+    }
+
+    func fits(_ digit: Int, _ row: Int, _ column: Int) -> Bool {
+        !rowHas[row][digit] && !columnHas[column][digit] && !boxHas[row / 3 * 3 + column / 3][digit]
+    }
+
+    mutating func mark(_ digit: Int, _ row: Int, _ column: Int, _ on: Bool) {
+        rowHas[row][digit] = on
+        columnHas[column][digit] = on
+        boxHas[row / 3 * 3 + column / 3][digit] = on
+        grid[row][column] = on ? digit : 0
+    }
+
+    /// The empty cell to fill next, or nil if the grid is full
+    func nextCell(mostConstrained: Bool) -> (row: Int, column: Int)? {
+        var best: (row: Int, column: Int)?
+        var fewest = 10
+        for row in 0..<9 {
+            for column in 0..<9 where grid[row][column] == 0 {
+                if !mostConstrained { return (row, column) }    // reading order: the first empty cell
+                var candidates = 0
+                for digit in 1...9 where fits(digit, row, column) {
+                    candidates += 1
+                }
+                if candidates < fewest {
+                    best = (row, column)
+                    fewest = candidates
+                    if fewest <= 1 { return best }              // dead end or forced: look no further
+                }
+            }
+        }
+        return best
+    }
+
+    mutating func solve(mostConstrained: Bool) -> Bool {
+        guard let (row, column) = nextCell(mostConstrained: mostConstrained) else { return true }
+        for digit in 1...9 where fits(digit, row, column) {
+            mark(digit, row, column, true)                      // choose
+            placements += 1
+            if solve(mostConstrained: mostConstrained) { return true }   // explore
+            mark(digit, row, column, false)                     // unchoose
+        }
+        return false                                            // no digit fits here: back up
+    }
+}
+
+let puzzle = "..9748...7.........2.1.9.....7...24..64.1.59..98...3.....8.3.2.........6...2759.."
+for mostConstrained in [false, true] {
+    var sudoku = Sudoku(puzzle)
+    let solved = sudoku.solve(mostConstrained: mostConstrained)
+    print(mostConstrained ? "most constrained cell:" : "first empty cell:     ", solved, sudoku.placements, "placements")
+    print("  first row:", sudoku.grid[0].map(String.init).joined())
+}
+```
+
+```output
+first empty cell:      true 13528 placements
+  first row: 519748632
+most constrained cell: true 115 placements
+  first row: 519748632
+```
+
+Over a hundred times fewer placements for the same answer. Finding the best cell costs a scan of the grid at every step, which is far cheaper than exploring a doomed subtree. A few details of the code:
+
+- **A `mutating func` can call itself.** The struct is changed in place all the way down, and the state lives in its properties.
+- **A cell with 0 candidates** is returned as the next cell, the `for` loop finds no digit that fits, and `solve` returns `false` straight away. That's the dead end detected immediately.
+- **The scan stops early** at a cell with 0 or 1 candidates: nothing can beat it.
+
+How far does this go? Some puzzles are built deliberately to defeat reading-order solvers, by making the digits 1, 2, 3, … wrong in exactly the cells they're tried first. On one such 17-clue puzzle (it's in the practice problem's tests), the first-empty-cell solver makes over 69 million placements before it finishes, while the most-constrained-cell solver needs about 11,000: a few hundredths of a second.
+
+## Bitmasks: candidates in one expression
+
+Nine Bool flags per row fit in one integer. Let bit d stand for digit d: `rowDigits[r]` has bit d set when row r holds d, and likewise `columnDigits` and `boxDigits`. Then the digits used around a cell are the OR of three masks, and its candidates are the bits **not** set, among bits 1 to 9:
+
+```swift
+let used = rowDigits[row] | columnDigits[column] | boxDigits[box]
+let candidates = ~used & 0b11_1111_1110        // bits 1...9; bit 0 is never a digit
+let count = candidates.nonzeroBitCount         // how many digits fit
+```
+
+Iterating over the candidates uses the lowest-set-bit tricks from M16, as N-Queens did:
+
+```swift run
+let cells = "..53.....8......2..7..1.5..4....53...1..7...6..32...8..6.5....9..4....3......97.."
+let digits = cells.map { $0.wholeNumberValue ?? 0 }
+var rowDigits = Array(repeating: 0, count: 9)        // bit d set: digit d is in that row
+var columnDigits = Array(repeating: 0, count: 9)
+var boxDigits = Array(repeating: 0, count: 9)
+for index in 0..<81 where digits[index] != 0 {
+    let row = index / 9
+    let column = index % 9
+    let bit = 1 << digits[index]
+    rowDigits[row] |= bit
+    columnDigits[column] |= bit
+    boxDigits[row / 3 * 3 + column / 3] |= bit
+}
+
+func candidates(_ row: Int, _ column: Int) -> Int {
+    ~(rowDigits[row] | columnDigits[column] | boxDigits[row / 3 * 3 + column / 3]) & 0b11_1111_1110
+}
+
+func list(_ mask: Int) -> [Int] {
+    var found: [Int] = []
+    var rest = mask
+    while rest != 0 {
+        found.append(rest.trailingZeroBitCount)      // the lowest set bit's position is the digit
+        rest &= rest - 1                             // clear that bit
+    }
+    return found
+}
+
+for (row, column) in [(0, 0), (0, 1), (4, 2), (8, 8)] {
+    let mask = candidates(row, column)
+    print("(\(row), \(column)):", list(mask), "count", mask.nonzeroBitCount)
+}
+```
+
+```output
+(0, 0): [1, 2, 6, 9] count 4
+(0, 1): [2, 4, 9] count 3
+(4, 2): [2, 8, 9] count 3
+(8, 8): [1, 2, 4, 5, 8] count 5
+```
+
+Placing digit d at a cell is three ORs with `1 << d`, and removing it is three ANDs with `~(1 << d)`. With masks, scanning all the empty cells for the fewest candidates costs a handful of instructions per cell, which is why the practice problem's reference solution combines both ideas: bitmasks for the bookkeeping, the most constrained cell for the order.
+
+## Beyond backtracking
+
+Serious solvers add **constraint propagation**: after each placement, repeatedly fill every cell that has only one candidate, and every digit that has only one possible cell in some row, column or box, before branching again. Many puzzles are then solved without any guessing at all. Sudoku can also be written as an *exact cover* problem and solved with Knuth's Algorithm X and its "dancing links" data structure. Both are refinements of the same search; the most constrained cell rule already gets you most of the way.
+
+<Callout kind="gotcha" title="Common mistakes">
+- **Wrong box index.** `row / 3 * 3 + column / 3`, not `row / 3 + column / 3`, which maps different boxes to the same number.
+- **Forgetting to reset the cell to 0** after the last digit fails. Earlier cells then see a stale digit and reject digits that would fit.
+- **Undoing after success.** Return `true` straight away and leave the digits in place; undoing them would hand back an empty grid.
+- **Recounting candidates for one cell from scratch** with 27 lookups per digit. Fine for a single check, slow when every step scans the whole grid. The tables or masks make it cheap.
+- **Copying the whole grid into every call.** It works (copy-per-call state), but costs 81 values per node. Shared state with undo is the usual choice here.
+</Callout>
+
+## Practice
+
+**Sudoku solver** takes a puzzle as 9 strings and returns the solved grid. Its tests include the 17-clue puzzle built against reading-order solvers, so you'll need the most constrained cell rule; bitmasks are optional but make each step fast.
+
+```cards
+- id: sudoku-box
+  front: "Which 3 × 3 box holds the cell (row, column)?"
+  back: "Box `row / 3 * 3 + column / 3`, numbering the boxes 0 to 8 left to right, top to bottom."
+- id: sudoku-mrv
+  front: "Which empty cell should a Sudoku solver fill next, and why?"
+  back: "The one with the fewest candidates. Zero candidates exposes a dead end at once, one candidate is a forced move, and few candidates means few branches near the top of the tree."
+- id: sudoku-bitmask
+  front: "With a bitmask per row, column and box, how do you get a cell's candidates?"
+  back: "`~(row | column | box) & 0b11_1111_1110`: the digits 1 to 9 that none of the three already holds. `nonzeroBitCount` gives how many."
+- id: sudoku-success
+  front: "Why does a Sudoku solver not undo its placement when the recursive call returns true?"
+  back: "True means the grid below is solved. Returning at once with the digits still in place keeps the answer; the undo only runs when every digit failed."
+```
+
+```quiz
+- id: q1
+  type: output
+  prompt: "Which box holds each of these cells?"
+  code: |
+    func box(_ row: Int, _ column: Int) -> Int {
+        row / 3 * 3 + column / 3
+    }
+    print(box(0, 8), box(4, 7), box(8, 0))
+  answer: "2 5 6"
+  explain: "(0, 8) is in the top band, right stack: 0 + 2. (4, 7) is in the middle band, right stack: 3 + 2. (8, 0) is in the bottom band, left stack: 6 + 0."
+- id: q2
+  type: mcq
+  prompt: "The solver finds an empty cell with no candidates at all. What should happen?"
+  options:
+    - "Skip that cell and come back to it later"
+    - "Put a 0 there and continue"
+    - "Back up at once: the current partial grid can't be completed"
+    - "Start the whole search again from the first cell"
+  answer: 2
+  explain: "No digit can ever go there given the choices already made, so some earlier choice is wrong. Discovering this now, instead of many levels later, is the point of the most constrained cell rule."
+- id: q3
+  type: blank
+  prompt: "Complete the candidates mask for a cell, using bits 1 to 9 for the digits."
+  code: |
+    let candidates = ~(rowDigits[row] | columnDigits[column] | boxDigits[box]) & ___
+  answers: [["0b11_1111_1110", "0b1111111110", "0x3FE", "0x3fe", "1022"]]
+  explain: "Bits 1 through 9 set and bit 0 clear: 0b11_1111_1110, which is 1022 or 0x3FE. Without the mask, `~` would also set bit 0 and every bit above 9."
+- id: q4
+  type: truefalse
+  prompt: "Choosing the most constrained cell first changes which solution a proper Sudoku ends up with."
+  answer: false
+  explain: "A proper puzzle has exactly one solution, so every complete search finds the same grid. The rule changes only how much of the tree is explored on the way."
+- id: q5
+  type: multi
+  prompt: "Which of these make each step of a Sudoku solver cheaper, without changing the tree it explores? Choose all that apply."
+  options:
+    - "Bool tables of which digits each row, column and box holds"
+    - "Bitmasks instead of Bool tables"
+    - "Filling the cell with the fewest candidates first"
+    - "Stopping at the first solution found"
+  answer: [0, 1]
+  explain: "Tables and masks make checks O(1) but visit the same cells in the same order. Choosing the most constrained cell changes the tree itself, and stopping at the first solution cuts off the rest of the search; both reduce the number of nodes rather than the cost of each."
+```

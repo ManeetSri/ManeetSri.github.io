@@ -1,0 +1,218 @@
+## Why it matters
+
+A crash loses someone's half-written message and a little of their trust. An outage at the wrong moment, at a payment terminal or a boarding gate, costs real money. And when something does go wrong, the difference between finding out from your dashboards in five minutes and from one-star reviews five days later is a quality of its own. These three qualities, **reliability**, **availability** and **operability**, are what interviewers probe with the question every design gets eventually: "what happens when this part is down?"
+
+## Reliability: doing the right thing, every time
+
+A system is **reliable** if it does its job correctly, under the conditions it was designed for, for as long as it's needed. Two words help you reason about it:
+
+- A **fault** is something wrong inside: a bug, a dropped connection, a full disk, a server returning `503`.
+- A **failure** is what the user sees: the system not doing its job. The message didn't send; the photo is gone.
+
+Reliable systems still have faults. What they don't do is let each fault become a failure. That's **fault tolerance**, and on iOS it looks like this:
+
+| Fault | Tolerant response |
+| --- | --- |
+| The network drops mid-request | Time out, retry with backoff (D14), and keep the user's input |
+| The server returns JSON the app doesn't expect | Decode defensively: skip or label the bad element, never force-unwrap |
+| The app is killed while saving | Write files atomically (`.atomic` writes to a temporary file, then renames) and use database transactions |
+| A write is sent twice by a retry | Make it idempotent: the server recognises the repeat by a request id (D34) |
+| A non-essential service is down | Degrade: show the screen without that section, or with cached data |
+
+**Recoverability** is the other half: after a failure, how much comes back? Does the draft survive a crash? Does an upload resume where it stopped? Saving drafts as people type and using background `URLSession` transfers for large uploads are recoverability decisions.
+
+For an app, reliability is measured from real devices: the **crash-free rate** (sessions or users without a crash), the hang rate, terminations by the system for memory or launch time, and failed operations such as messages that never sent. A typical target for a mature consumer app is above 99.8% crash-free sessions.
+
+## Availability: is it there when I need it?
+
+**Availability** is the fraction of time the system is usable. It's usually quoted in "nines", and each one is worth knowing as downtime:
+
+| Availability | Downtime per 30 days | Downtime per year |
+| --- | --- | --- |
+| 99% ("two nines") | 7.2 hours | 3.65 days |
+| 99.9% | 43 minutes | 8.8 hours |
+| 99.95% | 22 minutes | 4.4 hours |
+| 99.99% | 4.3 minutes | 53 minutes |
+| 99.999% | 26 seconds | 5.3 minutes |
+
+Two ideas make availability something you can design rather than hope for.
+
+**Availability depends on recovery as much as on failures.** If MTBF is the mean time between failures and MTTR the mean time to repair, then availability = MTBF ÷ (MTBF + MTTR). Halving the time to repair improves availability exactly as much as doubling the time between failures, and it's often far cheaper. Detecting problems quickly and being able to switch things off are availability features.
+
+**Dependencies multiply.** A screen that needs three services, all of which must answer, is available only when all three are: you multiply their availabilities, and the result is worse than any one of them. A dependency the screen can live without drops out of the product. Move the sliders:
+
+```visual estimator
+title: How dependencies add up for one screen
+inputs:
+  - { id: auth, label: Sign-in service, min: 99, max: 99.99, step: 0.01, value: 99.95, unit: "%" }
+  - { id: profile, label: Profile API, min: 99, max: 99.99, step: 0.01, value: 99.9, unit: "%" }
+  - { id: recs, label: Recommendations service, min: 95, max: 99.99, step: 0.01, value: 99.5, unit: "%" }
+outputs:
+  - { id: required, label: "Screen availability, all three required", formula: auth * profile * recs / 10000, unit: "%" }
+  - { id: requiredDown, label: "Downtime per 30 days, all required", formula: (1 - required / 100) * 30 * 86400, format: duration }
+  - { id: optional, label: "Screen availability, recommendations optional", formula: auth * profile / 100, unit: "%" }
+  - { id: optionalDown, label: "Downtime per 30 days, recommendations optional", formula: (1 - optional / 100) * 30 * 86400, format: duration }
+```
+
+With recommendations required, the screen is down for hours a month, mostly because of the least important service on it. Making that section optional (render the profile, and show recommendations if and when they arrive) cuts downtime by three quarters without making any server more reliable. Try pushing the recommendations service to 99.99% instead: that's the expensive way to get a similar result.
+
+For an app there's one more dependency in the chain: **the user's connection**. A backend at 99.99% is irrelevant to someone underground. That's why "works offline" is the most effective availability feature a mobile app can have: a cached feed is available whenever the phone is on.
+
+## Operability: running it in production
+
+**Operability** is how easy a system is to run: to see what it's doing, find out what went wrong and change its behaviour safely. A server team can watch dashboards, roll back a bad deploy in a minute and fix it in an hour. An app team can't roll back at all. A release goes through App Review, people update over days and weeks, and some never do. So an operable app is built with three kinds of tools:
+
+**To see what's happening:**
+
+- Crash and hang reports from users' devices: Xcode Organizer, MetricKit's diagnostics, or a crash-reporting service.
+- Structured logs with `os.Logger`, using privacy levels so personal data stays redacted in collected logs.
+- Metrics: MetricKit's daily payloads (launch time, hangs, memory, battery), plus your own analytics for business-level failures such as payments that didn't complete.
+
+**To change behaviour without a release:**
+
+- **Feature flags and kill switches**: every risky feature ships behind a flag the server can turn off (D54).
+- **Remote configuration** for limits and timeouts, and server-side rules wherever the server can decide instead of the app.
+- A **minimum supported version** check, kept for the day an old version is actively harmful.
+
+**To release safely:**
+
+- TestFlight builds for internal and external testers.
+- **Phased release** on the App Store: over 7 days, the update reaches 1%, 2%, 5%, 10%, 20%, 50% and then 100% of people with automatic updates on, and you can pause it (for up to 30 days) if crash rates jump. People can still update manually.
+- Expedited App Review, which you can request for a critical fix.
+
+A kill switch only helps if a bad payload can't make things worse. The store below starts with safe defaults, keeps the last good flags when a payload doesn't decode, and logs the problem without leaking anything personal:
+
+```swift check
+import Foundation
+import os
+
+struct Flags: Decodable, Sendable {
+    var newCheckout: Bool
+    var maxUploadMB: Int
+
+    // What the app does before it has ever heard from the server: the old, proven behaviour
+    static let safeDefaults = Flags(newCheckout: false, maxUploadMB: 25)
+}
+
+actor FlagStore {
+    private(set) var current = Flags.safeDefaults
+    private let logger = Logger(subsystem: "com.example.shop", category: "flags")
+
+    func apply(_ payload: Data) {
+        do {
+            current = try JSONDecoder().decode(Flags.self, from: payload)
+            logger.info("Flags updated: newCheckout=\(self.current.newCheckout, privacy: .public)")
+        } catch {
+            // A broken payload must never turn features on or off by accident: keep the last good flags
+            logger.error("Ignoring a flags payload that didn't decode: \(error.localizedDescription, privacy: .public)")
+        }
+    }
+}
+```
+
+With a kill switch, the time to repair a bad feature drops from "fix, review, wait for people to update" (days) to "flip the flag" (minutes), and by the formula above, that's an availability gain.
+
+## Trade-offs
+
+Every extra nine costs more than the last: as a rule of thumb, each one is about ten times harder, because the failures left are the rare, strange ones. So pick targets per feature, not per app: payments might need 99.95%, recommendations 99%.
+
+| Technique | Improves | Costs | When it wins |
+| --- | --- | --- | --- |
+| Retries with backoff | Reliability against brief faults | Latency; extra load in an outage unless jittered and capped | Idempotent calls on flaky networks |
+| Offline cache and outbox | Availability from the user's point of view | Staleness, sync conflicts, storage | Anything people use on the move |
+| Graceful degradation | Availability of the core flow | Design work for each partial state | Screens built from several services |
+| Redundant servers or regions | Server availability | Money, operational complexity, consistency | Core APIs with a high cost per minute down |
+| Kill switches and remote config | Time to repair | A flag system to build and keep tidy; untested combinations | Every risky launch |
+| Phased release | Limits how many people a bad build reaches | Slower rollout of fixes too | Almost every release |
+
+<Callout kind="interview">
+
+**Say:** for each dependency, what the user sees when it's down: "If recommendations fail, the screen renders without them. If sign-in is down, people already signed in carry on with cached tokens. If the network is gone, the feed shows the cache with its age." Then the operational plan: crash and hang monitoring, a kill switch for the new feature, a phased release.
+
+**Ask:** "What does a minute of downtime cost here?" It tells you whether 99.9% or 99.99% is worth paying for.
+
+**Red flags:** assuming the server is always up; "100% availability"; one failing optional call blanking a whole screen; no answer to "and if the new version crashes on launch?"
+
+</Callout>
+
+<Callout kind="gotcha" title="iOS gotcha: crash-free sessions flatter you">
+
+"99.9% crash-free sessions" sounds excellent, but someone who opens the app 20 times a week has 20 chances to crash, so the share of *people* who saw a crash that week can be close to 20 times higher (up to about 2% here). Track crash-free **users** too. And remember that Xcode Organizer's crash and hang data comes only from people who agreed to share analytics with developers, often a minority of your users. A crash reporter built into the app sees far more of them (and belongs in your privacy disclosures).
+
+</Callout>
+
+## Practice
+
+The kata *Performance budget gate* includes a budget that runs the other way: crash-free sessions must stay *above* a limit. Writing the comparison for both directions, and deciding that missing data fails rather than passes, is the operability habit this lesson describes.
+
+```cards
+- id: fault-vs-failure
+  front: "What's the difference between a fault and a failure?"
+  back: "A fault is something wrong inside (a bug, a dropped connection); a failure is the user seeing the system not do its job. Fault tolerance stops faults becoming failures."
+- id: mtbf-mttr
+  front: "How do MTBF and MTTR combine into availability, and what follows?"
+  back: "Availability = MTBF ÷ (MTBF + MTTR). Halving repair time helps as much as doubling the time between failures, which is why monitoring and kill switches are availability features."
+- id: dependencies-multiply
+  front: "Why does a screen that calls three services have lower availability than any of them?"
+  back: "If all three are required, their availabilities multiply. Making non-essential calls optional removes them from the product."
+- id: app-operability
+  front: "Why does operability need extra tools in an app?"
+  back: "You can't roll back a release, review takes time and people update slowly. Kill switches, remote config, phased release and crash monitoring replace the server's quick rollback."
+```
+
+```quiz
+- id: q1
+  type: estimate
+  prompt: "A service promises 99.9% availability. How many minutes may it be down in a 30-day month and still keep its promise?"
+  answer: 43.2
+  unit: minutes
+  within: { percent: 15 }
+  explain: "30 days is 43,200 minutes, and 0.1% of that is 43.2 minutes. Each extra nine divides it by ten: 99.99% allows about 4.3 minutes."
+- id: q2
+  type: mcq
+  prompt: "A checkout screen needs three services, each 99.9% available, and can't render without any of them. About how available is the screen?"
+  options:
+    - "99.9%"
+    - "99.7%"
+    - "99.99%"
+    - "97%"
+  answer: 1
+  explain: "0.999³ ≈ 0.997. Required dependencies multiply, so the screen is down for about three times as long as any single service: roughly 2 hours a month instead of 43 minutes."
+- id: q3
+  type: mcq
+  prompt: "The home screen shows the profile (essential) and a carousel from a recommendations service at 99%. The screen is down too often. What's the cheapest effective fix?"
+  options:
+    - "Ask the recommendations team to reach 99.99%"
+    - "Render the screen without the carousel when recommendations fail, and fill it in if it arrives"
+    - "Retry the recommendations call until it succeeds before rendering"
+    - "Add a full-screen error with a retry button"
+  answer: 1
+  explain: "Making the non-essential call optional removes it from the screen's availability. Raising a service to four nines is expensive; retrying before rendering makes the screen slower and still fails in an outage; an error screen is the failure you're trying to avoid."
+- id: q4
+  type: truefalse
+  prompt: "Halving the mean time to repair improves availability exactly as much as doubling the mean time between failures."
+  answer: true
+  explain: "MTBF ÷ (MTBF + MTTR) with MTTR halved is M ÷ (M + R/2) = 2M ÷ (2M + R), the same as doubling MTBF. Faster detection and a kill switch are often far cheaper than making failures rarer."
+- id: q5
+  type: order
+  prompt: "Day 2 of a phased release: crash-free sessions drop from 99.9% to 98% for people on the new version. Put the response in order."
+  lines:
+    - "Pause the phased release in App Store Connect"
+    - "Turn off the new feature with its kill switch, if the crashes are in it"
+    - "Find the cause from crash reports and logs"
+    - "Ship a fix, requesting expedited review if it's severe"
+    - "Resume the phased release once the fix is out and crash rates recover"
+  explain: "Stop the spread first, then reduce harm with what you can change remotely, then fix properly. The phased release limited the damage to about 2% of auto-updating users; the kill switch protects those who already have it."
+- id: q6
+  type: sort
+  prompt: "Which quality does each practice mainly improve?"
+  buckets: [Reliability, Availability, Operability]
+  items:
+    - ["Writing the draft to disk atomically on every edit", 0]
+    - ["Showing the cached feed when the network is down", 1]
+    - ["Structured logs with os.Logger and privacy levels", 2]
+    - ["Decoding unexpected JSON without force-unwrapping", 0]
+    - ["A kill switch for the new checkout", 2]
+    - ["Rendering the screen without the failed recommendations", 1]
+  explain: "Reliability is doing the job correctly despite faults; availability is being usable when needed; operability is seeing and controlling the system in production. The kill switch also helps availability, by cutting the time to repair."
+```

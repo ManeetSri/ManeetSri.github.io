@@ -1,0 +1,245 @@
+## Why it matters
+
+A benchmark tells you *how long*; a profiler tells you *where*. When a solution is too slow and you can't see why, guessing wastes hours: the time is rarely where you expect. Instruments, the profiler that comes with Xcode, records what your program is doing thousands of times a second and shows you which functions, and which lines, the time went to. Its **Time Profiler** finds slow code and its **Allocations** instrument finds memory churn, which together cover nearly every performance problem in this module. iOS engineers use exactly the same tools on apps, so this lesson walks through them step by step on a slow solution to one of this module's problems.
+
+There's nothing to run in this lesson's page. Follow along in Xcode.
+
+## A slow solution to profile
+
+The practice problem **Many short routes on one grid** asks for many BFS queries on one big grid. Here's a first attempt that's correct but slow, because every query creates a fresh array the size of the whole grid:
+
+```swift title="Router.swift (the slow version)"
+struct Router {
+    let rows: Int
+    let columns: Int
+    let open: [Bool]
+
+    init(grid: [String]) {
+        rows = grid.count
+        columns = grid.first?.utf8.count ?? 0
+        open = grid.flatMap { line in line.utf8.map { $0 != UInt8(ascii: "#") } }
+    }
+
+    func distance(fromRow: Int, fromColumn: Int, toRow: Int, toColumn: Int) -> Int {
+        let start = fromRow * columns + fromColumn
+        let target = toRow * columns + toColumn
+        var distanceTo = Array(repeating: -1, count: rows * columns)     // O(cells), every query
+        distanceTo[start] = 0
+        var queue = [start]
+        var head = 0
+        while head < queue.count {
+            let cell = queue[head]
+            head += 1
+            if cell == target { return distanceTo[cell] }
+            let row = cell / columns, column = cell % columns
+            for (r, c) in [(row - 1, column), (row + 1, column), (row, column - 1), (row, column + 1)]
+            where r >= 0 && r < rows && c >= 0 && c < columns {
+                let next = r * columns + c
+                if open[next] && distanceTo[next] == -1 {
+                    distanceTo[next] = distanceTo[cell] + 1
+                    queue.append(next)
+                }
+            }
+        }
+        return -1
+    }
+}
+```
+
+Pretend you don't know what's wrong with it. The tests take far too long, and you want to find out why.
+
+### Step 1: give Instruments a program to launch
+
+A profiler launches a program and watches it. The companion package's code runs inside a test runner, and you shouldn't edit its shared `Package.swift`, so make a small scratch package somewhere outside `dsa-swift`:
+
+```bash
+mkdir ProfileRoutes
+cd ProfileRoutes
+swift package init --type executable
+```
+
+SwiftPM creates `Sources/ProfileRoutes/` with one source file containing a `main()` function (its exact name varies between Swift versions). Save the slow `Router` above as `Sources/ProfileRoutes/Router.swift`, and replace the generated file's contents with a driver that builds a big input and runs the slow part many times:
+
+```swift title="Sources/ProfileRoutes/ProfileRoutes.swift"
+@main
+struct ProfileRoutes {
+    static func main() {
+        let size = 1_000
+        let grid = Array(repeating: String(repeating: ".", count: size), count: size)
+        let router = Router(grid: grid)
+
+        // Queries from a seed read at run time, so the optimiser can't predict them
+        var state = UInt64(CommandLine.arguments.dropFirst().first ?? "68") ?? 68
+        var checksum = 0
+        for _ in 0..<2_000 {
+            state = state &* 6_364_136_223_846_793_005 &+ 1_442_695_040_888_963_407
+            let row = Int(state >> 40) % (size - 2)
+            let column = Int(state >> 20) % (size - 2)
+            checksum &+= router.distance(fromRow: row, fromColumn: column, toRow: row + 2, toColumn: column + 1)
+        }
+        print("checksum:", checksum)
+    }
+}
+```
+
+This follows [Benchmarking properly](/dsa/learn/fs-benchmarking): inputs the optimiser can't predict, and a checksum so no work is deleted. Aim for a run of a few seconds. Time Profiler takes a sample about once a millisecond, so a program that finishes in 50 ms gives it too little to work with.
+
+Check it builds and runs with `swift run -c release`. It prints `checksum: 6000`: every query is three moves.
+
+### Step 2: open it in Xcode and profile
+
+1. Open the package: `open Package.swift` (or `xed .`) in the package folder.
+2. Choose **Product › Profile** (Command-I). Xcode builds with the scheme's Profile configuration, which is **Release**, as [Debug, release and -Ounchecked](/dsa/learn/fs-build-settings) showed. Release builds still include debug information, so Instruments can show your function names.
+3. Instruments opens with a template chooser. Pick **Time Profiler** and click **Choose**.
+4. Click the red **Record** button. Instruments launches your program, records until it exits, and stops.
+
+## Reading Time Profiler
+
+The window has a **timeline** at the top, showing CPU use over the run, and a **detail area** below it with the **call tree**: every function that appeared in a sample, arranged by who called whom. The **Weight** column is how much time was spent in that function *and everything it called*; **Self Weight** is time spent in its own code only.
+
+The raw tree starts at `start` and `main`, which are at 100% and tell you nothing. Use the **Call Tree** options at the bottom of the detail area:
+
+- **Invert Call Tree** flips the tree, so the functions where samples actually landed come first, each one expandable to show who called it. This is usually the fastest way to the answer.
+- **Hide System Libraries** charges time spent in Apple's libraries to the function of yours that called them. Toggle it both ways: hidden, it points at your code; shown, it tells you *what kind* of work the time was.
+- **Separate by Thread** splits the tree per thread. With one thread it changes little; with several (M70) it's essential.
+
+For the slow router, on one Mac, the inverted tree said:
+
+| Weight | Function | What it is |
+| --- | --- | --- |
+| about 90% | `_platform_memset` | a system routine that fills memory with a value |
+| about 8% | `madvise`, under `free_medium` and `_swift_release_dealloc` | handing big blocks of memory back to the system |
+| under 1% | everything else, including the BFS itself | |
+
+Expanding `_platform_memset` shows its caller: `ProfileRoutes.main()`. Not `distance(fromRow:…)`, because the optimiser had **inlined** `distance` into `main`, the same inlining you met in [final, dispatch and generic specialisation](/dsa/learn/fs-dispatch-generics). Double-click `main()` and Instruments opens the source with a cost beside each line: almost all of it sits on `var distanceTo = Array(repeating: -1, count: rows * columns)`.
+
+So the search, the part you'd have been tempted to optimise, was under 1% of the time. Nine-tenths was filling a million-element array with -1 on every query, and most of the rest was freeing it again. The right side of the window also has a **Heaviest Stack Trace** in its inspector, which shows the single most expensive call path at a glance.
+
+## Allocations
+
+Time Profiler showed the symptom: filling and freeing memory. The **Allocations** instrument shows the memory itself.
+
+1. Choose **Product › Profile** again, and this time pick the **Allocations** template.
+2. Record as before.
+3. The top row of the statistics table is **All Heap & Anonymous VM**: everything your program allocated. The important columns are:
+
+| Column | Meaning |
+| --- | --- |
+| Persistent Bytes / # Persistent | memory allocated and still alive at the end of the selected time range |
+| # Transient | allocations that were made and already freed |
+| Total Bytes / # Total | everything ever allocated, alive or not |
+
+For the slow router you'd expect, and see, a huge **Total Bytes** with small **Persistent Bytes**: about 2,000 transient allocations of 8 MB each, one per query (a million `Int`s is 8 MB), for around 16 GB allocated and freed over a few seconds. That pattern, big totals and small persistent memory, means **churn**: memory that's created and thrown away in a loop. Large transient allocations the size of one of your arrays are also how [accidental copies](/dsa/learn/fs-avoiding-copies) show up.
+
+To see *who* allocated, change the detail view from **Statistics** to **Call Trees** using the bar at the top of the detail area, then turn on **Invert Call Tree** and **Hide System Libraries** as before. Two more tools are worth knowing:
+
+- **Mark Generation** (a button in the inspector) snapshots the heap. Everything allocated after a mark and still alive is grouped in that generation, which is how you find memory that grows and is never freed.
+- **Record reference counts**, in the Allocations recording options, logs every retain and release of each object. It's how you'd confirm the reference-counting traffic of class nodes from [Index-based nodes vs class nodes](/dsa/learn/fs-index-based-nodes).
+
+## Fix it, then profile again
+
+The profile pointed straight at one line, and [ContiguousArray, reserveCapacity and buffer pointers](/dsa/learn/fs-memory-layout) has the fix: allocate the buffers once in `init`, use a visit stamp instead of clearing, and use a preallocated queue with head and tail indices. `distance` becomes `mutating`, since it now updates the router's own buffers, so `let router` in the driver becomes `var router`.
+
+Profile again. Time Profiler now shows the search loop itself as the heaviest code, which is what a healthy BFS profile looks like, and Allocations shows a handful of allocations, all in `init`. On the same Mac, 20,000 queries took about 0.3 seconds for the whole program with the fix, against about 40 seconds without it, with the same checksum. Instruments keeps every recording in the document as a separate run, so you can switch between the before and after profiles.
+
+Confirm a fix with your benchmark harness as well. The profiler tells you where time goes; the harness tells you how much you saved.
+
+## What common problems look like
+
+| What the profile shows | Likely cause | Where to look |
+| --- | --- | --- |
+| `_platform_memset`, `_platform_memmove`, `malloc`, `free` near the top | allocating, clearing or copying big buffers in a loop | reuse buffers, avoid copies |
+| `swift_retain`, `swift_release` near the top | reference counting from class nodes or class references in a hot loop | index-based nodes, `final`, fewer class references |
+| `swift_allocObject` with many small allocations | an object (or a closure context, or a small array) created per iteration | hoist it out of the loop |
+| array functions with "copy" or "create new buffer" in their names | copy-on-write copies or growth | in-place mutation, `reserveCapacity` |
+| witness-table or existential functions | `any` in a hot path | generics or an enum |
+| String and Unicode functions | walking `Character`s or indexing a `String` in a loop | `Array(text)` once, or work in `utf8` |
+
+The exact function names change between Swift and OS versions, so read them for their meaning rather than memorising them.
+
+## Profiling from Terminal
+
+You don't need the Xcode project to record. `xctrace`, Instruments' command-line tool, records the same traces:
+
+```bash
+swift build -c release
+xcrun xctrace record --template 'Time Profiler' --output routes.trace --launch -- .build/release/ProfileRoutes
+open routes.trace
+```
+
+The last line opens the recording in Instruments for reading. This is handy for profiling a package executable without opening Xcode, or on a remote build machine.
+
+For marking phases of a run, such as "build the grid" versus "answer queries", Apple's `OSSignposter` (in the `os` module) lets you mark intervals in your code, and they appear on Time Profiler's **Points of Interest** track, lined up with the samples.
+
+<Callout kind="gotcha" title="Gotchas: profiling">
+- **Profile release builds.** A debug profile is dominated by things the optimiser would remove, so it points at the wrong code. Xcode's Profile action already uses Release.
+- **Inlined functions disappear into their callers.** If a function you expected is missing, the optimiser probably pasted it into the caller. The caller's source view still shows the cost line by line.
+- **Too short a run gives a noisy picture.** Make the program run for a few seconds by repeating the work, as the driver does.
+- **Fix the biggest thing first, then profile again.** Removing the top cost often changes the rest of the picture completely.
+</Callout>
+
+## Practice
+
+Profile your own solution to **Many short routes on one grid** with the steps above, before and after you add buffer reuse. You should see the profile move from memory-filling routines to the search loop itself, and the allocation count fall to a handful.
+
+```cards
+- id: time-profiler-what
+  front: "What does Time Profiler measure, and how?"
+  back: "Where a program spends its time. It samples every thread's call stack about once a millisecond and builds a call tree weighted by how often each function appeared."
+- id: invert-call-tree
+  front: "Why turn on Invert Call Tree?"
+  back: "It lists the functions where samples actually landed first, with their callers underneath, so the hot spot is at the top instead of buried under `main`."
+- id: allocations-churn
+  front: "In Allocations, what does huge Total Bytes with small Persistent Bytes mean?"
+  back: "Churn: memory being allocated and freed over and over, typically a buffer or copy created inside a loop."
+- id: profile-release
+  front: "Which build should you profile, and why?"
+  back: "Release (Xcode's Profile action uses it). Debug builds spend time on work the optimiser removes, so their profiles point at the wrong code."
+```
+
+```quiz
+- id: q1
+  type: order
+  prompt: "Put the steps of profiling a slow package solution with Time Profiler in order."
+  lines:
+    - "Make a small executable that runs the slow code on a big input for a few seconds"
+    - "Open the package in Xcode"
+    - "Choose Product › Profile, which builds in Release"
+    - "Pick the Time Profiler template and record"
+    - "Invert the call tree and find the heaviest functions"
+    - "Double-click the function to see the cost of each line"
+  explain: "Instruments needs a program to launch, built optimised and running long enough to sample well. The inverted tree points at the hot functions, and the source view narrows it to lines."
+- id: q2
+  type: mcq
+  prompt: "Time Profiler shows 85% of samples in `swift_retain` and `swift_release`, called from a linked-list traversal. What's the most promising change?"
+  options:
+    - "Rebuild with `-Ounchecked`"
+    - "Store the nodes as structs in an array and link them by index"
+    - "Add `reserveCapacity` before the loop"
+    - "Switch from `Array` to `Set`"
+  answer: 1
+  explain: "Retain and release come from following class references. Index-based nodes have no reference counting at all. `-Ounchecked` removes safety checks, not ARC."
+- id: q3
+  type: truefalse
+  prompt: "If `distance(fromRow:fromColumn:toRow:toColumn:)` is missing from a release-build call tree, it can't have taken any time."
+  answer: false
+  explain: "The optimiser may have inlined it into its caller, so its cost is reported under the caller's name. The caller's source view still shows which lines were expensive."
+- id: q4
+  type: match
+  prompt: "Match each Allocations column to its meaning."
+  pairs:
+    - ["Persistent Bytes", "Memory still allocated at the end of the selected range"]
+    - ["# Transient", "Allocations already freed"]
+    - ["Total Bytes", "Everything ever allocated"]
+  explain: "Comparing them tells you whether memory is growing (high persistent) or churning (high total, low persistent)."
+- id: q5
+  type: multi
+  prompt: "Which make a Time Profiler recording more trustworthy?"
+  options:
+    - "Profiling a release build"
+    - "Making the program run for a few seconds"
+    - "Profiling a debug build so every function shows up"
+    - "Using inputs the optimiser can't predict"
+  answer: [0, 1, 3]
+  explain: "Release builds show where real time goes, longer runs give more samples, and unpredictable inputs stop the optimiser computing results in advance. A debug profile shows costs the shipped code doesn't have."
+```

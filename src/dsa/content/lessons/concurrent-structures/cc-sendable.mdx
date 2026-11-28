@@ -1,0 +1,278 @@
+## Why it matters
+
+The last two lessons kept data safe by never sharing it, or by locking it inside an actor. But values still have to travel: an order handed to an actor, a configuration captured by a child task, a result returned from one. Some values are safe to hand over and some aren't. A struct of numbers can go anywhere; a class instance with a mutable property, shared between two tasks, is a data race waiting to happen. **`Sendable`** is how Swift tells the two apart, at compile time, before your users find out. It's also the heart of what changes when a project moves to Swift 6 language mode.
+
+## What Sendable means
+
+Swift thinks of concurrent code in **isolation domains**: each actor is one, the main actor is one, and code that belongs to no actor, such as a child task's body, runs outside them all. Values that cross from one domain to another, by being passed to an actor, captured by a child task or returned from one, end up reachable from two places that run at the same time.
+
+A type is **`Sendable`** when its values can cross that boundary safely. `Sendable` is a **marker protocol**: it has no methods to implement. Conforming to it is a claim the compiler checks against the type's contents.
+
+## Which types are Sendable
+
+| Kind of type | Sendable? |
+| --- | --- |
+| `Int`, `Double`, `Bool`, `String` and the other basic value types | yes |
+| `Array`, `Dictionary`, `Set` and `Optional` of Sendable elements | yes |
+| Your structs and enums whose stored properties are all Sendable | yes, inferred automatically |
+| Actors | always: they protect their own state |
+| A `final` class whose stored properties are all `let`s of Sendable types | yes, when you declare `: Sendable` |
+| A class with a `var` property | no, unless it's protected internally |
+| Closures | only those marked `@Sendable`, which can't capture mutable variables |
+
+Value types are the easy case. Passing a struct copies it, so the sender and receiver each have their own, and neither can see the other's changes. That's [Collections are values](/dsa/learn/swift-collections-are-values) paying off again. Swift infers `Sendable` for your structs and enums when every stored property is Sendable. The one exception is a `public` type in a library, which has to say `: Sendable` explicitly, so that adding a property later can't silently break code in other modules.
+
+A class is shared by reference, so it's only safe if nothing about it can change: `final`, so no subclass can add a `var`, and only `let` properties of Sendable types.
+
+```swift run
+struct Order {                      // Sendable automatically: every stored property is Sendable
+    let id: Int
+    var items: [String]
+}
+
+final class ShopInfo: Sendable {    // allowed: final, and every property is a let of a Sendable type
+    let name: String
+    let currency: String
+
+    init(name: String, currency: String) {
+        self.name = name
+        self.currency = currency
+    }
+}
+
+actor Kitchen {
+    private var received: [Order] = []
+
+    func receive(_ order: Order) {
+        received.append(order)
+    }
+
+    var itemCount: Int {
+        received.reduce(0) { $0 + $1.items.count }
+    }
+}
+
+let shop = ShopInfo(name: "Corner Café", currency: "GBP")
+let kitchen = Kitchen()
+
+var order = Order(id: 1, items: ["tea", "toast"])
+await kitchen.receive(order)        // the kitchen stores its own copy
+order.items.append("jam")           // changes only this copy
+
+await withTaskGroup(of: Void.self) { group in
+    for id in 2...4 {
+        group.addTask {
+            await kitchen.receive(Order(id: id, items: ["coffee in \(shop.currency)"]))
+        }
+    }
+}
+print(shop.name, order.items.count, await kitchen.itemCount)
+```
+
+```output
+Corner Café 3 5
+```
+
+What to notice:
+
+- **`Order` crosses into the actor as a copy.** Appending "jam" afterwards changes only the local `order`, so the kitchen still counts 2 items for it, plus one coffee from each of the three child tasks: 5.
+- **`ShopInfo` is a class, shared by reference with every child task**, and that's fine: nothing about it can ever change.
+- Neither type needed any concurrency code. Choosing value types and immutable classes is most of the work.
+
+## What Swift says when a type isn't Sendable
+
+Here's a mutable class handed to an actor, then changed afterwards:
+
+```swift
+final class Draft {
+    var text = ""
+}
+
+actor Outbox {
+    private var drafts: [Draft] = []
+
+    func add(_ draft: Draft) {
+        drafts.append(draft)
+    }
+}
+
+func send(_ outbox: Outbox) async {
+    let draft = Draft()
+    await outbox.add(draft)
+    draft.text = "edited after sending"     // the actor holds the same object: two domains, one var
+}
+```
+
+The actor and the caller now share one mutable object, and Swift 6 language mode rejects it:
+
+```text title="What Swift 6 language mode reports"
+error: sending 'draft' risks causing data races
+note: sending 'draft' to actor-isolated instance method 'add' risks causing data races between
+actor-isolated and local nonisolated uses
+note: access can happen concurrently
+```
+
+Delete the last line of `send`, and the error goes away. Swift 6 tracks whether a non-Sendable value is still used after it's been sent: if the caller never touches `draft` again, handing it over is safe, and the compiler allows it. (This analysis is called **region-based isolation**, and you'll see the keyword `sending` in APIs that rely on it.)
+
+Declaring a conformance the type can't honour is caught too:
+
+```swift
+final class Counter: Sendable {
+    var count = 0           // error: stored property 'count' of 'Sendable'-conforming class 'Counter' is mutable
+}
+
+class Settings: Sendable {  // error: non-final class 'Settings' cannot conform to the 'Sendable' protocol
+    let name = "default"
+}
+```
+
+## @unchecked Sendable: a promise the compiler can't check
+
+Some classes are mutable **and** thread-safe, because every access goes through a lock. The compiler can't see that a lock is used correctly, so it can't verify the conformance. `@unchecked Sendable` tells it: "trust me, I've made this safe myself."
+
+```swift run
+import Foundation
+
+/// Thread-safe because every access to `counts` holds the lock. The compiler can't verify that,
+/// so the conformance is @unchecked: a promise you make.
+final class HitCounter: @unchecked Sendable {
+    private let lock = NSLock()
+    private var counts: [String: Int] = [:]
+
+    func record(_ page: String) {
+        lock.lock()
+        defer { lock.unlock() }
+        counts[page, default: 0] += 1
+    }
+
+    func count(for page: String) -> Int {
+        lock.lock()
+        defer { lock.unlock() }
+        return counts[page, default: 0]
+    }
+}
+
+let hits = HitCounter()
+await withTaskGroup(of: Void.self) { group in
+    for visitor in 0..<300 {
+        group.addTask {
+            hits.record(visitor.isMultiple(of: 3) ? "home" : "search")
+        }
+    }
+}
+print(hits.count(for: "home"), hits.count(for: "search"), hits.count(for: "cart"))
+```
+
+```output
+100 200 0
+```
+
+Three hundred tasks record visits at once, and the counts are exact on every run, because each access takes the lock (`NSLock`, from Foundation) and `defer` releases it on every path out of the method.
+
+The word **unchecked** is literal. If you add a method next month that forgets the lock, the compiler stays silent and the race is back. Treat `@unchecked Sendable` as a last resort, keep the class small, and keep every access to the protected state in one place. In Swift 6 there's a better option for exactly this class: wrap the dictionary in a `Mutex`, and the class becomes checked `Sendable` with no `@unchecked` at all. That's in [Mutex and atomics in Swift 6](/dsa/learn/cc-mutex-atomics).
+
+## Swift 5 mode and Swift 6 mode
+
+The companion package says `swiftLanguageModes: [.v5]` in its `Package.swift`, and the `run` blocks run in Swift 5 mode too. The compiler is Swift 6 in both cases; the **language mode** decides how strictly concurrency is checked. Here's how the examples in this module fare:
+
+| Code | Swift 5 mode | Swift 5 mode, complete checking | Swift 6 mode |
+| --- | --- | --- | --- |
+| A class declared `Sendable` with a `var` | warning | warning | error |
+| A `@Sendable` closure that changes a captured `var` | warning | warning | error |
+| A non-Sendable value sent to an actor, then used again | nothing | warning | error |
+| Child tasks capturing the same mutable class instance | nothing | warning | error |
+| A non-Sendable type passed where `Sendable` is required | nothing | warning | error |
+
+In short: **Swift 6 language mode turns data-race safety into a compile-time guarantee.** Code that compiles in Swift 6 mode, without `@unchecked` or other escape hatches, has no data races. Swift 5 mode lets most of these through silently, which is why the package used it while Parts I to VIII were teaching other things.
+
+To change modes:
+
+- **A whole package:** `swiftLanguageModes: [.v6]` in `Package.swift` (it's the default for packages whose tools version is 6.0, unless they say otherwise, as this one does).
+- **One target:** `.target(name: "Cache", swiftSettings: [.swiftLanguageMode(.v6)])`.
+- **An Xcode project:** the **Swift Language Version** build setting.
+- **Warnings first, in Swift 5 mode:** set Xcode's **Strict Concurrency Checking** to Complete, or add `swiftSettings: [.enableUpcomingFeature("StrictConcurrency")]` to a target. That shows every Swift 6 error as a warning, so you can fix them gradually.
+
+Every concurrent problem in this module is written to compile cleanly in both modes, so you can try switching your own copy of the package to Swift 6 and see.
+
+<Callout kind="gotcha" title="Swift gotchas with Sendable">
+- **Silence in Swift 5 mode isn't safety.** Turn on complete checking, or Swift 6 mode, before trusting concurrent code.
+- **`let` doesn't make a class instance safe.** `let draft = Draft()` means the variable can't point elsewhere, but `draft.text` can still change. Sendability is about the type, not the variable.
+- **`@unchecked Sendable` switches the checking off for the whole type**, including methods you add later. Prefer an actor or a `Mutex`.
+- **Public types aren't inferred.** In a library, write `public struct Point: Sendable` explicitly.
+</Callout>
+
+## Practice
+
+**A coalescing memo cache** requires `Key: Hashable & Sendable` and `Value: Sendable`, and takes its compute function as `@escaping @Sendable (Key) async -> Value`. Work out why each of those requirements is needed: which values cross from one isolation domain to another?
+
+```cards
+- id: sendable-meaning
+  front: "What does it mean for a type to be Sendable?"
+  back: "Its values can safely cross from one isolation domain to another: into a child task, to an actor or back. It's a marker protocol the compiler checks against the type's contents."
+- id: sendable-which-types
+  front: "Which of your own types are Sendable?"
+  back: "Structs and enums whose stored properties are all Sendable (inferred unless public), actors, and final classes whose properties are all lets of Sendable types (declared)."
+- id: sendable-unchecked
+  front: "What does `@unchecked Sendable` do, and when is it acceptable?"
+  back: "It tells the compiler to trust you that the type is thread-safe, switching off its checks. Only for small types that protect every access themselves, such as with a lock; prefer actors or Mutex."
+- id: sendable-modes
+  front: "What does Swift 6 language mode change about concurrency?"
+  back: "Data-race checks that are silent or warnings in Swift 5 mode become errors, so code that compiles without escape hatches is free of data races."
+```
+
+```quiz
+- id: q1
+  type: multi
+  prompt: "Which of these types are Sendable without any `@unchecked`? Choose all that apply."
+  options:
+    - "`struct Score { let name: String; var points: Int }`"
+    - "`final class Config: Sendable { let url: String }`"
+    - "`final class Cart { var items: [String] = [] }`"
+    - "`actor Inventory { var stock: [String: Int] = [:] }`"
+    - "`struct Wrapper { let cart: Cart }`, with `Cart` from option 3"
+  answer: [0, 1, 3]
+  explain: "Score's properties are Sendable value types, Config is final with only lets, and actors are always Sendable. Cart has a var, so it isn't, and a struct holding a non-Sendable class isn't either: copying the struct copies only the reference."
+- id: q2
+  type: output
+  prompt: "What does this print?"
+  code: |
+    struct Note {
+        var text: String
+    }
+    actor Board {
+        private var notes: [Note] = []
+        func pin(_ note: Note) { notes.append(note) }
+        var texts: [String] { notes.map(\.text) }
+    }
+    let board = Board()
+    var note = Note(text: "buy milk")
+    await board.pin(note)
+    note.text = "buy bread"
+    await board.pin(note)
+    print(await board.texts, note.text)
+  answer: "[\"buy milk\", \"buy bread\"] buy bread"
+  explain: "Note is a struct, so each `pin` hands the actor its own copy. Changing `note` afterwards doesn't affect the copy already pinned."
+- id: q3
+  type: mcq
+  prompt: "A class protects a dictionary with an `NSLock` around every access. How should it conform to Sendable before Swift 6's Mutex?"
+  options:
+    - "`: Sendable`, and the compiler verifies the lock"
+    - "`: @unchecked Sendable`, promising the safety yourself"
+    - "It can't be Sendable at all"
+    - "Make it a struct and keep the lock"
+  answer: 1
+  explain: "The compiler can't see that a lock is used correctly, so a mutable class can only claim Sendable with @unchecked. Swift 6's Mutex lets such a class be checked Sendable instead."
+- id: q4
+  type: match
+  prompt: "Match each piece of code to how Swift 5 mode (default checking) treats it."
+  pairs:
+    - ["`final class C: Sendable { var x = 0 }`", "A warning that's an error in Swift 6 mode"]
+    - ["A non-Sendable class sent to an actor and edited afterwards", "Nothing at all"]
+    - ["`let f: @Sendable () -> Void = { total += 1 }` with `var total`", "A warning that's an error in Swift 6 mode"]
+  explain: "Explicit Sendable claims and @Sendable closures are checked even in Swift 5 mode, as warnings. Region-based checks on values sent between domains only appear with complete checking or Swift 6 mode."
+- id: q5
+  type: truefalse
+  prompt: "In Swift 6 mode, passing a non-Sendable class instance to an actor method is always an error."
+  answer: false
+  explain: "Region-based isolation allows it when the caller never uses the instance again after sending it, because then only the actor can reach it. It's an error when the caller keeps using it."
+```
