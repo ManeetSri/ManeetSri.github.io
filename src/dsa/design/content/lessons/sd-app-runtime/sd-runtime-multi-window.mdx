@@ -1,0 +1,313 @@
+## Why it matters
+
+On iPad, people open the same app in several windows: two notes side by side, a draft next to the inbox, a document on an external display under Stage Manager. An app designed around "the window" falls apart there. Both windows navigate together, an alert appears in the wrong one, an edit in one window doesn't show in the other, and undo in one window undoes the other's work. Supporting multiple windows forces the question every architecture should answer anyway: **which state belongs to the app, and which to one window?** Interviewers ask "what happens with two windows?" for any iPad-facing design, and it's a quick way to see whether your state has clear owners.
+
+## Turning it on
+
+Multiple windows need one Info.plist key: `UIApplicationSupportsMultipleScenes` set to `YES` inside `UIApplicationSceneManifest` (Xcode's "Supports multiple windows" checkbox). From then on, iPadOS lets users create windows by dragging content to the edge of the screen, from the app's icon (Show All Windows), from your own "Open in New Window" actions, and through Split View, Slide Over and Stage Manager. iPadOS 26 went further with freely resizable windows on every iPad, so "the size of the screen" is no longer a useful assumption either.
+
+It isn't only an iPad concern. Even on iPhone, CarPlay and an external display connect extra scenes with their own roles, and the same rules apply to them.
+
+## Session, scene, window
+
+Three objects, three lifetimes:
+
+- A **`UISceneSession`** is the persistent identity of one window. It has a `persistentIdentifier`, a `role`, its `stateRestorationActivity` and a `userInfo` dictionary, and it survives the app being suspended, killed and relaunched. It ends only when the user closes that window, and then the app delegate hears `application(_:didDiscardSceneSessions:)`.
+- A **`UIWindowScene`** is the live UI for a session. It exists while the session is **connected**. iOS may disconnect a background scene to reclaim memory (`sceneDidDisconnect(_:)`) and later connect a new scene for the same session.
+- **`UIWindow`s** belong to a scene: usually one main window per scene.
+
+So a session can outlive many scenes, and a scene lives inside one session. Anything a window needs to come back to after a disconnect must be stored with its **session** (its restoration state, from [the previous lesson](/design/learn/sd-runtime-restoration)), not in the scene's objects.
+
+## App-wide or per window?
+
+This is the design decision that matters. Put each piece of state with the smallest owner that covers everyone who needs it:
+
+| App-wide: one per process | Per window: one per scene |
+| --- | --- |
+| Data stores and repositories | Navigation stack, selected tab, selection |
+| Network and sync clients | The coordinator for that window's flows |
+| The signed-in session | View models of the screens in that window |
+| Image and response caches | Which document or item this window shows |
+| Feature flags, analytics | The undo manager (UIKit gives each window its own) |
+| | Text field focus, scroll position, sheets and alerts |
+
+The rule that follows: **windows share data through the app-wide store, never through each other.** Each window's view models observe the store; an edit made in one window goes into the store; the store tells every window. Step through an edit:
+
+```visual flow
+title: Two windows, one source of truth
+nodes:
+  - { id: store, label: Note store, kind: store, at: [2, 0] }
+  - { id: sync, label: Sync client, kind: service, at: [4, 0] }
+  - { id: winA, label: Window A, kind: view, at: [0, 2] }
+  - { id: winB, label: Window B, kind: view, at: [4, 2] }
+groups:
+  - { id: shared, label: App-wide, nodes: [store, sync] }
+  - { id: sceneA, label: Scene A, nodes: [winA] }
+  - { id: sceneB, label: Scene B, nodes: [winB] }
+edges:
+  - [winA, store, edit]
+  - [store, winA, changes, { style: async }]
+  - [store, winB, changes, { style: async }]
+  - [store, sync, upload]
+  - [sync, store, remote edit]
+steps:
+  - say: "The app creates one **note store** and one **sync client** for the whole process."
+    show: [shared]
+  - say: "Two windows, two scenes. Each has its own navigation and selection, and both read the **same store**."
+    show: [sceneA, sceneB]
+  - say: "The user edits a note in window A. The edit goes **into the store**, not into a copy that window A keeps."
+    send: winA->store
+  - say: "The store publishes the change, and **both** windows update. Window B, showing the same note, has A's edit at once."
+    send: [store->winA, store->winB]
+  - say: "An edit from the user's Mac arrives through the sync client, lands in the same store, and fans out the same way."
+    send: [sync->store, store->winA, store->winB]
+  - say: "The user closes window B. Its scene and its per-window objects go; the store, and window A, carry on untouched."
+    hide: [sceneB]
+```
+
+The opposite designs each fail in a recognisable way. Navigation state in a shared singleton: open a second window and both navigate together. Each window decoding its own copy of the data: window B shows a stale note until it's reopened. A store that windows talk to by finding each other: the coupling breaks as soon as either window is disconnected.
+
+### Two windows on the same item
+
+Users will open the same note in two windows. If both editors bind to the store's single copy, typing in one shows in the other and there's nothing to reconcile. If each editor keeps a private draft, decide the policy explicitly: last write wins, or the second window becomes read-only while the first is editing. Undo stays per window: UIKit gives each window its own `undoManager` through the responder chain, so undo in window A never touches window B's work.
+
+## Building it
+
+In SwiftUI, a `WindowGroup` already means "one of these per window". Keep app-wide objects in the `App` and per-window state in the views, and add a value-based `WindowGroup` for "open this item in its own window":
+
+```swift check ios title="NotesApp.swift"
+import SwiftUI
+
+struct Note: Identifiable, Hashable, Sendable {
+    let id: UUID
+    var title: String
+    var body: String
+}
+
+// App-wide: one per process, the single source of truth every window reads
+@MainActor @Observable
+final class NoteStore {
+    private(set) var notes: [Note] = []
+
+    func note(id: Note.ID) -> Note? { notes.first { $0.id == id } }
+
+    func update(_ note: Note) {
+        guard let index = notes.firstIndex(where: { $0.id == note.id }) else { return }
+        notes[index] = note
+    }
+}
+
+// Marked @main in the app target
+struct NotesApp: App {
+    @State private var store = NoteStore()
+
+    var body: some Scene {
+        // The main window: the user can open several, each with its own selection and navigation
+        WindowGroup {
+            NoteListView()
+                .environment(store)
+        }
+        // One window per note: opening a note that already has a window brings that window forward
+        WindowGroup(for: Note.ID.self) { $noteID in
+            if let noteID {
+                NoteEditor(noteID: noteID)
+                    .environment(store)
+            }
+        }
+    }
+}
+
+struct NoteListView: View {
+    @Environment(NoteStore.self) private var store
+    @Environment(\.openWindow) private var openWindow
+    @Environment(\.supportsMultipleWindows) private var supportsMultipleWindows
+    @State private var selection: Note.ID? // per window
+
+    var body: some View {
+        List(store.notes, selection: $selection) { note in
+            Text(note.title)
+                .contextMenu {
+                    if supportsMultipleWindows {
+                        Button("Open in New Window") { openWindow(value: note.id) }
+                    }
+                }
+        }
+    }
+}
+
+struct NoteEditor: View {
+    @Environment(NoteStore.self) private var store
+    let noteID: Note.ID
+
+    var body: some View {
+        if let note = store.note(id: noteID) {
+            Text(note.body)
+        } else {
+            // Deleted from another window while this one was open
+            ContentUnavailableView("Note deleted", systemImage: "trash")
+        }
+    }
+}
+```
+
+`supportsMultipleWindows` hides the menu item on iPhone, where it would do nothing. And the editor handles the note disappearing, because in a multi-window app another window can delete what this one shows.
+
+In UIKit, the scene delegate is the per-window composition root: it builds that window's coordinator from the app-wide services the app delegate owns:
+
+```swift check ios title="SceneDelegate.swift (UIKit)"
+import UIKit
+
+final class NoteStore: Sendable {}
+
+@MainActor
+final class NotesCoordinator {
+    private let window: UIWindow
+    private let store: NoteStore
+    let navigation = UINavigationController()
+
+    init(window: UIWindow, store: NoteStore) {
+        self.window = window
+        self.store = store
+    }
+
+    func start(restoring activity: NSUserActivity?) {
+        window.rootViewController = navigation
+        window.makeKeyAndVisible()
+    }
+
+    // Present from this window's own navigation, never from "the" window
+    func showError(_ message: String) {
+        let alert = UIAlertController(title: "Couldn't save", message: message, preferredStyle: .alert)
+        alert.addAction(UIAlertAction(title: "OK", style: .default))
+        navigation.present(alert, animated: true)
+    }
+}
+
+final class AppDelegate: UIResponder, UIApplicationDelegate {
+    let store = NoteStore() // app-wide
+}
+
+final class SceneDelegate: UIResponder, UIWindowSceneDelegate {
+    var window: UIWindow?
+    private var coordinator: NotesCoordinator? // one per window
+
+    func scene(_ scene: UIScene, willConnectTo session: UISceneSession, options connectionOptions: UIScene.ConnectionOptions) {
+        guard let windowScene = scene as? UIWindowScene,
+              let app = UIApplication.shared.delegate as? AppDelegate else { return }
+        let window = UIWindow(windowScene: windowScene)
+        let coordinator = NotesCoordinator(window: window, store: app.store)
+        coordinator.start(restoring: session.stateRestorationActivity)
+        self.window = window
+        self.coordinator = coordinator
+    }
+
+    func sceneDidDisconnect(_ scene: UIScene) {
+        // The session may come back; this scene's objects don't
+        coordinator = nil
+        window = nil
+    }
+}
+
+@MainActor
+func openInNewWindow(noteID: UUID) {
+    let activity = NSUserActivity(activityType: "com.example.notes.open")
+    activity.userInfo = ["noteID": noteID.uuidString]
+    let request = UISceneSessionActivationRequest(userActivity: activity)
+    UIApplication.shared.activateSceneSession(for: request) { error in
+        print("Couldn't open a window: \(error)")
+    }
+}
+```
+
+`activateSceneSession(for:errorHandler:)` (iOS 17) opens a window, and the new scene receives the activity in its connection options. To send a URL or activity to an **existing** window instead, for example the one already showing that note, set the scene's `activationConditions` in UIKit, or use `.handlesExternalEvents(matching:)` on the SwiftUI scene.
+
+### Memory, per window
+
+Every window costs memory: its view hierarchy, its decoded images, its view models. iOS manages that by **disconnecting** background scenes, which is why each scene must be rebuildable from its session alone. Design per-window objects so that dropping them all on `sceneDidDisconnect(_:)` is safe, and app-wide caches so they serve every window rather than one cache per window.
+
+## Trade-offs
+
+| Design | iPad experience | Complexity | Typical bugs | When it wins |
+| --- | --- | --- | --- | --- |
+| Single window only (multiple scenes off) | One window; Split View and Stage Manager still resize it | Lowest | None of these, but users notice the missing feature | Simple utilities; phone-first apps for now |
+| Multiple windows, one shared store, per-window navigation | Full | Moderate: state needs clear owners | Few, once ownership is right | Productivity apps: notes, mail, documents, chat |
+| Multiple windows, each loading its own copy | Full, but windows disagree | Looks simple, isn't | Stale data, conflicting saves | Rarely: only for truly independent documents |
+
+<Callout kind="interview">
+
+**Say** what's app-wide and what's per window, and how changes travel: "One store per process as the source of truth; each window owns its navigation, selection and coordinator; edits go into the store and every window observes it. A window's place is kept with its scene session, so iOS can disconnect it and I can rebuild it." **Ask** whether two windows may edit the same item, and what should happen if they do. **Red flags:** navigation in a singleton, `UIApplication.shared.windows.first` to present something, and a cache per window.
+
+</Callout>
+
+<Callout kind="gotcha" title="iOS gotcha: there's no 'the window'">
+
+Code that finds "the" window, such as `UIApplication.shared.windows.first` (deprecated since iOS 15) or the first of `connectedScenes`, picks an arbitrary one when there are several. The alert appears in the window the user isn't looking at, or behind a sheet. Present from the view controller that asked, use `view.window?.windowScene` when you need the scene, and in SwiftUI rely on the environment, which is already per window.
+
+</Callout>
+
+## Practice
+
+[The design exercise](/design/practice/sd-design-app-runtime-flow-restoration) includes a multi-window twist: the same flow open in two windows, each with its own progress, sharing one store. Decide what each window restores, and what they share.
+
+```cards
+- id: session-vs-scene
+  front: "What's the difference between a UISceneSession and a UIWindowScene?"
+  back: "The session is a window's persistent identity, kept across suspension and relaunch until the user closes the window. The scene is the live UI, which iOS may disconnect to reclaim memory and later recreate for the same session."
+- id: app-vs-window-state
+  front: "Which state is app-wide and which is per window?"
+  back: "App-wide: stores, network and sync clients, the session, caches. Per window: navigation, selection, the coordinator, screen view models, undo, focus."
+- id: share-through-store
+  front: "How should two windows share changes?"
+  back: "Through the app-wide store as the single source of truth. Each window observes it; neither talks to the other."
+```
+
+```quiz
+- id: q1
+  type: sort
+  prompt: "In a multi-window notes app, which of these is app-wide and which belongs to one window?"
+  buckets: [App-wide, Per window]
+  items:
+    - [The notes repository, 0]
+    - [The navigation path, 1]
+    - [The sync client, 0]
+    - [Which note is selected in the sidebar, 1]
+    - [The image cache for attachments, 0]
+    - [The undo manager, 1]
+  explain: "Shared data and the services around it exist once per process. Where each window is, what it's showing and what undo means there are that window's own."
+- id: q2
+  type: mcq
+  prompt: "A user has two windows of your app open. A save fails in the right-hand window, but the error alert appears in the left one. What's the likeliest cause?"
+  options:
+    - "iPadOS shows alerts in the most recently opened window"
+    - "The code presents the alert from a window it found globally, such as the first connected scene, instead of from the view controller that asked"
+    - "Alerts don't support multiple windows"
+    - "The save ran on a background thread"
+  answer: 1
+  explain: "With several windows, \"the first window\" is arbitrary. Present from the view controller (or SwiftUI view) whose action failed, so the alert lands in that window."
+- id: q3
+  type: truefalse
+  prompt: "When iOS disconnects a background scene to save memory, the window is gone for good, along with its restoration state."
+  answer: false
+  explain: "Disconnecting frees the scene's UI, but the session survives with its restoration activity and user info. When the user returns, a new scene connects to the same session and rebuilds from that state. Only closing the window discards the session."
+- id: q4
+  type: mcq
+  prompt: "A user opens the same note in two windows and types in one. What's the simplest design that keeps both correct?"
+  options:
+    - "Each window keeps its own copy and saves on close"
+    - "Both editors read and write the app-wide store's single copy of the note, so the other window updates as the user types"
+    - "Prevent the same note from being opened twice"
+    - "Send a notification from one window's view controller to the other's"
+  answer: 1
+  explain: "One source of truth means there's nothing to reconcile: both windows observe the same model. Private copies need a conflict policy, and windows messaging each other break when either is disconnected."
+- id: q5
+  type: multi
+  prompt: "Which of these are safe in an app with multiple windows? Choose all that apply."
+  options:
+    - "Keeping the navigation path in a shared singleton"
+    - "Restoring each window's position from its own scene session"
+    - "One image cache shared by every window"
+    - "Using `UIApplication.shared.windows.first` to present a sheet"
+    - "Building a coordinator per scene in `scene(_:willConnectTo:options:)`"
+  answer: [1, 2, 4]
+  explain: "Per-window state restored from each session, shared caches, and a coordinator per scene are the multi-window design. A shared navigation path makes windows navigate together, and \"the first window\" is arbitrary."
+```

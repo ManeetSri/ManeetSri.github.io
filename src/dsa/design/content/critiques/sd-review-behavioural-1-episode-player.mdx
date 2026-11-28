@@ -1,0 +1,144 @@
+<Brief>
+
+A podcast app's player screen. Testers report that after closing it the episode **keeps playing**, that memory climbs every time they open an episode, and that the app sometimes crashes when an episode ends. Review the code as you would a pull request: what's wrong, what matters most, and how you'd fix it.
+
+```swift check ios title="EpisodePlayerViewController.swift"
+import AVFoundation
+import UIKit
+
+@MainActor protocol PlayerControlsDelegate {
+    func controlsDidTapPlayPause(_ controls: PlayerControlsView)
+}
+
+final class PlayerControlsView: UIView {
+    var delegate: PlayerControlsDelegate?
+    var onScrub: ((Double) -> Void)?
+}
+
+final class EpisodePlayerViewController: UIViewController, PlayerControlsDelegate {
+    let episodeID: String
+    let player: AVPlayer
+    let controls = PlayerControlsView()
+    private var progressTimer: Timer?
+
+    init(episodeID: String, url: URL) {
+        self.episodeID = episodeID
+        self.player = AVPlayer(url: url)
+        super.init(nibName: nil, bundle: nil)
+    }
+
+    required init?(coder: NSCoder) { nil }
+
+    override func viewDidLoad() {
+        super.viewDidLoad()
+        view.addSubview(controls)
+        controls.delegate = self
+        controls.onScrub = { fraction in
+            let duration = self.player.currentItem?.duration.seconds ?? 0
+            self.player.seek(to: CMTime(seconds: fraction * duration, preferredTimescale: 600))
+        }
+    }
+
+    override func viewWillAppear(_ animated: Bool) {
+        super.viewWillAppear(animated)
+        NotificationCenter.default.addObserver(forName: AVPlayerItem.didPlayToEndTimeNotification, object: nil, queue: nil) { _ in
+            MainActor.assumeIsolated { self.markFinished() }
+        }
+        progressTimer = Timer.scheduledTimer(timeInterval: 1, target: self, selector: #selector(tick), userInfo: nil, repeats: true)
+    }
+
+    @objc private func tick() {
+        title = "\(Int(player.currentTime().seconds)) s"
+    }
+
+    func controlsDidTapPlayPause(_ controls: PlayerControlsView) {
+        player.timeControlStatus == .playing ? player.pause() : player.play()
+    }
+
+    private func markFinished() {
+        NotificationCenter.default.post(name: Notification.Name("episodeFinished"), object: nil, userInfo: ["id": episodeID])
+    }
+}
+
+final class LibraryViewController: UITableViewController {
+    private var played: Set<String> = []
+
+    override func viewDidLoad() {
+        super.viewDidLoad()
+        NotificationCenter.default.addObserver(self, selector: #selector(episodeFinished), name: Notification.Name("episodeFinished"), object: nil)
+    }
+
+    @objc private func episodeFinished(_ notification: Notification) {
+        played.insert(notification.userInfo!["episodeID"] as! String)
+        tableView.reloadData()
+    }
+}
+```
+
+</Brief>
+
+```workspace
+template: critique
+minutes: 25
+```
+
+```findings
+- id: strong-delegate
+  title: The controls hold their delegate strongly, so the screen and its controls keep each other alive
+  severity: high
+  lines: 4-9
+  detail: "`PlayerControlsDelegate` isn't class-bound (`AnyObject`), so `delegate` can't be `weak`, and line 30 sets it to the view controller that owns the controls. Screen → controls → screen is a cycle: the screen is never freed, and because it owns the `AVPlayer`, the episode keeps playing after the user closes it."
+- id: scrub-closure-cycle
+  title: The scrub closure captures self strongly and is stored on an object self owns
+  severity: high
+  lines: 31-34
+  detail: "`controls.onScrub` lives as long as the controls, which live as long as the screen, and the closure holds `self`. A second cycle with the same result. Capture `[weak self]`, or capture only what it needs: `[player]`."
+- id: lost-observer-token
+  title: The block observer's token is thrown away, and a new observer is added on every appearance
+  severity: high
+  lines: 39-41
+  detail: "`addObserver(forName:object:queue:using:)` returns the only handle that can remove the observer, and it's discarded. NotificationCenter keeps the block, and the block keeps `self`, forever. `viewWillAppear` runs every time the screen comes back on screen (a pushed screen popped, a full-screen cover dismissed), so each time adds another observer: one episode ending posts \"finished\" several times, from screens that should have died long ago."
+- id: assume-isolated-crash
+  title: MainActor.assumeIsolated is used for a notification that can arrive on any thread
+  severity: high
+  lines: 40
+  detail: "With `queue: nil` the block runs on whatever thread posts, and AVFoundation documents that `didPlayToEndTimeNotification` may be posted on a different thread from the one that registered. `assumeIsolated` doesn't move work to the main actor; it traps when the caller isn't on it. This silenced the Swift 6 compiler and swapped a warning for a crash. Pass `queue: .main`, or hop with `Task { @MainActor in … }`."
+- id: userinfo-crash
+  title: The library force-unwraps a userInfo key the player never sends
+  severity: high
+  lines: "67"
+  detail: "The player posts `[\"id\": episodeID]` (line 54); the library reads `\"episodeID\"` with `!` and `as!`. Every finished episode crashes the app while the library is alive, which is always, since it's under the player in the navigation stack. Untyped dictionaries keyed by strings fail at runtime, never at compile time."
+- id: timer-retains-target
+  title: A repeating timer retains the screen, and each appearance starts another one
+  severity: medium
+  lines: "42"
+  detail: "A scheduled `Timer` keeps a strong reference to its target until it's invalidated, and nothing invalidates it. Overwriting `progressTimer` doesn't stop the old timer either; the run loop still owns it. Even with the cycles fixed, the screen would live forever and tick several times a second. `player.addPeriodicTimeObserver(forInterval:queue:using:)` is the AVFoundation tool for this, and its token is removed when the screen goes."
+- id: observes-every-item
+  title: "object: nil hears every player item in the app finish"
+  severity: medium
+  lines: "39"
+  detail: "Any `AVPlayerItem` that ends (another episode, a trailer in the library, a leaked player from an earlier visit) triggers `markFinished()`, which marks *this* episode as played. Pass `player.currentItem` as the object, so only this screen's item counts."
+- id: broadcast-for-one-listener
+  title: A global broadcast with a string name is used for one screen telling another
+  severity: low
+  lines: "63"
+  detail: "The player and the library have a direct relationship: the library wants to know which episodes have been played. A notification named by a string literal (typed twice, at lines 54 and 63), carrying an untyped payload, hides that dependency from both readers and the compiler. A shared `PlaybackHistory` that both screens are given, and that the library observes, makes it explicit and testable."
+```
+
+<ReferenceReview>
+
+**Most important first.** Two crashes ship today: `MainActor.assumeIsolated` traps whenever AVFoundation posts the end-of-item notification off the main thread, and the library force-unwraps a `userInfo` key (`episodeID`) that the player never sends (it sends `id`). Fix both before anything else.
+
+**Then the leaks, which users can hear.** The screen can't be freed for four separate reasons: the strong delegate (a cycle), the scrub closure capturing `self` (another cycle), the discarded observer token (NotificationCenter owns a block that owns `self`), and the scheduled timer (the run loop owns a timer that owns `self`). Any one of them keeps the `AVPlayer` alive, which is why the episode plays on after the screen closes. Because observers and timers are added in `viewWillAppear`, every reappearance makes it worse.
+
+**How I'd fix it, in small steps:**
+
+1. Make `PlayerControlsDelegate: AnyObject` and the property `weak var delegate`. That's the convention for every UIKit delegate, for this reason.
+2. Capture only what the scrub closure needs: `controls.onScrub = { [player] fraction in … }`.
+3. Register for the end of *this* item once, in `viewDidLoad`, with `object: player.currentItem` and `queue: .main`, and keep the token so the screen can remove the observer when it goes away. (In a task-based screen, `for await _ in NotificationCenter.default.notifications(named:object:)` in a task cancelled on disappear does the same with no token to lose.)
+4. Replace the timer with `player.addPeriodicTimeObserver(forInterval:queue:using:)` using `[weak self]`, and remove the observer when the screen goes away.
+5. Replace the string-named notification with a `PlaybackHistory` injected into both screens: the player calls `history.markPlayed(episodeID)`, and the library observes the history. If a notification has to stay for now, give it a `Notification.Name` constant and read the payload with `as?`, never `!`.
+
+**Tests to add:** a leak test that creates the player screen, loads its view, runs it through `viewWillAppear` twice, drops it, and checks a `weak` reference is `nil` (this catches all four retainers); a test that finishing a *different* player item doesn't mark this episode played; and a `PlaybackHistory` test for marking and observing. In the app, the Xcode memory graph debugger shows each cycle directly.
+
+</ReferenceReview>

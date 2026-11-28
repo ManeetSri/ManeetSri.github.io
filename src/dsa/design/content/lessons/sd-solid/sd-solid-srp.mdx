@@ -1,0 +1,332 @@
+## Why it matters
+
+The massive view controller is the most common iOS design problem, and it's almost always a single-responsibility problem: one type that answers to the designers, the backend team, finance and analytics at once. Every change risks breaking something unrelated, two people's pull requests collide in the same file, and nothing can be tested without the whole screen. Interviewers love it because "what are this class's reasons to change?" separates people who split code by instinct from people who split it on purpose.
+
+## One reason to change means one group of people
+
+The usual summary, "a class should do one thing", is not what the principle says. "Do one thing" is good advice for *functions*. Robert C. Martin's wording is that a module should have **one reason to change**, and he later made the meaning plainer: a module should be responsible to **one actor**, meaning one person or group who would ask for it to change.
+
+That shift from "things" to "people" is the useful part. A type can do several small things and still have one reason to change, if the same people own all of them. And a type that looks like it does one thing, "show a receipt", can answer to four different groups.
+
+Here's a receipt screen in a grocery app. It's short, it works, and it has four reasons to change:
+
+```swift check ios title="ReceiptViewController.swift (before)"
+import UIKit
+
+struct Line: Sendable {
+    let name: String
+    let pence: Int
+}
+
+struct Order: Sendable {
+    let id: String
+    let lines: [Line]
+    let deliveryPence: Int
+}
+
+enum Analytics {
+    static func log(_ event: String, _ values: [String: Int]) { /* the analytics SDK */ }
+}
+
+final class ReceiptViewController: UIViewController {
+    let order: Order
+    let totalLabel = UILabel()
+
+    init(order: Order) {
+        self.order = order
+        super.init(nibName: nil, bundle: nil)
+    }
+    required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
+
+    override func viewDidLoad() {
+        super.viewDidLoad()
+        // Finance: what the customer owes, and the VAT inside it
+        let total = order.lines.reduce(0) { $0 + $1.pence } + order.deliveryPence
+        let vat = total / 6
+        // Design: how money looks
+        let money = { (pence: Int) in String(format: "£%d.%02d", pence / 100, pence % 100) }
+        totalLabel.text = money(total)
+        // Support: the text people paste into emails when they complain
+        let shareText = "Order \(order.id): \(order.lines.count) items, \(money(total)) including \(money(vat)) VAT"
+        navigationItem.rightBarButtonItem = UIBarButtonItem(systemItem: .action, primaryAction: UIAction { [weak self] _ in
+            self?.present(UIActivityViewController(activityItems: [shareText], applicationActivities: nil), animated: true)
+        })
+        // Growth: analytics
+        Analytics.log("receipt_viewed", ["total_pence": total, "lines": order.lines.count])
+    }
+}
+```
+
+The comments name the actors, which is the first technique: **for each block of code, write down who would ask you to change it.** Finance changes the VAT rule or decides delivery isn't taxed. Design changes how money looks. Support rewrites the share text. Growth renames the event. None of them cares about the others' code, and all of them edit this file.
+
+<Callout kind="analogy">
+
+A shared spreadsheet that finance, marketing and operations all edit works until marketing sorts a column finance depends on. Nobody did anything wrong in their own terms; the spreadsheet had three owners. Giving each department its own sheet, with one summary sheet that reads from the others, is the single-responsibility principle.
+
+</Callout>
+
+## Spotting mixed responsibilities
+
+A list of reasons to change is the direct test, but these signs point to the same problem faster:
+
+- **You can't describe the type without "and".** "Shows the receipt *and* works out VAT *and* builds the share text."
+- **Its imports and dependencies span layers.** UIKit, `URLSession`, Core Data and an analytics SDK in one file.
+- **Its history mixes unrelated changes.** `git log --oneline -- ReceiptViewController.swift` shows "Fix VAT on delivery", "New share copy" and "Rename analytics event" side by side, often from different teams.
+- **Its tests need far more setup than the behaviour under test.** To check the VAT sum you have to load a view controller.
+- **It's divided into `// MARK:` sections that never call each other.** The sections are the types waiting to be extracted.
+
+## Splitting along the seams
+
+Each actor gets a type that holds only their rules, and the screen composes them. None of them needs a protocol: single responsibility is about where code lives and who it answers to, not about abstraction.
+
+```swift run title="One type per reason to change"
+struct Line {
+    let name: String
+    let pence: Int
+}
+
+struct Order {
+    let id: String
+    let lines: [Line]
+    let deliveryPence: Int
+}
+
+// Finance owns this: what the customer owes, and the VAT included in it
+struct ReceiptCalculator {
+    func total(for order: Order) -> Int {
+        order.lines.reduce(0) { $0 + $1.pence } + order.deliveryPence
+    }
+
+    func vat(includedIn total: Int) -> Int {
+        total / 6    // 20% VAT is a sixth of a VAT-inclusive price
+    }
+}
+
+// Design owns this: how an amount looks
+struct MoneyFormatter {
+    func string(pence: Int) -> String {
+        "£\(pence / 100)." + (pence % 100 < 10 ? "0" : "") + "\(pence % 100)"
+    }
+}
+
+// Support owns this: the wording people paste into emails
+struct ShareTextComposer {
+    let calculator = ReceiptCalculator()
+    let money = MoneyFormatter()
+
+    func text(for order: Order) -> String {
+        let total = calculator.total(for: order)
+        let vat = calculator.vat(includedIn: total)
+        return "Order \(order.id): \(order.lines.count) items, \(money.string(pence: total)) including \(money.string(pence: vat)) VAT"
+    }
+}
+
+let order = Order(id: "A1029", lines: [Line(name: "Sourdough", pence: 450), Line(name: "Olive oil", pence: 899), Line(name: "Coffee", pence: 1_250)], deliveryPence: 149)
+let calculator = ReceiptCalculator()
+let total = calculator.total(for: order)
+print("Total:", MoneyFormatter().string(pence: total))
+print("VAT included:", MoneyFormatter().string(pence: calculator.vat(includedIn: total)))
+print(ShareTextComposer().text(for: order))
+```
+
+```output
+Total: £27.48
+VAT included: £4.58
+Order A1029: 3 items, £27.48 including £4.58 VAT
+```
+
+The view controller is left with layout and wiring: it asks the calculator, the formatter and the composer for values, and passes the analytics event to an `Analytics` type owned by growth. Each piece now has a test that needs no UIKit, and each team's change touches one file.
+
+Here's how changes flow after the split:
+
+```visual flow
+title: After the split, each request lands in one place
+nodes:
+  - { id: finance, label: Finance, kind: actor, at: [0, 0] }
+  - { id: design, label: Design, kind: actor, at: [0, 1] }
+  - { id: support, label: Support, kind: actor, at: [0, 2] }
+  - { id: growth, label: Growth, kind: actor, at: [0, 3] }
+  - { id: calc, label: ReceiptCalculator, at: [2, 0] }
+  - { id: money, label: MoneyFormatter, at: [2, 1] }
+  - { id: share, label: ShareTextComposer, at: [2, 2] }
+  - { id: events, label: ReceiptEvents, at: [2, 3] }
+  - { id: screen, label: ReceiptViewController, kind: view, at: [4, 1.5] }
+edges:
+  - [finance, calc, VAT rule]
+  - [design, money, format]
+  - [support, share, wording]
+  - [growth, events, event names]
+  - [calc, screen]
+  - [money, screen]
+  - [share, screen]
+  - [events, screen]
+steps:
+  - say: Four groups of people want changes to the receipt. Before the split, all four requests landed in the **view controller**.
+    show: [finance, design, support, growth, screen]
+  - say: Finance decides delivery is zero-rated for VAT. The change goes to **ReceiptCalculator** and its tests, and nothing else.
+    show: [calc]
+    send: finance->calc
+    state: { calc: active }
+    label: { calc: changed }
+  - say: Design wants amounts without pence when they're whole pounds. Only **MoneyFormatter** changes.
+    show: [money]
+    send: design->money
+    state: { calc: null, money: active }
+    label: { calc: null, money: changed }
+  - say: Support and growth change their wording and their event names, each in their own type.
+    show: [share, events]
+    send: [support->share, growth->events]
+    state: { money: null, share: active, events: active }
+    label: { money: null, share: changed, events: changed }
+  - say: The screen composes the four and changes only when the **layout** does. Four teams, four files, no collisions.
+    send: [calc->screen, money->screen, share->screen, events->screen]
+    state: { share: null, events: null, screen: ok }
+    label: { share: null, events: null }
+```
+
+## The trap: accidental duplication
+
+The receipt total and the spending chart on the "Insights" tab both need "what this order cost". It's tempting to share one function:
+
+```swift check title="One helper, two masters"
+struct Order {
+    let itemsPence: Int
+    let deliveryPence: Int
+    let refundedPence: Int
+}
+
+// Used by the receipt (finance) and by the spending chart (product)
+func amountSpent(on order: Order) -> Int {
+    order.itemsPence + order.deliveryPence - order.refundedPence
+}
+```
+
+Today the two answers happen to match. Then finance asks for refunds to appear as a separate line on the receipt, so the receipt total must *include* the refunded amount. A developer edits `amountSpent`, the receipt test passes, and the spending chart silently starts over-reporting what people spend. Nobody on the product team asked for that change.
+
+This is Martin's warning about **accidental duplication**: code that looks the same but answers to different actors isn't really duplicated, and sharing it couples the actors. Keep `ReceiptCalculator.total` and `SpendingInsights.amountSpent` separate even while their bodies are identical. When you meet DRY in the next module, this is the distinction that matters: remove duplicated *knowledge*, not duplicated *text*.
+
+## Single responsibility at every scale
+
+The same question works at each level of the code:
+
+| Level | One reason to change means… | iOS example |
+| --- | --- | --- |
+| Function | It does one step at one level of abstraction | `vat(includedIn:)` only computes |
+| Type | It answers to one actor | `ReceiptCalculator` answers to finance |
+| Module | Code that changes together lives together | A `Receipts` package owned by the orders team |
+| Process | Separate lifecycles and permissions | A widget extension that only reads a shared cache |
+
+At module level this becomes the Common Closure Principle, which you'll meet with the other package principles in D05.
+
+## How far to split
+
+Every split has a cost: a new name, a new file, wiring, and one more hop when you read the code. Split when the cost of *not* splitting shows up:
+
+- two actors' changes are colliding in the same type, in reviews or in merge conflicts;
+- you can't test one concern without dragging in another (a VAT test that needs UIKit);
+- a concern needs to be reused somewhere the rest can't go, such as a widget or a share extension.
+
+Stop when a type has one actor, even if it has ten small methods. Signs you've gone too far: types with one method that only forwards to another, names like `ReceiptTotalCalculationHelperManager`, and a feature you can't follow without opening eight files. Splitting *by actor* rather than *by verb* is what keeps the count sensible: four actors, four types.
+
+## Trade-offs
+
+| Option | Files to read | Testability | Merge conflicts | Wins when |
+| --- | --- | --- | --- | --- |
+| One screen type with `// MARK:` sections | 1 | Poor: tests need the screen | Frequent once several teams touch it | A screen one person owns and rarely changes |
+| Split by actor (calculator, formatter, composer) | A few | Each piece alone, no UIKit | Rare | Most screens with real business rules |
+| Split by verb (every operation its own type) | Many | Good, but tests mirror the shrapnel | Rare | Almost never: it raises the cost without lowering risk |
+| Extensions in separate files (`+Formatting.swift`) | Several | Unchanged: still one type | Fewer textual conflicts | Organising one actor's large type; it is *not* a split |
+
+<Callout kind="interview">
+
+**What to say:** "I'd list who would ask for each part of this to change." Then name the actors (design, backend, finance, analytics) and propose one type each, with the screen composing them. Mention that you'd move the code in small steps behind characterisation tests.
+
+**What to ask:** which parts change most often and who requests those changes. If only one person ever touches the screen, say you'd split less.
+
+**Red flags:** defining SRP as "one method per class"; splitting by verb into `Fetcher`, `Parser`, `Mapper`, `Saver` without asking who owns each; and calling extension files a separation of responsibilities.
+
+</Callout>
+
+<Callout kind="gotcha" title="Swift gotcha: extensions in other files don't split anything">
+
+Moving code into `ReceiptViewController+Sharing.swift` makes each file shorter, but it's still one type: it shares the same stored properties, the same initialiser, the same lifetime and the same test setup, and with `private` widened to `fileprivate` or `internal` to make it compile, often *more* coupling than before. Extensions are a fine way to organise one actor's code (conformances, a group of helpers). They don't give a concern its own owner, its own tests or its own reason to change.
+
+</Callout>
+
+<Callout kind="gotcha" title="iOS gotcha: SwiftUI views hide the same problem">
+
+A SwiftUI `View` struct can grow the same four responsibilities as a view controller: computing totals in `body`, formatting inline, firing analytics in `.onAppear`. Splitting the *body* into subviews helps layout but leaves the rules in the view. Move the rules into plain types like the ones above (or an `@Observable` model that uses them), and keep the view about layout.
+
+</Callout>
+
+## Practice
+
+**Split the sign-up form** gives you the same split on a screen everyone has built: product's validation rules, the backend's request body and content design's error copy each in their own type, with a small flow that sequences them. Notice how each test touches only one piece. The **profile screen review** shows the opposite: a view controller with several owners, and a subclass that makes it worse.
+
+```cards
+- id: srp-actor
+  front: "What does \"one reason to change\" mean in the single-responsibility principle?"
+  back: "The module answers to one actor: one person or group who would ask for it to change. It's about owners of change, not about doing one thing."
+- id: srp-signs
+  front: "Name three signs a type has more than one responsibility."
+  back: "You can't describe it without \"and\"; its imports span layers (UIKit, URLSession, an SDK); its git history mixes unrelated teams' changes; its tests need far more setup than the behaviour tested; it has MARK sections that never call each other."
+- id: srp-accidental-duplication
+  front: "What is accidental duplication, and why keep it?"
+  back: "Code that looks identical but answers to different actors, like a receipt total and a spending-chart total. Sharing it means one actor's change silently alters the other's behaviour, so keep them separate."
+- id: srp-extensions
+  front: "Why doesn't moving code into extension files satisfy single responsibility?"
+  back: "It's still one type with the same stored state, lifetime and tests. The code has no separate owner or reason to change; only the file is shorter."
+```
+
+```quiz
+- id: q1
+  type: sort
+  prompt: "Who would ask for each change to a checkout screen?"
+  buckets: [Finance, Design, Backend team, Analytics]
+  items:
+    - ["Delivery is no longer charged VAT", 0]
+    - ["Show prices as £5 instead of £5.00", 1]
+    - ["The basket endpoint now returns `line_items`", 2]
+    - ["Rename `checkout_started` to `checkout_begin`", 3]
+    - ["Round discounts down, never up", 0]
+    - ["Use the new button style", 1]
+  explain: "Each bucket is one reason to change. A type that holds code from all four answers to all four, and every change risks the others. That's the list you split by."
+- id: q2
+  type: mcq
+  prompt: "A `ProfileStore` type has `load()`, `save()`, `clear()` and `migrate(fromVersion:)`, all about one file on disk that only the profile feature's developers ever change. Does it break the single-responsibility principle?"
+  options:
+    - "Yes: it has four methods, so four responsibilities."
+    - "No: every method answers to the same owner and changes for the same reason, the profile's storage format."
+    - "Yes: migration should always be a separate type."
+    - "Only if it's a class rather than a struct."
+  answer: 1
+  explain: "Counting methods isn't the test. All four change together, when the storage format changes, and the same people request those changes, so the type has one reason to change."
+- id: q3
+  type: bug
+  prompt: "This helper is shared by the receipt and the Insights chart. Finance now asks for the receipt total to include refunded items. Which line, once changed for finance, silently alters the chart too?"
+  code: |
+    struct Order { let itemsPence: Int; let deliveryPence: Int; let refundedPence: Int }
+
+    // Used by ReceiptCalculator and by SpendingInsights
+    func amountSpent(on order: Order) -> Int {
+        order.itemsPence + order.deliveryPence - order.refundedPence
+    }
+  answer: 5
+  explain: "Line 5 is the shared rule. Two actors depend on it, so finance's change becomes the product team's bug. Give each actor its own function, even while the bodies match."
+- id: q4
+  type: multi
+  prompt: "Which of these are good reasons to split a type? Choose all that apply."
+  options:
+    - "Two teams' pull requests keep conflicting in it"
+    - "You can't test its VAT rules without creating a view controller"
+    - "It's over 200 lines long"
+    - "A widget extension needs its formatting code but can't link UIKit-heavy screen code"
+    - "Each of its methods does a different verb"
+  answer: [0, 1, 3]
+  explain: "Collisions between owners, tests dragged into unrelated setup, and reuse somewhere the rest can't go are the costs of not splitting. Length and verb count are weak signals on their own: a 300-line parser with one owner can be perfectly cohesive."
+- id: q5
+  type: truefalse
+  prompt: "Moving a view controller's networking code into `FeedViewController+Networking.swift` separates its responsibilities."
+  answer: false
+  explain: "It's still one type: the same stored state, the same lifetime, the same tests. Extract a type (a repository or an API client) that the screen uses, and the networking gets its own owner and its own tests."
+```

@@ -1,0 +1,104 @@
+A popped screen that never deinitialises keeps its view model, its timers and its network observers alive, and every one of them keeps working for nobody. Build the two tools a design review and a test suite need to catch that: an audit that runs ARC's rules over an ownership graph you've drawn, and a tracker that watches real objects through weak references.
+
+`OwnershipLeakAudit.audit(objects:references:roots:) -> Report` and `OwnershipLeakAudit.Tracker`
+
+**The audit.** `objects` are the names in the graph, `references` the stored references between them (each `.strong`, `.weak` or `.unowned`), and `roots` what the app itself still holds: the app delegate, the window, a navigation stack.
+
+- Apply ARC's rule: an object that isn't a root stays alive only while some *live* object holds a **strong** reference to it. Freeing one object can free others, so keep going until nothing changes.
+- `leaked`: the objects still alive that no root can reach by following strong references, in `objects` order.
+- `dangling`: the `.unowned` references whose holder is alive but whose target was freed, in `references` order. Reading one would crash.
+
+**The tracker.** `track(_:as:)` watches an object without keeping it alive. `survivors` lists the names of tracked objects that are still alive, in the order they were tracked.
+
+## Examples
+
+| Objects | References | Roots | Report |
+| --- | --- | --- | --- |
+| app, nav, detail, viewModel | app→nav, detail→viewModel, viewModel→detail | app | leaked `[detail, viewModel]` |
+| the same | the same, but viewModel→detail is weak | app | nothing leaked |
+| app, store, observer | app→store, store→observer, observer→store | app | nothing leaked: the cycle is in use |
+| app, player | player→player | app | leaked `[player]`: a stored closure capturing `self` |
+| app, nav, coordinator, screen | app→nav, nav→screen, screen→coordinator unowned | app | dangling `[screen -unowned-> coordinator]` |
+
+| Tracker steps | `survivors` |
+| --- | --- |
+| track a screen whose `onRefresh` closure captures the screen; let every variable go | `["leaky"]` |
+| track a screen whose closure uses `[weak self]`; let every variable go | `[]` |
+
+## Constraints
+
+- Every reference names objects in `objects`, and `roots` is a subset of `objects`. An object may reference itself.
+- Roots are always alive and never reported as leaks.
+- Weak and unowned references never keep anything alive. A weak reference to a freed object becomes `nil`, which is harmless; an unowned one doesn't.
+- `Tracker` must not keep the objects it tracks alive, or every test would see a leak.
+
+<Hints>
+<Hint>
+Start with every object alive. Repeatedly free any non-root that no live object holds strongly, until a full pass frees nothing. What's left is exactly what ARC keeps.
+</Hint>
+<Hint>
+Then walk strong references from the roots (a stack or a queue) to find what the app can still reach. Alive but unreachable means leaked.
+</Hint>
+<Hint>
+For the tracker, store a small struct with the name and a `weak var object: AnyObject?`. A tracked object is alive while that property isn't `nil`.
+</Hint>
+</Hints>
+
+## Solutions
+
+<Approach title="Free unheld objects to a fixed point, then walk from the roots" time="O(V × E) per pass, at most V passes" space="O(V + E)">
+
+```swift
+public static func audit(objects: [String], references: [Reference], roots: Set<String>) -> Report {
+    let strong = references.filter { $0.strength == .strong }
+
+    var alive = Set(objects)
+    var changed = true
+    while changed {
+        changed = false
+        for object in objects where alive.contains(object) && !roots.contains(object) {
+            let held = strong.contains { $0.to == object && alive.contains($0.from) }
+            if !held {
+                alive.remove(object)
+                changed = true
+            }
+        }
+    }
+
+    var reachable = Set<String>()
+    var stack = objects.filter { roots.contains($0) }
+    while let next = stack.popLast() {
+        guard reachable.insert(next).inserted else { continue }
+        stack += strong.filter { $0.from == next }.map(\.to)
+    }
+
+    let leaked = objects.filter { alive.contains($0) && !reachable.contains($0) }
+    let dangling = references.filter { $0.strength == .unowned && alive.contains($0.from) && !alive.contains($0.to) }
+    return Report(leaked: leaked, dangling: dangling)
+}
+
+public final class Tracker {
+    private struct Entry {
+        let name: String
+        weak var object: AnyObject?
+    }
+
+    private var entries: [Entry] = []
+
+    public init() {}
+
+    public func track(_ object: AnyObject, as name: String) {
+        entries.append(Entry(name: name, object: object))
+    }
+
+    public var survivors: [String] {
+        entries.filter { $0.object != nil }.map(\.name)
+    }
+}
+```
+
+The fixed point mirrors what ARC does at run time: each release can drop another object's count to zero. What survives is everything a root reaches **plus** every strong cycle and whatever those cycles hold. That's the whole reason cycles leak: nothing outside them is needed to keep them alive.
+
+Notice what the audit doesn't call a leak: an object a root can still reach, such as a view model held by a session-long store's observer list. Xcode's Memory Graph debugger draws the same line, which is why that kind slips past it. The tracker is the run-time half, and it catches both: in a test, build a screen with its real dependencies, track each object, drop your own references, and expect `survivors` to be empty. A tracker in the test suite stops a fixed leak from coming back.
+
+</Approach>

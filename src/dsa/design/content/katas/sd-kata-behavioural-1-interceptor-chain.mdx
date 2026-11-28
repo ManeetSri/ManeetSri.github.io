@@ -1,0 +1,104 @@
+Every request a travel app makes needs the same extras: an `Accept` header, a bearer token, and one retry with a fresh token when the server says `401`. Rather than writing that into every call, build a chain of interceptors that each request runs through on its way to the network, then write two of the interceptors.
+
+`RequestRelay.Pipeline(_:transport:).send(_:)`, `RequestRelay.DefaultHeader(_:_:)` and `RequestRelay.BearerAuth(token:refresh:)`
+
+- `Pipeline` is an `HTTPClient`. `send` runs the request through the interceptors first to last, then hands it to `transport`. The response comes back through them last to first.
+- An interceptor gets the request and a `Next`, which is the rest of the chain. It may change the request before calling `next`, call `next` more than once, or not call it at all and answer by itself. Whatever it returns or throws is what the interceptor before it sees.
+- `DefaultHeader(name, value)` sets the header only on requests that don't already have it.
+- `BearerAuth` sets `Authorization: Bearer <token>` using `token()`. If the response is a 401, it calls `refresh()` once, sends the original request again with the new token, and returns that second result, whatever it is. Any other status goes straight back.
+
+## Examples
+
+| Pipeline | Request | What happens |
+| --- | --- | --- |
+| `[]` | `GET /trips` | the transport gets it unchanged |
+| `[A, B]`, both logging | `GET /trips` | A in, B in, transport, B out, A out |
+| `[Outer, Cache, Inner]`, where Cache answers itself | `GET /trips` | Outer in, Outer out; Inner and the transport never run |
+| `[DefaultHeader("Accept", "application/json")]` | `Accept: image/heic` | sent with `image/heic` |
+| `[BearerAuth]`, server answers 401 then 200 | `GET /trips` | sent with the old token, refreshed once, sent with the new token, returns the 200 |
+| `[BearerAuth]`, server always answers 401 | `GET /trips` | two requests, one refresh, returns the second 401 |
+
+## Constraints
+
+- `Next` is written for you: call it like a function, `try await next(request)`.
+- Everything is `Sendable`, so a pipeline can be shared by any task. Interceptors are structs holding `@Sendable` closures.
+- Errors pass through untouched unless an interceptor chooses to catch them.
+- Tests use `StubHTTPClient` from DesignKit as the transport, so nothing touches the network.
+
+<Hints>
+<Hint>
+Start from the end. A `Next` that calls `transport.send` is the chain with no interceptors. Wrapping it with the last interceptor gives a slightly longer chain, and so on back to the first.
+</Hint>
+<Hint>
+`interceptors.reversed().reduce(last) { next, interceptor in Next { request in try await interceptor.intercept(request, next: next) } }` builds the whole chain once, in `init`.
+</Hint>
+<Hint>
+For `BearerAuth`, keep the original request and sign a copy twice, rather than editing the request you already sent.
+</Hint>
+</Hints>
+
+## Solutions
+
+<Approach title="Fold the interceptors into one Next" time="O(k) per request for k interceptors" space="O(k)">
+
+```swift
+public struct Pipeline: HTTPClient {
+    private let chain: Next
+
+    public init(_ interceptors: [any Interceptor], transport: any HTTPClient) {
+        let last = Next { request in try await transport.send(request) }
+        chain = interceptors.reversed().reduce(last) { next, interceptor in
+            Next { request in try await interceptor.intercept(request, next: next) }
+        }
+    }
+
+    public func send(_ request: URLRequest) async throws -> (Data, HTTPURLResponse) {
+        try await chain(request)
+    }
+}
+
+public struct DefaultHeader: Interceptor {
+    private let name: String
+    private let value: String
+
+    public init(_ name: String, _ value: String) {
+        self.name = name
+        self.value = value
+    }
+
+    public func intercept(_ request: URLRequest, next: Next) async throws -> (Data, HTTPURLResponse) {
+        guard request.value(forHTTPHeaderField: name) == nil else { return try await next(request) }
+        var request = request
+        request.setValue(value, forHTTPHeaderField: name)
+        return try await next(request)
+    }
+}
+
+public struct BearerAuth: Interceptor {
+    private let token: @Sendable () async throws -> String
+    private let refresh: @Sendable () async throws -> String
+
+    public init(token: @escaping @Sendable () async throws -> String, refresh: @escaping @Sendable () async throws -> String) {
+        self.token = token
+        self.refresh = refresh
+    }
+
+    public func intercept(_ request: URLRequest, next: Next) async throws -> (Data, HTTPURLResponse) {
+        let first = try await next(signed(request, with: token()))
+        guard first.1.statusCode == 401 else { return first }
+        return try await next(signed(request, with: refresh()))
+    }
+
+    private func signed(_ request: URLRequest, with token: String) -> URLRequest {
+        var request = request
+        request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
+        return request
+    }
+}
+```
+
+Each interceptor knows only `next`, never what comes after it, so they can be reordered, added or removed without touching each other. Order is still a design decision: put `BearerAuth` *before* a logging interceptor and the log shows the retried request too; put it after, and the log sees one request and one final response.
+
+Retrying exactly once is what stops a server that always answers 401 from causing an endless loop. In a real app, `refresh` would also be single-flight, so ten requests that fail together cause one refresh, not ten. You'll build that in D14.
+
+</Approach>

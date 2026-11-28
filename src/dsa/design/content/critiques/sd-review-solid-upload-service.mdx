@@ -1,0 +1,141 @@
+<Brief>
+
+A chat and social app uploads three kinds of image through one shared service: avatars, chat photos and expense receipts. A Wi-Fi-only variant was added for people on capped data plans. The bug tracker has "avatar shows a blank image", "the pending badge stops updating", "scrolling stutters while a photo sends" and "retries take ages on a bad connection". Review the service as you would a pull request, and connect each bug to the design problem behind it.
+
+```swift check ios title="UploadService.swift"
+import UIKit
+
+enum UploadKind: String {
+    case avatar, chatPhoto, receipt
+}
+
+protocol UploadObserver: AnyObject {
+    func uploadDidStart(_ id: UUID)
+    func uploadDidProgress(_ id: UUID, fraction: Double)
+    func uploadDidFinish(_ id: UUID, url: URL)
+    func uploadDidFail(_ id: UUID, error: any Error)
+    func pendingCountDidChange(_ count: Int)
+}
+
+struct UploadResponse: Decodable { let url: URL }
+
+@MainActor
+class UploadService {
+    static let shared = UploadService()
+    weak var observer: UploadObserver?
+    private var pending: Set<UUID> = []
+
+    func upload(_ image: UIImage, kind: UploadKind) async throws -> URL {
+        let id = UUID()
+        observer?.uploadDidStart(id)
+        let quality: CGFloat
+        switch kind {
+        case .avatar: quality = 0.6
+        case .chatPhoto: quality = 0.8
+        case .receipt: quality = 1.0
+        }
+        guard let data = image.jpegData(compressionQuality: quality) else { throw URLError(.cannotDecodeRawData) }
+        if kind == .avatar && data.count > 2_000_000 { throw URLError(.dataLengthExceedsMaximum) }
+
+        var request = URLRequest(url: URL(string: "https://api.example.com/uploads/\(kind.rawValue)")!)
+        request.httpMethod = "POST"
+        request.setValue("Bearer \(UserDefaults.standard.string(forKey: "token") ?? "")", forHTTPHeaderField: "Authorization")
+        pending.insert(id)
+        observer?.pendingCountDidChange(pending.count)
+        defer {
+            pending.remove(id)
+            observer?.pendingCountDidChange(pending.count)
+        }
+        for attempt in 1...3 {
+            do {
+                let (body, _) = try await URLSession.shared.upload(for: request, from: data)
+                let url = try JSONDecoder().decode(UploadResponse.self, from: body).url
+                observer?.uploadDidFinish(id, url: url)
+                NotificationCenter.default.post(name: .init("UploadFinished"), object: nil, userInfo: ["kind": kind.rawValue])
+                return url
+            } catch where attempt < 3 {
+                try await Task.sleep(for: .seconds(attempt))
+            }
+        }
+        throw URLError(.cannotConnectToHost)
+    }
+}
+
+final class WiFiOnlyUploadService: UploadService {
+    var isOnCellular = false
+
+    override func upload(_ image: UIImage, kind: UploadKind) async throws -> URL {
+        if isOnCellular { return URL(string: "about:blank")! } // the queue retries it later on Wi-Fi
+        return try await super.upload(image, kind: kind)
+    }
+}
+```
+
+</Brief>
+
+```workspace
+template: critique
+minutes: 30
+```
+
+```findings
+- id: wifi-subclass
+  title: The Wi-Fi-only subclass reports success without uploading
+  severity: high
+  lines: 59-66
+  detail: "Callers of `upload` rely on its postcondition: the URL points at the uploaded image. On cellular, `WiFiOnlyUploadService` returns `about:blank` instead, so the avatar is saved as a blank link and a chat message is sent pointing at nothing. The comment promises a queue that doesn't exist, so the photo is lost. That's a Liskov violation: the subclass can't be substituted for its base. Make \"not now\" part of the contract (return `.uploaded(URL)` or `.deferred(id)`), and give deferral to an outbox that stores the image and retries, injected as a policy rather than added by overriding."
+- id: does-everything
+  title: One method compresses, authenticates, retries and notifies
+  severity: high
+  lines: 23-56
+  detail: "Image quality (design), size limits (product), the endpoint and auth header (backend and security), the retry policy (reliability) and the pending count and notifications (UI and analytics) all live in one 34-line method. Each changes for a different reason, and none can be tested on its own: to test the retry you need a real network and real waiting. Split out an image preparer, an upload request builder, a retry policy and the event reporting, and keep `upload` as the sequence of steps."
+- id: main-actor-compression
+  title: The whole service runs on the main actor, JPEG encoding included
+  severity: medium
+  lines: 17-32
+  detail: "`@MainActor` on the class (added to make `static let shared` compile under Swift 6) puts `jpegData(compressionQuality:)` on the main thread. Encoding a full-resolution camera photo is slow enough to drop frames, which is the stutter while a photo sends. Only the observer calls need the main actor: encode in a nonisolated async function (marked `@concurrent` if the target uses Swift 6.2's approachable concurrency settings) or a dedicated actor."
+- id: kind-rules-scattered
+  title: Each kind's rules are spread through the method
+  severity: medium
+  lines: 26-35
+  detail: "Quality comes from a `switch`, the size limit from an `if kind == .avatar`, and the endpoint from `rawValue`. Adding a kind (product photos for reviews) means editing the service in three places, and the compiler only checks the `switch`: forget the `if` and product photos have no limit. Closed for modification means one `UploadPolicy` value per kind (quality, maximum bytes, path), built in one exhaustive `switch` or passed in by the caller, so the service never changes for a new kind."
+- id: fat-observer
+  title: A five-method observer protocol, two of whose methods never fire
+  severity: medium
+  lines: 7-13, 20
+  detail: "A badge that only shows the pending count must implement four other methods with empty bodies, and `uploadDidProgress` and `uploadDidFail` are never called, so observers wait for failures that never arrive. With one `weak var observer` (line 20), the second screen to subscribe silently replaces the first, which is the badge that stops updating. Split the roles: return the result from `upload`, and publish the pending count separately (an `@Observable` property or an `AsyncStream` that any number of screens can follow)."
+- id: concrete-dependencies
+  title: Reaches for URLSession, UserDefaults and NotificationCenter directly
+  severity: medium
+  lines: 19, 37-49, 52
+  detail: "The upload policy depends on concrete details: `URLSession.shared`, `UserDefaults.standard` for the token, `NotificationCenter.default`, and the real clock inside `Task.sleep`. Callers in turn depend on the concrete class through `UploadService.shared`. Tests can't stub the network or skip the waits. Declare what uploads need (an HTTP client, a token provider, a clock) as protocols owned by the upload code, inject them, and create the one shared instance at the composition root."
+- id: retries-everything
+  title: Retries errors that can't succeed, on a fixed schedule
+  severity: low
+  lines: 44-55
+  detail: "The status code is never checked, so a 401 or 413 error body is decoded as if it were a success, fails to decode, and is retried. Every error is retried the same way, with linear 1 s and 2 s waits and no jitter. Check the response, retry only transient failures (timeouts, 5xx, 429) with exponential backoff and jitter, and report the final failure."
+- id: token-in-defaults
+  title: The auth token is read from UserDefaults
+  severity: low
+  lines: 37
+  detail: "UserDefaults is an unencrypted plist that's included in backups. Tokens belong in the Keychain, behind a token provider that can also refresh them."
+```
+
+<ReferenceReview>
+
+**Most important first.** The Wi-Fi-only subclass loses data and corrupts state: it returns a fake URL that callers store as if it were real. Ship a hotfix that makes the cellular path throw a clear "waiting for Wi-Fi" error before anything else, so at least nothing saves `about:blank`. Then fix the main-thread encoding, which every user feels.
+
+**The design problem underneath** is a service that is both too big and too concrete. Because everything lives in one `@MainActor` method that talks to globals, the only way to vary behaviour was to subclass and override it, and the override broke the method's promise. Because the observer protocol is one fat role with a single slot, every new screen that cares about uploads fights over it.
+
+**How I'd fix it, in small steps:**
+
+1. Make the outcome explicit: `func upload(_:kind:) async throws -> UploadOutcome` with `.uploaded(URL)` and `.deferred(UploadID)`. Update the callers (they must now handle deferral) and delete `WiFiOnlyUploadService`; a `NetworkPolicy` value decides whether to defer.
+2. Extract an `UploadPolicy` per kind (quality, maximum size, path) from one exhaustive `switch`. The service reads the policy and never switches on the kind again.
+3. Move JPEG encoding into a nonisolated `ImagePreparer`, so it runs off the main actor, and drop `@MainActor` from the service; only the published pending count is main-actor state.
+4. Introduce protocols the upload code owns: `UploadTransport` (wrapping URLSession), `TokenProviding` (backed by the Keychain) and a `Clock` for retries. Inject them, and build the shared instance once at the composition root.
+5. Replace `UploadObserver` with the returned outcome plus an observable `pendingCount`, so any number of screens can show it.
+6. Put retries behind a retry policy that checks status codes and uses exponential backoff with jitter.
+
+**Tests to add:** each `UploadPolicy` (size limits per kind); the service with a stub transport for success, a 413, a timeout then success, and deferral on cellular; the retry schedule with a test clock (no real waiting); and the pending count rising and falling with two observers following it at once.
+
+</ReferenceReview>

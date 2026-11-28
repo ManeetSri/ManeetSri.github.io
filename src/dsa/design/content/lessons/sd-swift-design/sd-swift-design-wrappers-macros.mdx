@@ -1,0 +1,293 @@
+## Why it matters
+
+Some behaviour belongs to *properties* rather than to types: persist this setting, keep this value in range, tell the UI when this changes. Written by hand, it's the same getter and setter boilerplate on every property, and the copies drift. Swift has two tools for it: **property wrappers**, which are ordinary types that run at run time, and **macros**, which generate code at compile time. SwiftUI is built from both. `@State`, `@Binding` and `@Environment` are wrappers; `@Observable`, `@Entry` and `#Preview` are macros. Knowing what each really expands to tells you what it costs, and "how does `@Observable` differ from `ObservableObject`?" is a staple of iOS interviews.
+
+## Property wrappers: behaviour as a type
+
+A property wrapper is a type marked `@propertyWrapper` with a `wrappedValue`. Putting it on a property makes the compiler store an instance of the wrapper and route every read and write through it. If the wrapper has a `projectedValue`, `$property` reads it.
+
+Here's a wrapper that keeps a value in range, and reports through its projected value whether the last write had to be corrected:
+
+```swift run
+@propertyWrapper
+struct Clamped<Value: Comparable> {
+    private var value: Value
+    private let range: ClosedRange<Value>
+    // $property: whether the last write had to be pulled back into range
+    private(set) var projectedValue = false
+
+    init(wrappedValue: Value, _ range: ClosedRange<Value>) {
+        self.range = range
+        self.value = min(max(wrappedValue, range.lowerBound), range.upperBound)
+    }
+
+    var wrappedValue: Value {
+        get { value }
+        set {
+            value = min(max(newValue, range.lowerBound), range.upperBound)
+            projectedValue = value != newValue
+        }
+    }
+}
+
+struct PlayerSettings {
+    @Clamped(0...100) var volume = 50
+    @Clamped(0.5...2.0) var speed = 1.0
+}
+
+var settings = PlayerSettings()
+settings.volume = 140
+settings.speed = 1.25
+print(settings.volume, settings.$volume)
+print(settings.speed, settings.$speed)
+```
+
+```output
+100 true
+1.25 false
+```
+
+Behind `@Clamped(0...100) var volume = 50`, the compiler writes a stored property `_volume` holding `Clamped(wrappedValue: 50, 0...100)`, a computed `volume` that reads and writes `_volume.wrappedValue`, and a computed `$volume` that reads `_volume.projectedValue`. That's all a wrapper is: a reusable pair of accessors with their own storage.
+
+SwiftUI's wrappers follow the same shape. `@State` stores its value in storage SwiftUI keeps for the view's identity, and its projected value is a `Binding`, which is why `$name` can be handed to a `TextField`. `@AppStorage` reads and writes `UserDefaults` and invalidates the view on change.
+
+### Designing a good wrapper
+
+- **It's a type, so test it as one.** `Clamped` gets unit tests with no view, store or screen involved.
+- **Inject what it touches.** A `@UserDefault("volume")` that reads `UserDefaults.standard` inside hides a global dependency in every type that uses it. Pass the store in (`@Stored("volume", in: store)`), or keep persistence in a settings service and leave the wrapper for pure behaviour.
+- **Reading should stay cheap.** `settings.volume` looks like a field access. If the wrapper reads from disk or the Keychain, every reader pays that cost without seeing it.
+- **Know the limits.** A wrapper can't see the instance that contains it (Combine's `@Published` relies on an unofficial static subscript to do so), can't add members or conformances to that type, and can't be required by a protocol. Stacking two wrappers on one property is possible but hard to follow. And in Swift 6 a wrapped `static` or global variable is shared mutable state, so the compiler rejects it unless it's isolated to an actor.
+
+## Macros: generating the code you'd have written
+
+Macros, added in Swift 5.9, are compile-time functions that receive your source code's syntax tree and return new code. There are two families:
+
+- **Freestanding macros** start with `#` and stand in for an expression or declarations: `#Preview`, Swift Testing's `#expect`, SwiftData's `#Predicate`.
+- **Attached macros** start with `@` and add to the declaration they're attached to: `@Observable`, `@Model`, `@Entry`, `@Test`, `@DebugDescription`.
+
+An attached macro declares **roles**, which say where its code may go: `member` (new members), `peer` (declarations next to it), `accessor` (getters and setters for a property), `memberAttribute` (attributes on each member), `extension` (conformances), and since Swift 6.0, `body` (a function's body). The roles are the limits: a macro produces only the kinds of code its roles allow, in those places, and can't rewrite the rest of your file.
+
+Here's how one is expanded during a build:
+
+```visual flow
+title: How a macro is expanded
+layers:
+  - { label: Your build, rows: 0 }
+  - { label: Plugin process, rows: 2 }
+nodes:
+  - { id: source, label: Your source, kind: client, at: [0, 0] }
+  - { id: compiler, label: Swift compiler, kind: service, at: [2, 0] }
+  - { id: plugin, label: Macro plugin, kind: external, at: [2, 2] }
+  - { id: binary, label: Compiled code, kind: store, at: [4, 0] }
+edges:
+  - [source, compiler, "@Observable class"]
+  - [compiler, plugin, syntax tree, { style: async }]
+  - [plugin, compiler, new code, { style: async }]
+  - [compiler, binary, type-checked]
+steps:
+  - say: "The compiler meets `@Observable` on a class and finds the macro's declaration, which names the plugin that implements it."
+    send: source->compiler
+  - say: "It sends the class's **syntax tree** to the plugin: a separate, sandboxed program that can't touch files or the network. Apple's macros ship with the SDK; yours is a package target built on swift-syntax."
+    send: compiler->plugin
+    state: { plugin: active }
+  - say: "The plugin returns new source code: members, accessors and an extension. It never sees types, only syntax."
+    send: plugin->compiler
+    state: { plugin: null }
+  - say: "The compiler type-checks the expansion like code you'd typed, so errors can point into it. In Xcode, **Expand Macro** shows exactly what was generated."
+    send: compiler->binary
+    state: { binary: ok }
+```
+
+Two consequences follow. A macro has **no run-time cost** of its own: once expanded, it's ordinary code. And it has a **build-time and trust cost**: a macro package must be built along with swift-syntax, which adds noticeably to a clean build, and Xcode asks you to trust a third-party macro package before it will run it.
+
+### What @Observable writes for you
+
+`@Observable` is the clearest example of a macro doing what a wrapper can't. Roughly, this:
+
+```swift
+@Observable final class Profile {
+    var name = ""
+}
+```
+
+expands to something like this:
+
+```swift
+final class Profile {
+    var name: String {
+        get { access(keyPath: \.name); return _name }
+        set { withMutation(keyPath: \.name) { _name = newValue } }
+    }
+    @ObservationIgnored private var _name = ""
+    @ObservationIgnored private let _$observationRegistrar = ObservationRegistrar()
+
+    // access(keyPath:) and withMutation(keyPath:_:) forward to the registrar
+}
+
+extension Profile: Observable {}
+```
+
+Every stored property becomes a computed one that reports **reads** to a registrar and wraps **writes** in a mutation. When SwiftUI evaluates `body`, it records exactly which properties were read, and it re-evaluates that view only when one of *those* changes. With `ObservableObject`, any `@Published` change fires `objectWillChange`, and every view observing the object is invalidated, whether it read that property or not.
+
+No property wrapper could do this. A wrapper can't add the registrar to the class, can't add the `Observable` conformance, and would need you to annotate every property by hand. A macro sees the whole class and writes all of it.
+
+`@Entry`, from Xcode 16, is a smaller example of the same idea: one line replaces an `EnvironmentKey` type and a computed property.
+
+```swift check ios
+import SwiftUI
+
+enum CardStyle: Sendable {
+    case standard
+    case compact
+}
+
+extension EnvironmentValues {
+    @Entry var cardStyle: CardStyle = .standard
+}
+
+struct OrderCard: View {
+    @Environment(\.cardStyle) private var style
+    let title: String
+
+    var body: some View {
+        Text(title)
+            .font(style == .compact ? .footnote : .body)
+            .padding(style == .compact ? 4 : 12)
+    }
+}
+
+struct OrdersList: View {
+    var body: some View {
+        VStack {
+            OrderCard(title: "Order 1042")
+            OrderCard(title: "Order 1043")
+        }
+        .environment(\.cardStyle, .compact)
+    }
+}
+```
+
+<Callout kind="gotcha" title="iOS gotcha: @State runs its initial value every time">
+
+`@State private var model = FeedModel()` keeps the first `FeedModel` for the view's lifetime, but the expression `FeedModel()` runs again every time SwiftUI recreates the view value, and the extra instances are thrown away. (`@StateObject` takes an autoclosure, so it didn't have this problem.) Keep an observable model's `init` cheap and free of side effects, and start loading in `.task`.
+
+</Callout>
+
+## Choosing: a function, a wrapper or a macro
+
+Reach for them in this order:
+
+1. **A plain function, type or extension.** Most "boilerplate" is a missing helper.
+2. **A property wrapper** when the behaviour belongs to individual properties and has state of its own at run time: clamping, validation on write, persistence through an injected store, lazy loading.
+3. **A macro** when the code must be **generated from declarations**: conformances, members derived from a type's properties (observation, coding keys, mocks for testing), or checks at compile time, such as validating a URL string literal. Prefer Apple's macros, which cost nothing to adopt, before writing your own.
+
+Large teams also use external code generators such as Sourcery and SwiftGen; you'll weigh them against macros in D63.
+
+## Trade-offs
+
+| | Hand-written accessors | Property wrapper | Macro |
+| --- | --- | --- | --- |
+| **When it runs** | run time | run time | compile time; the result runs at run time |
+| **What it can see** | everything | its own value only | the declaration's syntax (not types) |
+| **Can add members or conformances** | yes, by hand | no | yes |
+| **Debugging** | plain code | step into the wrapper | expand to read; errors can land in generated code |
+| **Build cost** | none | none | a plugin build, plus swift-syntax for your own |
+| **Testing** | per property | the wrapper alone | expansion tests and the generated behaviour |
+
+Hand-written code wins for one or two properties. A wrapper wins for repeated per-property behaviour with its own state. A macro wins when the repetition is structural, such as every property of every model, and only code generation removes it.
+
+<Callout kind="interview">
+
+**Say:** "`@Observable` is a macro that turns stored properties into tracked computed ones, so SwiftUI re-renders a view only when a property that view read changes. `ObservableObject` invalidates every observer on any `@Published` change." For your own reusable behaviour, explain why it's a wrapper or a macro.
+
+**Ask:** does this behaviour need its own state at run time, or code generated from declarations? Who maintains a macro package, and what does it add to build times?
+
+**Red flags:** a wrapper that quietly reads a global singleton; a custom macro where a function would do; not knowing what a `$` prefix gives you.
+
+</Callout>
+
+```cards
+- id: wrapper-expansion
+  front: "What does the compiler generate for `@Clamped(0...100) var volume = 50`?"
+  back: "A stored `_volume` holding the wrapper, a computed `volume` that reads and writes `_volume.wrappedValue`, and a `$volume` that reads `_volume.projectedValue` if there is one."
+- id: observable-vs-observableobject
+  front: "Why does `@Observable` cause fewer view updates than `ObservableObject`?"
+  back: "Its macro makes each property report reads and writes, so SwiftUI re-renders a view only when a property that view read changes, instead of on every `@Published` change."
+- id: wrapper-or-macro
+  front: "When is a macro the right tool instead of a property wrapper?"
+  back: "When code must be generated from declarations, such as members, conformances or compile-time checks. A wrapper can only manage one property's value at run time."
+```
+
+```quiz
+- id: q1
+  type: output
+  prompt: "Using the `Clamped` wrapper from this lesson, what does this print?"
+  code: |
+    @propertyWrapper
+    struct Clamped<Value: Comparable> {
+        private var value: Value
+        private let range: ClosedRange<Value>
+        private(set) var projectedValue = false
+
+        init(wrappedValue: Value, _ range: ClosedRange<Value>) {
+            self.range = range
+            self.value = min(max(wrappedValue, range.lowerBound), range.upperBound)
+        }
+
+        var wrappedValue: Value {
+            get { value }
+            set {
+                value = min(max(newValue, range.lowerBound), range.upperBound)
+                projectedValue = value != newValue
+            }
+        }
+    }
+
+    struct Thermostat {
+        @Clamped(10...30) var target = 21
+    }
+
+    var home = Thermostat()
+    home.target = 35
+    home.target = 18
+    print(home.target, home.$target)
+  answer: "18 false"
+  explain: "35 is clamped to 30, but the next write, 18, is in range, so the value is 18 and the projected value records that the *last* write needed no correction."
+- id: q2
+  type: mcq
+  prompt: "In a SwiftUI view with `@State private var name = \"\"`, what is `$name`?"
+  options:
+    - "A copy of the string"
+    - "A `Binding<String>`, the wrapper's projected value"
+    - "The `State<String>` wrapper itself"
+    - "An optional `String`"
+  answer: 1
+  explain: "`$` reads a wrapper's projected value, and `State` projects a `Binding` that reads and writes its storage. That's what `TextField(\"Name\", text: $name)` needs."
+- id: q3
+  type: sort
+  prompt: "Which tool fits each job?"
+  buckets: [Plain function, Property wrapper, Macro]
+  items:
+    - [Format a price for display, 0]
+    - [Keep a slider's stored value between 0 and 100, 1]
+    - [Generate a test mock for every protocol in a module, 2]
+    - [Persist a setting through an injected store on every write, 1]
+    - [Add an Observable conformance and tracking to a class, 2]
+    - [Check at compile time that a URL string literal is valid, 2]
+  explain: "Plain logic is a function. Per-property behaviour with run-time state is a wrapper. Anything that generates declarations, conformances or compile-time checks needs a macro."
+- id: q4
+  type: truefalse
+  prompt: "A property wrapper can add a protocol conformance to the type whose property it wraps."
+  answer: false
+  explain: "A wrapper only provides storage and accessors for one property. Adding members or conformances to the enclosing type needs a macro, which is exactly why Observation is built on one."
+- id: q5
+  type: mcq
+  prompt: "A view's `body` reads only `profile.name`. Elsewhere, `profile.avatarData` changes. What happens?"
+  options:
+    - "With `@Observable`, the view isn't re-evaluated; with `ObservableObject` and `@Published`, it is"
+    - "Both re-evaluate the view"
+    - "Neither re-evaluates the view"
+    - "With `@Observable`, the view is re-evaluated; with `ObservableObject`, it isn't"
+  answer: 0
+  explain: "Observation records which properties each `body` read and invalidates only those views. `ObservableObject` publishes one `objectWillChange` for any `@Published` property, so every observing view updates."
+```

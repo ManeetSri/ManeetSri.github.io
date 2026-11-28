@@ -1,0 +1,309 @@
+## Why it matters
+
+Users don't quit iOS apps; they switch away, and iOS quietly ends the process later. When they come back, they expect the app exactly as they left it: the same tab, the same screen, the half-filled form. An app that greets them with its home screen after every jetsam kill feels broken, and one that loses a draft loses their trust. Restoration is also where lifecycle, storage and navigation meet, which makes it a favourite deep dive: "the user is on step three of checkout and switches to their banking app; what happens?"
+
+## How apps end
+
+| How it ends | Does your code run? | What the user expects next time |
+| --- | --- | --- |
+| iOS reclaims memory from the suspended app (jetsam) | No | To be exactly where they were: they never chose to leave |
+| The user swipes the app away in the switcher | Rarely: only if it was still running in the background | A fresh start, with their data intact |
+| A crash or a watchdog kill | No | Their data intact; the screen they were on, if it's safe |
+| A reboot, an iOS update or an app update | No | Their data intact, and ideally their place |
+
+Two conclusions follow. First, **nothing runs at the end**, so everything must be saved earlier: on the way to the background, and better, as it changes. Second, **the user's intent differs by cause**: after a jetsam kill, restore; after a deliberate swipe-away, start fresh. iOS helps with the second: swiping a window away **discards its scene session**, and the restoration data stored with it goes too.
+
+## Two kinds of state
+
+Restoration goes wrong when two different things are treated as one:
+
+- **UI state** is *where* the user was: the selected tab, the navigation stack, the open item, the step of a flow, perhaps the scroll position. It's small, belongs to one window, and losing it is annoying but harmless.
+- **User data** is *what* the user made: a draft message, a form's answers, an unsent edit, photos picked for a post. Losing it is a failure, whatever ended the process, including a deliberate swipe-away.
+
+So they live in different places. **UI state goes in the system's restoration mechanism**, which ties it to the window and drops it when the window is closed. **User data goes in your own store** (a file or database in Application Support, from [the sandbox lesson](/design/learn/sd-runtime-sandbox)), written as it changes, which survives anything.
+
+And restoration stores **pointers, not payloads**: "order `A17` is open on step 2", never the order itself. On relaunch the app loads `A17` from its store, so the screen shows current data rather than a stale copy, and the restoration payload stays tiny.
+
+## The flow, end to end
+
+```visual sequence
+title: Killed while suspended, restored on return
+participants:
+  - { id: user, label: User }
+  - { id: ios, label: iOS }
+  - { id: scene, label: Scene delegate }
+  - { id: store, label: Draft store }
+messages:
+  - [user, ios, switches to Camera]
+  - [ios, scene, sceneDidEnterBackground, { say: "The checkout scene goes to the background. This is the last moment code is guaranteed to run." }]
+  - [scene, store, save draft, { say: "The form's answers are **user data**: they go to the app's own store. (Better still, they were saved as the user typed.)" }]
+  - [ios, scene, "stateRestorationActivity(for:)", { say: "UIKit asks for the scene's **UI state** and keeps the answer with the scene's session." }]
+  - [scene, ios, "order A17, step 2", { reply: true, say: "The answer is a pointer: which order, which step. No form data, no prices." }]
+  - { note: "Suspended. Camera needs memory: the app is killed, with no callback.", over: [ios, scene] }
+  - [user, ios, taps the icon]
+  - [ios, scene, "willConnectTo (session.stateRestorationActivity)", { say: "Cold launch. The scene reconnects with its old **session**, and the activity saved before the kill comes with it." }]
+  - [scene, store, load draft for A17]
+  - [store, scene, draft, { reply: true }]
+  - [scene, user, step 2 with answers, { reply: true, say: "The user sees step 2 with their answers filled in, as if the app had never stopped." }]
+```
+
+## The mechanisms
+
+### UIKit: an `NSUserActivity` per scene
+
+When a scene goes to the background, UIKit calls `stateRestorationActivity(for:)` on its delegate and stores the returned `NSUserActivity` with the scene's session. When the scene reconnects, the same activity is available as `session.stateRestorationActivity`, and UIKit also hands it to `scene(_:restoreInteractionStateWith:)` after connection, before the scene becomes active.
+
+```swift check ios title="SceneDelegate+Restoration.swift"
+import UIKit
+
+enum ActivityType {
+    // Listed under NSUserActivityTypes in Info.plist
+    static let browsing = "com.example.shop.browsing"
+}
+
+@MainActor
+protocol OrdersFlow: AnyObject {
+    var openOrderID: String? { get }
+    func showOrder(id: String)
+}
+
+final class SceneDelegate: UIResponder, UIWindowSceneDelegate {
+    var window: UIWindow?
+    weak var flow: (any OrdersFlow)?
+
+    // UIKit asks for this as the scene goes to the background, and keeps it with the session
+    func stateRestorationActivity(for scene: UIScene) -> NSUserActivity? {
+        let activity = NSUserActivity(activityType: ActivityType.browsing)
+        if let id = flow?.openOrderID {
+            activity.addUserInfoEntries(from: ["orderID": id])
+        }
+        return activity
+    }
+
+    // Called after connection and before activation, with the activity saved last time.
+    // If the device was locked when the scene connected, this is where it arrives.
+    func scene(_ scene: UIScene, restoreInteractionStateWith stateRestorationActivity: NSUserActivity) {
+        guard let id = stateRestorationActivity.userInfo?["orderID"] as? String else { return }
+        flow?.showOrder(id: id)
+    }
+}
+```
+
+That last comment is worth knowing: UIKit's own header warns that `session.stateRestorationActivity` may not be available yet at connection time, depending on your app's file protection class and whether the device is locked. Restoring in `scene(_:restoreInteractionStateWith:)` covers both cases. For small per-window values that aren't tied to an activity, `UISceneSession.userInfo` is persisted with the session too, as long as the values are property-list types.
+
+### SwiftUI: `@SceneStorage`
+
+`@SceneStorage` is a per-window key–value store that SwiftUI saves and restores for you. It takes `Bool`, `Int`, `Double`, `String`, `URL`, `Data` and `RawRepresentable` types backed by `String` or `Int`, and, like the UIKit activity, it's discarded when the window is.
+
+```swift check ios title="ShopRootView.swift"
+import SwiftUI
+
+enum ShopTab: String {
+    case browse, orders, account
+}
+
+struct ShopRootView: View {
+    // Saved per window by the system, and handed back if this window is recreated
+    @SceneStorage("tab") private var tab: ShopTab = .browse
+    @SceneStorage("openOrderID") private var openOrderID: String?
+
+    var body: some View {
+        TabView(selection: $tab) {
+            Text("Browse").tag(ShopTab.browse)
+            OrdersView(openOrderID: $openOrderID).tag(ShopTab.orders)
+            Text("Account").tag(ShopTab.account)
+        }
+    }
+}
+
+struct OrdersView: View {
+    @Binding var openOrderID: String?
+
+    var body: some View {
+        List {
+            Button("Order A17") { openOrderID = "A17" }
+        }
+    }
+}
+```
+
+A whole `NavigationPath` can be restored the same way, through its `codable` representation stored as `Data`; you'll do that in D20. Apple's documentation is explicit that scene storage isn't for sensitive data, and the same goes for restoration activities: keep tokens, card numbers and personal details out of both.
+
+### Validate before you restore
+
+Restored state is a message from the past. Between saving and restoring, the app may have been updated, the order deleted on another device, or the file corrupted. Treat it as untrusted input: decode it, check its version, check that what it points at still exists, and fall back to the nearest sensible screen:
+
+```swift run title="Validating a restoration snapshot"
+import Foundation
+
+// Where the user was, not what they had: ids that point into the app's own store
+struct RestorationSnapshot: Codable, Equatable {
+    static let currentVersion = 2
+    var version = currentVersion
+    var tab: String
+    var openOrderID: String?
+}
+
+enum Restoration: Equatable {
+    case restore(RestorationSnapshot)
+    case startFresh(String)
+}
+
+func restoration(from data: Data?, existingOrders: Set<String>) -> Restoration {
+    guard let data else { return .startFresh("nothing was saved") }
+    guard let saved = try? JSONDecoder().decode(RestorationSnapshot.self, from: data) else {
+        return .startFresh("the saved state is unreadable")
+    }
+    guard saved.version == RestorationSnapshot.currentVersion else {
+        return .startFresh("it was saved by version \(saved.version)")
+    }
+    var snapshot = saved
+    // The order may have been deleted on another device since: fall back to the list
+    if let id = snapshot.openOrderID, !existingOrders.contains(id) {
+        snapshot.openOrderID = nil
+    }
+    return .restore(snapshot)
+}
+
+func describe(_ result: Restoration) -> String {
+    switch result {
+    case .restore(let snapshot):
+        "restore the \(snapshot.tab) tab, " + (snapshot.openOrderID.map { "showing order \($0)" } ?? "showing the list")
+    case .startFresh(let reason):
+        "start fresh: \(reason)"
+    }
+}
+
+let encoder = JSONEncoder()
+encoder.outputFormatting = .sortedKeys
+let saved = try encoder.encode(RestorationSnapshot(tab: "orders", openOrderID: "A17"))
+print("saved \(saved.count) bytes: \(String(decoding: saved, as: UTF8.self))")
+
+let oldVersion = try encoder.encode(RestorationSnapshot(version: 1, tab: "orders", openOrderID: "A17"))
+let cases: [(String, Data?, Set<String>)] = [
+    ("first launch", nil, ["A17"]),
+    ("killed while suspended", saved, ["A17", "B02"]),
+    ("order deleted meanwhile", saved, ["B02"]),
+    ("after an app update", oldVersion, ["A17"]),
+    ("corrupted", Data("{".utf8), ["A17"]),
+]
+for (name, data, orders) in cases {
+    print("\(name): \(describe(restoration(from: data, existingOrders: orders)))")
+}
+```
+
+```output
+saved 48 bytes: {"openOrderID":"A17","tab":"orders","version":2}
+first launch: start fresh: nothing was saved
+killed while suspended: restore the orders tab, showing order A17
+order deleted meanwhile: restore the orders tab, showing the list
+after an app update: start fresh: it was saved by version 1
+corrupted: start fresh: the saved state is unreadable
+```
+
+Starting fresh after a version change is the simple policy. If an update ships while many users are mid-flow, migrate old snapshots instead, as you would a database. Either way it's a pure function, so every case gets a unit test. The pattern is the memento from [Memento: snapshots and state restoration](/design/learn/sd-behavioural-memento), with the system as caretaker.
+
+### What not to restore
+
+- **Transient UI:** alerts, action sheets, loading spinners, a toast. Restore the screen underneath.
+- **Sensitive screens:** a payment confirmation, a PIN entry, a revealed password. Restore to the safe step before (the cart, the locked screen).
+- **Stale content as if it were current:** restore *which* item was open, then load it fresh.
+
+<Callout kind="gotcha" title="iOS gotcha: the app switcher's snapshot">
+
+When your app goes to the background, iOS takes a screenshot of it for the app switcher, where anyone glancing at the phone can see it. If the screen shows an account balance or a medical result, so does the snapshot. Hide or blur sensitive content in `sceneWillResignActive(_:)` (or when `scenePhase` becomes `.inactive`), before the snapshot is taken.
+
+</Callout>
+
+## Testing restoration
+
+Both paths need testing, and each has its own trick:
+
+- **System termination** (should restore): run from Xcode, go to the home screen so the app saves its state, then stop the app with Xcode's Stop button. Relaunch it, and it should come back where it was.
+- **User termination** (should start fresh, keeping data): swipe the app away in the app switcher, then relaunch.
+- **The logic** (should be correct for every snapshot): unit-test the validation function, like the one above, with missing, old, corrupt and dangling snapshots.
+
+## Trade-offs
+
+| Mechanism | Per window | Survives a swipe-away | Size | Secrets OK? | When it wins |
+| --- | --- | --- | --- | --- | --- |
+| `@SceneStorage` | Yes | No | Small values | No | SwiftUI UI state |
+| `NSUserActivity` restoration | Yes | No | Small property lists | No | UIKit UI state; the same activity can power Handoff |
+| `UISceneSession.userInfo` | Yes | No | Small property lists | No | Per-window values outside an activity |
+| Your own store (file or database) | Only if you key it by session | Yes | Anything | With file protection | User data: drafts, answers, unsent edits |
+| `UserDefaults` | No | Yes | Small | No | Preferences, never UI state: it would restore after a deliberate quit too |
+
+<Callout kind="interview">
+
+**Say** the split: "The checkout's answers are user data, saved to disk as they change. Where the user is (order and step) is UI state in the scene's restoration activity. On relaunch I validate it, load the order fresh, and fall back to the cart if anything's missing or the step was the payment confirmation." **Ask** whether the flow is multi-window on iPad and whether drafts should sync across devices. **Red flags:** saving in `applicationWillTerminate(_:)`, restoration payloads that contain the data itself, and restoring straight into a payment screen.
+
+</Callout>
+
+## Practice
+
+[The design exercise](/design/practice/sd-design-app-runtime-flow-restoration) asks you to design restoration for a multi-screen flow as a component: what's stored where, when it's written, how it's validated, how it behaves with several windows, and how you'd test it.
+
+```cards
+- id: two-kinds-state
+  front: "What's the difference between UI state and user data in restoration?"
+  back: "UI state is where the user was (tab, screen, step): small, per window, kept by the system's restoration mechanism. User data is what they made (drafts, answers): saved to your own store as it changes, so it survives anything."
+- id: pointers-not-payloads
+  front: "What should a restoration payload contain?"
+  back: "Pointers, not payloads: ids and positions such as \"order A17, step 2\". Load the data itself fresh from the app's store on relaunch."
+- id: swipe-away
+  front: "What happens to restoration data when the user swipes the app away?"
+  back: "Swiping a window away discards its scene session, and the restoration data with it, so the app starts fresh. User data in your own store is untouched."
+- id: validate-restored
+  front: "Why validate restored state?"
+  back: "It's input from the past: the app may have been updated, the item deleted elsewhere, or the data corrupted. Check the version and the ids, and fall back to the nearest safe screen."
+```
+
+```quiz
+- id: q1
+  type: sort
+  prompt: "Where does each piece of a recipe app's state belong?"
+  buckets: [Restoration state, The app's own store, Don't keep it]
+  items:
+    - [The recipe the user had open, 0]
+    - [A new recipe they're halfway through writing, 1]
+    - ["The \"Saved!\" toast that was showing", 2]
+    - [The selected tab, 0]
+    - [Photos they picked for the new recipe, 1]
+  explain: "Where the user was goes into restoration state. What they made goes to disk as it changes. Transient UI like a toast is never restored."
+- id: q2
+  type: mcq
+  prompt: "A user is on step 3 of a 4-step insurance claim, switches to their photo library for ten minutes, and comes back to the app's home screen with the claim gone. Which design fixes both problems?"
+  options:
+    - "Keep the claim in a singleton so it survives in memory"
+    - "Save the claim's answers to disk as they change, and restore the claim's id and step through the scene's restoration state"
+    - "Save everything in `applicationWillTerminate(_:)`"
+    - "Store the whole claim, photos included, in `@SceneStorage`"
+  answer: 1
+  explain: "The app was killed while suspended, so memory and `applicationWillTerminate(_:)` are no help. Answers are user data and belong in the app's store; the id and step are UI state. Scene storage is for small values, not photos."
+- id: q3
+  type: truefalse
+  prompt: "After the user swipes an app away in the app switcher, its `@SceneStorage` values are restored the next time it launches."
+  answer: false
+  explain: "Swiping a window away discards its scene session, and its scene storage with it. That matches the user's intent: they chose to close it. Their saved data, in your own store, is still there."
+- id: q4
+  type: mcq
+  prompt: "Restoration brings a user back to order `A17`, which they deleted on their iPad in the meantime. What should the app do?"
+  options:
+    - "Show an error and quit"
+    - "Show the cached copy of A17 from the restoration payload"
+    - "Notice A17 no longer exists and show the orders list instead"
+    - "Crash, since restoration data should never be wrong"
+  answer: 2
+  explain: "Restored state is untrusted input from the past. Validate the ids against current data and fall back to the nearest sensible screen. A cached copy would show something that no longer exists."
+- id: q5
+  type: order
+  prompt: "Put a correct restoration in order, from leaving to coming back."
+  lines:
+    - "The draft is saved to disk as the user types"
+    - "The scene enters the background and returns its restoration activity"
+    - "iOS suspends the app, then terminates it for memory"
+    - "The user launches the app; the scene reconnects with its session"
+    - "The app validates the restored ids and loads the draft from disk"
+    - "The user sees the same step with their answers"
+  explain: "User data is saved continuously, UI state when the scene leaves, nothing at termination, and on return the state is validated before the screen is rebuilt from current data."
+```

@@ -1,0 +1,312 @@
+## Why it matters
+
+Swift frees an object the moment nothing holds a strong reference to it. That makes memory predictable, and it makes one class of bug structural: if two objects hold each other, neither is ever freed. In a real app the cycle rarely sits inside one class. It runs **across layers**: a screen, its view model, a shared repository's observer list, a timer, a task. Every leaked screen keeps working for nobody, fetching, logging and reacting to updates, until the footprint climbs into jetsam's range. Interviewers ask about `weak` and `unowned` to check the basics; staff-level candidates are expected to draw the ownership graph of a feature and say where the arrows must be weak.
+
+## ARC in one page
+
+Every class instance carries a **reference count**. Each strong reference to it adds one; when a reference goes away, the count drops; at zero, `deinit` runs and the memory is freed, right then, on whatever thread released the last reference. There's no garbage collector looking for unreachable objects later. You met the value-semantics side of this in [value vs reference semantics](/design/learn/sd-swift-design-value-semantics): structs and enums aren't counted, but a struct that stores a class reference retains it, and every copy of the struct retains it again.
+
+Three kinds of reference decide the graph:
+
+| Reference | Keeps the object alive? | If the object is freed | Use it for |
+| --- | --- | --- | --- |
+| `strong` (the default) | Yes | Can't happen while you hold it | Ownership: a parent holding its child |
+| `weak` | No | Becomes `nil` | Back-references, delegates, observers: anything that may outlive its target |
+| `unowned` | No | Reading it **traps** | A back-reference to an owner that's guaranteed to outlive you |
+
+And one fact that causes most real leaks: **closures are reference types that capture strongly.** A closure that mentions `self` holds `self`, unless its capture list says `[weak self]` or `[unowned self]`. Store that closure on an object that `self` owns, and you have a cycle.
+
+## Ownership graphs
+
+Draw a feature as a graph: one box per object, one arrow per stored strong reference. A healthy graph is a **tree** hanging from roots the app holds: the app delegate, the scene, the window, the navigation stack, the composition root's shared services. Three rules keep it that way:
+
+1. **Ownership points down.** Parents own children: a navigation stack owns its screens, a screen owns its view model, the composition root owns shared services.
+2. **Anything pointing back up is weak.** Delegates, parent pointers, observers, and closures that call back to their owner. Use `unowned` only when the lifetime is guaranteed by construction.
+3. **Long-lived objects never strongly hold short-lived ones.** A repository lives for the whole session; a screen lives until the user taps Back. If the repository's observer list holds the screen's view model strongly, the screen lives for the session too.
+
+Rule 3 is the one that bites across layers. Watch a detail screen leak through a shared repository:
+
+```visual flow
+title: A screen that outlives its navigation stack
+nodes:
+  - { id: app, label: App, kind: client, at: [0, 0] }
+  - { id: nav, label: Navigation stack, kind: view, at: [2, 0] }
+  - { id: screen, label: Detail screen, kind: view, at: [4, 0] }
+  - { id: repo, label: Repository, kind: store, at: [0, 2] }
+  - { id: vm, label: View model, at: [4, 2] }
+edges:
+  - [app, nav, owns]
+  - [nav, screen, owns]
+  - [app, repo, owns]
+  - [screen, vm, owns]
+  - [vm, screen, onChange]
+  - [vm, repo, uses]
+  - [repo, vm, observer]
+steps:
+  - say: "The app's navigation stack holds the detail screen. Strong arrows point **down** the tree."
+    show: [app, nav, screen]
+  - say: "The screen owns its view model."
+    show: [vm]
+    send: screen->vm
+  - say: "The repository is shared, so the **app** owns it, not any screen. The view model uses it."
+    show: [repo]
+    send: vm->repo
+  - say: "The view model subscribes by handing the repository a closure that captures `self` strongly. The repository keeps it in an array: a **long-lived object now holds a short-lived one**."
+    send: repo->vm
+  - say: "The screen sets `viewModel.onChange = { self.render() }`. That closure, stored on the view model, holds the screen: screen and view model now hold each other."
+    send: vm->screen
+  - say: "The user taps Back and the navigation stack lets go. But the repository still holds the view model, and the view model holds the screen. **Both stay alive.**"
+    hide: [nav->screen]
+    state: { screen: error, vm: error }
+    label: { screen: leaked, vm: leaked }
+  - say: "Open and close the screen ten times and there are ten of each, all reacting to every repository update: ten fetches, ten analytics events, ten times the memory."
+    active: [repo->vm]
+  - say: "The fix: the repository keeps observers **weakly** (or hands out a token the view model cancels), and `onChange` captures `[weak self]`. Now popping the screen frees both."
+    hide: [screen, vm]
+    state: { screen: null, vm: null }
+    label: { screen: null, vm: null }
+```
+
+Notice what kind of leak that is. The screen isn't part of an unreachable island: the app can still reach it, through the repository. Xcode's **Memory Graph debugger** flags unreachable cycles with a purple warning, but objects held by a live owner look legitimate to it, and Instruments' Leaks template agrees. You find this kind by **counting**: "why are there ten `DetailViewModel` instances after I closed the screen ten times?" Instruments' Allocations with generations, or the instance counts in the memory graph, show it at once.
+
+### Lifetimes, layer by layer
+
+Rule 3 is easier to apply when every object has a stated lifetime. Most iOS apps have four:
+
+| Lifetime | Typical objects | Owned by |
+| --- | --- | --- |
+| **Session** (the process) | API client, repositories, caches, the signed-in session | The composition root in the app delegate or `App` |
+| **Window** (a scene) | The window's root coordinator, its navigation state | The scene delegate, or the `WindowGroup`'s root view |
+| **Flow and screen** | Child coordinators, view controllers, views, view models | The parent coordinator, the navigation stack, the view |
+| **Request** | A task loading one page, a decode, an upload | Its caller: a structured scope, or a stored task cancelled with its owner |
+
+Any reference from a longer lifetime to a shorter one must be weak, or a token the shorter-lived object cancels. A repository (session) holding a view model (screen), a coordinator (flow) holding a finished child, a singleton analytics client holding a screen's closure: each is an arrow pointing the wrong way down that table.
+
+SwiftUI shifts where the cycles live. A view is a struct, so `self` inside a view's closure is a copy of a value, not a reference, and can't form a cycle. The references are in your `@Observable` models and the tasks and closures *they* store. `@State` in a view owns its model for as long as the view's identity lasts, and the `.task` modifier ties a task to the view's appearance, cancelling it when the view goes. Those two cover most screen-lifetime needs without any `[weak self]` at all.
+
+## The usual suspects
+
+Almost every retain cycle in an iOS codebase is one of these.
+
+### A strong delegate
+
+A delegate points back at whoever owns you. Declared strong, it closes a loop. Constrain the protocol to classes so it can be `weak`:
+
+```swift check title="ListScreen.swift"
+import Foundation
+
+protocol ListScreenDelegate: AnyObject {
+    func listScreen(didSelect id: UUID)
+}
+
+final class ListScreen {
+    // The coordinator owns this screen; this arrow points back up, so it's weak
+    weak var delegate: (any ListScreenDelegate)?
+
+    func select(_ id: UUID) {
+        delegate?.listScreen(didSelect: id)
+    }
+}
+```
+
+### A stored closure that captures its owner
+
+`viewModel.onChange = { self.render() }`, inside the view controller that owns the view model: self owns the view model, the view model owns the closure, the closure owns self. Write `{ [weak self] in self?.render() }`.
+
+### Timers
+
+A repeating `Timer` is retained by the run loop, and it retains its target or its closure. A screen that starts a timer capturing `self` and plans to `invalidate()` it in `deinit` never reaches `deinit`, because the timer is holding it. Capture `[weak self]`, and invalidate the timer when the screen stops needing it (`viewWillDisappear(_:)`, or when the work ends), not in `deinit`.
+
+### NotificationCenter block observers
+
+`addObserver(forName:object:queue:using:)` returns a token, and the center keeps the block alive until you remove that token. A block that captures `self` strongly keeps `self` alive for as long as the token is registered, which is forever if nobody removes it. Capture weakly and remove the token, or use `NotificationCenter.default.notifications(named:)` in a task that's cancelled with the screen.
+
+### Combine subscriptions
+
+`publisher.sink { self.update($0) }.store(in: &cancellables)` builds the loop by itself: self owns `cancellables`, which owns the subscription, which owns the closure, which owns self. Capture `[weak self]`, or bind straight to a property with `assign(to: &$property)`, which ties the subscription's lifetime to that `@Published` property without capturing `self`.
+
+### Tasks that never finish
+
+A `Task` holds everything its closure captures until the task **ends**. For a one-shot `Task { await self.load() }`, that's a short delay before `self` can be freed, not a leak. A task that loops over an endless stream is different: it never ends, so if it captures `self` strongly, `self` is never freed, and the `cancel()` you put in `deinit` never runs.
+
+```swift check title="ProfileViewModel.swift"
+import Combine
+import Foundation
+
+struct Profile: Sendable, Equatable {
+    var name: String
+}
+
+@MainActor
+final class ProfileViewModel {
+    @Published private(set) var profile = Profile(name: "")
+    var onChange: (() -> Void)?
+
+    private var cancellables = Set<AnyCancellable>()
+    private var updates: Task<Void, Never>?
+
+    init(profiles: AnyPublisher<Profile, Never>, events: AsyncStream<String>) {
+        profiles
+            .sink { [weak self] profile in self?.profile = profile }
+            .store(in: &cancellables)
+
+        updates = Task { [weak self] in
+            for await event in events {
+                guard let self else { return } // strong only for this iteration
+                self.handle(event)
+            }
+        }
+    }
+
+    deinit {
+        updates?.cancel() // reachable now, because nothing above holds self strongly
+    }
+
+    private func handle(_ event: String) {
+        onChange?()
+    }
+}
+```
+
+The `guard let self` sits **inside** the loop on purpose. Between events, while the loop waits at `for await`, the task holds only the weak reference, so the view model can be freed.
+
+<Callout kind="gotcha" title="Swift gotcha: [weak self] that isn't">
+
+`Task { [weak self] in guard let self else { return }; for await e in events { self.handle(e) } }` looks safe and isn't. The `guard` at the top makes a strong reference that lasts until the task ends, which for an endless stream is never. Rebind inside the loop, or tie the task's lifetime to the view: SwiftUI's `.task` modifier cancels its task when the view disappears.
+
+</Callout>
+
+### Coordinators that keep their children
+
+A parent coordinator keeps its child coordinators in an array so they stay alive while their flow runs. When the flow finishes, the parent must remove the child. Forget, and every completed sign-up or checkout flow stays in memory with its screens and services. You'll design coordinators properly in D20.
+
+## `weak` or `unowned`?
+
+Both break a cycle; they differ in what happens if you're wrong about lifetimes.
+
+- **`weak`** turns "the object is gone" into `nil`, which you handle. It costs an optional and a little bookkeeping.
+- **`unowned`** turns "the object is gone" into a crash the moment you touch it. It's right only when the target **owns** you, directly or indirectly, so it can't be freed first: a child view model's reference to the coordinator that created and holds it, a node's reference to the tree that owns it.
+
+If you can't say *why* the target must outlive the reference, use `weak`. An `unowned self` in a network completion handler is the classic crash: the user leaves the screen, the request finishes, and the handler touches a freed object.
+
+## Proving it in tests
+
+Leaks come back unless a test stops them. The pattern is a weak reference that must become `nil`:
+
+```swift
+@Test("Closing the detail screen frees its view model")
+func detailIsReleased() async {
+    weak var released: DetailViewModel?
+    do {
+        let viewModel = DetailViewModel(repository: repository)
+        released = viewModel
+        await viewModel.start()
+    }
+    #expect(released == nil)
+}
+```
+
+Build the object the way the app does, with its real dependencies (the shared repository, the analytics client), because the cycle usually runs through them. A test with every dependency stubbed out can pass while the real wiring leaks.
+
+## Trade-offs
+
+| Technique | If the target is freed | Cost | When it wins |
+| --- | --- | --- | --- |
+| Strong reference | Can't be freed: that's the point | None | Ownership, down the tree |
+| `weak` | Becomes `nil` | Optional handling, slight overhead | Delegates, observers, callbacks to an owner, anything you can't prove outlives you |
+| `unowned` | Trap on access | None at the use site | Back-references to a guaranteed owner |
+| Explicit teardown: `cancel()`, `invalidate()`, removing tokens | Depends on someone calling it at the right time | Discipline, and a moment that isn't `deinit` | Timers, tasks, observers, always alongside weak capture |
+| Lifetime-scoped APIs: SwiftUI's `.task`, `AnyCancellable`, value-type models | Handled by the framework | Tied to that framework's lifetimes | Whenever one fits |
+
+<Callout kind="interview">
+
+**Say** the ownership rule and apply it to the feature: "The composition root owns the repository; screens own their view models; anything that calls back up the tree is weak. The repository's observers are tokens the view model cancels, so a closed screen can't stay subscribed." **Ask** how long each object should live: the session, the screen, the request. Mismatched lifetimes are where leaks come from. **Red flags:** `[weak self]` sprinkled everywhere with no reasoning, `unowned` in async callbacks, and "ARC handles memory" with no mention of cycles.
+
+</Callout>
+
+## Practice
+
+[The kata](/design/practice/sd-kata-app-runtime-leak-audit) builds both tools from this lesson: an audit that runs ARC's rules over an ownership graph to separate true leaks from objects a root still holds, and a tracker that uses weak references to catch both kinds in tests. [The review](/design/practice/sd-review-app-runtime-retain-cycles) hands you a feature with cycles running through a coordinator, a view model, a shared service, a timer and a task, and asks you to find every one.
+
+```cards
+- id: arc-rule
+  front: "When does ARC free an object?"
+  back: "Immediately, when its last strong reference goes away. Weak and unowned references don't count, so a cycle of strong references is never freed."
+- id: ownership-rules
+  front: "What three rules keep an ownership graph a tree?"
+  back: "Ownership points down; anything pointing back up is weak; long-lived objects never strongly hold short-lived ones."
+- id: memory-graph-blind-spot
+  front: "Why doesn't the Memory Graph debugger flag a screen kept alive by a shared repository's observer list?"
+  back: "It's still reachable from a root, so it doesn't look leaked. Find it by counting instances after opening and closing the screen."
+- id: weak-vs-unowned
+  front: "When is unowned safe instead of weak?"
+  back: "Only when the target owns you, directly or indirectly, so it can't be freed first. Otherwise reading it after it's freed traps."
+```
+
+```quiz
+- id: q1
+  type: bug
+  prompt: "This view controller is never freed after the user taps Back. Which line creates the cycle?"
+  code: |
+    final class OrderViewController: UIViewController {
+        private let viewModel: OrderViewModel
+        private weak var coordinator: OrderCoordinator?
+
+        init(viewModel: OrderViewModel, coordinator: OrderCoordinator) {
+            self.viewModel = viewModel
+            self.coordinator = coordinator
+            super.init(nibName: nil, bundle: nil)
+            viewModel.onUpdate = { self.render() }
+        }
+
+        required init?(coder: NSCoder) { nil }
+
+        private func render() {}
+    }
+  answer: 9
+  explain: "The controller owns the view model, the view model stores the closure, and the closure captures `self` strongly. `{ [weak self] in self?.render() }` breaks it. The coordinator reference is already weak."
+- id: q2
+  type: multi
+  prompt: "Which of these keep a screen alive after it's popped? Choose all that apply."
+  options:
+    - "A repeating `Timer` whose closure captures `self`, invalidated in `deinit`"
+    - "A one-shot `Task { await self.reload() }` that finishes in two seconds"
+    - "`publisher.sink { self.apply($0) }.store(in: &cancellables)` on the screen"
+    - "A `weak var delegate` pointing at the screen from its view model"
+    - "A shared service storing the screen's closure in a strong observer array"
+  answer: [0, 2, 4]
+  explain: "The timer and the sink form cycles, and the shared service holds the closure for the session. The one-shot task delays the release by two seconds and then lets go. A weak delegate never keeps anything alive."
+- id: q3
+  type: sort
+  prompt: "Which kind of reference fits each?"
+  buckets: [strong, weak, unowned]
+  items:
+    - [A navigation controller's reference to its screens, 0]
+    - [A table view's reference to its delegate, 1]
+    - [A view model's reference to the coordinator that created and owns it, 2]
+    - [A cache observer list's references to its subscribers, 1]
+    - [The composition root's reference to the API client, 0]
+  explain: "Ownership down the tree is strong. Delegates and subscriber lists point at objects that may go away first, so they're weak. A child pointing at the owner that holds it can be unowned, because the owner can't be freed first."
+- id: q4
+  type: mcq
+  prompt: "This task lives in a view model that should be freed when its screen closes. What's wrong?"
+  code: |
+    updates = Task { [weak self] in
+        guard let self else { return }
+        for await price in prices {
+            self.show(price)
+        }
+    }
+  options:
+    - "Nothing: `[weak self]` prevents the cycle"
+    - "The `guard` creates a strong reference that lasts as long as the loop, and the price stream never ends, so the view model is never freed"
+    - "`for await` can't be used inside a `Task`"
+    - "`self.show` must be called with `await`"
+  answer: 1
+  explain: "The weak capture only matters until the `guard` rebinds `self` strongly, and that binding lives to the end of the task. Move the `guard` inside the loop, so the task holds only the weak reference while it waits for the next price."
+- id: q5
+  type: truefalse
+  prompt: "Xcode's Memory Graph debugger will flag a view model kept alive by a strong observer array in a shared repository as a leak."
+  answer: false
+  explain: "The repository is reachable from the app, so the view model is too. The tool flags unreachable cycles. Counting instances after opening and closing the screen several times is how you find this kind."
+```

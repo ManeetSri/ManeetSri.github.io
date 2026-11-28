@@ -1,0 +1,285 @@
+## Why it matters
+
+Many features have one job and several ways to do it: order a feed by newest or by what's trending, shrink uploads more on cellular, settle a sync conflict by "last write wins" or by merging, lay out a grid differently on iPad. **Strategy** puts each way behind one interface, so the code that does the job never changes when a new way arrives, and the choice can be made at runtime by a setting, a device or an experiment. Apple's frameworks use it everywhere, and "make the ranking swappable for an A/B test" is a standard interview follow-up.
+
+## One job, several ways
+
+The pattern has three parts:
+
+- **The context** does the job and holds a strategy. A feed ranker, an upload queue, a JSON decoder.
+- **The strategy interface** describes the one decision that varies: "order these posts".
+- **Concrete strategies** each implement it their own way, with whatever they need (a formula, a Core ML model, a user's follow list).
+
+Whoever builds the context picks the strategy. The context only calls it:
+
+```visual flow
+title: A feed ranker with swappable strategies
+nodes:
+  - { id: screen, label: Feed screen, kind: view, at: [0, 1] }
+  - { id: ranker, label: Feed ranker, kind: service, at: [2, 1] }
+  - { id: config, label: Remote config, kind: external, at: [2, 3] }
+  - { id: newest, label: Newest, kind: service, at: [4, 0] }
+  - { id: trending, label: Trending, kind: service, at: [4, 1] }
+  - { id: liked, label: Most liked, kind: service, at: [4, 2] }
+edges:
+  - [screen, ranker, posts]
+  - [ranker, newest]
+  - [ranker, trending]
+  - [ranker, liked]
+  - [config, ranker, choose, { style: async }]
+steps:
+  - say: "The screen asks the ranker for a feed. The ranker holds **one** strategy and calls it, without asking which one it is."
+    show: [screen, ranker, newest]
+    send: screen->ranker
+    active: [ranker->newest]
+    state: { newest: active }
+  - say: "Remote config starts an experiment: half of users get **Trending**. Only the strategy the ranker holds changes."
+    show: [config, trending]
+    send: config->ranker
+    active: [ranker->trending]
+    state: { newest: null, trending: active }
+  - say: "Next quarter, **Most liked** ships as a new type. The screen and the ranker aren't touched."
+    show: [liked]
+    active: [ranker->liked]
+    state: { trending: null, liked: active }
+```
+
+The alternative is a `switch` inside the ranker: `case .newest: …; case .trending: …`. It's fine for two cases that never change. It stops being fine when each new order means editing the ranker, retesting every case, and giving the ranker every dependency of every order, including that Core ML model only one of them uses. That's the open–closed principle (D04) as a pattern.
+
+## Strategy in Swift: three shapes
+
+### A protocol and a type per strategy
+
+The classic shape. Each strategy is a type, and can carry its own configuration and dependencies:
+
+```swift run title="Feed ranking strategies"
+import Foundation
+
+struct Post {
+    let title: String
+    let likes: Int
+    let hoursOld: Int
+}
+
+/// One way of ordering a feed
+protocol RankingStrategy {
+    var name: String { get }
+    func rank(_ posts: [Post]) -> [Post]
+}
+
+struct Newest: RankingStrategy {
+    let name = "Newest"
+
+    func rank(_ posts: [Post]) -> [Post] {
+        posts.sorted { $0.hoursOld < $1.hoursOld }
+    }
+}
+
+struct MostLiked: RankingStrategy {
+    let name = "Most liked"
+
+    func rank(_ posts: [Post]) -> [Post] {
+        posts.sorted(using: KeyPathComparator(\.likes, order: .reverse))
+    }
+}
+
+/// Likes count for less as a post ages: a simplified "hot" ranking
+struct Trending: RankingStrategy {
+    let name = "Trending"
+    var gravity = 1.5
+
+    func rank(_ posts: [Post]) -> [Post] {
+        func score(_ post: Post) -> Double {
+            Double(post.likes) / pow(Double(post.hoursOld + 2), gravity)
+        }
+        return posts.sorted { score($0) > score($1) }
+    }
+}
+
+/// The context: it holds a strategy and uses it, without asking which one it is
+struct FeedRanker {
+    var strategy: any RankingStrategy
+
+    func titles(for posts: [Post]) -> [String] {
+        strategy.rank(posts).map(\.title)
+    }
+}
+
+let posts = [
+    Post(title: "Release notes", likes: 40, hoursOld: 1),
+    Post(title: "Design review", likes: 300, hoursOld: 48),
+    Post(title: "Lunch poll", likes: 200, hoursOld: 5),
+]
+
+var ranker = FeedRanker(strategy: Newest())
+let options: [any RankingStrategy] = [Newest(), MostLiked(), Trending()]
+for option in options {
+    ranker.strategy = option
+    print("\(option.name): \(ranker.titles(for: posts))")
+}
+```
+
+```output
+Newest: ["Release notes", "Lunch poll", "Design review"]
+Most liked: ["Design review", "Lunch poll", "Release notes"]
+Trending: ["Lunch poll", "Release notes", "Design review"]
+```
+
+`FeedRanker` holds `any RankingStrategy` because the strategy changes at runtime. If it were fixed when the ranker is built, `FeedRanker<Strategy: RankingStrategy>` would let the compiler specialise every call (no dynamic dispatch, no existential box), at the cost of a different ranker *type* per strategy. Reach for the generic in a hot loop; the existential is right for a choice made by a setting.
+
+### A struct of closures
+
+When strategies have no state of their own, a struct holding a closure is lighter than a type each. Static members give a call site that reads like an enum, `FeedRanker(ranking: .mostLiked)`, and tests can make one on the spot. You met this "dependencies as values" style in D07.
+
+```swift check title="Strategies as values, and an enum for a closed set"
+import Foundation
+
+struct Post: Sendable {
+    let title: String
+    let likes: Int
+    let hoursOld: Int
+}
+
+/// The same idea as a struct of closures: each strategy is a value, not a type
+struct Ranking: Sendable {
+    let name: String
+    let rank: @Sendable ([Post]) -> [Post]
+
+    static let newest = Ranking(name: "Newest") { posts in
+        posts.sorted { $0.hoursOld < $1.hoursOld }
+    }
+
+    static let mostLiked = Ranking(name: "Most liked") { posts in
+        posts.sorted(using: KeyPathComparator(\.likes, order: .reverse))
+    }
+
+    /// Tests and previews can make one on the spot
+    static func fixed(_ titles: [String]) -> Ranking {
+        Ranking(name: "Fixed") { posts in
+            titles.compactMap { title in posts.first { $0.title == title } }
+        }
+    }
+}
+
+/// A closed set the user picks from in Settings, saved as a raw value
+enum FeedOrder: String, Codable, CaseIterable, Sendable {
+    case newest
+    case mostLiked
+
+    var ranking: Ranking {
+        switch self {
+        case .newest: .newest
+        case .mostLiked: .mostLiked
+        }
+    }
+}
+```
+
+### An enum, when the set is closed
+
+`FeedOrder` above is an enum, and that's deliberate. When the options are few, known and chosen by the user, an enum is the honest model: it's `Codable` (save the user's choice), `CaseIterable` (build the Settings picker), and the compiler checks every `switch`. Here the enum only *selects*; the behaviour still lives in the strategies, so adding a third order means one case and one value.
+
+## Strategies in Apple's frameworks
+
+Once you look, they're everywhere:
+
+- **`JSONDecoder`** has `keyDecodingStrategy` (`.convertFromSnakeCase`) and `dateDecodingStrategy` (`.iso8601`, or `.custom { decoder in … }` when none fits). The strategy's name is in the API.
+- **`SortComparator`** (iOS 15) is a sorting strategy: `posts.sorted(using: KeyPathComparator(\.likes, order: .reverse))`, and SwiftUI's `Table` sorts with them.
+- **`FormatStyle`**: `price.formatted(.currency(code: "GBP"))` passes a formatting strategy as a value.
+- **`UICollectionViewLayout`**: the collection view hands every position calculation to its layout object. Swap it with `setCollectionViewLayout(_:animated:)` and the same data rearranges.
+- **SwiftUI styles**: `ButtonStyle`, `ToggleStyle` and `LabelStyle` decide *how* a control draws; `.buttonStyle(.borderedProminent)` injects one through the environment for a whole subtree.
+- **Core Data's `NSMergePolicy`**: how to settle a conflict between the store and the context.
+
+## Who chooses
+
+The strategy is chosen outside the context, and *where* is a design decision of its own:
+
+- **The composition root** (D21) for choices fixed per build or environment, such as a stub ranking in UI tests.
+- **The user**, through a saved setting, usually an enum like `FeedOrder`.
+- **An experiment or remote flag** (D54), which is how A/B tests of rankings ship. Log which strategy served each session, or the experiment can't be analysed.
+- **A strategy that chooses strategies.** A `ByNetwork` strategy that asks a cheaper one on cellular is still one strategy to the context. Strategies compose like this without the context knowing.
+
+## Trade-offs
+
+| | Protocol and types | Struct of closures | Enum and `switch` |
+| --- | --- | --- | --- |
+| Adding an option | A new type; nothing else changes | A new static value | A new case, and every `switch` must handle it |
+| Swap at runtime | Yes (`any`) or fixed (generic) | Yes | Yes |
+| Own state and dependencies | Natural: stored properties | Captured by the closure | Awkward: in the context |
+| Save the choice | Needs a separate identifier | Needs a separate identifier | Free: `Codable` |
+| Test doubles | A fake type | A closure on the spot | Not needed |
+| Wins when | Open-ended algorithms with real dependencies | Small, stateless rules; tests and previews | A small, closed set the user picks |
+
+<Callout kind="interview">
+**"Make the feed ranking swappable for an experiment."** Say: a `RankingStrategy` protocol, the current order as the default, the experiment's order as a second type; the view model is given a strategy, and remote config decides which at the composition root; each session logs the strategy it used; a failing strategy falls back to the default.
+
+**Ask:** Will there be more than two? Does any strategy need dependencies the others don't (a model, a network call)? Must the user's choice be saved?
+
+**Red flags:** `if experiment == "B"` scattered through the view model; a strategy protocol with exactly one implementation "for later" (speculative generality, D15); strategies that reach into the context's private state.
+</Callout>
+
+<Callout kind="gotcha" title="Swift gotcha: strategies cross actors">
+Ranking a long feed is work you may move off the main actor. Then the strategy goes with it, so it must be `Sendable`. Declare the protocol as `protocol RankingStrategy: Sendable`, keep strategies as value types, and make closure-based ones `@Sendable`, as `Ranking` does. Swift 6 rejects the rest.
+</Callout>
+
+## Practice
+
+**Upload strategies for Low Data Mode** has you write strategies for sizing photo uploads, one that chooses between them by network, and the queue that uses whichever it's given.
+
+```cards
+- id: strategy-parts
+  front: "What are the three parts of the strategy pattern?"
+  back: "A context that does the job, a strategy interface for the decision that varies, and concrete strategies. Whoever builds the context picks the strategy."
+- id: strategy-vs-switch
+  front: "When does a strategy beat a `switch` in the context?"
+  back: "When options keep being added, or bring their own dependencies. Each new option is a new type, and the context never changes."
+- id: any-or-generic
+  front: "`any Strategy` or a generic parameter?"
+  back: "`any` when the strategy changes at runtime; a generic when it's fixed at build time and performance matters, since calls can be specialised."
+```
+
+```quiz
+- id: q1
+  type: mcq
+  prompt: "The feed sorts by Newest and Most liked today. Product wants Following next quarter, then a personalised order that runs a Core ML model. Which design keeps the feed view model unchanged as orders are added?"
+  options:
+    - "A `switch` over an order enum inside the view model"
+    - "A `RankingStrategy` protocol, with each order a type, given to the view model"
+    - "A subclass of the view model for each order"
+    - "A notification posted when the order changes"
+  answer: 1
+  explain: "Each order becomes a type with its own dependencies (only the personalised one needs the model), and the view model calls whichever it's given. The `switch` would grow and pull every dependency into the view model; subclasses multiply screens for one varying decision."
+- id: q2
+  type: sort
+  prompt: "Which of these Apple APIs is a strategy?"
+  buckets: [A strategy, Not a strategy]
+  items:
+    - [JSONDecoder.dateDecodingStrategy, 0]
+    - [SwiftUI's ButtonStyle, 0]
+    - [A collection view's UICollectionViewLayout, 0]
+    - [NotificationCenter.default, 1]
+    - [UIApplication.shared, 1]
+  explain: "A strategy is one swappable decision handed to an object that does a bigger job: how to read dates, how to draw a button, where to put cells. A shared hub or singleton isn't one."
+- id: q3
+  type: truefalse
+  prompt: "An enum with a `switch` is never a good alternative to a strategy protocol."
+  answer: false
+  explain: "For a small, closed set the user chooses and you save, an enum is simpler and `Codable`, and the compiler checks every case. Strategy pays off when the set is open or options carry their own dependencies."
+- id: q4
+  type: match
+  prompt: "Match each shape to where it wins."
+  pairs:
+    - [A protocol and a type per strategy, Open-ended algorithms with their own dependencies]
+    - [A struct holding a closure, "Small, stateless rules, and test doubles made on the spot"]
+    - [An enum with cases, A small closed set the user picks and you save]
+    - [A generic parameter, A choice fixed at build time in performance-critical code]
+  explain: "They're all strategies in spirit; they differ in how open the set is, where state lives and when the choice is made."
+- id: q5
+  type: blank
+  prompt: "Sort posts so the most liked comes first."
+  code: |
+    let ranked = posts.sorted(using: KeyPathComparator(\.likes, order: ___))
+  answers:
+    - [".reverse", "SortOrder.reverse"]
+  explain: "`KeyPathComparator` is Foundation's ready-made sorting strategy. `.forward` is ascending; `.reverse` puts the largest first."
+```

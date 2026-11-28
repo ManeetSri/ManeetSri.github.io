@@ -1,0 +1,277 @@
+## Why it matters
+
+iOS, not your app, decides when your code runs. It tells you what's happening through a handful of callbacks, and nearly every lifecycle bug comes from doing the right work in the wrong one: refreshing on every phone call, saving too late, building UI during a launch that has no screen. You met the states in [System design on mobile](/design/learn/sd-orientation-mobile). This lesson is about who hears each transition, in what order, and what belongs in each callback. "What happens when the user presses home?" is a standard interview question, and the answer separates people who've shipped apps from people who've only built them.
+
+## Two lifecycles: the process and its scenes
+
+Since iOS 13, a UIKit app has two lifecycles, with a delegate for each:
+
+- The **process** lifecycle, heard by the `UIApplicationDelegate`. The process launches, runs, is suspended and is eventually terminated. Process-wide events arrive here: launch, push-notification registration, background URLSession events, memory warnings.
+- The **scene** lifecycle, heard by a `UISceneDelegate` (in practice a `UIWindowSceneDelegate`). A **scene** is one instance of your app's UI: one window. On iPhone there's usually exactly one; on iPad the user can open several, each moving through its own states. UI events arrive here: the window connecting, becoming active, going to the background.
+
+The app as a whole is in the foreground while **any** of its scenes is, and in the background once **all** of them are.
+
+Once you adopt scenes, UIKit stops calling the app delegate's UI-state methods such as `applicationDidBecomeActive(_:)`; their scene equivalents replace them. iOS 26 deprecated the old methods, and Apple has announced that apps built with the SDK *after* iOS 26 must use the scene lifecycle or they won't launch. If you maintain an app-delegate-only codebase, the migration is now on a deadline.
+
+## The states, and what runs in each
+
+| State | On screen? | Code runs? | What it means for you |
+| --- | --- | --- | --- |
+| **Not running** | No | No | No process. Nothing in memory survived. |
+| **Foreground inactive** | Yes | Yes | Visible but not receiving touches: launching, a call or alert on top, Control Center pulled down, the app switcher open. Usually brief. |
+| **Foreground active** | Yes | Yes | The only state where the user is interacting with you. |
+| **Background** | No | Yes, briefly | Off screen. A few seconds to finish, or longer with a background task or a background mode. |
+| **Suspended** | No | No | Frozen in memory. No callback announces it, and none announces the termination that may follow. |
+
+A scene also has an **unattached** state: the system has created it, or has disconnected it to reclaim memory, but it isn't showing UI.
+
+## The callbacks, in order
+
+Step through an afternoon in the life of one scene. Each transition names the scene delegate method UIKit calls.
+
+```visual states
+title: One scene's afternoon, as the scene delegate hears it
+states:
+  - { id: unattached, label: Unattached, at: [0, 0] }
+  - { id: inactive, label: Foreground inactive, at: [1, 0] }
+  - { id: active, label: Foreground active, at: [2, 0] }
+  - { id: background, label: Background, at: [1, 1] }
+  - { id: suspended, label: Suspended, at: [0, 1] }
+initial: unattached
+transitions:
+  - [unattached, inactive, willEnterForeground]
+  - [inactive, active, didBecomeActive]
+  - [active, inactive, willResignActive]
+  - [inactive, background, didEnterBackground]
+  - [background, inactive, willEnterForeground]
+  - [background, suspended, suspend]
+  - [suspended, inactive, willEnterForeground]
+  - [suspended, unattached, didDisconnect]
+intro: "The process has launched, `application(_:didFinishLaunchingWithOptions:)` has run, and `scene(_:willConnectTo:options:)` has built the window. The scene is still **unattached**."
+events:
+  - { event: willEnterForeground, say: "`sceneWillEnterForeground(_:)`: the window is about to appear. It's on screen but **inactive**." }
+  - { event: didBecomeActive, say: "`sceneDidBecomeActive(_:)`: touches arrive. Start timers, animations and the camera; refresh content if it's stale." }
+  - { event: willResignActive, say: "The user pulls down Notification Center. `sceneWillResignActive(_:)`: pause the game, the video, the timers. You're still visible, so don't tear the UI down." }
+  - { event: didBecomeActive, say: "They push it back up: `sceneDidBecomeActive(_:)` again, seconds later. Don't refetch the feed here only because it fired." }
+  - { event: willResignActive, say: "Now they swipe home. Every way out of the foreground passes through **inactive** first." }
+  - { event: didEnterBackground, say: "`sceneDidEnterBackground(_:)`: off screen. Save state, release what you can rebuild, and ask for a background task if the save takes more than an instant." }
+  - { event: suspend, say: "iOS **suspends** the app. No method is called: the next thing you hear might be `willEnterForeground`, or nothing ever again." }
+  - { event: willEnterForeground, say: "The user comes back an hour later: `sceneWillEnterForeground(_:)`, then active. Everything in memory is as it was." }
+  - { event: didBecomeActive, say: "Active again. Content an hour old is worth refreshing now." }
+  - { event: willResignActive, say: "They leave again..." }
+  - { event: didEnterBackground, say: "...and the scene goes to the background." }
+  - { event: suspend, say: "Suspended." }
+  - { event: didDisconnect, say: "Memory is tight, so iOS **disconnects** the scene: `sceneDidDisconnect(_:)`. Its window and view controllers are released, but the **session** survives, and the scene may reconnect later with `scene(_:willConnectTo:options:)`." }
+  - { event: willEnterForeground, say: "When the user returns, the scene reconnects and comes forward. Whatever you saved at `didEnterBackground` is what they'll see." }
+```
+
+Three callbacks happen outside that picture:
+
+- `application(_:didFinishLaunchingWithOptions:)` runs once per process, **before any scene connects**, and also for **background launches** that never get a scene at all: a BGTask, a silent push, a location event, a finished background download. Check `application.applicationState`, and never assume a window is coming.
+- `application(_:didDiscardSceneSessions:)` runs when the user closes a window for good (swiping it away in the app switcher). It may arrive at the next launch if the app wasn't running. Delete any per-window UI state you stored yourself for those sessions here, but never the user's data.
+- `applicationWillTerminate(_:)` runs only if the app is terminated while it's **running**, for example in the middle of a background task. A suspended app that's killed hears nothing, and that's the usual way apps end. Never rely on it to save.
+
+## What belongs where
+
+Most lifecycle design is deciding which callback owns which work. The rule of thumb: **process-wide work in the app delegate, per-window work in the scene delegate, and nothing slow in either.**
+
+| Work | Where | Why there |
+| --- | --- | --- |
+| Crash reporting, logging, the dependency container | `didFinishLaunchingWithOptions` | Once per process, before anything else can fail |
+| `BGTaskScheduler.register(...)` | `didFinishLaunchingWithOptions` | Handlers must be registered before launch finishes; registering later raises an exception |
+| The window, root view controller, per-window coordinator | `scene(_:willConnectTo:options:)` | Each window gets its own UI and navigation |
+| Handling a URL or user activity the scene opened with | `willConnectTo` (from `connectionOptions`) and `scene(_:openURLContexts:)` | Cold-start links arrive in the options; warm ones in the callback |
+| Pausing games, media, timers, the camera | `sceneWillResignActive(_:)` | The user may be gone for a second or for good |
+| Saving drafts, releasing caches, scheduling a refresh | `sceneDidEnterBackground(_:)` | The last reliable moment before suspension |
+| Refreshing stale content, re-reading permissions | `sceneWillEnterForeground(_:)` or `sceneDidBecomeActive(_:)` | The user may have changed settings while away |
+| Releasing per-window resources | `sceneDidDisconnect(_:)` | The scene may never come back, but its session can |
+
+Here is that split in code. The app delegate builds the services once; each scene gets a window and borrows the services:
+
+```swift check ios title="AppDelegate.swift and SceneDelegate.swift"
+import UIKit
+
+final class AppServices: Sendable {
+    func start() { /* crash reporting, logging: cheap and synchronous */ }
+}
+
+// Marked @main in the app target
+final class AppDelegate: UIResponder, UIApplicationDelegate {
+    // The composition root: one per process, shared by every scene
+    let services = AppServices()
+
+    func application(_ application: UIApplication, didFinishLaunchingWithOptions launchOptions: [UIApplication.LaunchOptionsKey: Any]?) -> Bool {
+        services.start()
+        // Background launches arrive here too, with no scene on the way: build no UI
+        return true
+    }
+
+    func application(_ application: UIApplication, configurationForConnecting connectingSceneSession: UISceneSession, options: UIScene.ConnectionOptions) -> UISceneConfiguration {
+        let configuration = UISceneConfiguration(name: "Default", sessionRole: connectingSceneSession.role)
+        configuration.delegateClass = SceneDelegate.self
+        return configuration
+    }
+}
+
+final class SceneDelegate: UIResponder, UIWindowSceneDelegate {
+    var window: UIWindow?
+
+    func scene(_ scene: UIScene, willConnectTo session: UISceneSession, options connectionOptions: UIScene.ConnectionOptions) {
+        guard let windowScene = scene as? UIWindowScene,
+              let app = UIApplication.shared.delegate as? AppDelegate else { return }
+        let window = UIWindow(windowScene: windowScene)
+        window.rootViewController = UINavigationController(rootViewController: UIViewController())
+        window.makeKeyAndVisible()
+        self.window = window
+        _ = app.services // hand these to the scene's coordinator
+    }
+
+    func sceneDidDisconnect(_ scene: UIScene) {
+        window = nil // the session survives; this scene's UI doesn't
+    }
+}
+```
+
+### Asking for background time
+
+`sceneDidEnterBackground(_:)` gives you a few seconds, and you don't get to know how many. If a save might take longer, bracket it with a **background task**: `beginBackgroundTask` before you start, `endBackgroundTask` when you finish *or* when the expiration handler runs, whichever comes first. iOS typically grants around 30 seconds, but read `backgroundTimeRemaining` rather than assuming. A task that's never ended gets the app killed, and MetricKit counts it as `cumulativeBackgroundTaskAssertionTimeoutExitCount`.
+
+```swift check ios title="DraftSaver.swift"
+import UIKit
+
+struct Draft: Sendable { var text: String }
+
+protocol DraftStore: Sendable {
+    func save(_ draft: Draft) async
+}
+
+@MainActor
+final class DraftSaver {
+    private let store: any DraftStore
+    private var taskID = UIBackgroundTaskIdentifier.invalid
+
+    init(store: any DraftStore) {
+        self.store = store
+    }
+
+    func saveBeforeSuspension(_ draft: Draft) {
+        // Ask for time before starting the work it protects
+        if taskID == .invalid {
+            taskID = UIApplication.shared.beginBackgroundTask(withName: "Save draft") { [weak self] in
+                self?.endTask() // time's up: end it now, or iOS terminates the app
+            }
+        }
+        Task {
+            await store.save(draft)
+            endTask()
+        }
+    }
+
+    private func endTask() {
+        guard taskID != .invalid else { return }
+        UIApplication.shared.endBackgroundTask(taskID)
+        taskID = .invalid
+    }
+}
+```
+
+The `if taskID == .invalid` guard matters: a user who leaves, returns and leaves again within a second would otherwise start a second task and overwrite the first one's identifier, which could then never be ended.
+
+## Trade-offs
+
+| Approach | Multi-window | Testability | Effort | When it wins |
+| --- | --- | --- | --- | --- |
+| App delegate only (pre-iOS 13 style) | None | Poor: state lives in one global delegate | Lowest, for now | Never for new code; deprecated, and soon unsupported |
+| App delegate plus scene delegate | Full | Fair: per-window state is separated | Moderate | Every UIKit app |
+| Scene delegates feeding a lifecycle state machine | Full | Good: the rules are a pure type you can test | Moderate, plus the machine | Apps with real lifecycle behaviour: media, location, sync, editors |
+| Observing `UIScene` notifications from features | Full | Good for each feature | Low per feature, but scattered | Features that need one event without a delegate in reach |
+
+The state machine row is the senior move. The delegates become thin adapters that translate callbacks into events, and a value type decides what to do: easy to read as a table, easy to test without a device. That's the kata for this lesson.
+
+<Callout kind="interview">
+
+**Say** the sequence and the work in it: "On home, the scene resigns active, where I pause playback, then enters the background, where I save inside a background task and release caches. Then it's suspended, and I assume it may be killed without another callback." **Ask** whether the app does anything in the background: audio, location, uploads. That changes which background modes and APIs you need. **Red flags:** saving in `applicationWillTerminate(_:)`, building UI in `didFinishLaunchingWithOptions`, and refreshing on every `didBecomeActive`.
+
+</Callout>
+
+<Callout kind="gotcha" title="iOS gotcha: didBecomeActive fires far more than you think">
+
+Pulling down Notification Center, an alert asking for permission, a Face ID prompt, a phone call: each one resigns and re-activates the scene. Code that fetches in `sceneDidBecomeActive(_:)` without checking how fresh its data is can hit your server every time the user checks the time. Gate refreshes on age, or refresh on `sceneWillEnterForeground(_:)`, which fires only when the scene comes on screen: at launch, or back from the background.
+
+</Callout>
+
+## Practice
+
+[The lifecycle kata](/design/practice/sd-kata-app-runtime-lifecycle-machine) turns this lesson's table into a tested state machine: events in, effects out, with the background-task bracket, the refresh-on-staleness rule, background launches and silent termination all covered by tests.
+
+```cards
+- id: two-lifecycles
+  front: "What's the split between the app delegate and the scene delegate?"
+  back: "The app delegate hears process events: launch, push registration, memory warnings, discarded sessions. The scene delegate hears each window's UI lifecycle: connect, active, inactive, background, disconnect."
+- id: will-terminate
+  front: "Why can't you rely on applicationWillTerminate(_:) to save?"
+  back: "It runs only if the app is killed while running. Apps are usually killed while suspended, which runs no code at all. Save when the scene enters the background."
+- id: background-task-bracket
+  front: "What are the rules of a background task?"
+  back: "Begin it before the work, end it when the work finishes or when the expiration handler runs, whichever is first, and end each one exactly once. An unended task gets the app terminated."
+- id: background-launch
+  front: "What's special about a background launch?"
+  back: "didFinishLaunchingWithOptions runs, but no scene connects, often while the device is locked. Build no UI there, and expect protected data to be unavailable."
+```
+
+```quiz
+- id: q1
+  type: order
+  prompt: "The app is open and the user swipes home. Put the scene delegate calls in order."
+  lines:
+    - "`sceneWillResignActive(_:)`"
+    - "`sceneDidEnterBackground(_:)`"
+    - "Suspension, with no callback"
+    - "`sceneWillEnterForeground(_:)` when the user returns"
+    - "`sceneDidBecomeActive(_:)`"
+  explain: "Leaving always passes through inactive before background, and suspension is silent. Returning mirrors it: enter foreground (still inactive), then become active."
+- id: q2
+  type: mcq
+  prompt: "A note-taking app saves the open note in `applicationWillTerminate(_:)`. Users report lost notes after switching to the camera for a few minutes. Why?"
+  options:
+    - "The camera app deletes other apps' files"
+    - "The app was suspended and then terminated for memory, which runs no code, so the save never happened"
+    - "`applicationWillTerminate(_:)` runs on a background thread and the write was cut off"
+    - "Scene-based apps never receive `applicationWillTerminate(_:)`"
+  answer: 1
+  explain: "The camera uses a lot of memory, so iOS reclaims it by killing suspended apps without notice. Save at `sceneDidEnterBackground(_:)`, or better, as the user types."
+- id: q3
+  type: sort
+  prompt: "Which callback should own each job?"
+  buckets: [didFinishLaunchingWithOptions, "scene(_:willConnectTo:options:)", sceneWillResignActive, sceneDidEnterBackground]
+  items:
+    - [Registering BGTaskScheduler handlers, 0]
+    - [Creating the window and its coordinator, 1]
+    - [Pausing a workout timer during an incoming call, 2]
+    - [Writing the draft to disk and dropping the image cache, 3]
+    - [Starting the crash reporter, 0]
+  explain: "Process-wide setup, including BGTask registration, which must finish before launch ends, belongs in the app delegate. Each window builds its own UI when it connects. Resigning active is for pausing, and entering the background is the moment to save and shrink."
+- id: q4
+  type: truefalse
+  prompt: "When iOS launches an app in the background to run a BGTask, `scene(_:willConnectTo:options:)` is called so the app can prepare its UI."
+  answer: false
+  explain: "A background launch runs `didFinishLaunchingWithOptions`, but no scene connects until the user opens the app. Code that assumes a window exists at launch breaks here."
+- id: q5
+  type: bug
+  prompt: "This scene delegate makes the feed hammer the server. Which line causes it?"
+  code: |
+    final class SceneDelegate: UIResponder, UIWindowSceneDelegate {
+        var window: UIWindow?
+        let feed = FeedController()
+
+        func sceneDidBecomeActive(_ scene: UIScene) {
+            feed.reloadFromServer()
+        }
+
+        func sceneDidEnterBackground(_ scene: UIScene) {
+            feed.saveScrollPosition()
+        }
+    }
+  answer: 6
+  explain: "`sceneDidBecomeActive(_:)` fires after every interruption: Notification Center, a permission alert, Face ID. Reloading unconditionally there means a request for each one. Reload only when the data is stale, or on `sceneWillEnterForeground(_:)`."
+```

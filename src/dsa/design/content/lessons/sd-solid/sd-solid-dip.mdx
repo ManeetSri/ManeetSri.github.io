@@ -1,0 +1,389 @@
+## Why it matters
+
+The rules that make your app valuable (when to ask for a review, how a basket is priced, when a draft syncs) are usually tangled up with the frameworks that carry them out: UserDefaults, URLSession, StoreKit, Core Data, an analytics SDK. Tangled like that, the rules can't be tested without a device, can't move into a package without dragging the SDKs along, and break whenever a vendor changes its API. Dependency inversion is the principle that untangles them, and it's the foundation under every layered architecture you'll meet later: clean, hexagonal, VIPER and TCA all build on it. Interviewers ask about it constantly, and often mean dependency *injection*; knowing the difference is a senior signal.
+
+## The principle in two parts
+
+Robert C. Martin's 1996 statement has two halves:
+
+1. **High-level modules shouldn't depend on low-level modules; both should depend on abstractions.**
+2. **Abstractions shouldn't depend on details; details should depend on abstractions.**
+
+"High-level" means **policy**: the decisions your product makes. "Low-level" means **mechanism**: how those decisions are carried out. In an iOS app:
+
+| Policy (high-level) | Detail (low-level) |
+| --- | --- |
+| Ask for a review after the third order, once per version | `UserDefaults`, StoreKit's `AppStore.requestReview(in:)` |
+| Retry a failed sync with backoff, at most five times | `URLSession`, `BGTaskScheduler`, the clock |
+| A basket's total includes delivery unless it's over £40 | Core Data, the pricing API's JSON |
+| Show the onboarding once per install | `UserDefaults`, the Keychain |
+
+The details are the parts most likely to change for reasons that have nothing to do with your product: a deprecated API, a new vendor, a storage migration. The principle keeps those changes from reaching the policy.
+
+## Before: the policy depends on the details
+
+Here's a review prompt written the direct way:
+
+```swift check ios title="ReviewPrompter.swift (before)"
+import StoreKit
+import UIKit
+
+@MainActor final class ReviewPrompter {
+    func orderCompleted(in scene: UIWindowScene) {
+        let defaults = UserDefaults.standard
+        let count = defaults.integer(forKey: "completedOrders") + 1
+        defaults.set(count, forKey: "completedOrders")
+        let version = Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String
+        guard count >= 3, defaults.string(forKey: "lastPromptVersion") != version else { return }
+        AppStore.requestReview(in: scene)
+        defaults.set(version, forKey: "lastPromptVersion")
+    }
+}
+```
+
+It's short and it works, but the rule ("third order, once per version") can't be run without StoreKit, a window scene, the real defaults database and the real bundle. A test would leave state behind in `UserDefaults.standard`, and nothing can check that the prompt *wasn't* shown. Moving the rule into a feature package means that package imports StoreKit and UIKit.
+
+## After: the policy owns the abstractions
+
+Invert it. The policy declares what it needs, **in its own words**, and the details conform:
+
+```swift check group=review-prompt title="ReviewPrompt package: the policy and the protocols it owns"
+import Foundation
+
+public struct ReviewHistory: Codable, Sendable {
+    public var completedOrders = 0
+    public var lastPromptVersion: String?
+    public init() {}
+}
+
+public protocol ReviewHistoryStore: Sendable {
+    func load() async -> ReviewHistory
+    func save(_ history: ReviewHistory) async
+}
+
+@MainActor public protocol ReviewRequesting {
+    func requestReview()
+}
+
+@MainActor public final class ReviewPromptPolicy {
+    private let store: any ReviewHistoryStore
+    private let requester: any ReviewRequesting
+    private let appVersion: String
+
+    public init(store: any ReviewHistoryStore, requester: any ReviewRequesting, appVersion: String) {
+        self.store = store
+        self.requester = requester
+        self.appVersion = appVersion
+    }
+
+    public func orderCompleted() async {
+        var history = await store.load()
+        history.completedOrders += 1
+        if history.completedOrders >= 3, history.lastPromptVersion != appVersion {
+            requester.requestReview()
+            history.lastPromptVersion = appVersion
+        }
+        await store.save(history)
+    }
+}
+```
+
+```swift check ios group=review-prompt title="App target: the details, and the one place that wires them"
+import StoreKit
+import UIKit
+
+struct UserDefaultsReviewHistory: ReviewHistoryStore {
+    let key = "reviewPrompt.history"
+
+    func load() async -> ReviewHistory {
+        guard let data = UserDefaults.standard.data(forKey: key),
+              let history = try? JSONDecoder().decode(ReviewHistory.self, from: data) else { return ReviewHistory() }
+        return history
+    }
+
+    func save(_ history: ReviewHistory) async {
+        UserDefaults.standard.set(try? JSONEncoder().encode(history), forKey: key)
+    }
+}
+
+struct StoreKitReviewRequester: ReviewRequesting {
+    let scene: () -> UIWindowScene?
+
+    func requestReview() {
+        guard let scene = scene() else { return }
+        AppStore.requestReview(in: scene)
+    }
+}
+
+// The composition root knows both sides; nothing else does
+@MainActor func makeReviewPolicy(scene: @escaping () -> UIWindowScene?) -> ReviewPromptPolicy {
+    let version = Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "0"
+    return ReviewPromptPolicy(store: UserDefaultsReviewHistory(), requester: StoreKitReviewRequester(scene: scene), appVersion: version)
+}
+```
+
+The package now imports only Foundation. Its tests run on a Mac in milliseconds with a fake store and a counting requester, and they can check every rule, including "didn't ask". Switching storage to a synced store, or StoreKit's API changing, touches one small adapter.
+
+## Control flow and source dependencies point opposite ways
+
+This is the "inversion". At runtime the policy still calls down into UserDefaults and StoreKit. But in the **source code**, the arrows point up: the adapters import the package and conform to its protocols, and the package never mentions them.
+
+```visual flow
+title: Calls go down; source dependencies point up
+groups:
+  - { id: package, label: ReviewPrompt package, nodes: [policy, history, requester] }
+  - { id: app, label: App target, nodes: [defaults, storekit, root] }
+nodes:
+  - { id: policy, label: ReviewPromptPolicy, at: [0, 1] }
+  - { id: history, label: ReviewHistoryStore, at: [2, 0] }
+  - { id: requester, label: ReviewRequesting, at: [2, 2] }
+  - { id: defaults, label: UserDefaultsHistory, kind: store, at: [4, 0] }
+  - { id: storekit, label: StoreKitRequester, kind: external, at: [4, 2] }
+  - { id: root, label: Composition root, kind: client, at: [4, 1] }
+edges:
+  - [policy, history, load/save]
+  - [policy, requester, ask]
+  - [defaults, history, conforms, { style: data }]
+  - [storekit, requester, conforms, { style: data }]
+  - [root, policy, injects, { style: async }]
+steps:
+  - say: "At runtime, control flows **down**: the policy loads its history and, when the rules allow, asks for a review. It only knows its own two protocols."
+    show: [package]
+    send: [policy->history, policy->requester]
+  - say: The calls arrive at the details, which read UserDefaults and call StoreKit.
+    show: [defaults, storekit]
+    send: [history->defaults, requester->storekit]
+  - say: "In the **source code** the arrows point the other way: each adapter imports the package and conforms. That reversal against the flow of control is the inversion."
+    active: [defaults->history, storekit->requester]
+    state: { defaults: active, storekit: active }
+  - say: The composition root, in the app target, builds the adapters and hands them to the policy. It's the only code that knows both sides.
+    show: [root]
+    send: root->policy
+    state: { defaults: null, storekit: null, root: active }
+  - say: In the package's tests, fakes stand where the app target is. The policy can't tell, and every rule is checked without a device.
+    state: { root: null, policy: ok, history: ok, requester: ok }
+```
+
+## Who owns the abstraction
+
+Part two of the principle is the one people skip. An abstraction **owned by the detail** doesn't invert anything, even if it's a protocol:
+
+```swift check title="An abstraction the detail owns, and one the policy owns"
+import Foundation
+
+// Mirrors URLSession: it changes when URLSession does, and leaks its types to every caller
+protocol URLSessionProtocol: Sendable {
+    func data(for request: URLRequest) async throws -> (Data, URLResponse)
+}
+
+// Says what checkout needs, in checkout's words; nothing about HTTP
+struct OrderDraft: Sendable {
+    let basketID: String
+    let deliverySlot: String
+}
+
+protocol OrderPlacing: Sendable {
+    func placeOrder(_ draft: OrderDraft) async throws -> String
+}
+```
+
+With `URLSessionProtocol`, the checkout code still builds `URLRequest`s, parses responses and knows the endpoint; you've made URLSession fakeable, which is useful, but the policy still depends on HTTP. With `OrderPlacing`, checkout depends on nothing but its own concepts; an adapter in the networking layer turns a draft into a request. The test of ownership:
+
+- **It's named for what the client needs** (`OrderPlacing`, `ReviewRequesting`), not for the technology (`NetworkService`, `StoreKitWrapper`).
+- **Its signatures use the client's types.** No `URLRequest`, `NSManagedObject` or vendor SDK types.
+- **It lives with the client**: in the feature's module, or in a small interface module when several features share it (`PaymentsInterface`, with the implementation in `PaymentsLive`). That split is common in large modular apps because features compile against the interface module alone.
+- **It changes when the policy's needs change**, not when the vendor ships a new version.
+
+## DIP, DI and IoC are three different things
+
+They're often blurred, and interviewers notice:
+
+| | What it's about | Example |
+| --- | --- | --- |
+| **Dependency inversion** (DIP) | Which way source dependencies point, and who owns the abstraction | The review package declares `ReviewRequesting`; the StoreKit adapter conforms to it |
+| **Dependency injection** (DI) | Handing an object its dependencies instead of letting it create them | `ReviewPromptPolicy(store:requester:appVersion:)` |
+| **Inversion of control** (IoC) | A framework calling your code, instead of your code calling it | UIKit calling `viewDidLoad()`; SwiftUI calling `body` |
+
+You can inject without inverting: `init(defaults: UserDefaults)` is injection, but the policy still depends on the detail. And you can invert without a DI framework: a hand-written composition root is enough. Injection is usually how inversion gets wired up, which is why the two travel together. You'll meet containers, scopes and the composition root properly in D21.
+
+## Shapes of abstraction in Swift
+
+Swift gives you four ways to express "the policy needs something that can do X":
+
+| Shape | Example | Strengths | Costs |
+| --- | --- | --- | --- |
+| Protocol, used as `any P` | `store: any ReviewHistoryStore` | Clear names; one value holds several methods | Dynamic dispatch and boxing (rarely matters in app code) |
+| Protocol, used generically | `init(store: some ReviewHistoryStore)` | Specialised, no boxing | The generic parameter can spread through types |
+| Closure | `requestReview: @MainActor () -> Void` | Zero ceremony for one operation | Unnamed; several closures get unwieldy |
+| Struct of closures | `ReviewDependencies(loadCount:saveCount:…)` | Easy fakes and previews; swap one operation at a time | No conformance checking; easy to wire a closure that does nothing |
+
+The struct-of-closures shape is popular in SwiftUI codebases (it's the style you'll meet as the environment style in D07). The same policy, with closures as its abstraction:
+
+```swift run title="Dependency inversion with a struct of closures"
+// The policy declares what it needs, here as a struct of closures
+struct ReviewDependencies {
+    var loadCount: () -> Int
+    var saveCount: (Int) -> Void
+    var appVersion: () -> String
+    var lastPromptedVersion: () -> String?
+    var recordPrompt: (String) -> Void
+    var requestReview: () -> Void
+}
+
+struct ReviewPolicy {
+    let dependencies: ReviewDependencies
+
+    func orderCompleted() {
+        let count = dependencies.loadCount() + 1
+        dependencies.saveCount(count)
+        let version = dependencies.appVersion()
+        guard count >= 3, dependencies.lastPromptedVersion() != version else { return }
+        dependencies.requestReview()
+        dependencies.recordPrompt(version)
+    }
+}
+
+// A test supplies the details as plain values: no UserDefaults, no StoreKit
+var count = 0
+var lastVersion: String?
+var prompts = 0
+let policy = ReviewPolicy(dependencies: ReviewDependencies(
+    loadCount: { count },
+    saveCount: { count = $0 },
+    appVersion: { "2.4" },
+    lastPromptedVersion: { lastVersion },
+    recordPrompt: { lastVersion = $0 },
+    requestReview: { prompts += 1 }
+))
+for order in 1...4 {
+    policy.orderCompleted()
+    print("order \(order): prompts so far \(prompts)")
+}
+```
+
+```output
+order 1: prompts so far 0
+order 2: prompts so far 0
+order 3: prompts so far 1
+order 4: prompts so far 1
+```
+
+### Isolation is part of the abstraction
+
+In Swift 6, an abstraction says **where** it runs and **whether it can cross actors**, and those choices bind every implementation:
+
+- `ReviewRequesting` is `@MainActor` because StoreKit's `requestReview(in:)` and window scenes live on the main actor. A background implementation can't conform by accident.
+- `ReviewHistoryStore` is `Sendable` with `async` methods, so the policy can hold it and call it from the main actor while an implementation does its disk work elsewhere.
+
+Leave `Sendable` off a protocol the policy shares across actors and the policy won't compile; mark a protocol `@MainActor` that a background sync engine needs, and you've forced a hop to the main thread on every call. Decide isolation when you design the protocol, not when the first conformer complains.
+
+## What not to invert
+
+Not every dependency deserves a protocol. Depending on things that are **stable**, **pure** and **fast** is fine (that's the stable dependencies idea from [Dependency direction and stable dependencies](/design/learn/sd-coupling-stable-dependencies)):
+
+- Foundation value types and algorithms: `Date` as a value, `URL`, `Decimal`, `JSONDecoder`, `Calendar` arithmetic;
+- your own domain types and pure helpers, like the receipt calculator;
+- formatting through `formatted()`, given an explicit locale.
+
+Invert the things that are **volatile, slow, side-effecting or non-deterministic**: the network, persistence, system prompts and permissions, notifications, analytics and payment SDKs, the current time, random numbers, UUIDs and device state. Those are exactly the things that make tests slow and flaky, and that change for reasons your product doesn't control.
+
+## Trade-offs
+
+| Approach | Testability | Reach of a vendor change | Indirection | Wins when |
+| --- | --- | --- | --- | --- |
+| Policy calls the framework directly | Needs a device and real state | The whole feature | None | Tiny apps, spikes, code with no rules |
+| Inject the concrete type (`init(defaults: UserDefaults)`) | Better: a separate suite of defaults | The whole feature | Low | A quick step towards testability |
+| Protocol owned by the detail (`URLSessionProtocol`) | Fakeable, but fakes emulate the framework | Every caller still sees its types | Medium | Wrapping a framework for one adapter's tests |
+| Protocol or closures owned by the policy | Fast, deterministic tests of every rule | One adapter | Medium | Rules worth protecting, volatile details |
+| Interface module plus implementation module | As above, and features build against interfaces only | One module | Highest | Large apps with many teams and long builds |
+
+<Callout kind="interview">
+
+**What to say:** "The policy declares what it needs as a protocol in its own module, in its own terms; the StoreKit and UserDefaults adapters live in the app target and conform; the composition root wires them." Draw the arrows: calls go down, imports point up. Separate it from injection in one sentence.
+
+**What to ask:** what changes most often underneath this feature (vendors, storage, APIs), what must be testable without a device, and whether the feature lives in its own module.
+
+**Red flags:** "dependency inversion means using a DI container"; a `protocol URLSessionProtocol` presented as the abstraction for a feature's business rules; protocols full of vendor types; and a protocol for every pure helper.
+
+</Callout>
+
+<Callout kind="gotcha" title="Swift gotcha: a default argument can undo the inversion">
+
+`init(store: any ReviewHistoryStore = UserDefaultsReviewHistory())` looks convenient, but to write that default the policy's module has to see `UserDefaultsReviewHistory`, so the dependency points from the policy to the detail again, and every test that forgets to pass a fake quietly uses the real defaults database. Keep defaults for the live wiring in the composition root, and make the policy's initialiser require its dependencies.
+
+</Callout>
+
+<Callout kind="gotcha" title="iOS gotcha: SwiftUI's requestReview is an environment value">
+
+In SwiftUI, StoreKit's review prompt comes from `@Environment(\.requestReview)`, a `RequestReviewAction` you call like a function. Only views can read the environment, so a policy object can't reach it directly. Have the view pass the action in as the requester (a closure or a small adapter), which is dependency inversion again: the policy stays ignorant of SwiftUI, and the view supplies the detail.
+
+</Callout>
+
+## Practice
+
+**A review prompt that owns its dependencies** is this lesson's example done properly: a policy with four rules, the two protocols it owns, and an adapter over a key–value store, tested with fakes and no StoreKit anywhere. The **upload service review** shows a service that reaches for `URLSession.shared`, `UserDefaults.standard` and `NotificationCenter.default` from inside its main method.
+
+```cards
+- id: dip-two-parts
+  front: "What are the two parts of the dependency inversion principle?"
+  back: "High-level policy and low-level detail should both depend on abstractions, not on each other; and abstractions shouldn't depend on details: the details depend on the abstractions."
+- id: dip-inversion
+  front: "What exactly is inverted in dependency inversion?"
+  back: "The direction of the source-code dependency relative to the flow of control: at runtime the policy calls the detail, but in the code the detail imports and conforms to an abstraction the policy owns."
+- id: dip-ownership
+  front: "How can you tell whether an abstraction is owned by the policy?"
+  back: "It's named for what the client needs, its signatures use only the client's types (no URLRequest or SDK types), it lives with the client or in an interface module, and it changes when the client's needs change."
+- id: dip-di-ioc
+  front: "How do dependency inversion, dependency injection and inversion of control differ?"
+  back: "DIP is about dependency direction and abstraction ownership; DI is handing an object its dependencies; IoC is a framework calling your code. You can inject a concrete type without inverting anything."
+```
+
+```quiz
+- id: q1
+  type: mcq
+  prompt: "Which protocol best inverts the dependency for a checkout feature that places orders over HTTP?"
+  options:
+    - "`protocol HTTPClient { func send(_ request: URLRequest) async throws -> (Data, HTTPURLResponse) }`"
+    - "`protocol OrderPlacing { func placeOrder(_ draft: OrderDraft) async throws -> OrderID }`, declared in the checkout module"
+    - "`protocol AlamofireSessionProtocol`, mirroring the Alamofire methods checkout uses"
+    - "`protocol NetworkManager` with a method per endpoint in the app, declared in the networking module"
+  answer: 1
+  explain: "`OrderPlacing` is named for checkout's need, uses checkout's types and lives with checkout. The others are owned by the detail: checkout would still build requests, or depend on every endpoint in the app."
+- id: q2
+  type: truefalse
+  prompt: "`init(defaults: UserDefaults)` is an example of dependency inversion."
+  answer: false
+  explain: "It's dependency injection: the dependency arrives from outside. But the type still depends directly on a low-level detail. Inversion would have it depend on an abstraction it owns, such as `ReviewHistoryStore`."
+- id: q3
+  type: order
+  prompt: "Put the steps of inverting a direct dependency on StoreKit in a sensible order."
+  lines:
+    - "Write down what the policy needs, in its own words (\"ask for a review\")"
+    - "Declare that protocol next to the policy, with the isolation it needs"
+    - "Change the policy to call the protocol instead of StoreKit"
+    - "Write the StoreKit adapter in the app target, conforming to the protocol"
+    - "Wire the adapter into the policy at the composition root"
+    - "Test the policy's rules with a fake requester"
+  explain: "Start from the policy's need, so the abstraction is shaped by its client rather than by StoreKit's API; only then write the detail that satisfies it."
+- id: q4
+  type: multi
+  prompt: "Which dependencies of a sync engine are worth putting behind abstractions it owns? Choose all that apply."
+  options:
+    - "The current time, used to decide when to retry"
+    - "`URLSession`, used to upload changes"
+    - "`JSONEncoder`, used to encode changes"
+    - "`BGTaskScheduler`, used to schedule the next sync"
+    - "Your own `Change` value type"
+  answer: [0, 1, 3]
+  explain: "Time, the network and the system scheduler are non-deterministic, slow or side-effecting, and they make tests flaky. `JSONEncoder` and your own value types are stable and pure: depending on them directly is fine."
+- id: q5
+  type: mcq
+  prompt: "A teammate writes `init(store: any ReviewHistoryStore = UserDefaultsReviewHistory())` in the review package. What's the problem?"
+  options:
+    - "Existentials can't have default values"
+    - "The package must now see the UserDefaults adapter, so it depends on the detail again, and tests that forget a fake hit real defaults"
+    - "Default arguments make initialisers slower"
+    - "Nothing: defaults are the recommended way to wire live dependencies"
+  answer: 1
+  explain: "The default value is a source dependency from the policy's module to the detail. Keep live wiring at the composition root and make the policy's dependencies required."
+```

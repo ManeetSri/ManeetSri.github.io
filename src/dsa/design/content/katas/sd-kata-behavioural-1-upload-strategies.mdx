@@ -1,0 +1,117 @@
+A photo-sharing app uploads full-size photos on Wi-Fi, smaller ones on cellular, and much smaller ones when the user has turned on Low Data Mode. The upload queue shouldn't contain any of those rules. Write each rule as a **strategy** behind one protocol, a strategy that chooses between others by network, and the queue that uses whichever strategy it's given.
+
+`UploadResizePolicy.Strategy.plan(for:on:) -> Plan`, for `Original`, `FitWithin`, `ByNetwork` and `Custom`, and `UploadResizePolicy.UploadQueue`'s `add(_:)` and `plans(on:)`
+
+- `Original` keeps the photo's width and height, at quality 1.
+- `FitWithin(maxSide:quality:)` scales the photo so its longer side is at most `maxSide`, keeping its shape. It never scales up. Each side is rounded to the nearest pixel, with halves rounding up, and is never less than 1.
+- `ByNetwork(unmetered:cellular:lowData:)` asks `lowData` when Low Data Mode is on (`isConstrained`), otherwise `cellular` when the network is expensive, otherwise `unmetered`.
+- `Custom` wraps a closure, so a one-off rule (or a test) doesn't need a new type.
+- `UploadQueue` keeps photos in the order they were added and plans each one with its current `strategy`. Changing `strategy` changes every plan from then on.
+
+## Examples
+
+| Strategy | Photo | Network | Plan |
+| --- | --- | --- | --- |
+| `Original()` | 4032 × 3024 | any | 4032 × 3024, quality 1 |
+| `FitWithin(maxSide: 2048, quality: 0.8)` | 4032 × 3024 | any | 2048 × 1536, 0.8 |
+| `FitWithin(maxSide: 2048, quality: 0.8)` | 3024 × 4032 | any | 1536 × 2048, 0.8 |
+| `FitWithin(maxSide: 2048, quality: 0.7)` | 800 × 600 | any | 800 × 600, 0.7 (no upscaling) |
+| `FitWithin(maxSide: 500, quality: 0.5)` | 1000 × 333 | any | 500 × 167, 0.5 (166.5 rounds up) |
+| `ByNetwork` with 2048 on cellular and 1024 on low data | 4032 × 3024 | cellular and Low Data Mode | 1024 × 768 |
+
+## Constraints
+
+- Widths and heights are whole numbers from 1 to 100,000.
+- The network flags mirror `NWPath.isExpensive` and `NWPath.isConstrained` from the Network framework; the tests set them directly.
+- Every type is `Sendable`, so an upload queue could be handed to a background task.
+
+<Hints>
+<Hint>
+The scale is `min(1, Double(maxSide) / Double(longerSide))`. Taking the minimum with 1 is what stops small photos growing.
+</Hint>
+<Hint>
+`(Double(side) * scale).rounded()` rounds halves away from zero, which for positive sizes means up. Wrap it in `max(1, Int(...))`.
+</Hint>
+<Hint>
+`ByNetwork` is a strategy that holds three strategies and forwards to one of them. The queue can't tell it apart from a simple one, which is the point.
+</Hint>
+</Hints>
+
+## Solutions
+
+<Approach title="One protocol, small structs, and a strategy that picks a strategy" time="O(n) to plan n photos" space="O(n)">
+
+```swift
+public struct FitWithin: Strategy {
+    public let maxSide: Int
+    public let quality: Double
+
+    public init(maxSide: Int, quality: Double) {
+        self.maxSide = maxSide
+        self.quality = quality
+    }
+
+    public func plan(for photo: Photo, on network: Network) -> Plan {
+        let longer = max(photo.width, photo.height)
+        let scale = min(1, Double(maxSide) / Double(longer))
+        func scaled(_ side: Int) -> Int {
+            max(1, Int((Double(side) * scale).rounded()))
+        }
+        return Plan(width: scaled(photo.width), height: scaled(photo.height), quality: quality)
+    }
+}
+
+public struct ByNetwork: Strategy {
+    private let unmetered: any Strategy
+    private let cellular: any Strategy
+    private let lowData: any Strategy
+
+    public init(unmetered: any Strategy, cellular: any Strategy, lowData: any Strategy) {
+        self.unmetered = unmetered
+        self.cellular = cellular
+        self.lowData = lowData
+    }
+
+    public func plan(for photo: Photo, on network: Network) -> Plan {
+        let chosen = network.isConstrained ? lowData : network.isExpensive ? cellular : unmetered
+        return chosen.plan(for: photo, on: network)
+    }
+}
+
+public struct Custom: Strategy {
+    private let makePlan: @Sendable (Photo, Network) -> Plan
+
+    public init(_ plan: @escaping @Sendable (Photo, Network) -> Plan) {
+        makePlan = plan
+    }
+
+    public func plan(for photo: Photo, on network: Network) -> Plan {
+        makePlan(photo, network)
+    }
+}
+
+public struct UploadQueue: Sendable {
+    public var strategy: any Strategy
+    public private(set) var photos: [Photo] = []
+
+    public init(strategy: any Strategy) {
+        self.strategy = strategy
+    }
+
+    public mutating func add(_ photo: Photo) {
+        photos.append(photo)
+    }
+
+    public func plans(on network: Network) -> [Plan] {
+        photos.map { strategy.plan(for: $0, on: network) }
+    }
+}
+```
+
+`Original` returns the photo's own size at quality 1.
+
+The queue stores `any Strategy` because the strategy changes at runtime: a settings switch, a remote flag, or `ByNetwork` reacting to `NWPathMonitor`. If it were fixed when the queue is built, a generic `UploadQueue<S: Strategy>` would avoid the existential and let the compiler specialise the call, at the price of a different queue type per strategy.
+
+Checking Low Data Mode before cellular matters: a user who turned it on wants less data used even on Wi-Fi, and a constrained cellular connection is the worst case of all.
+
+</Approach>

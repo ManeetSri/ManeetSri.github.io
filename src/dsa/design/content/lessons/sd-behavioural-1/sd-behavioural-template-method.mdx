@@ -1,0 +1,246 @@
+## Why it matters
+
+UIKit is a framework of template methods. It runs the algorithm (load the view, lay it out, show it) and calls your overrides at fixed points. Seeing `viewDidLoad` as a step in someone else's algorithm explains why you call `super`, why geometry isn't ready where you'd expect, and how view controllers grow huge. Template method is also inheritance's answer to the problem strategy solves with composition, and choosing between the two is a good interview conversation.
+
+## A fixed algorithm with steps to fill in
+
+A **template method** is a method on a base type that runs an algorithm as a fixed series of steps. Some steps are left for subtypes to supply; others are **hooks**: optional steps with a default (often doing nothing) that subtypes may override to join in at a known moment.
+
+The base type keeps control of the order. Subtypes can change what a step does, but not when it runs or whether it runs: "don't call us, we'll call you". That inversion of control is what makes frameworks frameworks: your code is called by theirs.
+
+## UIKit's lifecycle is a template method
+
+`UIViewController` runs its view's lifecycle and calls your overrides along the way:
+
+```visual sequence
+title: UIKit runs the algorithm; your controller fills in the steps
+participants:
+  - { id: uikit, label: UIKit }
+  - { id: vc, label: Your view controller }
+  - { id: vm, label: View model }
+messages:
+  - [uikit, vc, loadView]
+  - [uikit, vc, viewDidLoad]
+  - [vc, vm, "start()"]
+  - [uikit, vc, viewWillAppear]
+  - [uikit, vc, viewIsAppearing]
+  - [uikit, vc, viewDidAppear]
+  - { note: "UIKit decides when each runs; you only fill in steps.", over: [uikit, vc] }
+fragments:
+  - { kind: loop, label: each time it appears, from: 3, to: 5 }
+steps:
+  - { upTo: 0, say: "UIKit calls `loadView` the first time anything reads `view`. Override it only to supply your own root view, and then don't call `super`." }
+  - { upTo: 2, say: "`viewDidLoad` runs **once**. Keep the hook thin: build subviews, then hand the real work to a view model." }
+  - { upTo: 4, say: "Each time the screen appears, UIKit calls `viewWillAppear`, then `viewIsAppearing`, when the view is in the hierarchy with its size and traits up to date." }
+  - { upTo: 6, say: "Then `viewDidAppear`. You never call these methods yourself, and you can't reorder them." }
+```
+
+The same shape runs through Apple's frameworks:
+
+- **`UIView`:** `layoutSubviews()` is the hook in the layout pass, `draw(_:)` in drawing, `updateConstraints()` in constraint updates, and iOS 26's `updateProperties()` runs before layout. You request a pass with `setNeedsLayout()` and friends; UIKit decides when it happens.
+- **`UICollectionViewLayout`:** `prepare()`, then `layoutAttributesForElements(in:)` and `collectionViewContentSize` are the steps a custom layout fills in.
+- **`Operation`:** its `start()` manages the state (executing, finished, cancelled) and calls `main()`, the one step a simple subclass writes.
+
+```swift check ios title="Filling in UIKit's steps"
+import UIKit
+
+@MainActor
+final class OrdersViewModel {
+    func start() {}
+    func refreshIfStale() {}
+}
+
+final class OrdersViewController: UIViewController {
+    private let viewModel = OrdersViewModel()
+    private let tableView = UITableView()
+
+    override func viewDidLoad() {
+        super.viewDidLoad() // UIKit's own step first
+        view.addSubview(tableView)
+        viewModel.start()
+    }
+
+    override func viewIsAppearing(_ animated: Bool) {
+        super.viewIsAppearing(animated)
+        // The view is in the hierarchy, with its size and traits up to date: a good place for geometry
+        tableView.frame = view.bounds
+        viewModel.refreshIfStale()
+    }
+}
+
+/// An Operation subclass fills in main(); Operation's start() is the template around it
+final class ThumbnailOperation: Operation, @unchecked Sendable {
+    override func main() {
+        guard !isCancelled else { return }
+        // render the thumbnail
+    }
+}
+```
+
+Hooks come with rules the base type sets. UIKit's documentation says to call `super` in the appearance methods, at some point in your implementation, and not to call `super` in `loadView` when you create the view yourself. Swift can't enforce either; you have to know.
+
+`viewIsAppearing(_:)` arrived with the iOS 17 SDK and is back-deployed to iOS 13. It's the hook for work that needs the view's real size or trait collection, which `viewDidLoad` (too early) and `viewWillAppear` (not yet in the hierarchy) can't guarantee.
+
+## Template method with protocols
+
+Swift code more often writes the template in a **protocol extension**. The extension's method is the template; the protocol's requirements are the steps; a requirement with a default implementation in the extension is a hook:
+
+```swift run title="A template in a protocol extension, and the dispatch trap"
+protocol ReportExporter {
+    // Steps every exporter must provide
+    func header() -> String
+    func row(_ values: [String]) -> String
+    // A hook: declared here so conforming types can customise it, with a default below
+    func footer(rowCount: Int) -> String
+}
+
+extension ReportExporter {
+    /// The template method. It isn't a requirement, so no conforming type can replace it.
+    func export(_ rows: [[String]]) -> String {
+        ([header()] + rows.map(row) + [footer(rowCount: rows.count)])
+            .filter { !$0.isEmpty }
+            .joined(separator: "\n")
+    }
+
+    func footer(rowCount: Int) -> String { "" }
+
+    // Not a requirement: a conforming type's own version is NOT used through the protocol
+    func fileExtension() -> String { "txt" }
+}
+
+struct CSVExporter: ReportExporter {
+    func header() -> String { "date,amount" }
+    func row(_ values: [String]) -> String { values.joined(separator: ",") }
+    func fileExtension() -> String { "csv" } // looks like an override; isn't one
+}
+
+struct MarkdownExporter: ReportExporter {
+    func header() -> String { "| date | amount |\n| --- | --- |" }
+    func row(_ values: [String]) -> String { "| " + values.joined(separator: " | ") + " |" }
+    func footer(rowCount: Int) -> String { "Total: \(rowCount) rows" }
+}
+
+let rows = [["1 Nov", "12.50"], ["2 Nov", "8.00"]]
+let exporters: [any ReportExporter] = [CSVExporter(), MarkdownExporter()]
+for exporter in exporters {
+    print("--- file.\(exporter.fileExtension())")
+    print(exporter.export(rows))
+}
+print("--- but CSVExporter().fileExtension() is \(CSVExporter().fileExtension())")
+```
+
+```output
+--- file.txt
+date,amount
+1 Nov,12.50
+2 Nov,8.00
+--- file.txt
+| date | amount |
+| --- | --- |
+| 1 Nov | 12.50 |
+| 2 Nov | 8.00 |
+Total: 2 rows
+--- but CSVExporter().fileExtension() is csv
+```
+
+`export` isn't a requirement, so no conforming type can replace it: the template is fixed, which is what you want. `footer` *is* a requirement, so `MarkdownExporter`'s version is used even though the extension supplies a default.
+
+`fileExtension()` is the trap. It exists only in the extension, so calls through `any ReportExporter` are dispatched **statically** to the extension's version, and `CSVExporter`'s same-named method is ignored. Called on the concrete type, it isn't. The rule: anything a conforming type may customise must be declared in the protocol.
+
+## Template method or strategy
+
+Both let one part of an algorithm vary. They differ in how:
+
+- **Template method** varies a *step* by subtyping. The base owns the algorithm and the order; the choice is made when you pick the type.
+- **Strategy** varies a *decision* by handing in an object. The context owns the algorithm; the choice can change at runtime, and strategies can be combined and tested alone.
+
+The classic risk of the template is the **fragile base class**: subclasses depend on exactly when the base calls each hook, so changing the base's order or adding a step breaks them in ways the compiler can't see. UIKit has kept its order stable for over fifteen years; an app's `BaseViewController` with a dozen hooks usually hasn't. In Swift, mark template methods `final` in classes, and remember that across modules only `open` members can be overridden: access control decides which steps are hooks (D06).
+
+## Trade-offs
+
+| | Class inheritance (UIKit style) | Protocol extension template | Strategy |
+| --- | --- | --- | --- |
+| What varies | Steps, by overriding | Steps, by conforming | One decision, by passing an object |
+| Who controls the order | The base class | The extension | The context |
+| Change at runtime | No | No | Yes |
+| Shared state for steps | Inherited stored properties | None: requirements only | The strategy's own |
+| Main risk | Fragile base class; forgetting `super` | Extension-only methods dispatched statically | More types to name |
+| Wins when | A framework's lifecycle you plug into | Several types share an algorithm's shape | The behaviour is chosen by settings, flags or conditions |
+
+<Callout kind="interview">
+**Say:** "View controller lifecycle methods are hooks in UIKit's template method. I keep them thin and forward to a view model or child controllers, which is how I avoid a massive view controller."
+
+**Ask:** Will this behaviour change at runtime, or per type? Per type with a shared skeleton suits a template; anything chosen by configuration suits a strategy.
+
+**Red flags:** a deep tree of base view controllers; layout-dependent work in `viewDidLoad`; overrides that forget `super`; "customisation points" that exist only in a protocol extension.
+</Callout>
+
+<Callout kind="gotcha" title="iOS gotcha: once versus every time">
+`viewDidLoad` runs once per controller; `viewWillAppear`, `viewIsAppearing` and `viewDidAppear` run every time the screen comes back (after a pushed screen is popped, or a full-screen modal is dismissed). Starting a subscription or a timer in an appearance hook without stopping it in the matching disappearance hook starts another one on each visit.
+</Callout>
+
+```cards
+- id: template-definition
+  front: "What is a template method?"
+  back: "A method on a base type that runs an algorithm as fixed steps, some supplied by subtypes and some optional hooks. The base controls the order."
+- id: uikit-template
+  front: "Why must you call `super` in `viewWillAppear` but not in a `loadView` that builds its own view?"
+  back: "They're hooks in UIKit's algorithm with different rules: the appearance methods expect `super` to run; `super.loadView()` would build a default view you're replacing."
+- id: extension-dispatch
+  front: "A method exists only in a protocol extension, and a conforming type defines one with the same name. Which runs through `any Protocol`?"
+  back: "The extension's. Only protocol requirements are dynamically dispatched, so customisation points must be declared in the protocol."
+```
+
+```quiz
+- id: q1
+  type: output
+  prompt: "What does this print?"
+  code: |
+    protocol Greeter {
+        func name() -> String
+    }
+
+    extension Greeter {
+        func name() -> String { "friend" }
+        func greet() -> String { "Hello, \(name())" }
+        func sign() -> String { "from the base" }
+    }
+
+    struct Ada: Greeter {
+        func name() -> String { "Ada" }
+        func sign() -> String { "from Ada" }
+    }
+
+    let greeter: any Greeter = Ada()
+    print(greeter.greet())
+    print(greeter.sign())
+  answer: |
+    Hello, Ada
+    from the base
+  explain: "`name()` is a requirement, so the template `greet()` calls Ada's version. `sign()` exists only in the extension, so through `any Greeter` it's dispatched statically to the extension's version."
+- id: q2
+  type: order
+  prompt: "Put these UIViewController hooks in the order UIKit calls them the first time a screen is shown."
+  lines:
+    - "loadView()"
+    - "viewDidLoad()"
+    - "viewWillAppear(_:)"
+    - "viewIsAppearing(_:)"
+    - "viewDidAppear(_:)"
+  explain: "The view is created, then loaded once; each appearance runs will, is-appearing (in the hierarchy, with real geometry) and did."
+- id: q3
+  type: mcq
+  prompt: "Receipts must be formatted differently per country, and the country comes from the user's account at runtime. Which fits best?"
+  options:
+    - "A `ReceiptViewController` base class with a subclass per country overriding `formatTotal()`"
+    - "A `ReceiptFormatter` strategy chosen from the account and given to one receipt screen"
+    - "A protocol extension method `formatTotal()` that each country type redefines"
+    - "A NotificationCenter message per country"
+  answer: 1
+  explain: "The variation is chosen at runtime from data, which is strategy's job. A subclass per country fixes the choice at the type and multiplies screens; an extension-only method wouldn't even be dispatched to the country types."
+- id: q4
+  type: truefalse
+  prompt: "When you override `viewWillAppear(_:)`, you should call `super.viewWillAppear(animated)`."
+  answer: true
+  explain: "UIKit's documentation says to call `super` at some point in your implementation of the appearance methods. Skipping it can break behaviour UIKit (or a superclass of yours) implements there."
+```

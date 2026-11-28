@@ -1,2 +1,47 @@
 // Katas for D06 · Swift as a design language
-export default [];
+export default [
+    {
+        id: 'sd-kata-swift-design-generic-repository',
+        kind: 'problem',
+        title: 'A generic repository',
+        difficulty: 'medium',
+        patterns: ['swift', 'persistence'],
+        lessons: ['sd-swift-design-generics', 'sd-swift-design-protocols'],
+        swiftTest: 'GenericRepositoryKitTests',
+        lists: [],
+        minutes: 35,
+    },
+    {
+        id: 'sd-kata-swift-design-erased-filters',
+        kind: 'problem',
+        title: 'Erased search filters',
+        difficulty: 'medium',
+        patterns: ['swift'],
+        lessons: ['sd-swift-design-some-any'],
+        swiftTest: 'SearchFilterErasureTests',
+        lists: [],
+        minutes: 30,
+    },
+    {
+        id: 'sd-kata-swift-design-request-dsl',
+        kind: 'problem',
+        title: 'A request DSL',
+        difficulty: 'medium',
+        patterns: ['swift', 'networking'],
+        lessons: ['sd-swift-design-result-builders'],
+        swiftTest: 'DeclarativeRequestTests',
+        lists: [],
+        minutes: 30,
+    },
+    {
+        id: 'sd-kata-swift-design-seat-hold',
+        kind: 'problem',
+        title: 'A seat hold you can only settle once',
+        difficulty: 'hard',
+        patterns: ['swift', 'concurrency'],
+        lessons: ['sd-swift-design-noncopyable', 'sd-swift-design-errors', 'sd-swift-design-sendable'],
+        swiftTest: 'ConsumableSeatHoldTests',
+        lists: [],
+        minutes: 40,
+    },
+];

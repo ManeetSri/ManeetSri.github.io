@@ -1,0 +1,139 @@
+<Brief>
+
+This is the profile feature of a banking app: a shared account store, a view model, a view controller and a coordinator. QA reports that after opening and closing the profile screen a few times, the app makes several identical account requests every 30 seconds, memory climbs through the session, and one tester saw a crash right after closing the screen during a slow refresh. Review it as you would a pull request: find every reason a closed profile screen stays alive, what each one costs, and how you'd fix the design.
+
+```swift check ios title="Profile.swift"
+import UIKit
+
+struct Account: Sendable { var name: String }
+protocol AccountAPI: Sendable { func fetchAccount() async throws -> Account }
+
+@MainActor
+final class AccountStore {
+    static let shared = AccountStore()
+    private var listeners: [(Account) -> Void] = []
+
+    func addListener(_ listener: @escaping (Account) -> Void) {
+        listeners.append(listener)
+    }
+}
+
+@MainActor
+final class ProfileViewModel {
+    var onUpdate: (() -> Void)?
+    private(set) var title = ""
+    private let api: any AccountAPI
+    private var refreshTimer: Timer?
+    private var pushTask: Task<Void, Never>?
+
+    init(store: AccountStore, api: any AccountAPI, pushes: AsyncStream<String>) {
+        self.api = api
+        store.addListener { account in
+            self.title = account.name
+            self.onUpdate?()
+        }
+        refreshTimer = Timer.scheduledTimer(withTimeInterval: 30, repeats: true) { _ in
+            MainActor.assumeIsolated { self.refresh() }
+        }
+        pushTask = Task { for await _ in pushes { self.refresh() } }
+    }
+
+    deinit { pushTask?.cancel() }
+
+    func refresh() {
+        Task { [unowned self] in
+            guard let account = try? await api.fetchAccount() else { return }
+            title = account.name
+            onUpdate?()
+        }
+    }
+}
+
+final class ProfileViewController: UIViewController {
+    var coordinator: ProfileCoordinator?
+    private let viewModel: ProfileViewModel
+
+    init(viewModel: ProfileViewModel) {
+        self.viewModel = viewModel
+        super.init(nibName: nil, bundle: nil)
+        viewModel.onUpdate = { self.title = viewModel.title }
+    }
+    required init?(coder: NSCoder) { nil }
+}
+
+@MainActor
+final class ProfileCoordinator {
+    let navigation = UINavigationController()
+    private var profile: ProfileViewController?
+
+    func start(viewModel: ProfileViewModel) {
+        let controller = ProfileViewController(viewModel: viewModel)
+        controller.coordinator = self
+        profile = controller
+        navigation.pushViewController(controller, animated: true)
+    }
+}
+```
+
+</Brief>
+
+```workspace
+template: critique
+minutes: 30
+```
+
+```findings
+- id: store-holds-screens
+  title: The session-long store holds every profile view model it has ever seen
+  severity: high
+  lines: 26-29
+  detail: "`AccountStore.shared` lives for the whole session and keeps each listener closure, and each closure captures the view model strongly. Every profile screen ever opened stays alive and reacts to every account update. The Memory Graph debugger won't flag it, because the store is reachable: only counting `ProfileViewModel` instances shows it."
+- id: timer-cycle
+  title: A repeating timer keeps the view model alive and refreshing forever
+  severity: high
+  lines: 30-32
+  detail: "The run loop retains the timer, the timer retains its closure, and the closure captures `self` strongly. Nothing ever invalidates it, so each leaked view model calls the API every 30 seconds for the rest of the session: the duplicate requests QA saw, plus battery and data."
+- id: closure-cycle
+  title: The update closure captures the controller and the view model strongly
+  severity: high
+  lines: 54
+  detail: "The controller owns the view model, the view model stores `onUpdate`, and the closure captures `self` (the controller) strongly: a cycle. It also captures `viewModel`, so the view model holds itself through its own closure. `{ [weak self] in self?.title = self?.viewModel.title }`, or passing the title as the closure's parameter, removes both."
+- id: no-unsubscribe
+  title: Listeners can be added but never removed
+  severity: medium
+  lines: 9-13
+  detail: "Even with `[weak self]`, the store's array grows by one closure per screen opened and runs them all on every update. The API needs a lifetime: return a cancellable token, hold observers weakly, or expose an `AsyncStream` (or an `@Observable` property) that the screen consumes for as long as it's visible."
+- id: coordinator-cycle
+  title: The controller and its coordinator own each other
+  severity: medium
+  lines: 48, 62
+  detail: "The controller holds its coordinator strongly, and the coordinator keeps `profile` strongly. Popping the screen releases neither, and the coordinator's parent can't free it either. A coordinator is the owner, so the controller's reference back must be `weak`, and the coordinator shouldn't keep a screen the navigation controller already owns."
+- id: endless-task
+  title: The push task holds the view model, so the cancel in deinit never runs
+  severity: medium
+  lines: 33, 36
+  detail: "The task loops over an endless stream and captures `self` strongly, so it keeps the view model alive, and `deinit` (where it's cancelled) can't run until the task ends, which it never does. Capture `[weak self]` and rebind inside the loop, or start and cancel the task with the screen's appearance."
+- id: unowned-async
+  title: unowned self across an await will crash once the leaks are fixed
+  severity: medium
+  lines: 39-43
+  detail: "The task awaits the network, so it can finish after the screen is gone. Today the leaks keep `self` alive, which hides the bug; fix them and closing the screen during a slow refresh traps on `title = …`, the crash the tester saw once. Use `[weak self]` for work that can outlive its owner."
+```
+
+<ReferenceReview>
+
+**Most important first.** Nothing in this feature is ever freed. Three strong paths each keep a closed profile alive on their own: the shared store's listener array (lines 26–29), the repeating timer (30–32), and the controller's `onUpdate` closure (54). The visible symptoms (duplicate requests every 30 seconds, climbing memory) are leaked view models doing work for screens nobody can see. The worst of the three is the store, because the cycle tools won't show it: a session-long object holding short-lived ones looks like legitimate ownership.
+
+**The design problem underneath** is that no object has a stated lifetime. The store doesn't know its observers come and go, the view model starts a timer and a task with no moment to stop them, and teardown is left to `deinit`, which can't run while anything holds the object. Fix the ownership rules, and most of the individual leaks disappear.
+
+**How I'd fix it, in small steps:**
+
+1. Write the failing test first: build the real profile stack (store, view model, controller, coordinator) with a stub API, open and close it three times, and expect zero live `ProfileViewModel` and `ProfileViewController` instances, using weak references (the kata's tracker).
+2. Give the store a lifetime-aware API: `func accountUpdates() -> AsyncStream<Account>` (or an `@Observable` property). The stream's continuation is removed when the consumer's task is cancelled, so subscriptions can't outlive their screens.
+3. Give the view model `start()` and `stop()`, called from `viewWillAppear(_:)` and `viewDidDisappear(_:)`. `start()` begins one task that consumes the account stream and the push stream and refreshes on a timer through an injected clock; `stop()` cancels it. Every capture inside is `[weak self]`, rebound per iteration.
+4. Replace `[unowned self]` with `[weak self]` in `refresh()`, and make the controller's closure capture weakly (or pass the title as a parameter).
+5. Make `coordinator` weak in the controller, and drop the coordinator's `profile` property: the navigation controller owns the screen.
+
+**Tests to add:** the leak test from step 1, kept in the suite; a test that the store has no live subscribers after the screen closes; and a view-model test that advances a `TestClock` by 30 seconds after `stop()` and expects no further API calls.
+
+</ReferenceReview>

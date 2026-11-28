@@ -1,0 +1,111 @@
+Lifecycle code goes wrong in the same few ways in every app: a refresh on every return from a phone call, a save that's cut off because nobody asked for background time, a background task that's never ended, work that assumes a screen exists when iOS launched the app in the background. Pull those decisions out of the delegates into a pure state machine you can test: lifecycle events in, the work to do out.
+
+`AppRuntimeLifecycle.Machine.handle(_:at:) -> [Effect]`
+
+The machine starts in `.notRunning`. Each event moves it to a new phase and returns the effects, in order:
+
+| In phase | Event | Moves to | Effects |
+| --- | --- | --- | --- |
+| `.notRunning` | `.launch` | `.inactive` | `configureServices` |
+| `.notRunning` | `.launchInBackground` | `.background` | `configureServices` |
+| `.inactive` | `.didBecomeActive` | `.active` | `startLiveUpdates`, then `refreshContent` if the content is stale |
+| `.active` | `.willResignActive` | `.inactive` | `stopLiveUpdates` |
+| `.inactive` | `.didEnterBackground` | `.background` | `beginBackgroundTask` (unless one is already open), `saveState`, `releaseCaches` |
+| `.background` or `.suspended` | `.willEnterForeground` | `.inactive` | none |
+| any, with a background task open | `.saveFinished` or `.backgroundTimeExpired` | unchanged | `endBackgroundTask` |
+| `.background`, with no background task open | `.suspend` | `.suspended` | none |
+| anything but `.notRunning` | `.terminate` | `.notRunning` | none |
+
+- **Stale** means the content has never been refreshed by this process, or was last refreshed at least `refreshInterval` before `time`. Refreshing records `time`.
+- **Any other event is ignored:** no effects, and the phase doesn't change. That includes going from `.active` straight to the background, which iOS never does.
+- **Termination forgets everything** the process knew: an open background task, and when it last refreshed. Nothing runs, so it returns no effects.
+- `time` is when the event happened, measured from any fixed point. The tests use whole seconds.
+
+## Examples
+
+| Events (time in seconds) | Effects of the last event |
+| --- | --- |
+| `launch` 0, `didBecomeActive` 1 | `[startLiveUpdates, refreshContent]` |
+| … then `willResignActive` 60, `didBecomeActive` 180 (a short phone call) | `[startLiveUpdates]`: 3 minutes is fresher than the 15-minute default |
+| … then `willResignActive` 200, `didEnterBackground` 200 | `[beginBackgroundTask, saveState, releaseCaches]` |
+| … then `backgroundTimeExpired` 230, `saveFinished` 231 | `[]`: the task already ended when time ran out |
+| `launchInBackground` 0, `didBecomeActive` 1 | `[]`: there's no scene to activate yet |
+| `launch` 0, `didBecomeActive` 0, `terminate` 5, `launch` 60, `didBecomeActive` 61 | `[startLiveUpdates, refreshContent]`: the old refresh died with the process |
+
+## Constraints
+
+- `Machine` is a value type with no dependencies: no clocks, no `UIApplication`, no timers. Everything it needs arrives with the event.
+- At most one background task is open at a time, and each one ends exactly once.
+- `.saveFinished` means the app has nothing left to save. It may arrive in any phase, including after the user has come back.
+
+<Hints>
+<Hint>
+Beyond `phase`, the machine needs to remember two things the process knows: whether a background task is open, and when it last refreshed (an optional `Duration`).
+</Hint>
+<Hint>
+Switch over the pair `(phase, event)`. Each row of the table becomes one `case`, guards like "with a background task open" become `where` clauses, and `default` returns `[]`.
+</Hint>
+<Hint>
+For termination, replace the whole machine with a fresh one: `self = Machine(refreshInterval: refreshInterval)`. That forgets the task and the refresh time in one line.
+</Hint>
+</Hints>
+
+## Solutions
+
+<Approach title="One switch over phase and event" time="O(1) per event" space="O(1)">
+
+```swift
+public mutating func handle(_ event: Event, at time: Duration) -> [Effect] {
+    switch (phase, event) {
+    case (.notRunning, .launch):
+        phase = .inactive
+        return [.configureServices]
+    case (.notRunning, .launchInBackground):
+        phase = .background
+        return [.configureServices]
+    case (.inactive, .didBecomeActive):
+        phase = .active
+        var effects: [Effect] = [.startLiveUpdates]
+        if isStale(at: time) {
+            lastRefresh = time
+            effects.append(.refreshContent)
+        }
+        return effects
+    case (.active, .willResignActive):
+        phase = .inactive
+        return [.stopLiveUpdates]
+    case (.inactive, .didEnterBackground):
+        phase = .background
+        var effects: [Effect] = []
+        if !backgroundTaskOpen {
+            backgroundTaskOpen = true
+            effects.append(.beginBackgroundTask)
+        }
+        return effects + [.saveState, .releaseCaches]
+    case (.background, .willEnterForeground), (.suspended, .willEnterForeground):
+        phase = .inactive
+        return []
+    case (_, .saveFinished) where backgroundTaskOpen,
+         (_, .backgroundTimeExpired) where backgroundTaskOpen:
+        backgroundTaskOpen = false
+        return [.endBackgroundTask]
+    case (.background, .suspend) where !backgroundTaskOpen:
+        phase = .suspended
+        return []
+    case (let current, .terminate) where current != .notRunning:
+        self = Machine(refreshInterval: refreshInterval)
+        return []
+    default:
+        return []
+    }
+}
+
+private func isStale(at time: Duration) -> Bool {
+    guard let lastRefresh else { return true }
+    return time - lastRefresh >= refreshInterval
+}
+```
+
+The switch makes the rules readable as a table, and anything not listed is ignored by construction, so a stray `sceneDidBecomeActive` during a background launch can't start timers for a screen that doesn't exist. Because the machine is pure, the delegates shrink to one line each: send the event, then perform the effects. In the app, a thin `@MainActor` adapter maps `sceneWillResignActive(_:)` or a `scenePhase` change to an event and each effect to a real call such as `UIApplication.shared.beginBackgroundTask(withName:expirationHandler:)`. Only that adapter needs testing on a device.
+
+</Approach>

@@ -1,0 +1,281 @@
+## Why it matters
+
+A closure is the lightest callback there is: a completion handler, an `onBuy` property on a cell, a rule passed into a function. Swift code is full of them, they're the easiest callbacks to leak with, and `async`/`await` has taken over the job they used to do most. With delegates, target–action and observers behind you, this lesson adds the last style and then the decision you'll make every week: which one fits. Interviewers care about the reasoning, not a favourite.
+
+## Three jobs a closure does
+
+1. **Report one result.** A completion handler: `func loadOrders(completion: @escaping (Result<[Order], Error>) -> Void)`.
+2. **Handle an event.** A property such as `var onBuy: ((Product) -> Void)?` on a cell. For one event, it's lighter than a one-method delegate protocol.
+3. **Supply behaviour.** A parameter such as `isValid: (String) -> Bool`. That's a strategy in closure form, which you'll meet properly later in this module.
+
+The keyword that matters is **`@escaping`**. A closure that's stored, or called after the function returns, escapes; one that's only called during the call (like `map`'s) doesn't. A non-escaping closure can't outlive the call, so it can't create a retain cycle and never needs a capture list.
+
+## The contract a completion handler must keep
+
+A completion handler makes two promises, and code review should check both:
+
+- **Exactly once, on every path.** Including errors, early returns and cancellation. Miss a path and a spinner spins forever; call it twice and the screen updates twice, or a continuation crashes.
+- **On a documented thread.** "Called on the main queue" or "called on an arbitrary queue" must be written down, because the caller can't tell.
+
+`async` functions make the first promise structural: a function returns or throws exactly once, and the compiler checks every path. The second becomes isolation: an `async` function on the main actor resumes there. So for one-shot work, new code should be `async`, and old callback APIs can be wrapped once:
+
+```swift run title="Wrapping a callback API in an async function"
+enum LookupError: Error {
+    case notFound
+}
+
+/// A callback API, as many older SDKs offer
+func lookUpPrice(for sku: String, completion: @escaping @Sendable (Result<Int, LookupError>) -> Void) {
+    let prices = ["mug": 12, "beans": 9]
+    if let price = prices[sku] {
+        completion(.success(price))
+    } else {
+        completion(.failure(.notFound))
+    }
+}
+
+/// The same lookup as an async function: it returns or throws exactly once
+func price(for sku: String) async throws -> Int {
+    try await withCheckedThrowingContinuation { continuation in
+        lookUpPrice(for: sku) { result in
+            continuation.resume(with: result)
+        }
+    }
+}
+
+for sku in ["mug", "kettle"] {
+    do {
+        let pounds = try await price(for: sku)
+        print("\(sku): £\(pounds)")
+    } catch {
+        print("\(sku): \(error)")
+    }
+}
+```
+
+```output
+mug: £12
+kettle: notFound
+```
+
+A *checked* continuation enforces the contract at runtime: resuming it twice crashes, and dropping it without resuming logs a leak warning. D22 covers continuations and their pitfalls in depth.
+
+## Capturing self
+
+An escaping closure keeps alive everything it captures. When an object stores a closure that captures that same object, neither can be freed. Step through the most common version:
+
+```visual flow
+title: A closure that keeps its screen alive
+nodes:
+  - { id: nav, label: Navigation stack, kind: view, at: [0, 0] }
+  - { id: screen, label: Profile screen, kind: view, at: [2, 0] }
+  - { id: vm, label: View model, kind: service, at: [4, 0] }
+  - { id: closure, label: onChange closure, kind: service, at: [3, 2] }
+edges:
+  - [nav, screen, owns]
+  - [screen, vm, owns]
+  - [vm, closure, stores]
+  - [closure, screen, captures self]
+steps:
+  - say: "The navigation stack owns the profile screen, and the screen owns its view model."
+    show: [nav, screen, vm, nav->screen]
+  - say: "In `viewDidLoad` the screen hands the view model a closure to call whenever the profile changes. The view model stores it."
+    show: [closure]
+    active: [vm->closure]
+  - say: "The closure uses `self` to update the labels, so it holds the screen strongly. Follow the arrows: screen → view model → closure → screen."
+    send: closure->screen
+    active: [screen->vm, vm->closure, closure->screen]
+  - say: "The user goes back. The stack lets go of the screen, but the cycle keeps all three alive: a leak, and a view model still working for a screen nobody can see."
+    hide: [nav->screen]
+    state: { screen: error, vm: error, closure: error }
+    label: { screen: leaked }
+  - say: "Start again, this time with `[weak self]` in the closure. Its reference no longer keeps the screen alive."
+    reset: true
+    show: [nav, screen, vm, closure, nav->screen]
+    label: { closure->screen: weak self }
+  - say: "Now going back frees the screen, which frees the view model, which frees the closure. Nothing is left behind."
+    hide: [nav->screen]
+    state: { screen: ok, vm: ok, closure: ok }
+    label: { screen: freed, vm: freed, closure: freed }
+```
+
+You have three ways to break the cycle:
+
+- **`[weak self]`** makes the capture optional. Unwrap once at the top: `guard let self else { return }` (Swift 5.8 onwards), then write the body as usual.
+- **`[unowned self]`** doesn't keep `self` alive and isn't optional, but if `self` has gone by the time the closure runs, the app crashes. Use it only when the closure provably can't outlive `self`; `weak` costs almost nothing and is the safe default.
+- **Capture what you need instead of `self`.** `[basket]` or `[label]` captures that one object. Often the clearest fix, as in the cell below.
+
+```swift check ios title="A cell with a closure callback"
+import UIKit
+
+struct Product: Hashable, Sendable {
+    let id: Int
+    let name: String
+}
+
+final class ProductCell: UICollectionViewCell {
+    private(set) var onBuy: ((Product) -> Void)?
+    private var product: Product?
+    private let buyButton = UIButton(configuration: .filled())
+
+    override init(frame: CGRect) {
+        super.init(frame: frame)
+        buyButton.addAction(UIAction(title: "Buy") { [weak self] _ in
+            guard let self, let product else { return }
+            onBuy?(product)
+        }, for: .primaryActionTriggered)
+        contentView.addSubview(buyButton)
+    }
+
+    required init?(coder: NSCoder) { nil }
+
+    func configure(with product: Product, onBuy: @escaping (Product) -> Void) {
+        self.product = product
+        self.onBuy = onBuy
+    }
+
+    override func prepareForReuse() {
+        super.prepareForReuse()
+        onBuy = nil // a reused cell must never call the previous row's handler
+    }
+}
+
+@MainActor
+final class Basket {
+    private(set) var items: [Product] = []
+
+    func add(_ product: Product) {
+        items.append(product)
+    }
+}
+
+final class ShopViewController: UIViewController {
+    private let basket = Basket()
+
+    func configure(_ cell: ProductCell, with product: Product) {
+        // Capture what the closure needs, not self
+        cell.configure(with: product) { [basket] product in
+            basket.add(product)
+        }
+    }
+}
+```
+
+Not every closure that mentions `self` is a cycle. `DispatchQueue.main.async { self.reload() }` or `UIView.animate(withDuration: 0.3) { self.view.alpha = 0 }` keep `self` alive only until they run, and nothing of `self`'s owns them. The question is always "does something `self` owns hold this closure?"
+
+<Callout kind="gotcha" title="Swift gotcha: a Task is a closure too">
+`Task { for await value in stream { self.apply(value) } }` captures `self` for as long as the loop runs, and a loop over an endless stream runs forever. The view model is never freed, even with no cycle in sight. Store the task and cancel it when its owner goes away (SwiftUI's `.task` modifier does this for you), or capture `[weak self]` and unwrap inside the loop.
+</Callout>
+
+## Choosing a callback style
+
+You now have seven ways for one piece of code to call another. Ask these questions in order, and stop at the first yes:
+
+1. **Is it the single result of one piece of work?** Use an `async` function. (A completion handler only where you must support callers that can't use `async`.)
+2. **Is it a stream of values over time, consumed in a task?** An `AsyncSequence`, such as an `AsyncStream`.
+3. **Is it state that views display?** An `@Observable` model, or Combine when you need operators over time.
+4. **Does a component report several related events, or ask its owner questions?** A delegate.
+5. **One or two events from a small component?** A closure property, or a `UIAction` for a control.
+6. **A UIKit control event that several controls share, or an action that should travel up the responder chain?** Target–action.
+7. **Many listeners the sender shouldn't know, or a system event?** NotificationCenter.
+
+The answers differ for the same feature. A photo upload might expose `func upload(_:) async throws -> Photo` for the result, an `AsyncStream<Double>` for progress, and post nothing at all.
+
+## Trade-offs
+
+| Style | Listeners | Events | Answers back | Lifetime | Typical use |
+| --- | --- | --- | --- | --- | --- |
+| `async` function | The caller | Exactly one result | Return value | Structured: ends with the call | Fetch, save, any one-shot work |
+| Completion handler | One | Exactly one (by contract) | No | Capture lists | Older APIs and SDKs |
+| `AsyncSequence` | One consumer (for an `AsyncStream`) | Many, over time | No | The consuming task | Progress, live updates, events |
+| Observation / Combine | Many | Values over time | No | Tracking scope / `AnyCancellable` | State that views show |
+| Delegate | One | Many, related | Yes | `weak` property | Tables, forms, sessions |
+| Closure property | One | One or two | Yes, if it returns a value | Capture lists | Cells, small views |
+| Target–action | Several per control | Control events | No | Target not retained | UIKit controls, menus |
+| NotificationCenter | Many, unknown | Broadcasts | No | Tokens | System and app-wide events |
+
+<Callout kind="interview">
+**Say:** name the shape before the tool. "It's one result, so `async`; progress is a stream, so an `AsyncStream`; the list's state is observed, so `@Observable`." Then mention threading and lifetime for each.
+
+**Ask:** How many listeners? How often does it fire? Does the caller need an answer back? Which thread or actor is the caller on?
+
+**Red flags:** completion handlers not called on every path; nested callbacks four deep (you'll meet that smell in D15); `[unowned self]` used everywhere as a habit; a one-method delegate protocol where a closure would do.
+</Callout>
+
+<Callout kind="gotcha" title="iOS gotcha: reused cells keep old closures">
+Cells are reused. If `configure` sets a closure only sometimes, or a cell is reused for a row that doesn't need one, the previous row's handler fires: tapping "Buy" on one product buys another. Reset closures in `prepareForReuse()`, and always set them in `configure`.
+</Callout>
+
+## Practice
+
+The review **The episode player that never goes away** has a scrub closure that keeps its screen alive. Spot why, then decide between `[weak self]` and capturing only what the closure uses.
+
+```cards
+- id: escaping-matters
+  front: "Why can't a non-escaping closure cause a retain cycle?"
+  back: "It can't outlive the call it was passed to, so nothing can store it. Only escaping closures need capture lists."
+- id: completion-contract
+  front: "What two promises must a completion handler keep?"
+  back: "It's called exactly once on every path, including errors, and on a documented thread. An async function makes both structural."
+- id: weak-unowned
+  front: "When is `[unowned self]` safe?"
+  back: "Only when the closure can't possibly run after `self` is freed; otherwise it crashes. `[weak self]` with `guard let self` is the safe default."
+- id: style-order
+  front: "What's the first question when choosing a callback style?"
+  back: "Is it a single result of one piece of work? Then it's an `async` function. Streams, observed state, delegates and closures come after."
+```
+
+```quiz
+- id: q1
+  type: bug
+  prompt: "Sometimes the avatar spinner never stops. Which line is the bug?"
+  code: |
+    func loadAvatar(for user: User, completion: @escaping (UIImage?) -> Void) {
+        guard let url = user.avatarURL else { return }
+        URLSession.shared.dataTask(with: url) { data, _, _ in
+            completion(data.flatMap(UIImage.init(data:)))
+        }.resume()
+    }
+  answer: 2
+  explain: "A user without an avatar URL returns without calling `completion`, so the caller waits forever. Every path must call it: `else { completion(nil); return }`. An `async` version couldn't compile with this mistake."
+- id: q2
+  type: sort
+  prompt: "Which callback style fits each?"
+  buckets: [async function, AsyncSequence, Delegate, Closure property, NotificationCenter]
+  items:
+    - [Fetch one user's profile, 0]
+    - [An upload's progress as it goes, 1]
+    - [A calendar component with a dozen events and questions, 2]
+    - [A cell's single Follow button, 3]
+    - [The system's low-power-mode change, 4]
+  explain: "One result is `async`; values over time are a sequence; many related events and questions suit a protocol; one small event suits a closure; a system broadcast is a notification."
+- id: q3
+  type: output
+  prompt: "What does this print?"
+  code: |
+    var count = 1
+    let captured = { [count] in print("captured", count) }
+    let live = { print("live", count) }
+    count = 2
+    captured()
+    live()
+  answer: |
+    captured 1
+    live 2
+  explain: "A capture list copies the value when the closure is created. Without one, the closure captures the variable itself and sees later changes."
+- id: q4
+  type: mcq
+  prompt: "A screen starts a request whose completion updates its labels. The user may close the screen before the response arrives. Which capture is right?"
+  options:
+    - "`[unowned self]`, because the screen owns the request"
+    - "`[weak self]`, and do nothing if the screen has gone"
+    - "No capture list: completion handlers never cause problems"
+    - "`[self]`, to make sure the labels are updated"
+  answer: 1
+  explain: "The completion can run after the screen is freed, so `unowned` would crash. `weak` lets the screen go; capturing it strongly keeps a closed screen alive until the request ends, which is wasteful rather than fatal, but still wrong."
+- id: q5
+  type: truefalse
+  prompt: "`UIView.animate(withDuration: 0.3) { self.view.alpha = 0 }` creates a retain cycle."
+  answer: false
+  explain: "UIKit runs the animations closure straight away and doesn't keep it, and nothing `self` owns stores it. At most it keeps `self` alive briefly, which is fine. A cycle needs `self` to own, directly or indirectly, the closure that captures it."
+```

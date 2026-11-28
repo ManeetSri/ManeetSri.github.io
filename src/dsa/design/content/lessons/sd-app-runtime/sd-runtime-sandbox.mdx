@@ -1,0 +1,232 @@
+## Why it matters
+
+Every iOS app runs alone in a locked room: its own process, its own folders, and only the doors its entitlements open. Where you put a file decides whether it's backed up, whether iOS may delete it, whether your widget can read it, and whether a background launch can open it while the phone is locked. Get it wrong and users lose data, fail to sign in after a restore, or hit crashes you can't reproduce. Interviewers probe it with one question: "where would you store that?"
+
+## One app, one process
+
+When the user taps your icon, SpringBoard asks `launchd` to start your app as an ordinary Unix process. It gets its own virtual address space, its own threads, and a **sandbox profile**: a kernel-enforced list of what it may touch. It can't read another app's memory or files, can't start arbitrary processes, and can't talk to other apps except through doors Apple provides.
+
+Your app's **extensions** (a widget, a share extension, a notification service extension, a keyboard) are **separate processes**. iOS starts each one when it's needed, gives it a much smaller memory limit than the app, and kills it soon after it finishes. The app and its widget share code, because both link it, but never memory: a singleton in the app is a different object in the widget, and an in-memory cache filled by the app is empty in the extension.
+
+```visual flow
+title: Two processes, two sandboxes, one shared door
+nodes:
+  - { id: app, label: Your app, kind: client, at: [0, 0] }
+  - { id: launchd, label: launchd, kind: external, at: [2, 0] }
+  - { id: widget, label: Widget, kind: client, at: [4, 0] }
+  - { id: appdata, label: App container, kind: store, at: [0, 2] }
+  - { id: shared, label: App Group, kind: store, at: [2, 2] }
+  - { id: widgetdata, label: Widget container, kind: store, at: [4, 2] }
+groups:
+  - { id: appbox, label: App sandbox, nodes: [app, appdata] }
+  - { id: widgetbox, label: Widget sandbox, nodes: [widget, widgetdata] }
+edges:
+  - [launchd, app, starts]
+  - [launchd, widget, starts]
+  - [app, appdata, files, { style: data }]
+  - [widget, widgetdata, files, { style: data }]
+  - [app, shared, writes, { style: data }]
+  - [widget, shared, reads, { style: data }]
+steps:
+  - say: "`launchd` starts your app as its own process, inside its own **sandbox**."
+    show: [launchd, app]
+    send: launchd->app
+  - say: "The app reads and writes its **own container**. Nothing else can see inside it."
+    show: [appbox]
+    send: app->appdata
+  - say: "iOS starts the widget as a **separate process** with its own sandbox and container. Nothing in the app's memory exists here."
+    show: [widgetbox]
+    send: launchd->widget
+    label: { widget: own memory }
+  - say: "To share data, both sign the same **App Group** entitlement: the app writes to the shared container..."
+    show: [shared]
+    send: app->shared
+  - say: "...and the widget reads it. Files are the only thing they share."
+    send: widget->shared
+    label: { widget: null }
+```
+
+## The containers
+
+An installed app owns two containers, and each folder in them has its own rules.
+
+The **bundle container** holds the `.app` itself: your executable, frameworks, assets and `Info.plist`. It's read-only and code-signed. Writing into it would break the signature, so anything the app creates goes into the **data container**:
+
+| Folder | Backed up | Can iOS delete it? | Use it for |
+| --- | --- | --- | --- |
+| `Documents/` | Yes | No | Files the user made and thinks of as theirs. The Files app can show it if you opt in with `UIFileSharingEnabled` and `LSSupportsOpeningDocumentsInPlace`. |
+| `Library/Application Support/` | Yes | No | The app's own data: databases, downloaded content the user expects to keep, models |
+| `Library/Caches/` | No | Yes, when the device is very low on storage, never while the app runs | Anything you can download or rebuild: images, API responses |
+| `tmp/` | No | Yes, whenever the app isn't running | Scratch files you delete yourself when done |
+| `Library/Preferences/` | Yes | No | `UserDefaults`' plist. Don't write here directly. |
+
+Two more stores live **outside** the data container:
+
+- An **App Group container**, shared by every app and extension from your team that has the same `com.apple.security.application-groups` entitlement. It holds files, and `UserDefaults(suiteName:)` gives a shared defaults domain.
+- The **Keychain**, managed by a system daemon rather than stored in your folders. It holds small secrets, encrypted, and can be shared between your apps through a keychain access group.
+
+Write the layout down once, as a type, so nobody improvises paths:
+
+```swift check title="StorageLayout.swift"
+import Foundation
+
+struct StorageLayout: Sendable {
+    let appGroup: String
+
+    // The app's own data: backed up, never purged
+    var database: URL { URL.applicationSupportDirectory.appending(path: "Library.sqlite") }
+    // Rebuildable: iOS may purge it when storage runs low
+    var imageCache: URL { URL.cachesDirectory.appending(path: "Images", directoryHint: .isDirectory) }
+    // What the widget reads; nil if the entitlement is missing
+    var shared: URL? { FileManager.default.containerURL(forSecurityApplicationGroupIdentifier: appGroup) }
+
+    // Podcast episodes: kept until the user deletes them, but not worth a slot in their iCloud backup
+    func downloadsDirectory() throws -> URL {
+        var url = URL.applicationSupportDirectory.appending(path: "Downloads", directoryHint: .isDirectory)
+        try FileManager.default.createDirectory(at: url, withIntermediateDirectories: true)
+        var values = URLResourceValues()
+        values.isExcludedFromBackup = true
+        try url.setResourceValues(values)
+        return url
+    }
+}
+```
+
+`isExcludedFromBackup` is the tool for big files the user wants to keep but can download again: they stay on the device, but don't fill an iCloud backup the user pays for.
+
+<Callout kind="gotcha" title="iOS gotcha: the container's path changes">
+
+The absolute path of your data container contains a UUID that can change when the app is updated or the device is restored. Store a file's name or its path *relative* to a known folder, never the full URL. An absolute path saved in a database works on your test phone and breaks for users after an update.
+
+</Callout>
+
+## Data protection: files you can't read while locked
+
+Every file is encrypted with a key derived from the user's passcode, and its **protection class** decides when that key is available:
+
+| Class | Readable | Typical use |
+| --- | --- | --- |
+| `.complete` | Only while the device is unlocked (shortly after locking, the key is gone) | Health or financial records |
+| `.completeUnlessOpen` | Files already open stay usable while locked; new files can be created | Downloads that finish while the phone is locked |
+| `.completeUntilFirstUserAuthentication` | After the first unlock since the device started. **The default.** | Most app data |
+| `.none` | Always | Rarely right |
+
+This matters because iOS launches apps **in the background**, often while the phone is locked in a pocket: a BGTask at 3 a.m., a silent push, a location event. If the code that runs then needs a `.complete` file, the read fails. The Keychain has the same rules through its accessibility attribute: an item marked `kSecAttrAccessibleWhenUnlocked` can't be read by a background refresh that runs while the phone is locked.
+
+So classify data by **who needs it, and when**. A refresh token that background sync uses must be readable after first unlock. A medical record can be `.complete`, as long as the background work is designed never to need it. Check `UIApplication.shared.isProtectedDataAvailable` before work that does, and treat "can't read" as *unavailable*, not as *missing*: an app that sees an unreadable file and writes a fresh empty one destroys the user's data.
+
+```swift check title="Writing a protected file"
+import Foundation
+
+func saveStatement(_ data: Data, to url: URL) throws {
+    // Atomic: write to a temporary file, then rename, so a crash never leaves half a file
+    try data.write(to: url, options: [.atomic, .completeFileProtection])
+}
+```
+
+## Doors out of the sandbox
+
+The sandbox leaves a handful of sanctioned ways to reach beyond your app. Each has a cost to design around.
+
+- **Entitlements** are signed into the binary: App Groups, keychain sharing, push, associated domains. A missing one usually doesn't crash; the API returns `nil` or fails quietly, which is why `shared` above is optional.
+- **Privacy permissions** need an Info.plist purpose string (`NSCameraUsageDescription`, `NSLocationWhenInUseUsageDescription`). Ask for camera access without one and iOS terminates the app on the spot.
+- **App-to-app:** URL schemes and universal links, the share sheet, the pasteboard. Third-party apps can't open arbitrary channels to each other.
+- **App to its own extensions:** files and defaults in the App Group, the shared keychain, and a nudge such as `WidgetCenter.shared.reloadTimelines(ofKind:)` to tell the widget to reread.
+
+### Two processes, one file
+
+When the app and an extension both write the same database in the App Group, you're running a small distributed system on one phone. Two rules keep it safe:
+
+1. **Coordinate writes.** SQLite's locking handles two processes, but your caching layer won't notice the other process's changes. Core Data's persistent history tracking, or `NSFileCoordinator` for plain files, tells each side what changed.
+2. **Never get suspended holding a lock.** If the app is suspended while it holds a file lock in a shared container, the extension could wait on it forever, so iOS kills the app instead. Crash reports show the code `0xdead10cc`, and MetricKit counts it as `cumulativeSuspendedWithLockedFileExitCount`. Finish database work inside a background task before the app is suspended.
+
+## Trade-offs: where should it live?
+
+| Store | Survives deletion of the app | Shared with extensions | Size | Readable while locked |
+| --- | --- | --- | --- | --- |
+| Data container files | No | No | Large | Depends on protection class |
+| App Group files | No (removed with the last app in the group) | Yes | Large | Depends on protection class |
+| `UserDefaults` | No | With a suite | Small: it's loaded whole at launch | After first unlock |
+| Keychain | Often yes, but Apple doesn't promise it | With an access group | Small secrets | Depends on accessibility |
+
+Files in Application Support are the default for anything the app owns. The App Group wins only when an extension genuinely needs the data, because sharing brings the two-process problems above. `UserDefaults` wins for small preferences and loses for anything big, since the whole plist is read at launch. The Keychain wins for secrets and nothing else.
+
+<Callout kind="interview">
+
+**Say** where each piece of data lives and why: "Episodes go in Application Support, excluded from backup; artwork in Caches, since it can be fetched again; the auth token in the Keychain, readable after first unlock because background sync needs it." **Ask** whether any extension or widget needs the data, and whether work happens while the device is locked. **Red flags:** tokens in `UserDefaults`, user data in Caches, and assuming the widget can see the app's in-memory state.
+
+</Callout>
+
+<Callout kind="gotcha" title="iOS gotcha: the Keychain can outlive the app">
+
+Keychain items have historically survived the app being deleted and reinstalled, but Apple doesn't guarantee it either way. Design for both: a reinstalled app may find a stale token and appear signed in to an account whose local data is gone. A common fix is to record a "has launched" flag in `UserDefaults`, which *is* deleted with the app, and clear your keychain items when the flag is missing.
+
+</Callout>
+
+## Practice
+
+Two of the findings in [the launch review](/design/practice/sd-review-app-runtime-launch-main-thread) are sandbox problems in disguise: a protected file read during a locked background launch, and what the code does when that read fails. Find them before the performance problems; they're the ones that lose users' data.
+
+```cards
+- id: extensions-separate
+  front: "Do an app and its widget share memory?"
+  back: "No. Each extension is a separate process with its own sandbox and a smaller memory limit. They share code and, through an App Group, files and defaults."
+- id: caches-vs-support
+  front: "Application Support or Caches: how do you choose?"
+  back: "Caches is for data you can rebuild: it isn't backed up and iOS may purge it when storage is low. Anything the app or user would miss goes in Application Support."
+- id: protection-background
+  front: "Why can a background launch fail to read a file the app reads fine in the foreground?"
+  back: "Background launches often happen while the device is locked. A file with `.complete` protection, or a keychain item that's only accessible when unlocked, can't be read then."
+- id: deadlock-code
+  front: "What does a 0xdead10cc termination mean?"
+  back: "The app was suspended while holding a file or SQLite lock in a shared container. Finish that work in a background task before suspension."
+```
+
+```quiz
+- id: q1
+  type: sort
+  prompt: "Where should each of these live?"
+  buckets: [Application Support, Caches, Keychain, App Group container]
+  items:
+    - [The SQLite database of the user's saved recipes, 0]
+    - [Thumbnails downloaded from the CDN, 1]
+    - [An OAuth refresh token, 2]
+    - [Today's step count that the home-screen widget shows, 3]
+    - [An offline queue of edits not yet uploaded, 0]
+  explain: "The recipe database and the offline queue are data the user would miss, so they're backed up and never purged. Thumbnails can be fetched again. Secrets go in the Keychain. The widget is a separate process, so its data must be in the shared container."
+- id: q2
+  type: mcq
+  prompt: "A BGTask syncs messages at 3 a.m. It reads the cached auth token from a file written with `.complete` protection, and fails every night. What's the fix?"
+  options:
+    - "Retry the read until it succeeds"
+    - "Store the token in the Keychain with an after-first-unlock accessibility, so background work can read it while the phone is locked"
+    - "Move the file to `tmp/`, which isn't encrypted"
+    - "Write the token with `.none` protection in `Documents/`"
+  answer: 1
+  explain: "`.complete` files are unreadable while the device is locked, which is exactly when a 3 a.m. task runs. A secret belongs in the Keychain, and its accessibility should match when it's needed: after first unlock. Dropping protection entirely trades away security; every folder is encrypted anyway."
+- id: q3
+  type: truefalse
+  prompt: "If the app fills an in-memory image cache, its widget can use those images without downloading them again."
+  answer: false
+  explain: "The widget is a different process with its own memory. To share the images, write them to the App Group container, where both can read them."
+- id: q4
+  type: mcq
+  prompt: "Crash reports show the app being killed with `0xdead10cc` shortly after users leave it. It shares a SQLite database with its share extension. What's going on?"
+  options:
+    - "The database file is too big for the App Group container"
+    - "The app is suspended while still holding a database lock, so iOS kills it rather than risk the extension waiting forever"
+    - "The extension and the app use different SQLite versions"
+    - "The watchdog killed the app for launching too slowly"
+  answer: 1
+  explain: "That code means \"suspended while holding a file lock\" in a shared container. Wrap the database work that can run as the app leaves in `beginBackgroundTask`, and let it finish and release the lock before suspension."
+- id: q5
+  type: multi
+  prompt: "A podcast app keeps downloaded episodes the user chose, often gigabytes of them. Which choices are right? Choose all that apply."
+  options:
+    - "Store them in Application Support, so iOS never purges them"
+    - "Mark them `isExcludedFromBackup`, since they can be downloaded again"
+    - "Store them in Caches, so they don't count against the user's storage"
+    - "Save each episode's absolute file URL in the database"
+  answer: [0, 1]
+  explain: "The user chose these, so a purge would feel like data loss; Application Support keeps them. Excluding them from backup keeps iCloud backups small. Caches still use the device's storage and may vanish. Absolute paths break when the container moves, so store relative paths."
+```

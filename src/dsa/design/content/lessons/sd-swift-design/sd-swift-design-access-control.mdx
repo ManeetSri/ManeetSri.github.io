@@ -1,0 +1,249 @@
+## Why it matters
+
+Access control is the part of a module boundary the compiler enforces. Everything else, such as "please don't call this from the feature modules", is a comment someone will ignore. Every `public` declaration is a promise to every client, every `open` class is a promise about how it may be subclassed, and in a modular app the access levels decide whether feature modules can reach into each other's internals. "How do you decide what a module makes public?" is a common question in senior and staff interviews.
+
+## Six levels, six boundaries
+
+You met the keywords in the DSA course's [Access control](/dsa/learn/swift-access-control). As architecture, each one is a boundary:
+
+| Level | Visible to | Typical use |
+| --- | --- | --- |
+| `private` | the enclosing declaration, and its extensions in the same file | a type's own state and helpers |
+| `fileprivate` | the whole file | helpers shared by two types in one file |
+| `internal` (the default) | the whole module | everything that isn't API |
+| `package` (Swift 5.9) | every module in the same package | shared plumbing, test-support modules |
+| `public` | any module that imports this one | the module's API |
+| `open` | any module, *and* it may subclass and override | a designed extension point |
+
+`package` deserves a closer look, because it's the newest and the one modular apps need most. SwiftPM gives every target in a package the same package name, so a `package` declaration in `Networking` is visible to `Catalog` and to `CatalogTestSupport`, but not to the app that depends on the package. Xcode targets outside a package can opt in by sharing a package name in their build settings. Step through who sees what:
+
+```visual flow
+title: Who can see a declaration, level by level
+nodes:
+  - { id: app, label: Shop app, kind: client, at: [0, 0] }
+  - { id: catalog, label: Catalog, kind: service, at: [2, 0] }
+  - { id: support, label: Test support, kind: service, at: [4, 0] }
+  - { id: networking, label: Networking, kind: service, at: [2, 2] }
+groups:
+  - { id: pkg, label: ShopKit package, nodes: [catalog, support, networking] }
+edges:
+  - [app, catalog, imports]
+  - [support, catalog, imports]
+  - [catalog, networking, imports]
+steps:
+  - say: "An `internal` type in Catalog, such as its cache, is visible only inside Catalog. This is where most code should live."
+    show: [catalog]
+    state: { catalog: active }
+    label: { catalog: internal }
+  - say: "Mark a factory `package` and CatalogTestSupport can build fixtures with it, because it's in the same package. The app still can't see it."
+    show: [support, networking, pkg]
+    send: support->catalog
+    state: { support: ok }
+    label: { catalog: package }
+  - say: "Catalog uses Networking's `package` request builder, with no need to make it public to the whole world."
+    send: catalog->networking
+    state: { networking: ok }
+  - say: "Only `public` declarations reach the app. Each one is a promise: removing or changing it breaks a client you may not control."
+    show: [app]
+    send: app->catalog
+    state: { app: ok }
+    label: { catalog: public }
+  - say: "`open` lets the app *subclass* Catalog's classes and override their methods. Now even internal changes in how Catalog calls those methods can break the app."
+    state: { catalog: error }
+    label: { catalog: open }
+```
+
+## Default to the smallest
+
+The rule that keeps modules healthy is to start small and widen on purpose:
+
+- **Leave code `internal`, and make a type's state `private`.** Widen only when a real client needs something.
+- **Adding to an API is easy; removing is a breaking change.** A declaration made public "in case" becomes something you can never delete.
+- **Expose state read-only:** `public private(set) var items`. Clients can read it, and only the module can change it, so its invariants hold.
+- **Make public classes `final`.** `open` invites the *fragile base class* problem: once another module overrides a method, the order and timing in which your class calls its own methods become part of the API. Reserve `open` for designed extension points, the way UIKit opens `UIViewController`.
+
+<Callout kind="gotcha" title="Swift gotcha: public structs don't get a public memberwise initialiser">
+
+When you move `public struct Order` into its own module, the app fails with "initializer is inaccessible due to 'internal' protection level". The synthesised memberwise initialiser is always `internal`, so other modules can't create the struct until you write a `public init`. That's often a good moment to decide whether clients *should* be creating it at all.
+
+</Callout>
+
+## Patterns built on access control
+
+**A smart constructor** makes invalid values impossible outside the module: the type is public, but the only way to create one validates first.
+
+**A public protocol with an internal implementation** lets the module change how something works without breaking anyone: clients see the protocol and a factory, never the concrete type.
+
+```swift check
+import Foundation
+
+public struct EmailAddress: Hashable, Sendable {
+    public let value: String
+
+    // The only way in: an invalid address can't exist anywhere in the app
+    public init?(_ raw: String) {
+        let address = raw.trimmingCharacters(in: .whitespaces).lowercased()
+        guard let at = address.firstIndex(of: "@"), at != address.startIndex,
+              address[address.index(after: at)...].contains(".") else { return nil }
+        value = address
+    }
+}
+
+public protocol ImageLoading: Sendable {
+    func imageData(at url: URL) async throws -> Data
+}
+
+// Internal: clients see only the protocol and the factory
+final class CachingImageLoader: ImageLoading {
+    private let session: URLSession
+
+    init(session: URLSession) {
+        self.session = session
+    }
+
+    func imageData(at url: URL) async throws -> Data {
+        try await session.data(from: url).0
+    }
+}
+
+public enum ImageLoaders {
+    public static func standard() -> any ImageLoading {
+        CachingImageLoader(session: .shared)
+    }
+}
+```
+
+Tomorrow `CachingImageLoader` can become an actor with a disk cache, and no client recompiles against anything new.
+
+**A public enum is a commitment.** Inside one app, adding a case to a public enum breaks every client's exhaustive `switch` until it handles the case, which is usually exactly what you want: the compiler lists every place to update. A binary framework built with library evolution is different: clients must write `@unknown default`, because new cases can arrive without a recompile. If you expect to add cases to an SDK's enum often, a struct with static members is an alternative. You'll go deeper into binary frameworks, `@frozen` and `@inlinable` in D65.
+
+## Stop dependencies leaking: access-level imports
+
+A module's public API can leak *other* modules. If `Catalog`'s public initialiser takes a `Networking.HTTPTransport`, every client of Catalog now depends on Networking too, and Networking can never be swapped out. Swift 6 lets you mark an import with an access level (SE-0409), and the compiler then refuses any public declaration that exposes the imported module's types:
+
+```swift
+internal import Foundation
+
+public func makeTimestamp() -> Date {
+    Date()
+}
+```
+
+```text title="What you'll see"
+error: function cannot be declared public because its result uses an internal type
+note: struct 'Date' is imported by this file as 'internal' from 'Foundation'
+```
+
+For Foundation that's only a demonstration; for your own dependencies it's a guard rail. Mark imports `internal` (or `package`) by default, and write `public import` only for a module whose types are genuinely part of your API. In Swift 6 an import without a level is still treated as `public`; an upcoming-feature flag, `InternalImportsByDefault`, flips that default.
+
+## Testing without widening the API
+
+Never make something `public` so tests can reach it. Three better options:
+
+- **`@testable import Catalog`** gives a test target access to `internal` declarations, in builds compiled with testing enabled (Debug, by default).
+- **`package`** for a test-support module in the same package, such as one that builds fixtures or fakes for other modules' tests.
+- **Test through the public API** wherever you can. If a behaviour is impossible to test without reaching inside, that's a sign the module is missing a seam.
+
+## Trade-offs
+
+| | `private` | `internal` | `package` | `public` | `open` |
+| --- | --- | --- | --- | --- | --- |
+| **Who can depend on it** | one type | one module | one package | everyone | everyone, including subclasses |
+| **Cost of changing it** | none | rebuild the module | rebuild the package | a breaking release for clients | breaks overrides you can't see |
+| **Invariants** | fully protected | protected from other modules | protected from apps | only what the API allows | subclasses can break them |
+| **Best for** | state and helpers | implementation | shared plumbing, test support | the API | designed extension points |
+
+Choose the smallest level that lets the code that needs it compile. The right answer for most declarations in a well-shaped module is `internal` or `private`, a few are `package`, and the public surface is small enough to describe in a paragraph.
+
+<Callout kind="interview">
+
+**Say:** "I design a module's public API from its clients' use cases. Everything else is internal; public classes are final; state is read-only from outside; and dependencies are internal imports so they don't leak." In a modular app, mention `package` for shared plumbing and test support.
+
+**Ask:** who are this module's clients, and do we control them all? Is it shipped as source in one repo, or as a binary to other teams?
+
+**Red flags:** "public everything, it's my own module"; `open` as the default for classes; methods made public for tests; public signatures that mention a dependency's types.
+
+</Callout>
+
+## Practice
+
+The **"flexible" catalog module** review is a first shared module with open classes, public mutable state and a public test hook, alongside some existential mistakes from the previous lessons.
+
+```cards
+- id: smallest-level
+  front: "What's the default rule for choosing an access level?"
+  back: "The smallest level that lets the code that needs it compile: private for state, internal for implementation, package for shared plumbing, public only for the API."
+- id: package-level
+  front: "What is `package` access for?"
+  back: "Sharing declarations between modules of the same package, such as plumbing and test support, without making them part of the public API apps see."
+- id: final-not-open
+  front: "Why make public classes `final` rather than `open`?"
+  back: "`open` makes how your class calls its own methods part of the API (the fragile base class problem). Open only designed extension points."
+- id: access-imports
+  front: "What does `internal import Networking` buy you?"
+  back: "The compiler rejects any public declaration that exposes Networking's types, so the dependency can't leak into your clients."
+```
+
+```quiz
+- id: q1
+  type: sort
+  prompt: "Pick the smallest access level that works for each."
+  buckets: [private, internal, package, public]
+  items:
+    - [A cache dictionary inside an image loader, 0]
+    - [The concrete loader class behind a public protocol, 1]
+    - [A fixture factory that a test-support module in the same package needs, 2]
+    - [The protocol feature modules use to load images, 3]
+    - [A helper shared by three types in the same module, 1]
+  explain: "State belongs to its type, implementation to its module, shared plumbing to the package, and only what clients call is public. Widening later is easy; narrowing breaks someone."
+- id: q2
+  type: mcq
+  prompt: "In an app's own Catalog module (no library evolution), you add a case to a public enum. Feature modules switch over it exhaustively. What happens?"
+  options:
+    - "Nothing, until the new case appears at run time"
+    - "Each exhaustive switch fails to compile until it handles the new case"
+    - "The app crashes when it meets the new case"
+    - "Swift adds a default case automatically"
+  answer: 1
+  explain: "Within one build, exhaustive switches are checked against every case, so the compiler lists each place to update. Only binary frameworks with library evolution require `@unknown default`."
+- id: q3
+  type: truefalse
+  prompt: "A `public` class can be subclassed by other modules."
+  answer: false
+  explain: "Outside its module, a `public` class can be used but not subclassed, and its methods can't be overridden. That needs `open`, which is why `public final` is the safer default."
+- id: q4
+  type: mcq
+  prompt: "You move `public struct Order { public let id: String }` into its own module. The app now fails with \"initializer is inaccessible\". Why?"
+  options:
+    - "`let` properties can't be public"
+    - "The synthesised memberwise initialiser is `internal`, so you must write a `public init`"
+    - "Structs can't cross module boundaries"
+    - "The app needs `@testable import`"
+  answer: 1
+  explain: "Swift never makes the memberwise initialiser public. Other modules can create the struct only through an initialiser you write and mark `public`."
+- id: q5
+  type: bug
+  prompt: "Which line does the compiler reject?"
+  code: |
+    internal import Networking
+
+    public struct CatalogClient {
+        let transport: HTTPTransport
+        public init(transport: HTTPTransport) {
+            self.transport = transport
+        }
+    }
+  answer: 5
+  explain: "The stored property is internal, so it may use Networking's type. The public initialiser exposes `HTTPTransport`, from a module imported as `internal`, to every client: exactly the leak access-level imports exist to stop."
+- id: q6
+  type: multi
+  prompt: "Which of these protect a module's invariants from its clients?"
+  options:
+    - "`public private(set) var items`"
+    - "A public failable initialiser that validates its input"
+    - "An `open` class with overridable methods"
+    - "A public mutable stored property"
+    - "An internal implementation behind a public protocol"
+  answer: [0, 1, 4]
+  explain: "Read-only state, validating initialisers and hidden implementations all keep control inside the module. Open classes and public mutable properties hand it to every client."
+```

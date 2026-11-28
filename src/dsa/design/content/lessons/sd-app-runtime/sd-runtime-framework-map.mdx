@@ -1,0 +1,229 @@
+## Why it matters
+
+Every architecture decision on iOS lands on some Apple framework: which one draws the screen, which one stores the data, which one talks to the network. Knowing where a framework sits tells you what it costs, which thread it wants, whether it works in a widget, and whether the code that uses it can be tested on a Mac in a second. Interviewers ask "what would you use for this?" to hear whether you know the options and why one wins.
+
+## Four layers
+
+Apple's frameworks stack in layers. Each layer is built on the ones below it, and your code can reach into any of them. The higher you go, the more each framework does for you and the more opinions it has about how you work.
+
+```visual flow
+title: The Apple frameworks, bottom to top
+layers:
+  - { label: App frameworks, rows: 0 }
+  - { label: Media and graphics, rows: 1 }
+  - { label: Core services, rows: 2 }
+  - { label: Core OS, rows: 3 }
+nodes:
+  - { id: swiftui, label: SwiftUI, kind: view, at: [0, 0] }
+  - { id: uikit, label: UIKit, kind: view, at: [2, 0] }
+  - { id: widgetkit, label: WidgetKit, kind: view, at: [4, 0] }
+  - { id: coreanimation, label: Core Animation, at: [2, 1] }
+  - { id: avfoundation, label: AVFoundation, at: [4, 1] }
+  - { id: foundation, label: Foundation, at: [0, 2] }
+  - { id: swiftdata, label: SwiftData, kind: store, at: [2, 2] }
+  - { id: corelocation, label: Core Location, at: [4, 2] }
+  - { id: dispatch, label: libdispatch, at: [0, 3] }
+  - { id: security, label: Security, kind: store, at: [2, 3] }
+  - { id: kernel, label: XNU kernel, at: [4, 3] }
+edges:
+  - [swiftui, uikit, runs in]
+  - [uikit, coreanimation, draws with]
+  - [avfoundation, coreanimation, layers]
+  - [swiftui, foundation, URLSession]
+  - [swiftdata, foundation, built on]
+  - [foundation, dispatch, queues]
+steps:
+  - say: "**Core OS** is the plumbing: the XNU kernel, `launchd`, libdispatch (GCD), and the **Security** framework that guards the Keychain."
+    show: [dispatch, security, kernel]
+  - say: "**Core services** is what most of your non-UI code imports: **Foundation** (URLSession, FileManager, JSON, dates), persistence (**SwiftData**, Core Data), and system services such as **Core Location**."
+    show: [foundation, swiftdata, corelocation]
+  - say: "**Media and graphics** draws and plays: every view is backed by a **Core Animation** layer, and **AVFoundation** handles audio and video."
+    show: [coreanimation, avfoundation]
+  - say: "**App frameworks** are what users see: **UIKit**, **SwiftUI**, and the system surfaces such as **WidgetKit**. On iOS, a SwiftUI app still runs inside UIKit windows."
+    show: [swiftui, uikit, widgetkit]
+  - say: "A SwiftUI screen that loads a feed reaches down through the stack: a `URLSession` task in Foundation, scheduled on queues that libdispatch runs on kernel threads."
+    send: [swiftui->foundation, foundation->dispatch]
+```
+
+### Core OS: the kernel and the plumbing
+
+At the bottom is Darwin, the open-source core that iOS shares with macOS: the **XNU kernel** (processes, memory, threads), **launchd** (which starts every process, your app included), **libdispatch** (Grand Central Dispatch, the thread pool under queues and Swift concurrency's default executor) and the C library. Beside them sit **Security** (the Keychain and certificates) and **Network** (`NWConnection`, `NWPathMonitor`, raw TCP, UDP and QUIC).
+
+You rarely import these directly, but their rules shape everything above. The kernel decides when your app is suspended or killed. The thread pool is sized to the CPU cores, which is why blocking its threads stalls the whole app.
+
+### Core services: Foundation and friends
+
+**Foundation** is the framework you import most: strings, dates, `URL`, `URLSession`, `FileManager`, `JSONEncoder`, `NotificationCenter`, `UserDefaults`, `ProcessInfo`. Apple has rewritten much of Foundation's core in Swift as the open-source **swift-foundation** package, shared by its own platforms and Linux, so Foundation-only code is the most portable code you'll write.
+
+Around it: persistence (**SwiftData** on iOS 17 and later, built on the same store as **Core Data**), **CloudKit**, the **Observation** framework behind `@Observable`, **os** (`Logger` and signposts), and frameworks that front a system service: **Core Location**, **UserNotifications**, **StoreKit**, **BackgroundTasks**.
+
+That last group matters for design. Calling Core Location or StoreKit is a conversation with a separate system process over IPC. Answers can be slow, can need a permission prompt, and can come back after your screen has gone.
+
+### Media and graphics
+
+**Core Animation** (the `QuartzCore` module) is the compositor's client: every `UIView` is backed by a `CALayer`, and your changes reach the screen when Core Animation commits them to the render server, a separate process. **Core Graphics** draws 2D paths and bitmaps, **ImageIO** decodes and downsamples images, **Core Image** filters them, **Metal** talks to the GPU, and **AVFoundation** captures and plays audio and video.
+
+### App frameworks: what users see
+
+**UIKit** is the original iOS UI framework: view controllers, views, the responder chain, the app and scene delegates. It's an Objective-C framework with Swift annotations, built around classes and delegation, and every type in it is isolated to the main actor.
+
+**SwiftUI** is Swift-native and declarative, and runs on every Apple platform with platform-specific differences. On iOS it isn't a separate stack: SwiftUI's windows are UIKit windows, and many of its controls are UIKit controls underneath. That's why the two interoperate so well, and why UIKit's lifecycle rules still apply to a SwiftUI app.
+
+Around them sit the frameworks for the system's own surfaces: **WidgetKit**, **ActivityKit** (Live Activities), **App Intents** (Shortcuts, Siri, Spotlight, controls), **MapKit**, **PhotosUI**. Most of these run part of your code in a **separate process**, an extension, which you'll meet in the next lesson.
+
+## Reading a framework before you depend on it
+
+Before a framework goes into your architecture, check four things. Each one decides which layer of *your* app may import it.
+
+| Question | Why it matters | Example |
+| --- | --- | --- |
+| Which platforms? | Code that imports an iOS-only framework can't be shared with a Mac app, or tested with `swift test` on a Mac | UIKit is iOS, iPadOS, tvOS and visionOS only; Foundation is everywhere |
+| Which thread or actor? | Main-actor frameworks pull their callers onto the main actor | Every UIKit view and view controller is `@MainActor`; `URLSession` can be called from anywhere |
+| Available in extensions? | A widget or share extension can't link code that uses an app-only API | `UIApplication.shared` is marked unavailable in app extensions |
+| Does it front a system service? | IPC, permissions, entitlements and Info.plist keys | Core Location needs a usage string and the user's consent |
+
+System frameworks also cost almost nothing to load: they live in the **dyld shared cache**, already mapped into memory for every process. Your own dynamic frameworks are a different story, and you'll measure their launch cost in D51.
+
+## Import boundaries are architecture
+
+The cheapest architecture rule you'll ever enforce is **which modules may import which frameworks**. Keep the domain and data layers on Foundation alone, and they compile for the app, its widget, a Mac app and a fast test target. Put UIKit and SwiftUI only in the presentation layer, where an adapter maps domain values to UI values.
+
+The domain type describes what something *is*, in platform-neutral terms:
+
+```swift check group=order-status title="OrderStatus.swift (domain: Foundation only)"
+import Foundation
+
+enum OrderStatus: String, Codable, Sendable {
+    case placed, packed, shipped, delivered, cancelled
+
+    var isFinal: Bool { self == .delivered || self == .cancelled }
+}
+
+struct OrderSummary: Codable, Sendable, Identifiable {
+    let id: UUID
+    let status: OrderStatus
+    let total: Decimal
+    let placedAt: Date
+}
+```
+
+The presentation layer decides how it *looks*:
+
+```swift check ios group=order-status title="OrderStatus+UI.swift (presentation: imports SwiftUI)"
+import SwiftUI
+
+extension OrderStatus {
+    var tint: Color {
+        switch self {
+        case .placed, .packed: .orange
+        case .shipped: .blue
+        case .delivered: .green
+        case .cancelled: .secondary
+        }
+    }
+
+    var symbolName: String {
+        switch self {
+        case .placed: "cart"
+        case .packed: "shippingbox"
+        case .shipped: "truck.box"
+        case .delivered: "checkmark.circle"
+        case .cancelled: "xmark.circle"
+        }
+    }
+}
+```
+
+If `OrderStatus` stored a `UIColor`, the domain module would import UIKit, every domain type would drift towards the main actor, the widget would need UIKit for a colour, and the order rules could no longer be tested on a Mac. One import line, four costs.
+
+<Callout kind="tip">
+
+Make the rule mechanical. In a Swift package, a target's dependencies *are* its allowed imports, so a `Domain` target that doesn't depend on anything UI-related can't import UIKit by accident. You'll enforce rules like this automatically in D63.
+
+</Callout>
+
+## Trade-offs: overlapping frameworks
+
+Apple often ships two ways to do one job: an older, more capable framework and a newer, simpler one. Neither is always right.
+
+| Job | Older, more control | Newer, less code | Choose the newer one when… |
+| --- | --- | --- | --- |
+| UI | UIKit | SwiftUI | the screen is mostly standard controls and your minimum iOS is recent; keep UIKit for complex collection layouts, text editing and fine-grained performance work |
+| Persistence | Core Data | SwiftData (iOS 17+) | the model is simple and you're happy on iOS 17+; Core Data still has more mature migrations, batch operations and tooling |
+| Networking | Network.framework | URLSession | you speak HTTP, which is almost always; drop to Network.framework for custom protocols over TCP, UDP or QUIC, or `NWPathMonitor` |
+| Change propagation | Combine, KVO | Observation (`@Observable`, iOS 17+) | the consumer is SwiftUI or simple UI binding; Combine still wins at time-based operators like debounce and complex stream composition |
+| Location | `CLLocationManager` with a delegate | `CLLocationUpdate.liveUpdates()` (iOS 17+) | you want an `AsyncSequence` of updates; the delegate API still covers every mode |
+
+<Callout kind="interview">
+
+**Say** which framework and *why*: "SwiftUI for the screens, but the feed is a `UICollectionView` with a compositional layout, wrapped in a representable, because it needs prefetching and precise cell reuse." **Ask** what the minimum iOS version is: it decides whether SwiftData, Observation and the newer async APIs are on the table at all. **Red flags:** reaching for a third-party library for something Foundation does (JSON, HTTP, dates), not knowing that Core Location or notifications need permission, and putting UIKit types in models.
+
+</Callout>
+
+<Callout kind="gotcha" title="iOS gotcha: UIApplication.shared in shared code">
+
+A helper like `UIApplication.shared.open(url)` in a module the widget or share extension also links won't compile for the extension: the API is marked unavailable there. Pass the behaviour in instead (a closure, or SwiftUI's `openURL` environment value), so the app supplies the real implementation and the extension supplies its own or none.
+
+</Callout>
+
+```cards
+- id: four-layers
+  front: "What are the four layers of Apple's frameworks, bottom to top?"
+  back: "Core OS (kernel, libdispatch, Security), core services (Foundation, persistence, system services), media and graphics (Core Animation, AVFoundation), and app frameworks (UIKit, SwiftUI, WidgetKit)."
+- id: import-boundary
+  front: "Why keep a domain module on Foundation only?"
+  back: "It then compiles for the app, extensions, a Mac app and fast Mac test runs, and its types don't drift onto the main actor. UI frameworks belong in the presentation layer."
+- id: system-service
+  front: "What's different about calling a framework that fronts a system service, like Core Location?"
+  back: "It's IPC with another process: answers can be slow, need permission and entitlements, and arrive after your screen has gone."
+```
+
+```quiz
+- id: q1
+  type: sort
+  prompt: "Which layer does each framework belong to?"
+  buckets: [App frameworks, Media and graphics, Core services, Core OS]
+  items:
+    - [WidgetKit, 0]
+    - [Core Animation, 1]
+    - [SwiftData, 2]
+    - [libdispatch, 3]
+    - [ImageIO, 1]
+    - [UserNotifications, 2]
+  explain: "WidgetKit draws a system surface. Core Animation composites and ImageIO decodes images. SwiftData and UserNotifications are services your non-UI code uses. libdispatch is the thread pool at the bottom of everything."
+- id: q2
+  type: mcq
+  prompt: "Your team wants order rules tested in under a second with `swift test` on a Mac, and the same code used by a widget. Which import may the module holding those rules have?"
+  options:
+    - "UIKit, as long as only `UIColor` is used"
+    - "Foundation only"
+    - "SwiftUI, because it runs on macOS too"
+    - "Any framework, since widgets can import anything the app can"
+  answer: 1
+  explain: "UIKit doesn't exist on macOS, and SwiftUI would pull view concerns and main-actor isolation into business rules. Foundation runs everywhere, so a Foundation-only module serves the app, the widget and Mac tests."
+- id: q3
+  type: mcq
+  prompt: "A new feature talks HTTPS to your own API and needs to know when the device goes offline. What do you reach for?"
+  options:
+    - "Network.framework's `NWConnection` for the requests, to control the sockets"
+    - "`URLSession` for the requests and `NWPathMonitor` for connectivity"
+    - "A third-party HTTP library, since URLSession can't detect connectivity"
+    - "`URLSession` for both, polling a health endpoint every few seconds"
+  answer: 1
+  explain: "URLSession handles HTTP, caching, cookies and HTTP/2 and HTTP/3 for you. `NWPathMonitor` from Network.framework reports path changes. Raw connections are for protocols that aren't HTTP, and polling wastes battery."
+- id: q4
+  type: truefalse
+  prompt: "On iOS, a SwiftUI app doesn't use UIKit at all: the two are separate UI stacks."
+  answer: false
+  explain: "SwiftUI on iOS runs in UIKit windows and scenes, and many of its controls are UIKit underneath. That's why UIKit's lifecycle, the main thread's rules and UIKit interop all apply to SwiftUI apps."
+- id: q5
+  type: multi
+  prompt: "A shared `Utilities` module is linked by the app and its share extension. Which of these lines will cause trouble? Choose all that apply."
+  options:
+    - "`UIApplication.shared.open(url)`"
+    - "`JSONDecoder().decode(Order.self, from: data)`"
+    - "`UIApplication.shared.applicationIconBadgeNumber = 0`"
+    - "`FileManager.default.containerURL(forSecurityApplicationGroupIdentifier: group)`"
+  answer: [0, 2]
+  explain: "`UIApplication.shared` is unavailable in app extensions, so anything that goes through it won't compile for the extension. JSON decoding and App Group containers work in both, and the App Group is exactly how the two share files."
+```

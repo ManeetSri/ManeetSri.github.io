@@ -1,0 +1,272 @@
+## Why it matters
+
+Some things must not be duplicated: a file handle that must be closed exactly once, a payment authorisation that may be captured once, a one-time sign-in code, a transaction that must either commit or roll back. Until Swift 5.9 every type could be copied, so "exactly once" lived in comments and runtime checks. **Noncopyable types**, written `~Copyable`, make ownership a rule the compiler enforces. They're still rare in app code, but Apple's own APIs use them (`Mutex` and `Atomic` are noncopyable), and "how would you guarantee this happens only once?" is a question where knowing them, and their limits, makes a staff-level answer.
+
+## Copyable is a default you can switch off
+
+Every Swift type is implicitly `Copyable`. Writing `~Copyable` (SE-0390, Swift 5.9) removes that, and changes what ordinary code means:
+
+- **Assignment and passing move the value** instead of copying it. After `let b = a`, using `a` is an error: "'a' used after consume".
+- **A `deinit` is allowed** on a noncopyable struct or enum. It runs when the value's life ends, if nothing consumed it first.
+- **Parameters say how they take the value:** `borrowing` (read it; the caller keeps it), `consuming` (take it; the caller loses it) or `inout` (change it in place). Methods can be marked the same way.
+- **`consume x`** ends a binding's life explicitly, and **`discard self`** ends `self`'s life inside a consuming method *without* running `deinit`.
+
+The classic example is a resource that must be released exactly once:
+
+```swift run
+struct FileDescriptor: ~Copyable {
+    let raw: Int32
+
+    consuming func close() {
+        print("close(\(raw))")
+        discard self            // closed by hand, so skip deinit
+    }
+
+    deinit {
+        print("deinit closes \(raw)")
+    }
+}
+
+func readConfig() {
+    let file = FileDescriptor(raw: 3)
+    print("reading from \(file.raw)")
+    file.close()
+}
+
+func forgetToClose() {
+    let file = FileDescriptor(raw: 4)
+    print("reading from \(file.raw)")
+}   // nobody closed it, so its deinit runs here
+
+readConfig()
+forgetToClose()
+```
+
+```output
+reading from 3
+close(3)
+reading from 4
+deinit closes 4
+```
+
+Two guarantees came from the type alone. The descriptor is released exactly once on every path: by hand, or by `deinit` when its owner forgets. And the mistakes don't compile:
+
+```text title="What you'll see"
+file.close()
+file.close()      // error: 'file' consumed more than once
+
+let copy = file   // moves it
+print(file.raw)   // error: 'file' used after consume
+```
+
+<Callout kind="gotcha" title="Swift gotcha: discard self needs simple stored properties">
+
+`discard self` is allowed only when every stored property is trivially destroyed: integers, booleans, other plain values. A type holding a `String`, an array or a class reference can't use it, at least in today's Swift. The workaround, used in this module's seat-hold kata, is a private `var settled = false` that a consuming method sets before it returns, and that `deinit` checks.
+
+</Callout>
+
+## Typestate: make the wrong order unrepresentable
+
+In [Making illegal states unrepresentable](/design/learn/sd-modelling-illegal-states) you used enums so impossible *states* couldn't be built. Noncopyable types extend that to impossible *sequences*. Give each stage of a process its own type, and let each consuming method return the next stage. The old stage is gone the moment you move on, so it can't be used out of order. This is called the **typestate** pattern.
+
+```swift run
+struct UploadDraft: ~Copyable {
+    let fileName: String
+
+    consuming func start(session: Int) -> ActiveUpload {
+        ActiveUpload(fileName: fileName, session: session)
+    }
+}
+
+struct ActiveUpload: ~Copyable {
+    let fileName: String
+    let session: Int
+    private(set) var bytesSent = 0
+
+    mutating func send(_ bytes: Int) {
+        bytesSent += bytes
+    }
+
+    consuming func finish() -> UploadReceipt {
+        UploadReceipt(fileName: fileName, session: session, bytes: bytesSent)
+    }
+
+    consuming func cancel() -> Int {
+        session
+    }
+}
+
+struct UploadReceipt {
+    let fileName: String
+    let session: Int
+    let bytes: Int
+}
+
+func uploadVideo() -> UploadReceipt {
+    let draft = UploadDraft(fileName: "holiday.mov")
+    var upload = draft.start(session: 41)
+    upload.send(5_000)
+    upload.send(2_500)
+    return upload.finish()
+}
+
+let receipt = uploadVideo()
+print("\(receipt.fileName): \(receipt.bytes) bytes in session \(receipt.session)")
+```
+
+```output
+holiday.mov: 7500 bytes in session 41
+```
+
+Each line of the flow is checked: a draft has no `finish()` to call, `start` can't be called twice on one draft, and once `finish()` has consumed the upload, `upload.send(10)` is "used after consume". The receipt is an ordinary copyable struct, because copies of a receipt hurt no one. Walk the stages:
+
+```visual states
+title: An upload's stages, each one its own type
+states:
+  - { id: draft, label: UploadDraft, at: [0, 0] }
+  - { id: active, label: ActiveUpload, at: [1, 0] }
+  - { id: receipt, label: UploadReceipt, at: [2, 0] }
+  - { id: cancelled, label: Cancelled, at: [1, 1] }
+initial: draft
+final: [receipt, cancelled]
+transitions:
+  - [draft, active, start]
+  - [active, active, send]
+  - [active, receipt, finish]
+  - [active, cancelled, cancel]
+events:
+  - { event: start, say: "`start` **consumes** the draft and returns an `ActiveUpload`. The draft variable is gone, so it can't be started twice." }
+  - { event: send, say: "`send` is `mutating`, not consuming: the upload stays alive and can send again." }
+  - { event: send }
+  - { event: finish, say: "`finish` consumes the upload and returns a copyable `UploadReceipt`. Sending after this is a compile error, not a runtime check." }
+```
+
+The same idea fits a checkout (`Cart` → `PendingPayment` → `ConfirmedOrder`), an authentication flow, or a database transaction that must end in `commit()` or `rollback()`.
+
+## Where you'll meet them
+
+- **`Mutex` and `Atomic`** in the Synchronization framework (iOS 18) are noncopyable: a copied lock would protect nothing, so the type system forbids it. You store one in a class or an actor, as the previous lesson's `RequestCounter` did.
+- **`Optional` and generic code.** Since Swift 6.0, generic types and functions can accept noncopyable types if they opt in with `T: ~Copyable` (SE-0427), and the standard library's `Optional` does (SE-0437), so a `FileDescriptor?` works.
+- **Lifetimes beyond copying.** Swift 6.2 added `Span`, a safe view into contiguous memory that is `~Escapable`: the compiler stops it outliving the buffer it points into. It's the same family of idea, ownership checked at compile time, applied to how long a value may live rather than how many copies may exist.
+
+## The limits
+
+- **Not in the standard collections.** `Array`, `Dictionary` and `Set` need copyable elements, so a list of open handles lives inside an owner (a class or an actor) instead.
+- **Most protocols still assume copies.** `Codable`, `CustomStringConvertible` and most generic code require `Copyable`; recent Swift releases have begun relaxing a few, such as `Equatable`.
+- **Closures are restricted.** A borrowed noncopyable value can't be captured by an escaping closure, and a captured one can't be consumed inside a closure. Tests often have to restructure, catching errors in a `do` block instead of passing a closure.
+- **No globals to consume.** A noncopyable top-level or static variable can't be consumed, because the compiler can't prove nothing else uses it. Keep these values in local scopes and properties.
+- **`deinit` is synchronous.** It can't `await` or throw, so anything it calls must be synchronous, which can decide between an actor and a lock elsewhere in the design.
+- **The guarantee stops at the process.** A crash or a killed app skips every `deinit`, and a retried network request is a second request no matter what the client's types said.
+
+That last point is the one interviews probe. `~Copyable` makes "confirm at most once" true inside your app. "Charge at most once" across retries, reconnects and two devices also needs a server-side idempotency key (D34) and a server-side expiry for anything the client might abandon.
+
+## Trade-offs
+
+| | `~Copyable` type | Class with a runtime flag | Checked continuation style | A comment |
+| --- | --- | --- | --- | --- |
+| **When misuse is caught** | compile time | at run time, if tested | at run time: a crash or a log | in code review, maybe |
+| **Releases on every path** | yes, `deinit` | yes, class `deinit` | no | no |
+| **Works in collections and protocols** | limited | yes | yes | yes |
+| **Ergonomics** | new rules: borrowing, consuming | familiar | familiar | free |
+| **Best for** | handles, capabilities, typestate | shared objects with identity | bridging callbacks | nothing important |
+
+Reach for `~Copyable` when a value represents unique ownership of a resource or a one-time capability, and passing it around is local and simple. Prefer a class when the thing must be shared, stored in collections or observed. Use a runtime check when you need the guarantee in code that can't adopt the ownership rules yet.
+
+<Callout kind="interview">
+
+**Say:** "Inside the app, the authorisation is a `~Copyable` value with a `consuming capture()`, so it can't be captured twice or used after it's spent, and its `deinit` releases it if abandoned. Across the network, the capture request carries an idempotency key, and the server expires holds on its own, because a crash skips every `deinit`."
+
+**Ask:** where does "exactly once" really have to hold: in memory, on this device, or across devices and retries?
+
+**Red flags:** treating `~Copyable` as a distributed guarantee; relying on a comment or a boolean for something that must happen once; using it for ordinary data where copies are harmless.
+
+</Callout>
+
+## Practice
+
+The **seat hold** kata puts all of this together: a `~Copyable` hold that can be confirmed or released once, returns its seats by itself if abandoned, uses typed throws for sold-out and expired holds, and keeps its books behind a `Mutex` because `deinit` can't `await`.
+
+```cards
+- id: noncopyable-meaning
+  front: "What changes when a type is `~Copyable`?"
+  back: "Assignment and passing move it, so using the old binding is a compile error; it can have a `deinit`; and methods and parameters say whether they borrow or consume it."
+- id: typestate
+  front: "What is the typestate pattern?"
+  back: "One noncopyable type per stage, with consuming methods that return the next stage, so steps can't be repeated or run out of order."
+- id: discard-self
+  front: "What does `discard self` do, and when can you use it?"
+  back: "Ends `self`'s life in a consuming method without running `deinit`. Only for types whose stored properties are all trivially destroyed."
+- id: process-boundary
+  front: "What can't `~Copyable` guarantee?"
+  back: "Anything beyond one process: a crash skips `deinit`, and network retries are new requests. Pair it with idempotency keys and server-side expiry."
+```
+
+```quiz
+- id: q1
+  type: output
+  prompt: "What does this print?"
+  code: |
+    struct Ticket: ~Copyable {
+        let number: Int
+
+        consuming func use() {
+            print("used \(number)")
+            discard self
+        }
+
+        deinit {
+            print("refunded \(number)")
+        }
+    }
+
+    func visit() {
+        let first = Ticket(number: 1)
+        let second = Ticket(number: 2)
+        second.use()
+        print("leaving")
+        _ = first.number
+    }
+
+    visit()
+  answer: |
+    used 2
+    leaving
+    refunded 1
+  explain: "`use()` consumes ticket 2 and `discard self` skips its `deinit`. Ticket 1 is never consumed, so its `deinit` runs when its life ends at the end of `visit()`, after \"leaving\"."
+- id: q2
+  type: mcq
+  prompt: "`let token = OneTimeCode(value: \"481516\")`, then `let saved = token`, then `print(token.value)`. What happens, if `OneTimeCode` is `~Copyable`?"
+  options:
+    - "It prints the code: `saved` is a copy"
+    - "A compile error: `token` was used after it was consumed by the assignment"
+    - "A crash at run time"
+    - "It prints an empty string"
+  answer: 1
+  explain: "Assigning a noncopyable value moves it. `saved` now owns the code, and the compiler rejects any later use of `token`."
+- id: q3
+  type: multi
+  prompt: "Which of these can hold a noncopyable `FileDescriptor` directly?"
+  options:
+    - "`[FileDescriptor]`"
+    - "`FileDescriptor?`"
+    - "A stored property of a final class"
+    - "`[String: FileDescriptor]`"
+    - "A local `let` inside a function"
+  answer: [1, 2, 4]
+  explain: "`Optional` supports noncopyable types, and properties and locals can own one. The standard collections require copyable elements, so arrays and dictionaries can't hold them."
+- id: q4
+  type: mcq
+  prompt: "With the typestate upload from this lesson, what does `UploadDraft(fileName: \"a.mov\").finish()` do?"
+  options:
+    - "Finishes an empty upload"
+    - "Doesn't compile: a draft has no `finish()`"
+    - "Crashes, because the upload never started"
+    - "Returns a receipt with zero bytes"
+  answer: 1
+  explain: "Only `ActiveUpload` has `finish()`. Making each stage a separate type turns calling a step in the wrong order into a missing-method error."
+- id: q5
+  type: truefalse
+  prompt: "Because a `~Copyable` hold's `deinit` releases its seats, seats can't stay held after the user quits the app."
+  answer: false
+  explain: "If the app crashes or is killed, no `deinit` runs, and held seats stay held. The server must expire holds itself; `~Copyable` only governs memory inside one process."
+```

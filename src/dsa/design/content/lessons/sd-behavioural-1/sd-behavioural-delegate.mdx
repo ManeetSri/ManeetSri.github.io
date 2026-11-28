@@ -1,0 +1,286 @@
+## Why it matters
+
+UIKit is built on delegates: table views, scroll views, text fields, web views, Core Location and URLSession all hand their decisions to another object. Writing your own delegate protocol is one of the most common design choices in an iOS codebase, and getting its ownership wrong is one of the most common leaks. Interviewers ask when you'd pick a delegate over a closure or a notification, and why delegates are `weak`.
+
+## Telling and asking
+
+A **delegate** is the one object that another object (the *delegating* object) tells about events and asks for decisions, through a protocol. The delegating object stays general-purpose; the delegate supplies the app-specific behaviour. It's composition instead of subclassing: you customise a table view's selection by giving it a delegate, not by subclassing `UITableView`.
+
+The method names tell you what kind of conversation each one is:
+
+- **`did…`** tells: something happened. `tableView(_:didSelectRowAt:)`.
+- **`will…`** tells before it happens, sometimes with a chance to change it. `tableView(_:willSelectRowAt:)` can return a different index path, or `nil` to refuse.
+- **`should…`** asks permission and needs an answer. `textFieldShouldReturn(_:)`.
+
+A **data source** is a delegate that supplies data instead of handling events: how many rows, which cell for this row. Splitting it from the delegate keeps "what to show" apart from "what happens when the user acts".
+
+```visual sequence
+title: A table view asks its data source and tells its delegate
+participants:
+  - { id: user, label: User }
+  - { id: table, label: UITableView }
+  - { id: source, label: Data source }
+  - { id: delegate, label: Delegate }
+messages:
+  - [table, source, "numberOfRowsInSection(0)"]
+  - [source, table, "200", { reply: true }]
+  - [table, source, "cellForRowAt(row)"]
+  - [source, table, configured cell, { reply: true }]
+  - [user, table, tap row 3]
+  - [table, delegate, "willSelectRowAt(3)"]
+  - [delegate, table, "row 3, or nil to refuse", { reply: true }]
+  - [table, delegate, "didSelectRowAt(3)"]
+fragments:
+  - { kind: loop, label: each visible row, from: 2, to: 3 }
+steps:
+  - { upTo: 1, say: "The table asks its **data source** how many rows there are. It never sees the array behind them." }
+  - { upTo: 3, say: "Then it asks for a cell for each row it's about to show: a dozen, not all 200. That's what makes long lists cheap." }
+  - { upTo: 6, say: "The user taps a row. Before selecting it, the table **asks** its delegate (`will…`), which may redirect the selection or refuse it." }
+  - { upTo: 7, say: "Then it **tells** the delegate (`did…`). The table stays generic; every decision specific to your app lives in the objects you gave it." }
+```
+
+Every method passes the delegating object as its first argument. That lets one delegate serve several tables, and lets it call back (`tableView.deselectRow(at:animated:)`) without storing a reference of its own.
+
+## Writing your own
+
+The most common custom delegate is a screen reporting back to whoever presented it. An address form shouldn't know whether checkout or settings opened it; it tells its delegate what happened and asks it which countries to offer:
+
+```swift check ios title="A form that reports to its delegate"
+import UIKit
+
+struct Address: Equatable {
+    var street: String
+    var city: String
+    var country: String
+}
+
+@MainActor
+protocol AddressFormDelegate: AnyObject {
+    func addressForm(_ form: AddressFormViewController, didSave address: Address)
+    func addressFormDidCancel(_ form: AddressFormViewController)
+    /// Asked for each country the form could offer
+    func addressForm(_ form: AddressFormViewController, shouldOffer country: String) -> Bool
+}
+
+extension AddressFormDelegate {
+    // A default implementation makes a requirement optional, Swift-style
+    func addressForm(_ form: AddressFormViewController, shouldOffer country: String) -> Bool { true }
+}
+
+final class AddressFormViewController: UIViewController {
+    weak var delegate: AddressFormDelegate?
+    private let allCountries = ["France", "Germany", "Japan", "United Kingdom"]
+    private var draft = Address(street: "", city: "", country: "United Kingdom")
+
+    var offeredCountries: [String] {
+        allCountries.filter { delegate?.addressForm(self, shouldOffer: $0) ?? true }
+    }
+
+    @objc private func saveTapped() {
+        delegate?.addressForm(self, didSave: draft)
+    }
+
+    @objc private func cancelTapped() {
+        delegate?.addressFormDidCancel(self)
+    }
+}
+
+final class CheckoutViewController: UIViewController, AddressFormDelegate {
+    private(set) var shippingAddress: Address?
+
+    func editAddress() {
+        let form = AddressFormViewController()
+        form.delegate = self
+        present(UINavigationController(rootViewController: form), animated: true)
+    }
+
+    func addressForm(_ form: AddressFormViewController, didSave address: Address) {
+        shippingAddress = address
+        form.dismiss(animated: true)
+    }
+
+    func addressFormDidCancel(_ form: AddressFormViewController) {
+        form.dismiss(animated: true)
+    }
+
+    func addressForm(_ form: AddressFormViewController, shouldOffer country: String) -> Bool {
+        country != "Japan" // this shop doesn't ship there yet
+    }
+}
+```
+
+Four conventions are doing the work:
+
+- **`AnyObject`** makes it a class-only protocol, which is what allows `weak var delegate`.
+- **`@MainActor`** on the protocol says every call happens on the main actor, which UIKit delegates already promise. Without it, Swift 6 refuses to let a view controller conform.
+- **Optional methods** come from default implementations in an extension. (`@objc optional` also works, but forces an `@objc` protocol and makes every call site write `delegate?.method?(…)`.)
+- **The delegate decides navigation.** The form never dismisses itself, so the same form can be pushed, presented or embedded.
+
+## Who owns whom
+
+The rule is simple: **the owner holds the helper strongly, and the helper holds its delegate weakly.** A screen owns its table view, and the table view points back to the screen without keeping it alive. If both references were strong, neither could ever be freed.
+
+```swift run title="A weak delegate lets the owner go"
+protocol DownloaderDelegate: AnyObject {
+    func downloader(_ downloader: Downloader, didFinish file: String)
+    func downloader(_ downloader: Downloader, shouldRetryAfter attempts: Int) -> Bool
+}
+
+final class Downloader {
+    weak var delegate: DownloaderDelegate?
+
+    /// Pretends the first `failures` attempts fail, asking the delegate before each retry
+    func download(_ file: String, failures: Int) {
+        for attempt in stride(from: 1, through: failures, by: 1) {
+            print("Attempt \(attempt) failed")
+            guard delegate?.downloader(self, shouldRetryAfter: attempt) == true else {
+                print("Giving up on \(file)")
+                return
+            }
+        }
+        delegate?.downloader(self, didFinish: file)
+    }
+}
+
+final class EpisodeScreen: DownloaderDelegate {
+    let downloader = Downloader()
+
+    init() {
+        downloader.delegate = self
+    }
+
+    func downloader(_ downloader: Downloader, didFinish file: String) {
+        print("Screen shows \(file) as downloaded")
+    }
+
+    func downloader(_ downloader: Downloader, shouldRetryAfter attempts: Int) -> Bool {
+        attempts < 3
+    }
+
+    deinit {
+        print("Screen freed")
+    }
+}
+
+var screen: EpisodeScreen? = EpisodeScreen()
+screen?.downloader.download("episode-12.mp3", failures: 2)
+screen?.downloader.download("episode-13.mp3", failures: 5)
+screen = nil
+print("Done")
+```
+
+```output
+Attempt 1 failed
+Attempt 2 failed
+Screen shows episode-12.mp3 as downloaded
+Attempt 1 failed
+Attempt 2 failed
+Attempt 3 failed
+Giving up on episode-13.mp3
+Screen freed
+Done
+```
+
+Make `delegate` strong and "Screen freed" never prints: screen → downloader → screen is a cycle. Note too that `delegate?.downloader(…, shouldRetryAfter:) == true` treats "no delegate" as "no", a deliberate default. Decide what each `should` means when nobody answers.
+
+Apple's frameworks follow the weak rule, with exceptions worth memorising:
+
+- **`URLSession` keeps a strong reference to its delegate** until you call `finishTasksAndInvalidate()` or `invalidateAndCancel()`. A session created per screen with `delegate: self` leaks that screen unless it's invalidated.
+- **`CAAnimation` retains its delegate**, so an animation that never ends keeps it alive.
+- **`CLLocationManager`'s delegate is weak**, but nothing else keeps the manager alive. Create it as a local variable and your delegate is never called; store it in a property.
+
+<Callout kind="gotcha" title="Swift gotcha: delegates that cross actors">
+A `@MainActor` class can't conform to a delegate protocol that isn't isolated: Swift 6 reports that the "conformance crosses into main actor-isolated code and can cause data races". For your own protocols, mark them `@MainActor` when they're about UI. For framework delegates called on other queues (URLSession's run on its `delegateQueue`), put the callbacks on a small dedicated object with `nonisolated` methods and hand results to the main actor. Swift 6.2 adds isolated conformances, `extension UploadScreen: @MainActor ProgressReporting`, for protocols that will only ever be used on the main actor.
+</Callout>
+
+## Data sources today
+
+`UITableViewDiffableDataSource` and `UICollectionViewDiffableDataSource` (iOS 13) are ready-made data source objects. You give one a cell provider closure, then `apply` **snapshots** of item identifiers; it works out what was inserted, deleted or moved and animates the difference. The data source protocol hasn't gone away: the diffable source implements it for you, which is why you no longer write `numberOfRowsInSection`. You'll design with them properly in D17.
+
+Several frameworks also now offer an `async` alternative to their delegate for the common case: `URLSession.data(for:)` instead of a data delegate, and Core Location's `CLLocationUpdate.liveUpdates()` (iOS 17) instead of `locationManager(_:didUpdateLocations:)`. Delegates remain the richer API when you need many kinds of callback, or need to answer questions.
+
+## Trade-offs
+
+| | Delegate | Closure property | Observer |
+| --- | --- | --- | --- |
+| Listeners | One | One per closure | Many |
+| Callbacks | Many related ones, grouped by a protocol | One or two | One kind of change |
+| Answers back (`should`, data) | Natural | Possible (a closure that returns a value) | No |
+| Ownership | `weak` property, automatic | Capture list on every closure | Tokens |
+| Finding the code | Go to the conformance | Find where the closure is set | Find subscribers |
+| Wins when | A component has several events and questions, as a table or a form does | A small view reports one event, like a cell's button | Several parts react to the same change |
+
+<Callout kind="interview">
+**Say:** "It's one-to-one and the component needs answers back, so I'd use a delegate: a class-bound, `@MainActor` protocol, held `weak`, passing the sender first." Mention what happens when no delegate is set.
+
+**Ask:** Does more than one object need these events? (Then it's an observer, not a delegate.) Does the component ask questions, or only report?
+
+**Red flags:** a strong `delegate` property; a delegate protocol without `AnyObject`; a "multicast delegate" array that holds its delegates strongly; a component that dismisses or pushes screens itself instead of telling its delegate.
+</Callout>
+
+## Practice
+
+The review **The episode player that never goes away** includes a delegate that can't be weak. Find it, and the other three things keeping that screen alive.
+
+```cards
+- id: delegate-role
+  front: "What does a delegate do that a data source doesn't?"
+  back: "A delegate is told about events (`did`, `will`) and asked for decisions (`should`). A data source supplies the data itself: counts and cells."
+- id: delegate-weak
+  front: "Why are delegates `weak`, and what does that require of the protocol?"
+  back: "The delegating object is usually owned by its delegate, so a strong back-reference would be a retain cycle. `weak` needs a class-only protocol (`AnyObject`)."
+- id: delegate-exceptions
+  front: "Which Apple APIs hold their delegate strongly?"
+  back: "URLSession (until invalidated) and CAAnimation. Also keep a CLLocationManager in a property, or its weak delegate is never called."
+```
+
+```quiz
+- id: q1
+  type: bug
+  prompt: "This timer view leaks the screen that uses it. Which line is the cause?"
+  code: |
+    protocol CountdownViewDelegate: AnyObject {
+        func countdownViewDidFinish(_ view: CountdownView)
+    }
+
+    final class CountdownView: UIView {
+        var delegate: CountdownViewDelegate?
+        private var remaining = 10
+    }
+  answer: 6
+  explain: "The protocol is class-bound, so the property could be `weak`, but it isn't. The screen owns the view, and the view holds the screen strongly: a cycle. Write `weak var delegate`."
+- id: q2
+  type: mcq
+  prompt: "A screen creates `URLSession(configuration: .default, delegate: self, delegateQueue: nil)` to show upload progress, and never invalidates it. What happens when the user closes the screen?"
+  options:
+    - "Nothing: delegates are always weak"
+    - "The session keeps the screen alive, so it leaks with everything it owns"
+    - "The upload is cancelled automatically"
+    - "The app crashes when the next progress callback arrives"
+  answer: 1
+  explain: "URLSession is the famous exception: it keeps a strong reference to its delegate until `finishTasksAndInvalidate()` or `invalidateAndCancel()`. Invalidate it when the screen goes, or use a session owned by something longer-lived."
+- id: q3
+  type: multi
+  prompt: "Which are good reasons to choose a delegate over a single closure?"
+  options:
+    - "The component has several related events: started, progressed, finished, failed"
+    - "The component needs answers: should this row highlight, how tall is it"
+    - "Exactly one event, fired once, with no answer needed"
+    - "Many unrelated objects need to hear about it"
+  answer: [0, 1]
+  explain: "A protocol groups many callbacks and questions in one typed place. One event is simpler as a closure; many listeners need an observer."
+- id: q4
+  type: order
+  prompt: "Put a table view's calls in the order they happen when it first appears and the user taps a row."
+  lines:
+    - "numberOfRowsInSection, to the data source"
+    - "cellForRowAt for each visible row, to the data source"
+    - "willSelectRowAt, to the delegate"
+    - "didSelectRowAt, to the delegate"
+  explain: "Count, then cells for what's visible; on a tap, ask before selecting and tell after."
+- id: q5
+  type: truefalse
+  prompt: "Because `AddressFormDelegate`'s extension gives `shouldOffer` a default, the checkout screen's own `shouldOffer` is ignored when the form calls it."
+  answer: false
+  explain: "`shouldOffer` is declared in the protocol, so it's a requirement and calls dispatch to the conforming type's version. Only methods that exist *solely* in an extension are dispatched statically; you'll meet that trap in the template method lesson."
+```

@@ -1,0 +1,324 @@
+## Why it matters
+
+Apps grow by variants: another analytics vendor, another payment method, another kind of feed card, another promotion. If each one means editing a `switch` deep inside code that already works, every addition risks the existing ones and the riskiest files change most often. The open–closed principle is about choosing where new variants plug in. In interviews it's the principle behind "how would you add X without touching Y?", and Swift gives you two very different answers: protocols and enums.
+
+## Open for extension, closed for modification
+
+Bertrand Meyer's 1988 statement was that a module should be **open for extension** and **closed for modification**. In his day, extension meant inheritance: a finished class stays as it is, and new behaviour goes in a subclass. Robert C. Martin's 1996 version, the one people mean today, puts the extension point behind an **abstraction**: code that works against an interface doesn't change when new implementations of that interface arrive.
+
+"Closed" means more on iOS than it sounds. Code is closed when changing it is expensive or impossible:
+
+- it's tested and shipped, and editing it risks behaviour people rely on;
+- it lives in a package or framework another team owns;
+- it's **in a binary already on people's phones**. Last month's app version can't be edited at all, and plenty of people never update.
+
+Here's code that isn't closed. Every new vendor means editing the tracker, importing another SDK into it and re-testing the vendors that were fine:
+
+```swift check title="AnalyticsTracker.swift (before)"
+enum Vendor {
+    case firebase
+    case mixpanel
+}
+
+struct AnalyticsTracker {
+    let vendors: [Vendor]
+
+    func track(_ name: String) {
+        for vendor in vendors {
+            switch vendor {
+            case .firebase:
+                print("Firebase.logEvent(\(name))")    // the Firebase SDK call
+            case .mixpanel:
+                print("Mixpanel.track(\(name))")       // the Mixpanel SDK call
+            }
+        }
+    }
+}
+```
+
+## Extending with protocols
+
+Move the variation behind a protocol, and the tracker only knows the protocol. A new destination is a new conforming type, and the tracker never changes:
+
+```swift run title="Destinations as conforming types"
+struct AnalyticsEvent {
+    let name: String
+    let properties: [String: String]
+}
+
+protocol AnalyticsDestination {
+    func send(_ event: AnalyticsEvent)
+}
+
+// Closed: written and tested once, and it never learns about a vendor
+struct AnalyticsTracker {
+    let destinations: [any AnalyticsDestination]
+
+    func track(_ name: String, _ properties: [String: String] = [:]) {
+        let event = AnalyticsEvent(name: name, properties: properties)
+        destinations.forEach { $0.send(event) }
+    }
+}
+
+struct ConsoleDestination: AnalyticsDestination {
+    let prefix: String
+    func send(_ event: AnalyticsEvent) { print("\(prefix): \(event.name)") }
+}
+
+// Added months later for a privacy review, without editing the tracker:
+// it wraps another destination and drops events that carry personal data
+struct PrivacyFilter: AnalyticsDestination {
+    let wrapped: any AnalyticsDestination
+    let blockedKeys: Set<String>
+
+    func send(_ event: AnalyticsEvent) {
+        guard blockedKeys.isDisjoint(with: event.properties.keys) else {
+            print("filtered: \(event.name)")
+            return
+        }
+        wrapped.send(event)
+    }
+}
+
+let tracker = AnalyticsTracker(destinations: [
+    ConsoleDestination(prefix: "debug log"),
+    PrivacyFilter(wrapped: ConsoleDestination(prefix: "vendor"), blockedKeys: ["email"]),
+])
+tracker.track("checkout_started", ["items": "3"])
+tracker.track("newsletter_signup", ["email": "maneet@example.com"])
+```
+
+```output
+debug log: checkout_started
+vendor: checkout_started
+debug log: newsletter_signup
+filtered: newsletter_signup
+```
+
+`PrivacyFilter` is worth a second look. It extends the system by *wrapping* an existing destination, a pattern you'll meet as the decorator in D11. Extension doesn't have to mean a new leaf; it can mean composing what's there.
+
+The strongest form of "closed" is a module boundary. Put the tracker and the protocol in their own Swift package, which imports no vendor SDKs, and the adapters in the app target:
+
+```visual flow
+title: The analytics package stays closed while the app extends it
+layers:
+  - { label: Feature code, rows: 0 }
+  - { label: Analytics package, rows: 2 }
+  - { label: App target, rows: 4 }
+nodes:
+  - { id: screen, label: Checkout screen, kind: view, at: [0, 0] }
+  - { id: tracker, label: AnalyticsTracker, at: [1, 2] }
+  - { id: protocol, label: AnalyticsDestination, at: [3, 2] }
+  - { id: privacy, label: PrivacyFilter, at: [0, 4] }
+  - { id: firebase, label: FirebaseDestination, kind: external, at: [2, 4] }
+  - { id: console, label: DebugConsole, at: [4, 4] }
+edges:
+  - [screen, tracker, track]
+  - [tracker, protocol, send]
+  - [firebase, protocol, conforms, { style: data }]
+  - [console, protocol, conforms, { style: data }]
+  - [privacy, protocol, conforms, { style: data }]
+  - [privacy, firebase, wraps]
+steps:
+  - say: The checkout screen calls `track`. The tracker hands the event to every **AnalyticsDestination**. The package imports no vendor SDK, so it builds and tests on its own.
+    show: [screen, tracker, protocol]
+    send: [screen->tracker, tracker->protocol]
+  - say: The app target supplies the destinations. Each conforms to the package's protocol; the package has never heard of them.
+    show: [firebase, console]
+    send: [protocol->firebase, protocol->console]
+  - say: Legal asks that no event carrying an email reaches the vendor. You add **PrivacyFilter** in the app target and wrap the Firebase destination with it.
+    show: [privacy]
+    state: { privacy: active }
+    label: { privacy: new }
+  - say: The package didn't change, so it wasn't even rebuilt, and its tests still describe exactly what it does. Closed and still extended.
+    send: [protocol->privacy, privacy->firebase]
+    state: { tracker: ok, protocol: ok }
+```
+
+## Extending with enums
+
+Protocols aren't the only answer, and in Swift they're often not the best one. An enum is **closed over its cases** and **open for new operations**:
+
+```swift check title="A closed set the compiler checks"
+enum SignInMethod {
+    case apple
+    case google
+    case email(address: String)
+}
+
+// A new operation is a new function: nothing existing changes
+func buttonTitle(for method: SignInMethod) -> String {
+    switch method {
+    case .apple: "Sign in with Apple"
+    case .google: "Sign in with Google"
+    case .email: "Continue with email"
+    }
+}
+
+func analyticsName(for method: SignInMethod) -> String {
+    switch method {
+    case .apple: "apple"
+    case .google: "google"
+    case .email: "email"
+    }
+}
+```
+
+Adding a case, say `.passkey`, *does* modify code: every `switch` must handle it. But the compiler lists every one of them as an error until you do, so the modification is complete and safe. For a set of variants that **you own and that changes rarely** (sign-in methods, payment states, the tabs of your app), that's usually better than a protocol: all the behaviour for one operation sits in one place, exhaustiveness is checked, and there are no extra types.
+
+The choice between the two is a whole lesson of its own, the expression problem, which comes next.
+
+Enums from frameworks are a special case. Apple's SDK enums such as `CLAuthorizationStatus` are **non-frozen**: Apple may add cases in a later iOS, so code compiled today must say what to do with a case it's never seen. In Swift 6 mode, leaving out `@unknown default` is a compile error:
+
+```swift check ios title="Switching over an enum you don't own"
+import CoreLocation
+
+func locationMessage(for status: CLAuthorizationStatus) -> String {
+    switch status {
+    case .notDetermined: "We'll ask for your location when you search nearby."
+    case .restricted, .denied: "Turn on location in Settings to see nearby shops."
+    case .authorizedAlways, .authorizedWhenInUse: "Showing shops near you."
+    @unknown default: "Showing shops near your saved address."
+    }
+}
+```
+
+`@unknown default` still warns when a *known* case is missing, so you keep exhaustiveness for today's cases and a safe path for tomorrow's. It's the open–closed principle applied across releases: your shipped code is closed, Apple's enum is open, and the unknown case is the agreed extension point.
+
+## Extending with styles and closures
+
+Apple's own APIs are full of open–closed design. SwiftUI's `Button` is closed: you can't edit it, and you don't need to. Its appearance is open through `ButtonStyle`:
+
+```swift check ios title="Button is closed; its style is open"
+import SwiftUI
+
+struct PillButtonStyle: ButtonStyle {
+    func makeBody(configuration: Configuration) -> some View {
+        configuration.label
+            .padding(.horizontal, 20)
+            .padding(.vertical, 10)
+            .background(.tint, in: Capsule())
+            .foregroundStyle(.white)
+            .opacity(configuration.isPressed ? 0.7 : 1)
+    }
+}
+
+struct CheckoutButton: View {
+    var body: some View {
+        Button("Pay now") {}
+            .buttonStyle(PillButtonStyle())
+    }
+}
+```
+
+`LabelStyle`, `ToggleStyle`, `ViewModifier`, `URLSessionDelegate` and `sorted(by:)` all follow the same idea: the type stays fixed and you supply the part that varies. A closure is the smallest extension point there is. When the variation is a single function, `let isEligible: (Order) -> Bool` is often all the "protocol" you need.
+
+## Choosing where to be open
+
+You can't make code closed against every possible change, and trying produces abstraction nobody uses. Martin called the alternative **strategic closure**: decide which kind of change you expect, and make the code closed against that one. Good evidence that a direction of change is real:
+
+- it has already happened at least once (the second analytics vendor is the signal, not the first);
+- the roadmap or the business names the variants (payment methods per country);
+- someone outside your team adds them (plugins, other feature teams, a CMS);
+- it must change **without an app release**, which pushes the variation out of code and into data: promotion rules, onboarding screens or feature flags from the server.
+
+Where none of these hold, write the straightforward version and keep it easy to change. Extracting a protocol later, when the second case arrives, is a small refactor.
+
+## Trade-offs
+
+| Extension point | Add a variant | Add an operation | Checked by the compiler | Wins when |
+| --- | --- | --- | --- | --- |
+| `switch` inside the code that uses it | Edit tested code | Edit the same code | Only if exhaustive | One or two variants, one place uses them |
+| Enum, with one function per operation | Edit every `switch` (the compiler finds them) | New function, nothing else | Yes, fully | A small set you own; operations change more than cases |
+| Protocol, with one type per variant | New type, nothing else | New requirement on every type | Conformance yes, behaviour no | Variants change often, or others add them |
+| Closure or style parameter | New closure | Usually a new parameter | Signature only | One small piece of behaviour varies |
+| Data from the server (config, rules) | No release at all | Needs a release | No: validate at runtime | Variation must ship faster than App Review |
+
+<Callout kind="interview">
+
+**What to say:** name the axis of change first ("payment methods will grow, the checkout flow won't"), then put the extension point on that axis. Offer both Swift answers: "If we own the list and it's small, an enum with exhaustive switches; if other teams add methods, a protocol with registration in the composition root." For anything that must change without a release, say so and move it to configuration.
+
+**What to ask:** how often new variants arrive, who adds them, and whether they need to reach users without an App Store update.
+
+**Red flags:** a protocol "for flexibility" with one conformer and no plan for a second; `default:` in every switch over your own enums; and claiming enums break open–closed without mentioning that the compiler finds every place to change.
+
+</Callout>
+
+<Callout kind="gotcha" title="Swift gotcha: `default` throws away the compiler's help">
+
+A `default:` branch in a `switch` over *your own* enum makes the switch compile when someone adds `.passkey`, and silently route the new case to whatever `default` does. That's the one thing that makes enums unsafe to extend. Write every case out (group them, `case .apple, .google:`, if they share behaviour) so adding a case becomes a list of compile errors. Keep `default` for types with too many values to list, like `Int` and `String`, and `@unknown default` for enums you don't own.
+
+</Callout>
+
+## Practice
+
+**Open pricing rules** has you build a checkout pricing engine that never changes when marketing invents a new promotion: rules are types that conform to a protocol, and the tests add rules the engine has never seen. The **upload service review** shows the opposite: rules for each kind of upload scattered through one method, one `switch` and one easily missed `if` at a time.
+
+```cards
+- id: ocp-meaning
+  front: "What do \"open for extension\" and \"closed for modification\" mean?"
+  back: "New behaviour is added by writing new code (a conforming type, a case, a closure) rather than by editing code that already works, is shipped, or belongs to someone else."
+- id: ocp-enum-protocol
+  front: "In Swift, what is each of enums and protocols open and closed to?"
+  back: "An enum is open to new operations (a new function with a switch) and closed to new cases. A protocol is open to new types (a new conformer) and closed to new operations (a new requirement touches every conformer)."
+- id: ocp-unknown-default
+  front: "Why does switching over an Apple enum like CLAuthorizationStatus need `@unknown default`?"
+  back: "SDK enums are non-frozen: a later iOS may add cases. `@unknown default` handles cases your build has never seen while still warning about known ones you missed; Swift 6 mode makes leaving it out an error."
+- id: ocp-strategic
+  front: "What is strategic closure?"
+  back: "Choosing the one direction of change you expect (evidence: it already happened, it's on the roadmap, others add variants, it must ship without a release) and making code closed against that, instead of abstracting everything."
+```
+
+```quiz
+- id: q1
+  type: mcq
+  prompt: "Your app has three sign-in methods you own, and product adds one every year or two. Each method needs a button title, an analytics name, an icon and an error message, and new needs like these arrive often. Which shape fits best?"
+  options:
+    - "A `SignInMethod` protocol with one conforming type per method"
+    - "A `SignInMethod` enum, with one function per need that switches over every case"
+    - "A dictionary from method names to closures"
+    - "A `switch` on a string inside the sign-in screen"
+  answer: 1
+  explain: "Operations change more often than cases, and you own the set. With an enum, a new need is one new function, and a new method is a list of compile errors pointing at every place to update."
+- id: q2
+  type: bug
+  prompt: "A teammate adds `case passkey` to `SignInMethod`. The app builds, but passkey users see the wrong title. Which line let it through?"
+  code: |
+    enum SignInMethod { case apple, google, email, passkey }
+
+    func buttonTitle(for method: SignInMethod) -> String {
+        switch method {
+        case .apple: return "Sign in with Apple"
+        case .google: return "Sign in with Google"
+        default: return "Continue with email"
+        }
+    }
+  answer: 7
+  explain: "`default` matches `.passkey` silently. Listing `.email` explicitly would have turned the new case into a compile error at this exact switch."
+- id: q3
+  type: truefalse
+  prompt: "Adding a requirement to a protocol is a change you can make without touching any of its conforming types, as long as the protocol is open–closed."
+  answer: false
+  explain: "A new requirement must be implemented by every conformer, or given a default in an extension. Protocols are open to new types and closed to new operations, which is the trade-off the next lesson explores."
+- id: q4
+  type: multi
+  prompt: "Which are good evidence that a direction of change deserves an extension point? Choose all that apply."
+  options:
+    - "A second analytics vendor was added last month"
+    - "Another team will add their own feed card types"
+    - "Promotions must go live without waiting for App Review"
+    - "It might be useful one day"
+    - "The class is long"
+  answer: [0, 1, 2]
+  explain: "Change that has happened, change made by others, and change that must bypass a release are real axes. \"Might be useful\" and length aren't: an extension point there is cost with no return."
+- id: q5
+  type: mcq
+  prompt: "Why is `PrivacyFilter` in the analytics example an extension, not a modification?"
+  options:
+    - "It edits the tracker's loop to skip some events"
+    - "It's a new conforming type that wraps another destination, so the tracker and the existing destinations are unchanged"
+    - "It subclasses ConsoleDestination"
+    - "It adds a requirement to AnalyticsDestination"
+  answer: 1
+  explain: "It plugs in through the existing abstraction and composes an existing destination. The tracker's code and tests are untouched, which is the whole point of the principle."
+```

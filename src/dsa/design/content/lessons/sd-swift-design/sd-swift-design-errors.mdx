@@ -1,0 +1,262 @@
+## Why it matters
+
+An error type is part of an API. It tells callers what can go wrong and, more importantly, what they can do about it. Badly modelled errors are why apps show "The operation couldn't be completed (NSURLErrorDomain error -1009)", or spin forever, or show an alert when the user only left the screen. Swift 6 added **typed throws**, which makes the trade-off between precise errors and evolvable ones an explicit decision. "How do you model errors across the layers of an app?" is a standard design-interview question.
+
+## Four kinds of failure
+
+Not everything that goes wrong is the same kind of thing, and each kind wants a different tool:
+
+1. **Domain outcomes** the user can act on: the card was declined, the username is taken, only two are left in stock. Model them as cases with the data the recovery needs.
+2. **Transient failures** of the infrastructure: offline, a timeout, a `503`. The right response is usually to retry with backoff, or to show cached data with an "offline" banner.
+3. **Programmer errors:** a broken invariant, a state that "can't happen". These aren't errors to throw; they're bugs. `precondition` and `assert` belong here, and you'll weigh them properly in D24.
+4. **Cancellation:** the user left the screen, so the task was cancelled. `CancellationError` (or `URLError.cancelled`) isn't a failure to report. The right response is to stop quietly.
+
+The design rule that follows: **shape errors by what the caller can do, not by where they came from.** A screen doesn't care whether DNS or TLS failed. It cares whether to retry later, ask the user to fix their input, or send them to sign in again.
+
+## Translate at every boundary
+
+Each layer speaks its own vocabulary, and translates the errors from the layer below into it. Low-level types never leak up, for the same reason a module's dependencies shouldn't leak into its public API. Step through one failure crossing the app:
+
+```visual flow
+title: One failure, translated at each boundary
+nodes:
+  - { id: session, label: URLSession, kind: external, at: [0, 0] }
+  - { id: client, label: API client, kind: service, at: [2, 0] }
+  - { id: repo, label: Catalog repository, kind: service, at: [4, 0] }
+  - { id: vm, label: View model, kind: service, at: [4, 2] }
+  - { id: view, label: Catalog screen, kind: view, at: [2, 2] }
+edges:
+  - [session, client, URLError]
+  - [client, repo, APIError]
+  - [repo, vm, CatalogError]
+  - [vm, view, view state]
+steps:
+  - say: "The phone is offline, so `URLSession` throws `URLError(.notConnectedToInternet)`, code -1009. Accurate, and meaningless to a user."
+    send: session->client
+    state: { session: error }
+    label: { session: "-1009" }
+  - say: "The API client knows about transports, status codes and decoding. It wraps this as `APIError.transport(URLError)`, and keeps the original for logs."
+    send: client->repo
+    label: { client: .transport }
+  - say: "The repository knows about the catalog. Any transport failure means one thing here: `CatalogError.offline`. It also has a cached list to offer."
+    send: repo->vm
+    label: { repo: .offline }
+  - say: "The view model turns the domain error into what the screen needs: the cached products, a banner saying they may be out of date, and a retry action."
+    send: vm->view
+    state: { view: ok }
+    label: { vm: "offline + cache" }
+```
+
+Each translation throws away detail the layer above can't use and adds meaning it can. The original error still matters, for logging and diagnostics, so keep it as an associated value or log it where you translate. D33 builds this mapping for a real networking layer.
+
+## Designing the error type
+
+- **An enum for a closed set callers switch over.** Associated values carry what recovery needs: `.outOfStock(available: Int)`, `.rateLimited(retryAfter: Duration)`.
+- **A struct with a code for an open, growing set,** such as error codes the server may add without an app release: `struct ServerError: Error { let code: String; let message: String }`. An enum here would need an `.unknown` case that ends up doing most of the work.
+- **No UI strings in domain errors.** Whether "declined" becomes an alert, a red label or a retry button, and in which language, is the presentation layer's decision. The view model maps errors to messages and actions.
+- **Values, `Sendable` and usually `Equatable`.** `Error` already refines `Sendable`, because errors cross actors. Making them `Equatable` lets a test say `#expect(throws: CatalogError.offline)`.
+
+## Typed throws
+
+Until Swift 6, every throwing function threw `any Error`, and every `catch` had to deal with errors it couldn't name. **Typed throws** (SE-0413, Swift 6.0) lets a function declare exactly what it throws:
+
+```swift run
+enum PaymentError: Error, Equatable {
+    case declined(reason: String)
+    case insufficientFunds(shortByPence: Int)
+    case cardExpired
+}
+
+func charge(_ pence: Int, balance: Int, cardExpired: Bool = false) throws(PaymentError) -> Int {
+    if cardExpired { throw .cardExpired }
+    guard pence > 0 else { throw .declined(reason: "the amount must be positive") }
+    guard pence <= balance else { throw .insufficientFunds(shortByPence: pence - balance) }
+    return balance - pence
+}
+
+// Generic code passes the caller's error type straight through: no `any Error` appears
+func logged<T, E: Error>(_ label: String, _ body: () throws(E) -> T) throws(E) -> T {
+    do {
+        return try body()
+    } catch {
+        print("[log] \(label) failed: \(error)")
+        throw error
+    }
+}
+
+func checkoutMessage(pence: Int, balance: Int, cardExpired: Bool = false) -> String {
+    do throws(PaymentError) {
+        let left = try logged("charge") { () throws(PaymentError) -> Int in
+            try charge(pence, balance: balance, cardExpired: cardExpired)
+        }
+        return "Paid. \(left)p left"
+    } catch {
+        // `error` is a PaymentError, so the switch is exhaustive without a default
+        switch error {
+        case .declined(let reason): return "Declined: \(reason)"
+        case .insufficientFunds(let short): return "You're \(short)p short"
+        case .cardExpired: return "Your card has expired"
+        }
+    }
+}
+
+print(checkoutMessage(pence: 1_250, balance: 5_000))
+print(checkoutMessage(pence: 6_000, balance: 5_000))
+print(checkoutMessage(pence: 1_250, balance: 5_000, cardExpired: true))
+```
+
+```output
+Paid. 3750p left
+[log] charge failed: insufficientFunds(shortByPence: 1000)
+You're 1000p short
+[log] charge failed: cardExpired
+Your card has expired
+```
+
+What the example shows:
+
+- **`throws(PaymentError)`** promises only `PaymentError`s come out, so `catch` binds `error` as a `PaymentError` and the `switch` needs no `default`. Add a case to the enum and every such `switch` fails to compile until it handles it.
+- **`throws` is `throws(any Error)`,** and a function that can't throw is, in effect, `throws(Never)`.
+- **Generic code can be precise about errors it doesn't know.** `logged` throws whatever its closure throws: `E` is `PaymentError` here and would be `Never` for a closure that can't throw. That's a more exact `rethrows`, and the standard library adopted it in Swift 6: `map`, for one, now passes its closure's error type through.
+- **`do throws(PaymentError)`** states the error type of a `do` block explicitly. Recent compilers can often infer it, but writing it keeps the intent visible.
+
+<Callout kind="gotcha" title="Swift gotcha: closures don't infer typed throws">
+
+Write `try logged("charge") { try charge(…) }` and the closure is inferred as `throws(any Error)`, so `E` becomes `any Error` and your exhaustive `catch` stops compiling. Annotate the closure, `{ () throws(PaymentError) -> Int in … }`, as the example does. Inferring a closure's thrown type from its body is still an experimental compiler feature, so don't expect it.
+
+</Callout>
+
+## When typed throws pays, and when it doesn't
+
+The Swift proposal itself says untyped `throws` remains the right default for most code. Typed throws pays when:
+
+- **The set of errors is genuinely fixed,** and callers benefit from handling each one: validation, parsing, a payment step, a state machine's transitions.
+- **The code stays inside one module or one team,** so adding a case is a change you make everywhere at once, with the compiler's help.
+- **Generic helpers pass errors through,** like `logged` above, `Result`, or a retry wrapper.
+- **Allocation matters,** as in tight loops or embedded code: a concrete error type needs no boxed `any Error`.
+
+It costs you when:
+
+- **The API is public and will evolve.** Adding a case to a public typed error breaks every client's exhaustive `catch`, exactly as adding a case to any public enum does.
+- **The function calls code that throws other errors.** Typed throws forces you to wrap everything at once, even when the caller only logs and gives up.
+
+A common, good compromise: typed errors in the domain layer and in small closed components; untyped `throws` at module boundaries that change often, with the domain error type documented.
+
+## Trade-offs
+
+| | Untyped `throws` | Typed `throws(E)` | `Result<T, E>` | An optional | An error case in view state |
+| --- | --- | --- | --- | --- | --- |
+| **Caller knows the error type** | no | yes | yes | there's no error | yes |
+| **Exhaustive handling** | needs a default | yes | yes | n/a | yes |
+| **Evolving the error set** | free | breaks callers | breaks callers | n/a | breaks the view |
+| **Composes with `async`** | yes | yes | awkwardly | yes | n/a |
+| **Best for** | most APIs, module boundaries | closed sets, generic pass-through | storing an outcome (a cache, a test) | "not found" with nothing to explain | what the screen shows |
+
+Use `throws` (typed or not) for control flow, `Result` when you need to *store* an outcome, an optional only when absence needs no explanation, and a case in the screen's state enum for whatever the UI shows.
+
+<Callout kind="gotcha" title="iOS gotcha: cancellation isn't an error to show">
+
+When a SwiftUI view disappears, its `.task` is cancelled, and an in-flight `URLSession` call throws `URLError(.cancelled)` or `CancellationError`. A view model that turns every error into an alert shows "cancelled" to a user who only navigated back. Check for cancellation first (`error is CancellationError`, or `Task.isCancelled`) and return quietly.
+
+</Callout>
+
+<Callout kind="interview">
+
+**Say:** "Each layer has its own error type and translates the one below: transport errors become `APIError`, which the repository maps to domain errors like `.offline`, which the view model turns into a message and an action. I keep the original error for logging." On typed throws: "for closed sets inside a module; untyped at boundaries that evolve."
+
+**Ask:** what can the user do about each failure? Which errors does the server add without an app release? What must be logged for diagnosis?
+
+**Red flags:** `try?` swallowing errors silently; `URLError` or `DecodingError` reaching the UI; an alert for cancellation; one giant `AppError` enum that every layer imports.
+
+</Callout>
+
+## Practice
+
+The **seat hold** kata uses typed throws for a booking flow where every failure, sold out or expired, has a specific recovery, together with the ownership types of this module's last lesson.
+
+```cards
+- id: shape-by-recovery
+  front: "What should shape an error type?"
+  back: "What the caller can do about it (retry, fix input, sign in again, stop quietly), not where in the stack it came from."
+- id: translate-boundaries
+  front: "Why translate errors at each layer?"
+  back: "So low-level types like `URLError` don't leak upwards, and each layer gets errors in its own vocabulary. Keep the original for logs."
+- id: typed-throws-when
+  front: "When is typed throws a good fit?"
+  back: "Closed error sets handled exhaustively, code within one module, and generic helpers that pass a closure's error through. Untyped `throws` stays the default for evolving public APIs."
+- id: closure-typed-throws
+  front: "Why might `try helper { try charge() }` lose the typed error?"
+  back: "Closures don't infer typed throws by default, so the closure is `throws(any Error)`. Annotate it: `{ () throws(PaymentError) -> Int in … }`."
+```
+
+```quiz
+- id: q1
+  type: sort
+  prompt: "Which kind of failure is each?"
+  buckets: [Domain outcome, Transient, Programmer error, Cancellation]
+  items:
+    - [The card was declined, 0]
+    - [The request timed out on a train, 1]
+    - [An index the code computed is out of range, 2]
+    - [The user left the screen mid-request, 3]
+    - [The username is already taken, 0]
+    - [The server answered 503, 1]
+  explain: "Domain outcomes get specific cases and recovery; transient failures get retries or cached data; programmer errors are bugs for `precondition`; cancellation means stop quietly."
+- id: q2
+  type: mcq
+  prompt: "`func load() throws(CatalogError) -> [Product]`. In `do { try load() } catch { … }`, what is the type of `error`?"
+  options:
+    - "`any Error`"
+    - "`CatalogError`"
+    - "`Error?`"
+    - "`NSError`"
+  answer: 1
+  explain: "With typed throws, the `catch` clause binds the declared type, so you can switch over `CatalogError` exhaustively with no `default`."
+- id: q3
+  type: output
+  prompt: "What does this print?"
+  code: |
+    enum LoadError: Error { case offline, notFound }
+
+    func outcome(_ status: Int) -> String {
+        do throws(LoadError) {
+            if status == 0 { throw .offline }
+            if status == 404 { throw .notFound }
+            return "loaded"
+        } catch {
+            switch error {
+            case .offline: return "show cache"
+            case .notFound: return "show empty state"
+            }
+        }
+    }
+
+    print(outcome(200), outcome(404), outcome(0))
+  answer: "loaded show empty state show cache"
+  explain: "The `do throws(LoadError)` block can only throw `LoadError`, so `catch` gets a `LoadError` and the switch covers both cases without a `default`."
+- id: q4
+  type: truefalse
+  prompt: "Typed throws is a good default for the public API of a module that other teams depend on."
+  answer: false
+  explain: "Adding a case to a public typed error breaks every client's exhaustive handling. Prefer untyped `throws` at boundaries that evolve, and document the error type; use typed throws for closed sets inside a module."
+- id: q5
+  type: mcq
+  prompt: "A view model shows an alert for every error from `.task { await load() }`. Users report a \"cancelled\" alert when they go back. What's the best fix?"
+  options:
+    - "Catch `CancellationError` (and `URLError.cancelled`) and return without showing anything"
+    - "Use `try?` so no error ever reaches the alert"
+    - "Start the load in `Task.detached` so it can't be cancelled"
+    - "Retry the request when it's cancelled"
+  answer: 0
+  explain: "Cancellation means the work is no longer wanted. Treat it as a quiet exit. `try?` hides real failures too, and a detached task keeps working for a screen that's gone."
+- id: q6
+  type: mcq
+  prompt: "Where should the user-facing text \"Your card was declined\" come from?"
+  options:
+    - "A `message` property on the domain's `PaymentError`"
+    - "The view model (or view), mapping `PaymentError.declined` to localised text and an action"
+    - "The API client, from the server's error string"
+    - "`error.localizedDescription`, always"
+  answer: 1
+  explain: "Domain errors describe what happened; presentation decides what to say and offer, in which language. Keeping strings out of the domain lets the same error drive an alert, a label or a retry button."
+```

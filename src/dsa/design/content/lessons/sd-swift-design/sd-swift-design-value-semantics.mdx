@@ -1,0 +1,305 @@
+## Why it matters
+
+A surprising share of the strange bugs in an iOS app come down to one question: when two parts of the app hold "the cart", do they hold the same cart, or two copies? Get it wrong one way and a change on one screen leaks into another. Get it wrong the other way and an update never arrives. Swift lets you choose for each type, and that choice shapes the architecture: what can cross threads, what SwiftUI can compare, and what you can test with a plain `==`. Interviewers ask "struct or class?" because the answer shows whether you think about behaviour or about syntax.
+
+## Semantics, not keywords
+
+You met the mechanics in the DSA course's [Value vs reference semantics](/dsa/learn/swift-value-vs-reference). Here is the design view.
+
+- **Value semantics:** every variable holds its own independent value. A change made through one copy can never be seen through another.
+- **Reference semantics:** variables share one instance. A change made through one is seen through all of them, which is exactly what you want when the thing has an identity of its own.
+
+The important word is *semantics*. It describes how a type behaves, not whether it was declared with `struct` or `class`:
+
+| Type | Declared as | Behaves as | Why |
+| --- | --- | --- | --- |
+| `Int`, `String`, `[Order]` | struct | value | copies are independent; collections copy on write |
+| `URLRequest`, `Date`, `Measurement` | struct | value | Foundation's value types |
+| `UIImage` | class | value, in practice | it's immutable, so sharing one is safe |
+| a struct holding a `DateFormatter` | struct | **reference**, for the formatter | every copy shares one mutable formatter |
+| `URLSession`, `AVPlayer`, a view controller | class | reference | each one *is* something: a connection pool, a playback, a screen |
+
+So the design question isn't "struct or class?". It's **"should two holders of this see each other's changes?"** If the answer is no, you want value semantics, and a struct whose stored properties are themselves values gives you that for free.
+
+## Identity: domain identity is not object identity
+
+In [Entities, value objects and identity](/design/learn/sd-modelling-entities-values) you split the domain into **entities** (an order, a user: things with an identity that persists while their attributes change) and **value objects** (a price, an address). A common mistake is to map entities to classes because "they have identity".
+
+In Swift, an entity's identity is usually its `id`, not its memory address. `struct Order: Identifiable` is an entity: two values with the same `id` are two snapshots of the same order, perhaps taken a minute apart. What *should* be a reference type is the thing that owns the order's current state and decides how it changes.
+
+That gives three roles, which cover most of the types in an app:
+
+1. **Data:** orders, carts, forecasts, view state, messages between layers. Values.
+2. **Owners of mutable state:** the one place a piece of truth lives and changes, such as a cart store or an `@Observable` model. One reference type per piece of truth.
+3. **Resources and services:** things with a lifetime and side effects, such as a `URLSession`, an `AVPlayer`, a database connection or a WebSocket. References, because copying a network connection makes no sense.
+
+## The shared-mutable-state bug
+
+Here is the bug value semantics prevents. A promo banner previews what a discount code would save, by applying it to the cart it was handed. With a class, the preview leaks into the real cart:
+
+```swift run
+final class SharedCart {
+    var pricesInPence: [Int] = []
+    var discountPercent = 0
+    var total: Int { pricesInPence.reduce(0, +) * (100 - discountPercent) / 100 }
+}
+
+struct Cart {
+    var pricesInPence: [Int] = []
+    var discountPercent = 0
+    var total: Int { pricesInPence.reduce(0, +) * (100 - discountPercent) / 100 }
+}
+
+// The banner "tries" a code on the cart it was given
+func preview(code percent: Int, on cart: SharedCart) -> Int {
+    cart.discountPercent = percent
+    return cart.total
+}
+
+func preview(code percent: Int, on cart: Cart) -> Int {
+    var cart = cart
+    cart.discountPercent = percent
+    return cart.total
+}
+
+let shared = SharedCart()
+shared.pricesInPence = [1200, 800]
+print("Banner preview:", preview(code: 25, on: shared))
+print("Checkout total:", shared.total)
+
+let value = Cart(pricesInPence: [1200, 800])
+print("Banner preview:", preview(code: 25, on: value))
+print("Checkout total:", value.total)
+```
+
+```output
+Banner preview: 1500
+Checkout total: 1500
+Banner preview: 1500
+Checkout total: 2000
+```
+
+With the class, the checkout charges 25% less because a banner *looked* at a code. Nothing in the call `preview(code: 25, on: shared)` warns you. With the struct, the compiler enforces the rule: a function can't change a value it was given unless it copies it (`var cart = cart`) or takes it `inout`, and `inout` shows at the call site as `&cart`. Mutation becomes visible in the code, which is what makes value-based code easy to reason about.
+
+## Values flow, one owner mutates
+
+The architecture that falls out of this is simple to state. **Each piece of mutable truth has exactly one owner, a reference type. Everyone else gets values, and asks the owner for changes.** Step through it:
+
+```visual flow
+title: One owner, many snapshots
+layers:
+  - { label: Screens, rows: 0 }
+  - { label: State owner, rows: 2 }
+  - { label: Server, rows: 4 }
+nodes:
+  - { id: basket, label: Basket screen, kind: view, at: [0, 0] }
+  - { id: product, label: Product page, kind: view, at: [2, 0] }
+  - { id: banner, label: Promo banner, kind: view, at: [4, 0] }
+  - { id: store, label: CartStore, kind: service, at: [2, 2] }
+  - { id: api, label: Cart API, kind: external, at: [2, 4] }
+edges:
+  - [store, basket, Cart value, { style: data }]
+  - [store, banner, Cart value, { style: data }]
+  - [product, store, add(item)]
+  - [store, api, PUT /cart, { style: async }]
+steps:
+  - say: "The **store** is the only place the cart can change. It's a class because it has identity: one cart per session, with a lifetime."
+    show: [store]
+    label: { store: owns Cart }
+  - say: Screens receive the cart as a **value**. Each can read it, format it, or change its own copy for a preview without affecting anyone.
+    send: [store->basket, store->banner]
+  - say: The product page doesn't mutate anything it holds. It asks the owner, `add(item)`, so every change goes through one place that can validate it.
+    send: product->store
+    state: { store: active }
+  - say: The store changes its value and syncs with the server. Retry and conflict logic live here, not in the screens.
+    send: store->api
+  - say: Readers get the new snapshot. The old snapshot is still valid, which is what makes diffing, undo and "show the previous total" trivial.
+    send: [store->basket, store->banner]
+    state: { store: ok }
+```
+
+In SwiftUI this owner is usually an `@Observable` class on the main actor, and the truth inside it is a value:
+
+```swift check ios
+import SwiftUI
+import Observation
+
+struct CartLine: Identifiable, Hashable, Sendable {
+    let id: UUID
+    var name: String
+    var pence: Int
+    var quantity: Int
+}
+
+struct Cart: Equatable, Sendable {
+    var lines: [CartLine] = []
+    var totalPence: Int { lines.reduce(0) { $0 + $1.pence * $1.quantity } }
+}
+
+@MainActor @Observable
+final class CartStore {
+    // Readable by everyone, changeable only through the methods below
+    private(set) var cart = Cart()
+
+    func add(_ line: CartLine) {
+        cart.lines.append(line)
+    }
+
+    func setQuantity(_ quantity: Int, for id: CartLine.ID) {
+        guard let index = cart.lines.firstIndex(where: { $0.id == id }) else { return }
+        cart.lines[index].quantity = max(0, quantity)
+        cart.lines.removeAll { $0.quantity == 0 }
+    }
+}
+
+struct BasketView: View {
+    let store: CartStore
+
+    var body: some View {
+        List(store.cart.lines) { line in
+            Stepper("\(line.name) × \(line.quantity)", value: Binding(
+                get: { line.quantity },
+                set: { store.setQuantity($0, for: line.id) }
+            ))
+        }
+        .safeAreaInset(edge: .bottom) {
+            Text((Decimal(store.cart.totalPence) / 100).formatted(.currency(code: "GBP")))
+        }
+    }
+}
+```
+
+Notice what the value buys you. Testing `CartStore` is a matter of calling methods and comparing `store.cart` with an expected `Cart` using `==`. Undo is storing the previous `Cart`. Sending the cart to a background task needs no lock, because `Cart` is `Sendable` as soon as its stored properties are.
+
+## What copying really costs
+
+"Structs are copied, so big structs are slow" is half true.
+
+- **Collections copy on write.** Copying an `[Order]` of 10,000 elements copies one reference to its buffer. The elements are copied only when one of the sharing copies is mutated. The same goes for `String`, `Dictionary`, `Set` and `Data`.
+- **References inside a struct cost retains.** Copying a struct with twelve `String` and `Array` properties does up to twelve reference-count increments (short strings are stored inline and need none). That's cheap, but in a hot loop over thousands of large structs it shows up in Instruments as retain/release traffic.
+- **The fix, when you've measured a problem,** is to pass large values `borrowing` (you'll meet ownership modifiers at the end of this module), to wrap rarely changed bulk data in a copy-on-write box (the DSA course builds one in [Writing your own copy-on-write](/dsa/learn/swift-implementing-cow)), or to keep the data in one owner and pass ids.
+
+Choose value or reference for the semantics first. Performance is rarely the deciding factor, and when it is, measure.
+
+## Where Apple's frameworks draw the line
+
+- **SwiftUI views are values:** cheap descriptions, recreated all the time. State that must survive lives in storage SwiftUI owns (`@State`) or in reference-typed models. A plain, non-observable class stored in a view's `let` can change without SwiftUI ever knowing.
+- **Diffable data sources and lists separate identity from content.** Apple's advice for `UICollectionViewDiffableDataSource` is to put identifiers (`Order.ID`) in the snapshot rather than whole models, look up the current value when configuring a cell, and call `reconfigureItems(_:)` (iOS 15) when an item's content changes. The snapshot holds identities; the store holds values.
+- **Concurrency rewards values.** A struct or enum whose stored properties are all `Sendable` can cross actor boundaries freely. A mutable class needs an actor or a lock. You'll build on this in the Sendable lesson later in this module.
+- **Persistence objects are references bound to a context.** SwiftData's `@Model` classes and Core Data's `NSManagedObject` belong to the context that fetched them and aren't `Sendable`.
+
+<Callout kind="gotcha" title="iOS gotcha: SwiftData models aren't values">
+
+A `@Model` object is a class tied to its `ModelContext`. Handing it to another actor, or keeping it in a long-lived view model after the context has gone, leads to stale data or crashes. Across actors, pass its `persistentModelID` (a `Sendable` `PersistentIdentifier`) and fetch it again in that actor's own context, or map it to a plain struct at the boundary. Core Data has the same rule with `NSManagedObjectID`.
+
+</Callout>
+
+<Callout kind="gotcha" title="Swift gotcha: let doesn't freeze a class">
+
+`let store = CartStore()` stops you pointing `store` at a different object, but every `var` inside it can still change. Only a value type's `let` makes the whole value immutable. When you want an immutable reference type, make every stored property a `let` and the class `final`.
+
+</Callout>
+
+## Trade-offs
+
+| | struct or enum | final class | `@Observable` class | actor |
+| --- | --- | --- | --- | --- |
+| **Identity** | only through an `id` | object identity | object identity | object identity |
+| **Sharing a change** | explicit: return or assign | implicit, to every holder | implicit, and SwiftUI observes it | implicit, serialised |
+| **Thread safety** | free, if its members are `Sendable` | your job: a lock or immutability | usually main-actor only | built in; access is `async` |
+| **Testing** | `==` on whole values | property by property | property by property | async tests |
+| **Best for** | data, view state, messages | resources, services, UIKit and Objective-C interop | UI-facing owners of state | shared mutable state off the main thread |
+
+Values win for anything that describes something at a moment. A final class wins for resources and for interop, where the frameworks expect objects. An `@Observable` class wins as the single owner of state a screen displays. An actor wins when that state is shared by background work, such as a cache or a token store.
+
+<Callout kind="interview">
+
+**Say:** "Models and view state are value types: Equatable, Sendable, easy to test. Each piece of mutable truth has one owner, a reference type, which hands out snapshots and accepts intents." Then name the owner for each piece of state in your design.
+
+**Ask:** does anything else need to see this change as it happens? Does the thing have a lifecycle or hold a resource? Who is allowed to change it?
+
+**Red flags:** "structs are faster, so I use structs for everything" (a performance reason for a semantic choice); "a class, so both screens can share it" (shared mutable state with no owner); a "value" type that quietly holds a `DateFormatter`, `NSMutableArray` or other mutable class.
+
+</Callout>
+
+```cards
+- id: semantics-question
+  front: "What's the real question behind \"struct or class?\""
+  back: "Should two holders of this see each other's changes? If not, you want value semantics; if the thing has an identity and a lifecycle, a reference."
+- id: entity-not-class
+  front: "Should an entity like an `Order` be a class because it has identity?"
+  back: "Usually not. Its identity is its `id`; a struct with an `id` is a snapshot of it. The *owner* of its current state is the reference type."
+- id: one-owner
+  front: "What's the one-owner rule?"
+  back: "Each piece of mutable truth lives in exactly one reference type. Everyone else gets values and asks the owner for changes."
+- id: copy-cost
+  front: "What does copying a struct actually cost?"
+  back: "Collections inside it copy on write, so only references are copied, and each reference-typed property costs a retain. Choose for semantics; measure before optimising."
+```
+
+```quiz
+- id: q1
+  type: sort
+  prompt: "Which should each of these be?"
+  buckets: [Value type, Reference type]
+  items:
+    - [An order decoded from the API, 0]
+    - [The state a screen renders, 0]
+    - [A WebSocket connection, 1]
+    - [The image cache every screen shares, 1]
+    - [A price with its currency, 0]
+    - [An AVPlayer playing an episode, 1]
+    - [A URLRequest being assembled, 0]
+  explain: "Data that describes something at a moment is a value: orders, view state, prices, requests. Things with a lifetime, a resource or shared mutable state are references: a connection, a cache, a player."
+- id: q2
+  type: output
+  prompt: "What does this print?"
+  code: |
+    final class Counter { var value = 0 }
+    struct Tally {
+        var count = 0
+        let shared: Counter
+    }
+    let a = Tally(shared: Counter())
+    var b = a
+    b.count += 1
+    b.shared.value += 1
+    print(a.count, a.shared.value)
+  answer: "0 1"
+  explain: "Copying the struct copies `count`, so `a.count` stays 0, but it copies only the *reference* to the counter. Both tallies share one `Counter`, so the change through `b` shows through `a`. A struct holding a mutable class has reference semantics for that part."
+- id: q3
+  type: mcq
+  prompt: "A SwiftUI view stores `let cart: CartBox`, where `CartBox` is a plain final class (not `@Observable`). A button calls `cart.items.append(item)`. What happens?"
+  options:
+    - "The view updates, because the cart changed"
+    - "The data changes, but the screen doesn't update"
+    - "It doesn't compile, because `cart` is a `let`"
+    - "SwiftUI copies the class, so the change is lost"
+  answer: 1
+  explain: "`let` only fixes the reference, so the mutation compiles and happens. But SwiftUI has no way to know a plain class changed: nothing it tracks was written. Make the class `@Observable`, or keep the cart as a value in state SwiftUI owns."
+- id: q4
+  type: truefalse
+  prompt: "An `Order` has an id and changes over time, so it should be modelled as a class."
+  answer: false
+  explain: "Domain identity isn't object identity. A struct with an `id` represents the order perfectly well; each value is a snapshot. Put the order's *current state* in one owner (a store or repository), which is the reference type."
+- id: q5
+  type: mcq
+  prompt: "A view model passes an array of 10,000 orders, by value, to a function that only reads it. What does that copy cost?"
+  options:
+    - "Copying all 10,000 orders"
+    - "Copying one reference to the array's buffer"
+    - "Nothing at all, because structs are free"
+    - "A deep copy of every string inside every order"
+  answer: 1
+  explain: "Arrays copy on write: the copy shares the buffer until one side mutates it, so a read-only use never copies the elements. The cost is a retain, not a loop over 10,000 orders."
+- id: q6
+  type: mcq
+  prompt: "A background importer creates a SwiftData `@Model` object and needs to tell the main actor which one to show. What should it send?"
+  options:
+    - "The model object itself"
+    - "Its `persistentModelID`"
+    - "Its `ModelContext`"
+    - "A JSON string of the object"
+  answer: 1
+  explain: "`@Model` objects are references tied to the context that made them and aren't `Sendable`. The `PersistentIdentifier` is a `Sendable` value: the main actor fetches the object again in its own context."
+```

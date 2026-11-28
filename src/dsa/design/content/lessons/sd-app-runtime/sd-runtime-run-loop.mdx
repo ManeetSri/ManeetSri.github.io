@@ -1,0 +1,291 @@
+## Why it matters
+
+Every touch, every animation frame and every line of UI code in your app runs on one thread. When that thread is busy, scrolling stutters, taps feel ignored, and after long enough the system kills the app. Understanding the **run loop**, the loop that thread spends its life in, explains a lot of iOS folklore at once: why a label doesn't change until your function returns, why a timer stops while the user scrolls, why a 50 ms decode drops frames, and why `await` on the main actor doesn't freeze the screen. "Why does my list stutter?" is a favourite interview question, and the answer starts here.
+
+## One thread for all UI
+
+UIKit and SwiftUI are not thread-safe. Every view, view controller and SwiftUI view must be touched only from the **main thread**, the thread the process started on. Swift 6 turns this into types: `UIView`, `UIViewController` and SwiftUI's `View` protocol are all `@MainActor`, so the compiler checks most calls for you.
+
+Most, not all. Objective-C callbacks such as `URLSession`'s completion handler are imported leniently, so the mistake is only a warning:
+
+```swift
+URLSession.shared.dataTask(with: url) { data, _, _ in
+    self.label.text = "Loaded \(data?.count ?? 0) bytes" // runs on a background queue
+}.resume()
+```
+
+```text title="What you'll see"
+warning: main actor-isolated property 'text' can not be mutated from a Sendable closure
+```
+
+Treat that warning as an error. At run time, Xcode's **Main Thread Checker** also catches UIKit calls made off the main thread in debug builds.
+
+## The run loop
+
+The main thread doesn't run your code top to bottom and exit. After launch it enters a loop that it never leaves:
+
+1. **Sleep** until something needs doing. A sleeping main thread uses no CPU at all.
+2. **Wake** for whatever arrived: a touch from the system, a timer coming due, a block on the main dispatch queue, a job for the main actor.
+3. **Run the handlers**, one after another: your gesture handler, your timer's closure, your `DispatchQueue.main.async` block, the next slice of a `@MainActor` async function.
+4. **Commit** before going back to sleep. Core Animation's run loop observer runs the pending layout (`layoutSubviews`, SwiftUI's body updates and layout), the pending drawing, and sends the resulting layer tree to the **render server**, a separate system process that composites the frame and puts it on the display.
+
+<Callout kind="analogy">
+
+Think of a receptionist at a quiet front desk. They doze until the phone rings or an alarm goes off, deal with each call in turn, and only file the day's paperwork (the commit) once nobody is waiting. A caller who keeps them talking for ten minutes delays everyone behind, and the paperwork too.
+
+</Callout>
+
+```visual states
+title: Two turns of the main run loop
+states:
+  - { id: asleep, label: Asleep, at: [0, 0] }
+  - { id: handle, label: Run handlers, at: [1, 0] }
+  - { id: commit, label: Layout and commit, at: [1, 1] }
+initial: asleep
+transitions:
+  - [asleep, handle, wake]
+  - [handle, handle, next]
+  - [handle, commit, beforeWaiting]
+  - [commit, asleep, sleep]
+intro: "The main thread is **asleep**, waiting for work. It costs nothing while it waits."
+events:
+  - { event: wake, say: "A touch arrives. The run loop wakes and your button's action runs: it sets `label.text` three times. Nothing appears yet." }
+  - { event: next, say: "In the same turn, a `DispatchQueue.main.async` block that was queued earlier runs too. Each handler runs to completion before the next starts." }
+  - { event: beforeWaiting, say: "Nothing else is due, so **Core Animation commits**: layout runs once, the label draws its *final* text once, and the layer tree goes to the render server." }
+  - { event: sleep, say: "Back to sleep. The render server puts the new frame on screen at the next display refresh." }
+  - { event: wake, say: "A timer fires. Its closure updates a progress bar." }
+  - { event: beforeWaiting, say: "Commit again. One turn, one commit: that's why changes you make in a handler appear together, after it returns." }
+  - { event: sleep, say: "Asleep. While your code is running, none of this can happen: no touches handled, no commits, no new frames." }
+```
+
+That last sentence is the whole lesson. **Your code runs inside the loop.** While a handler is running, the loop can't take new touches or commit new frames.
+
+## The frame budget
+
+The display refreshes 60 times a second on most iPhones, and up to 120 times on ProMotion displays. For smooth motion, each frame's work must be done in time:
+
+| Refresh rate | Time per frame | Main thread's share |
+| --- | --- | --- |
+| 60 Hz | 16.7 ms | Less: the render server needs its part of the frame too |
+| 120 Hz | 8.3 ms | Less again |
+
+A frame that arrives late is a **hitch**: the scroll jumps instead of gliding. When the main thread is busy long enough that the app visibly stops responding, it's a **hang**: Apple's tools count 250 ms or more as a hang, and users start to notice stalls from about 100 ms. Watch what one synchronous decode costs, and what moving it off the main thread buys:
+
+```visual timeline
+title: A 50 ms decode during a scroll, on and off the main thread
+unit: ms
+lanes:
+  - { id: main, label: Main thread }
+  - { id: pool, label: Thread pool }
+  - { id: display, label: Display }
+spans:
+  - { lane: main, from: 0, to: 3, label: scroll, tone: active }
+  - { lane: main, from: 3, to: 53, label: decode JSON, tone: error }
+  - { lane: main, from: 53, to: 56, label: commit, tone: active }
+  - { lane: display, from: 0, to: 16.7, label: on time, tone: ok }
+  - { lane: display, from: 16.7, to: 33.3, label: stale, tone: error }
+  - { lane: display, from: 33.3, to: 50, label: stale, tone: error }
+  - { lane: display, from: 50, to: 66.7, label: stale, tone: error }
+  - { lane: display, from: 66.7, to: 83.3, label: moves, tone: ok }
+  - { lane: main, from: 100, to: 103, label: scroll, tone: active }
+  - { lane: pool, from: 103, to: 153, label: decode JSON, tone: wait }
+  - { lane: main, from: 117, to: 119, label: frame }
+  - { lane: main, from: 133, to: 135, label: frame }
+  - { lane: main, from: 150, to: 152, label: frame }
+  - { lane: main, from: 153, to: 156, label: apply, tone: ok }
+  - { lane: display, from: 100, to: 116.7, label: on time, tone: ok }
+  - { lane: display, from: 116.7, to: 133.3, label: on time, tone: ok }
+  - { lane: display, from: 133.3, to: 150, label: on time, tone: ok }
+  - { lane: display, from: 150, to: 166.7, label: on time, tone: ok }
+  - { lane: display, from: 166.7, to: 183.3, label: on time, tone: ok }
+markers:
+  - { at: 0, label: decode on main }
+  - { at: 100, label: decode off main }
+steps:
+  - { at: 2, say: "The user is scrolling at 60 Hz. Every 16.7 ms the main thread must finish that frame's layout and commit." }
+  - { at: 40, say: "A **50 ms JSON decode** runs on the main thread. The display refreshes at 16.7, 33.3 and 50 ms with nothing new: three frames lost, and the scroll freezes." }
+  - { at: 80, say: "The decode ends, the commit goes out, and the scroll lurches forward. Users feel that lurch as jank." }
+  - { at: 140, say: "Now the decode runs on the **thread pool**. The main thread stays free and keeps committing a frame every 16.7 ms." }
+  - { at: 180, say: "When the decode finishes, the main thread spends 3 ms applying the result. Every frame was on time." }
+```
+
+The usual suspects on the main thread: JSON decoding, image decoding at full size, synchronous file or database reads, Auto Layout on a huge hierarchy, string formatting with a new `DateFormatter` per cell, and waiting on a lock another thread holds.
+
+## Main thread, main queue, main actor
+
+Three names, one thread:
+
+- The **main thread** is the thread itself.
+- The **main dispatch queue** is GCD's serial queue whose blocks the main run loop runs on the main thread. `DispatchQueue.main.async` puts a block on it.
+- The **main actor** is Swift concurrency's global actor for the main thread. Code marked `@MainActor` runs there, and its executor schedules jobs through the main queue.
+
+What matters for design is the difference between **suspending** and **blocking**. When a `@MainActor` function reaches an `await`, it gives the main thread back to the run loop until the awaited work finishes, so touches and frames carry on. When it runs synchronous code, it holds the thread until that code returns. A `@MainActor` view model is fine; a `@MainActor` view model that decodes 2 MB of JSON synchronously is a hitch.
+
+To move work off the main actor, call code that isn't isolated to it: an `actor`, or an async function that runs on the thread pool. The simplest is a function marked `@concurrent` (Swift 6.2 and later), which always leaves the caller's actor:
+
+```swift run title="Hopping off the main actor and back"
+import Foundation
+
+// A synchronous check, so async code can show where it's running (for teaching, not for logic)
+func whereAmI() -> String { Thread.isMainThread ? "the main thread" : "a pool thread" }
+
+// Synchronous work runs on whatever thread calls it
+func checksum(_ bytes: [UInt8]) -> Int {
+    bytes.reduce(0) { $0 + Int($1) }
+}
+
+// @concurrent: runs on the thread pool, never on the caller's actor
+@concurrent
+func checksumOffMain(_ bytes: [UInt8]) async -> Int {
+    print("2. checksum runs on \(whereAmI())")
+    return checksum(bytes)
+}
+
+@MainActor
+func refresh() async {
+    print("1. refresh starts on \(whereAmI())")
+    let bytes = [UInt8](repeating: 7, count: 1_000_000)
+    let total = await checksumOffMain(bytes) // the main thread is free while this runs
+    print("3. refresh resumes on \(whereAmI())")
+    print("4. total \(total)")
+}
+
+await refresh()
+```
+
+```output
+1. refresh starts on the main thread
+2. checksum runs on a pool thread
+3. refresh resumes on the main thread
+4. total 7000000
+```
+
+Without `@concurrent`, where a plain `nonisolated async` function runs depends on your build settings, which is a recent change worth knowing. In Swift 6 language mode it runs on the thread pool. With the upcoming feature `NonisolatedNonsendingByDefault` (part of Xcode's "Approachable Concurrency" setting), it runs on the **caller's** actor, so called from the main actor it stays on the main thread. `@concurrent` says what you mean either way. You'll go deep on actors, isolation and these settings in D22.
+
+## Run loop modes, and the timer that stops
+
+The run loop runs in a **mode**, and each timer or source is registered for some modes and not others. While the user's finger is dragging a scroll view, UIKit switches the main run loop into a tracking mode. A timer scheduled the usual way, with `Timer.scheduledTimer`, is registered only for the default mode, so **it stops firing while the user scrolls**: the countdown freezes, the "live" clock lags.
+
+Register it for the **common** modes, which include tracking:
+
+```swift check title="CountdownTicker.swift"
+import Foundation
+
+@MainActor
+final class CountdownTicker {
+    private var timer: Timer?
+
+    func start(onTick: @escaping @MainActor () -> Void) {
+        let timer = Timer(timeInterval: 1, repeats: true) { _ in
+            // A timer on the main run loop fires on the main thread; say so to the compiler
+            MainActor.assumeIsolated { onTick() }
+        }
+        // .common includes the tracking mode UIKit runs while the user scrolls
+        RunLoop.main.add(timer, forMode: .common)
+        self.timer = timer
+    }
+
+    func stop() {
+        timer?.invalidate()
+        timer = nil
+    }
+}
+```
+
+Main-queue blocks and main-actor jobs run in the common modes already, which is why a `Task` loop with `Task.sleep` keeps ticking during a scroll. For anything tied to the display's refresh, such as a custom animation, use `CADisplayLink` instead of a timer: it fires once per frame, in step with the display.
+
+## Trade-offs: where should this work run?
+
+| Where | Responsiveness | Safety | Cost | When it wins |
+| --- | --- | --- | --- | --- |
+| Synchronously on the main actor | Blocks for as long as it takes | Simplest: no data crosses threads | None | Small work (well under a millisecond), and anything that touches UI |
+| `await` from the main actor into an `actor` or `@concurrent` function | Main thread stays free | Data passed across must be `Sendable` | A hop each way | Decoding, parsing, image work, disk and database I/O |
+| A GCD queue with a completion handler | Main thread stays free | Easy to touch UI from the wrong queue | Callback plumbing | Older code and APIs that have no async version |
+| Precompute ahead of time (prefetch, cache) | Best: no work at the moment of need | Depends on the cache | Memory, and work that may be wasted | Scrolling lists: prefetch cells, decode images before they're visible |
+
+<Callout kind="interview">
+
+**Say** how you'd find the cause before guessing: "I'd record the scroll in Instruments with the Hangs and Animation Hitches instruments, look at what the main thread was doing during the long frames, and move that work off the main actor or out of the scroll path." **Ask** which devices and refresh rates matter: a 120 Hz target halves the budget. **Red flags:** "use a background thread" with no word about getting results back safely, `DispatchQueue.main.sync`, and believing `async` alone moves work off the main thread.
+
+</Callout>
+
+<Callout kind="gotcha" title="iOS gotcha: callbacks that trap in Swift 6">
+
+In Swift 6 mode, a closure written inside a `@MainActor` type is isolated to the main actor, and the compiler inserts a check where an Objective-C API might call it. If the API calls it on a background queue, as some notification, authorisation and SDK callbacks do, the app now **traps** with `_dispatch_assert_queue_fail` instead of racing silently. Prefer the API's `async` version, or mark the closure `@Sendable` and hop to the main actor explicitly.
+
+</Callout>
+
+<Callout kind="gotcha" title="iOS gotcha: DispatchQueue.main.sync deadlocks">
+
+Calling `DispatchQueue.main.sync` from the main thread waits for the main queue to run a block, but the main queue can't run anything until the current block (yours) returns. The app freezes forever. The same deadlock hides in a semaphore that waits on the main thread for a callback delivered on the main queue.
+
+</Callout>
+
+## Practice
+
+[The launch review](/design/practice/sd-review-app-runtime-launch-main-thread) is a run-loop exercise in disguise: find everything that holds the main thread before the first commit, and say where each piece should run instead.
+
+```cards
+- id: run-loop-turn
+  front: "What happens in one turn of the main run loop?"
+  back: "It wakes for input, a timer, main-queue blocks or main-actor jobs, runs their handlers one after another, then commits layout and drawing to the render server before sleeping again."
+- id: suspend-vs-block
+  front: "Why doesn't `await` on the main actor freeze the UI, while synchronous work does?"
+  back: "At an `await` the function suspends and the run loop keeps turning. Synchronous work holds the main thread until it returns, so no touches or frames are handled."
+- id: timer-modes
+  front: "Why does a scheduled Timer stop firing while the user scrolls, and what's the fix?"
+  back: "Scrolling switches the run loop to its tracking mode, and `scheduledTimer` registers only for the default mode. Add the timer for `.common` modes, or use a Task loop or CADisplayLink."
+- id: frame-budget
+  front: "What's the frame budget at 60 Hz and at 120 Hz?"
+  back: "16.7 ms and 8.3 ms per frame, of which the main thread gets only part."
+```
+
+```quiz
+- id: q1
+  type: output
+  prompt: "This runs as top-level code, which Swift 6 runs on the main actor. What does it print?"
+  code: |
+    import Foundation
+
+    print("A")
+    DispatchQueue.main.async {
+        print("C")
+        exit(0)
+    }
+    print("B")
+    dispatchMain()
+  answer: "A\nB\nC"
+  explain: "The block is queued on the main queue, which can only run it after the current code gives the main thread back, here at `dispatchMain()`. UI changes behave the same way: they're applied after your handler returns."
+- id: q2
+  type: estimate
+  prompt: "On a 120 Hz ProMotion display, roughly how many milliseconds does each frame get?"
+  answer: 8.3
+  unit: ms
+  within: { percent: 15 }
+  explain: "1,000 ms ÷ 120 ≈ 8.3 ms, half the 16.7 ms of a 60 Hz display, and the main thread gets only part of it."
+- id: q3
+  type: mcq
+  prompt: "A `@MainActor` view model calls `let items = try JSONDecoder().decode([Item].self, from: data)` on a 3 MB response, and scrolling hitches every refresh. What's the best fix?"
+  options:
+    - "Wrap the call in `Task { }` inside the view model"
+    - "Move the decode into a `@concurrent` function (or an actor) and `await` its result"
+    - "Call it with `DispatchQueue.main.async`"
+    - "Mark the view model `nonisolated`"
+  answer: 1
+  explain: "A `Task` created on the main actor inherits it, so the decode still runs on the main thread, and `main.async` only delays it. Doing the work in `@concurrent` code or an actor frees the main thread, and the result comes back to the view model after the `await`. Removing isolation from the whole view model breaks its UI safety."
+- id: q4
+  type: truefalse
+  prompt: "Setting `label.text` three times in one button handler draws the label three times."
+  answer: false
+  explain: "Drawing happens once, at the commit before the run loop sleeps, and uses the final text. That's also why a long handler delays every visible change it makes."
+- id: q5
+  type: mcq
+  prompt: "A live auction countdown, driven by `Timer.scheduledTimer`, freezes whenever the user scrolls the bid list. Why?"
+  options:
+    - "Timers can't fire on the main thread"
+    - "Scrolling puts the run loop in its tracking mode, and the timer is registered only for the default mode"
+    - "The scroll view's layout blocks the timer's thread"
+    - "Timers are paused whenever the app is inactive"
+  answer: 1
+  explain: "`scheduledTimer` adds the timer for the default mode only. Adding it for `.common` modes, which include tracking, keeps it firing during scrolls."
+```
