@@ -1,0 +1,569 @@
+## Why it matters
+
+A shopping cart looks like an array of products with a total at the bottom. Underneath it are money, limits, stale prices, promotions that interact with delivery fees, offline edits and a server that has the final say. That's why "design the cart for a shopping app" is a common interview prompt and a common source of real bugs. This lesson models one from scratch, using every idea in this module in order, so you can see how they fit together.
+
+## The brief
+
+You're building the cart for a clothing shop's iPhone app.
+
+- People add a product **variant** (a size and colour, identified by its SKU) with a quantity. Adding a SKU that's already in the cart adds to that line.
+- Each line holds **1 to 10** of its SKU; a cart holds at most **50 lines**.
+- People can change a quantity, remove a line, and enter **one promo code**.
+- The cart shows a **subtotal**, any **discount**, a **delivery fee** (£3.99, free when the order is £40 or more after discounts) and a **total**.
+- Prices shown in the cart are what the catalogue said when the item was added. At checkout the **server** prices the cart again, and its total is the one that's charged.
+- A guest's cart is kept on the device; a signed-in cart syncs to the account.
+- Each regional store sells in one currency.
+
+The scale is modest (a few million users, carts of a handful of items), so the hard parts are correctness and clarity, not performance.
+
+## Step 1: nouns, verbs and rules
+
+Start by reading the brief for three things: the **nouns** (candidate types), the **verbs** (operations) and the **rules**.
+
+- **Nouns:** cart, line, product, variant or SKU, quantity, price, promo code, discount, delivery fee, subtotal, total, currency, checkout.
+- **Verbs:** add, change quantity, remove, apply a code, remove a code, check out.
+- **Rules**, sorted by what kind of rule they are:
+
+| Rule | Kind | Who enforces it |
+| --- | --- | --- |
+| A quantity is 1 to 10 | Value rule | The `Quantity` type |
+| One line per SKU; adding again merges | Invariant across lines | The cart aggregate |
+| At most 50 lines | Invariant | The cart aggregate |
+| One currency per cart | Invariant | The cart aggregate |
+| At most one promo code | Invariant | The cart (it holds an optional) |
+| Subtotal, discount, delivery, total | Derived values | A pricing function, computed on demand |
+| Whether a code is valid, current prices, stock | Server decisions | The checkout API |
+
+That last row matters as much as the others. Deciding what the app **doesn't** own is part of modelling: the app can estimate a discount to show, but only the server can say a code is valid or an item is in stock.
+
+## Step 2: entities, values and the boundary
+
+Next, decide what each noun *is*, using the earlier lessons' tests.
+
+- The **cart** is an entity: it changes constantly and stays the same cart. It gets a client-generated `UUID`, so a guest's cart exists offline. It's also the **aggregate root**, because the invariants above span its lines.
+- A **line** is an entity *inside* the aggregate. Its identity is its SKU, and only within this cart (that's how "adding again merges" works). Nothing outside the cart refers to a line directly.
+- A **product** is an entity in a different aggregate, the catalogue. The cart never edits it, and refers to it by SKU.
+- **Money, quantity, SKU and promo code** are values. So is the **price snapshot**: the name and price as they were when the item was added.
+- The **summary** (subtotal, discount, delivery, total) is a derived value: computed from the cart, never stored beside it.
+
+Step through how the pieces meet:
+
+```visual flow
+title: The cart's model
+nodes:
+  - { id: view, label: CartView, kind: view, at: [0, 0] }
+  - { id: store, label: CartStore, at: [2, 0] }
+  - { id: server, label: Checkout API, kind: external, at: [4, 0] }
+  - { id: pricing, label: Pricing, at: [0, 1.5] }
+  - { id: cart, label: Cart (root), at: [2, 1.5] }
+  - { id: catalogue, label: Catalogue, kind: external, at: [4, 1.5] }
+  - { id: lines, label: Lines, at: [2, 3] }
+groups:
+  - { id: aggregate, label: Cart aggregate, nodes: [cart, lines] }
+edges:
+  - [view, store, intents]
+  - [store, cart, try add]
+  - [cart, lines, merge, { style: data }]
+  - [store, pricing, summary]
+  - [pricing, cart, reads, { style: data }]
+  - [lines, catalogue, SKU, { style: data }]
+  - [store, server, quote, { style: async }]
+steps:
+  - say: "The cart screen sends **intents** to a `CartStore`: add this SKU, set this quantity, remove that line. The view never edits the cart itself."
+    show: [view, store]
+    send: view->store
+  - say: "The store asks the **cart** aggregate. The root checks the rules (one currency, one line per SKU, quantities 1 to 10, at most 50 lines) and either changes its lines or throws."
+    show: [aggregate]
+    send: [store->cart, cart->lines]
+  - say: "Totals come from **Pricing**, a pure function of the cart and the server's rules. Nothing stores a total that could disagree with the lines."
+    show: [pricing]
+    send: [store->pricing, pricing->cart]
+  - say: "Each line refers to the **catalogue** by SKU, and keeps a *snapshot* of the price it was added at. Products are a separate aggregate the cart never edits."
+    show: [catalogue]
+    send: lines->catalogue
+  - say: "At checkout the **server** prices the cart again. Its quote is the only total the order trusts; the app's figure was an estimate."
+    show: [server]
+    send: store->server
+    label: { server: the real price }
+```
+
+## Step 3: values that refuse bad data
+
+Each value type takes one rule out of the rest of the code. All the code in this lesson compiles together, in order.
+
+```swift check group=cart title="Values"
+import Foundation
+
+/// A stock-keeping unit: one sellable variant, such as a T-shirt in medium, blue
+struct SKU: Hashable, Sendable, CustomStringConvertible {
+    let rawValue: String
+
+    init?(_ text: String) {
+        let code = text.trimmingCharacters(in: .whitespaces).uppercased()
+        guard !code.isEmpty, code.allSatisfy({ $0.isASCII && ($0.isLetter || $0.isNumber || $0 == "-") }) else { return nil }
+        rawValue = code
+    }
+
+    var description: String { rawValue }
+}
+
+/// An exact amount in a currency. This shop sells in pounds and euros, both with two decimal places.
+struct Money: Hashable, Sendable {
+    let minorUnits: Int
+    let currency: Locale.Currency
+
+    static func zero(_ currency: Locale.Currency) -> Money {
+        Money(minorUnits: 0, currency: currency)
+    }
+
+    // Inside the cart, mixing currencies can only be a bug: the cart refuses foreign prices at the door
+    static func + (lhs: Money, rhs: Money) -> Money {
+        precondition(lhs.currency == rhs.currency, "Adding \(rhs.currency.identifier) to \(lhs.currency.identifier)")
+        return Money(minorUnits: lhs.minorUnits + rhs.minorUnits, currency: lhs.currency)
+    }
+
+    static func - (lhs: Money, rhs: Money) -> Money {
+        lhs + Money(minorUnits: -rhs.minorUnits, currency: rhs.currency)
+    }
+
+    static func * (lhs: Money, quantity: Int) -> Money {
+        Money(minorUnits: lhs.minorUnits * quantity, currency: lhs.currency)
+    }
+}
+
+/// How many of one SKU a line holds: 1 to 10, so "zero" and "eleven" can't exist
+struct Quantity: Hashable, Sendable {
+    static let allowed = 1...10
+    let value: Int
+
+    init?(_ value: Int) {
+        guard Self.allowed.contains(value) else { return nil }
+        self.value = value
+    }
+}
+
+struct PromoCode: Hashable, Sendable {
+    let rawValue: String
+
+    init?(_ text: String) {
+        let code = text.trimmingCharacters(in: .whitespacesAndNewlines).uppercased()
+        guard (4...12).contains(code.count), code.allSatisfy({ $0.isASCII && ($0.isLetter || $0.isNumber) }) else { return nil }
+        rawValue = code
+    }
+}
+```
+
+Two decisions are worth saying out loud.
+
+- **`Money`'s `+` uses `precondition`, not `throws`.** Inside the aggregate, two currencies can only meet through a bug, because the cart refuses foreign prices when they arrive. That's the contracts lesson's rule: trap on programmer errors, throw on outside input. (The Money kata builds the general version, which throws, because there the input comes from anywhere.)
+- **`Quantity` has no zero.** So "the user stepped the quantity down to zero" can't be passed to `setQuantity`. The UI has to decide what that means (here: remove the line), instead of the model quietly holding a line of nothing.
+
+## Step 4: the aggregate
+
+The cart holds its lines `private(set)` and exposes one method per verb. Each method checks before it changes anything, so a refused change leaves the cart as it was. The errors are a closed set the screen will show, so they're **typed throws** (Swift 6): callers know exactly what can go wrong.
+
+```swift check group=cart title="The cart aggregate"
+/// What the catalogue said when the item was added: a value, frozen at that moment
+struct PriceSnapshot: Hashable, Sendable {
+    let name: String
+    let unitPrice: Money
+}
+
+/// A line inside the cart. Its identity is its SKU, and only within this cart.
+struct CartLine: Identifiable, Hashable, Sendable {
+    let sku: SKU
+    let snapshot: PriceSnapshot
+    fileprivate(set) var quantity: Quantity
+
+    var id: SKU { sku }
+    var total: Money { snapshot.unitPrice * quantity.value }
+}
+
+/// The cart aggregate. Lines are only changed through these methods.
+/// - Invariant: one currency, at most `maxLines` lines, one line per SKU, every quantity 1 to 10.
+struct Cart: Identifiable, Sendable {
+    enum Problem: Error, Equatable {
+        case wrongCurrency
+        case tooManyOfOne(max: Int)
+        case tooManyLines(max: Int)
+        case notInCart(SKU)
+    }
+
+    static let maxLines = 50
+
+    let id: UUID
+    let currency: Locale.Currency
+    private(set) var lines: [CartLine] = []
+    private(set) var promoCode: PromoCode?
+
+    init(id: UUID, currency: Locale.Currency) {
+        self.id = id
+        self.currency = currency
+    }
+
+    /// Adds to the line for `sku` if there is one, or starts a new line.
+    mutating func add(_ sku: SKU, _ snapshot: PriceSnapshot, quantity: Quantity) throws(Problem) {
+        guard snapshot.unitPrice.currency == currency else { throw .wrongCurrency }
+        if let index = lines.firstIndex(where: { $0.sku == sku }) {
+            guard let merged = Quantity(lines[index].quantity.value + quantity.value) else {
+                throw .tooManyOfOne(max: Quantity.allowed.upperBound)
+            }
+            lines[index].quantity = merged
+        } else {
+            guard lines.count < Self.maxLines else { throw .tooManyLines(max: Self.maxLines) }
+            lines.append(CartLine(sku: sku, snapshot: snapshot, quantity: quantity))
+        }
+    }
+
+    mutating func setQuantity(_ quantity: Quantity, for sku: SKU) throws(Problem) {
+        guard let index = lines.firstIndex(where: { $0.sku == sku }) else { throw .notInCart(sku) }
+        lines[index].quantity = quantity
+    }
+
+    mutating func remove(_ sku: SKU) {
+        lines.removeAll { $0.sku == sku }
+    }
+
+    /// Whether the code is real is the server's call; the cart only remembers which one was entered
+    mutating func apply(_ code: PromoCode) {
+        promoCode = code
+    }
+
+    mutating func removePromoCode() {
+        promoCode = nil
+    }
+}
+```
+
+Look at the choices the code makes, because each one is a product decision you'd confirm with the team.
+
+- **Merging past the limit throws.** Nine more T-shirts on top of three would be twelve, so `add` throws `.tooManyOfOne(max: 10)` and the cart is unchanged. Another shop might clamp to ten and say "we've added as many as we can". Either is defensible; what matters is that the rule lives in one method.
+- **The line keeps a snapshot, not the product.** If the price changes tomorrow, the cart still shows what the customer saw when they added it, until checkout reprices it and says so.
+- **`remove` can't fail.** Removing a SKU that isn't there leaves "no line for that SKU", which is what the caller wanted. That's defining an error out of existence, from the lesson on deep modules.
+- **`apply(_:)` doesn't validate the code.** It can't: only the server knows. It stores the normalised code and lets pricing and checkout decide what it's worth.
+
+## Step 5: totals are derived, never stored
+
+If the cart stored a `total` property, every method would have to update it, and one day one wouldn't. Totals are a pure function of the cart and the rules the server sent:
+
+```swift check group=cart title="Pricing"
+/// A promotion the server described, used to show an estimate before checkout
+struct Promotion: Sendable {
+    let code: PromoCode
+    let percentOff: Int
+    let minimumSpend: Money
+}
+
+struct DeliveryRules: Sendable {
+    let fee: Money
+    let freeFrom: Money
+}
+
+struct CartSummary: Equatable, Sendable {
+    let subtotal: Money
+    let discount: Money
+    let delivery: Money
+
+    var total: Money { subtotal - discount + delivery }
+}
+
+/// Derived values are computed from the cart, never stored beside it
+enum Pricing {
+    static func summary(for cart: Cart, promotion: Promotion?, delivery: DeliveryRules) -> CartSummary {
+        let zero = Money.zero(cart.currency)
+        let subtotal = cart.lines.reduce(zero) { $0 + $1.total }
+
+        var discount = zero
+        if let promotion, promotion.code == cart.promoCode, subtotal.minorUnits >= promotion.minimumSpend.minorUnits {
+            // Round half up to the penny: the same rule the server uses, or the totals disagree
+            let exact = subtotal.minorUnits * promotion.percentOff
+            discount = Money(minorUnits: (exact + 50) / 100, currency: cart.currency)
+        }
+
+        let freeDelivery = cart.lines.isEmpty || (subtotal - discount).minorUnits >= delivery.freeFrom.minorUnits
+        return CartSummary(subtotal: subtotal, discount: discount, delivery: freeDelivery ? zero : delivery.fee)
+    }
+}
+```
+
+Because `Pricing` is a pure function, it's trivial to test, and it surfaces rule interactions you'd otherwise find in production. Try it on two T-shirts at £18 and a pack of socks at £6.50, with a code for 10% off orders of £30 or more:
+
+| | Without the code | With the code |
+| --- | --- | --- |
+| Subtotal | £42.50 | £42.50 |
+| Discount | £0.00 | £4.25 |
+| Delivery | Free (£42.50 is over £40) | £3.99 (£38.25 isn't) |
+| **Total** | **£42.50** | **£42.24** |
+
+The 10% code saves the customer 26p, because the discount pushes the order under the free-delivery line. Is that what the business wants? It's not your call, but modelling it this precisely is how the question gets asked before launch, not after the support tickets.
+
+## Step 6: checkout as an enum
+
+Checkout is a sequence of mutually exclusive phases, each with its own data, which is exactly what an enum with associated values is for:
+
+```swift check group=cart title="Checkout"
+/// The server's price for this cart: the only total checkout trusts
+struct Quote: Equatable, Sendable {
+    let id: String
+    let summary: CartSummary
+    let expiresAt: Date
+}
+
+enum CheckoutProblem: Error, Equatable, Sendable {
+    case outOfStock([SKU])
+    case promoRejected(PromoCode)
+    case paymentDeclined
+    case offline
+}
+
+enum Checkout: Equatable, Sendable {
+    case editing
+    case quoting
+    case reviewing(Quote, pricesChanged: Bool)
+    case placing(Quote)
+    case placed(orderID: String)
+    case failed(CheckoutProblem)
+}
+```
+
+There's no way to be "placing" without a quote, or "placed" without an order id. Walk one checkout, including the two things that go wrong most often:
+
+```visual states
+title: One checkout, with a price change and a declined card
+states:
+  - { id: editing, label: Editing, at: [0, 0] }
+  - { id: quoting, label: Quoting, at: [1, 0] }
+  - { id: reviewing, label: Reviewing, at: [2, 0] }
+  - { id: placing, label: Placing, at: [3, 0] }
+  - { id: placed, label: Placed, at: [4, 0] }
+  - { id: failed, label: Failed, at: [2, 1] }
+initial: editing
+final: [placed]
+transitions:
+  - [editing, quoting, checkOut]
+  - [quoting, reviewing, quoted]
+  - [quoting, failed, rejected]
+  - [reviewing, placing, confirm]
+  - [reviewing, editing, edit]
+  - [placing, placed, accepted]
+  - [placing, failed, declined]
+  - [failed, editing, fix]
+intro: "The customer is **editing** the cart. Every total on screen so far is the app's estimate."
+events:
+  - { event: checkOut, say: "They tap **Check out**. The app sends the cart (SKUs, quantities, the promo code) and asks the server for a **quote**." }
+  - { event: quoted, say: "The quote comes back, and the T-shirt has gone up by £2 since it was added. The state is `.reviewing(quote, pricesChanged: true)`, so the screen shows the new total and asks before going on." }
+  - { event: confirm, say: "They confirm. `.placing(quote)` carries the quote's id, so the server charges exactly what was shown, or refuses if the quote has expired." }
+  - { event: declined, say: "The card is declined: `.failed(.paymentDeclined)`. The cart is untouched, because checkout never changed it." }
+  - { event: fix, say: "They go back to change the payment method." }
+  - { event: checkOut, say: "A new quote, because the old one belonged to the failed attempt." }
+  - { event: quoted, say: "Prices are unchanged this time: `pricesChanged` is false." }
+  - { event: confirm, say: "They confirm again." }
+  - { event: accepted, say: "The order is **placed**, with the server's order id. Now, and only now, the app can empty the cart." }
+```
+
+In D07 you'll turn diagrams like this into code, with a function that takes a state and an event and returns the next state. For modelling, the enum is the part that matters: it says which phases exist and what each one knows.
+
+## Step 7: putting it in the app
+
+One `@MainActor` store owns the cart value. Every edit is tried on a copy, and the copy replaces the cart only if the aggregate accepts it. The view sends intents and reads state; it never touches the lines.
+
+```swift check ios group=cart title="CartStore and CartView"
+import SwiftUI
+
+@MainActor @Observable
+final class CartStore {
+    private(set) var cart: Cart
+    private(set) var summary: CartSummary
+    private(set) var problem: Cart.Problem?
+    private let promotion: Promotion?
+    private let delivery: DeliveryRules
+
+    init(cart: Cart, promotion: Promotion?, delivery: DeliveryRules) {
+        self.cart = cart
+        self.promotion = promotion
+        self.delivery = delivery
+        summary = Pricing.summary(for: cart, promotion: promotion, delivery: delivery)
+    }
+
+    func add(_ sku: SKU, _ snapshot: PriceSnapshot, quantity: Quantity) {
+        change { cart throws(Cart.Problem) in try cart.add(sku, snapshot, quantity: quantity) }
+    }
+
+    func setQuantity(_ quantity: Quantity, for sku: SKU) {
+        change { cart throws(Cart.Problem) in try cart.setQuantity(quantity, for: sku) }
+    }
+
+    func remove(_ sku: SKU) {
+        change { $0.remove(sku) }
+    }
+
+    /// Every edit is tried on a copy and kept only if the cart accepts it. (Closures don't infer
+    /// typed throws from context yet, which is why the callers above spell out `throws(Cart.Problem)`.)
+    private func change(_ edit: (inout Cart) throws(Cart.Problem) -> Void) {
+        var draft = cart
+        do {
+            try edit(&draft)
+        } catch {
+            problem = error
+            return
+        }
+        cart = draft
+        summary = Pricing.summary(for: draft, promotion: promotion, delivery: delivery)
+        problem = nil
+        // Here the store would also save `draft` to disk, and sync it if the user is signed in
+    }
+}
+
+extension Money {
+    var text: String {
+        (Decimal(minorUnits) / 100).formatted(.currency(code: currency.identifier))
+    }
+}
+
+struct CartView: View {
+    let store: CartStore
+
+    var body: some View {
+        List {
+            ForEach(store.cart.lines) { line in
+                Stepper(value: quantityBinding(for: line), in: Quantity.allowed) {
+                    LabeledContent(line.snapshot.name, value: line.total.text)
+                }
+                .swipeActions {
+                    Button("Remove", role: .destructive) { store.remove(line.sku) }
+                }
+            }
+            Section {
+                LabeledContent("Subtotal", value: store.summary.subtotal.text)
+                LabeledContent("Discount", value: store.summary.discount.text)
+                LabeledContent("Delivery", value: store.summary.delivery.text)
+                LabeledContent("Estimated total", value: store.summary.total.text)
+            }
+        }
+    }
+
+    private func quantityBinding(for line: CartLine) -> Binding<Int> {
+        Binding(
+            get: { line.quantity.value },
+            set: { newValue in
+                if let quantity = Quantity(newValue) { store.setQuantity(quantity, for: line.sku) }
+            }
+        )
+    }
+}
+```
+
+The `Stepper`'s range is `Quantity.allowed`, so the UI and the model share one definition of the limit. The rows use `ForEach(store.cart.lines)` keyed by SKU, the line's identity, so changing a quantity updates a row instead of replacing it. And the label says **estimated** total, because it is.
+
+## Step 8: the tests this design makes easy
+
+Almost everything above is plain values and pure functions, so the tests are short and need no mocks:
+
+- **Values:** `SKU(" tee-m-blue ")` normalises; `Quantity(0)` and `Quantity(11)` are `nil`; `PromoCode("50%OFF")` is `nil`.
+- **The aggregate:** adding a SKU twice merges; merging past ten throws and leaves the cart unchanged; the 51st line throws; a price in euros is refused by a pound cart; removing a missing SKU is harmless.
+- **Pricing:** the table above, as a test, plus the edges: exactly £30 qualifies for the code, exactly £40 gets free delivery, an empty cart has no delivery fee, and a half penny rounds up.
+- **The store:** a refused edit sets `problem` and keeps the old cart and summary.
+- **Decoding:** a saved cart from the previous release still decodes, once you add `Codable`.
+
+## What we left out, and how it grows
+
+A model is also a set of decisions about what *not* to model yet. Each of these would change it in a predictable place:
+
+- **Stock.** It's contended between customers, so it stays on the server and arrives as `.failed(.outOfStock(skus))`. Showing "only 2 left" is a read model, not a rule the cart enforces.
+- **Merging carts at sign-in.** A guest cart and an account cart need a merge rule (sum the quantities, capped at ten?), which is one new method on `Cart` and a product decision.
+- **Tax.** It depends on the delivery address and the region's rules, so it comes from the quote.
+- **Several currencies in one app.** `Money` would need each currency's minor units instead of assuming two, which is exactly what the Money kata builds.
+- **Gift cards and split payments.** These change checkout's data, not the cart's, which is a sign the boundary was drawn in the right place.
+
+## Trade-offs
+
+| Decision | Chosen | Alternative | Why this one |
+| --- | --- | --- | --- |
+| Where totals come from | Computed on the device as an estimate; the server's quote is final | Ask the server on every change | Instant feedback and offline editing, at the cost of keeping two sets of pricing rules in step |
+| Amounts | Integer minor units plus currency | `Decimal`, or `Double` | Exact and simple; `Decimal` also works, `Double` never does |
+| Over-limit merges | Throw and leave the cart unchanged | Clamp to the maximum | Predictable and easy to explain; clamping is friendlier but quietly changes what was asked |
+| Prices on lines | Snapshot when added | Read the live catalogue | The cart shows what the customer saw; checkout reprices and flags changes |
+| The aggregate's type | A plain struct, saved by the store | A SwiftData `@Model` edited directly | Rules in one value type, testable without a database; storage becomes a mapping job |
+
+<Callout kind="interview">
+
+**Say** the model in the order you built it: the rules first, then which nouns are entities and values, then the aggregate and its invariants, then what's derived and what the server decides. "The cart is an aggregate with lines keyed by SKU; quantities are a 1-to-10 type; totals are computed, and the server's quote is the price of record." **Ask** what happens to a cart when prices change, whether carts sync across devices, and who validates promo codes. **Red flags:** a stored `total` property, prices in `Double`, the app deciding a code is valid, and checkout states held in several booleans.
+
+</Callout>
+
+<Callout kind="gotcha" title="iOS gotcha: a saved cart outlives its prices">
+
+Carts are saved to disk and reopened days later, after prices, promotions and stock have all moved. Store when each snapshot was taken, and when the app comes back to the foreground with a cart that's more than a few hours old, ask the server for fresh prices and highlight what changed. Otherwise the first time the customer sees the new price is the checkout screen, and that's when they abandon the order.
+
+</Callout>
+
+## Practice
+
+The design exercise **The domain model for booking fitness classes** asks you to do all of this yourself, for a domain with harder rules: classes that fill in seconds, waitlists, credits and cancellation windows.
+
+```cards
+- id: modelling-order
+  front: "In what order did the worked example build the model?"
+  back: "Rules, nouns and verbs first; then entities and values; then the aggregate boundary and its invariants; then value types; then the aggregate's operations; then derived totals; then the checkout phases as an enum."
+- id: derived-not-stored
+  front: "Why does the cart compute its totals instead of storing them?"
+  back: "A stored total must be updated by every method that changes a line, and one day one won't. A pure function of the cart can never disagree with it, and it's trivial to test."
+- id: estimate-vs-quote
+  front: "Who decides the price of a cart?"
+  back: "The server. The app computes an estimate from price snapshots so the screen is instant and works offline; at checkout the server's quote is the price of record, and the app flags any change."
+```
+
+```quiz
+- id: q1
+  type: sort
+  prompt: "Where does each rule belong in this design?"
+  buckets: [The cart aggregate or its value types, Derived by Pricing, The server]
+  items:
+    - [A line holds 1 to 10 of its SKU, 0]
+    - [Adding a SKU twice merges the lines, 0]
+    - [The delivery fee shown in the cart, 1]
+    - [Whether the promo code SUMMER25 is valid, 2]
+    - [Whether the jumper is in stock, 2]
+    - [The subtotal, 1]
+    - [Every price in a cart is in pounds, 0]
+  explain: "Invariants live in the aggregate and its types; totals are derived so they can't drift; anything contended or trusted (stock, code validity, the final price) belongs to the server."
+- id: q2
+  type: estimate
+  prompt: "Two T-shirts at £18 and socks at £6.50, with a code for 10% off orders of £30 or more. Delivery is £3.99 unless the order is £40 or more after discounts. What's the total, in pounds?"
+  answer: 42.24
+  unit: pounds
+  within: { percent: 1 }
+  explain: "Subtotal £42.50, discount £4.25, which leaves £38.25: under £40, so delivery is £3.99. Total £42.24, only 26p less than without the code, which got free delivery."
+- id: q3
+  type: mcq
+  prompt: "Why does each line keep a `PriceSnapshot` instead of reading the product's current price from the catalogue?"
+  options:
+    - "Reading the catalogue is slow"
+    - "So the cart shows what the customer saw when they added it; checkout reprices and flags the difference, instead of totals changing silently underneath them"
+    - "Because products can't be referred to by SKU"
+    - "Snapshots make the cart smaller"
+  answer: 1
+  explain: "The snapshot is a value recording a moment. Prices move, and a total that shifts without explanation is worse than one that's explicitly re-quoted at checkout."
+- id: q4
+  type: mcq
+  prompt: "A customer taps + on a line that already has 10 T-shirts. With this model, what happens?"
+  options:
+    - "The line becomes 11, and checkout fails later"
+    - "The cart crashes on a precondition"
+    - "`Quantity(11)` is `nil`, so the stepper (whose range is `Quantity.allowed`) can't go there, and no change reaches the cart"
+    - "The extra T-shirt goes on a new line"
+  answer: 2
+  explain: "The limit is defined once, in `Quantity.allowed`, and both the stepper and the model use it. The merge path in `add` throws `.tooManyOfOne` for the same reason."
+- id: q5
+  type: order
+  prompt: "Put the modelling steps in the order this lesson used them."
+  lines:
+    - "List the nouns, verbs and rules in the brief"
+    - "Decide which nouns are entities and which are values"
+    - "Draw the aggregate boundary around the invariants"
+    - "Write value types that refuse bad data"
+    - "Write the aggregate's operations"
+    - "Derive totals with a pure function"
+    - "Model the checkout phases as an enum"
+  explain: "Rules first, because they decide the boundaries; then the types that hold each rule; then behaviour; then what's derived; then the flow that uses it all."
+```

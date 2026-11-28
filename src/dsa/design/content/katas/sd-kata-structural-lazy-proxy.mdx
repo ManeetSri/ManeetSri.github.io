@@ -1,0 +1,99 @@
+Your app translates messages on the device. The translation model takes a couple of seconds and tens of megabytes to load, and most sessions never translate anything, so loading it at launch would waste both. Write a virtual proxy: an object with the model's interface that loads the real model the first time it's needed.
+
+`TranslatorVirtualProxy.LazyTranslator(load:)`, with `translate(_:) async throws -> String`, `isLoaded` and `unload()`
+
+- **Lazy.** Creating the proxy doesn't call `load`. The first `translate(_:)` loads the model, then forwards the text to it. Later calls reuse the loaded model.
+- **One load at a time.** Callers that arrive while the model is loading wait for that same load; `load` runs once for all of them.
+- **Failure.** If `load` throws, every caller waiting on it gets that error, the proxy forgets the failure, and the next `translate(_:)` tries again.
+- **Model errors.** An error thrown by the model's own `translate(_:)` is passed back to the caller; the model stays loaded.
+- **Memory.** `unload()` frees a loaded model (the app calls it on a memory warning), and the next translation loads it again. A load already in progress carries on. `isLoaded` is true only once a model is in memory, not while it's loading.
+
+## Examples
+
+| What happens | `load` calls | Result |
+| --- | --- | --- |
+| Create the proxy; nothing else | 0 | `isLoaded == false` |
+| `translate("hello")` | 1 | the model's translation, then `isLoaded == true` |
+| Three translations, one after another | 1 | each translated by the same model |
+| Three translations started together while loading takes 2 s | 1 | all three translated once the load finishes |
+| First load throws `outOfSpace`, two callers waiting | 1 | both callers get `outOfSpace`; `isLoaded == false` |
+| …then `translate("c")` | 2 | translated: the failure wasn't remembered |
+| Translate, `unload()`, translate | 2 | `isLoaded` is false after `unload()` |
+
+## Constraints
+
+- `LazyTranslator` is an `actor`. Remember that an actor runs other calls while one of its methods is suspended at an `await`, which is exactly when a second caller can arrive.
+- Don't block or poll: waiting callers should suspend until the load they share finishes.
+- The tests inject a slow `load` that sleeps on a `TestClock`, and count how many times it's called.
+
+<Hints>
+<Hint>
+Model the proxy as three states: idle, loading and loaded. An enum with associated values holds each state's data.
+</Hint>
+<Hint>
+A `Task` is a value you can store and await from several places. Keep the loading `Task` in the loading state, and have later callers `await task.value` instead of calling `load` again.
+</Hint>
+<Hint>
+Change the state to loading *before* the first `await`. If you await first and set the state after, every caller that arrives in between sees idle and starts its own load.
+</Hint>
+</Hints>
+
+## Solutions
+
+<Approach title="A small state machine on an actor" time="O(1) per call, plus the load" space="O(1)">
+
+```swift
+public actor LazyTranslator: Translating {
+    private enum State {
+        case idle
+        case loading(Task<any Translating, any Error>)
+        case loaded(any Translating)
+    }
+
+    private let load: @Sendable () async throws -> any Translating
+    private var state: State = .idle
+
+    public init(load: @escaping @Sendable () async throws -> any Translating) {
+        self.load = load
+    }
+
+    public var isLoaded: Bool {
+        if case .loaded = state { return true }
+        return false
+    }
+
+    public func translate(_ text: String) async throws -> String {
+        try await model().translate(text)
+    }
+
+    public func unload() {
+        if case .loaded = state { state = .idle }
+    }
+
+    private func model() async throws -> any Translating {
+        switch state {
+        case .loaded(let model):
+            return model
+        case .loading(let task):
+            return try await task.value
+        case .idle:
+            let task = Task { try await load() }
+            state = .loading(task)
+            do {
+                let model = try await task.value
+                state = .loaded(model)
+                return model
+            } catch {
+                state = .idle
+                throw error
+            }
+        }
+    }
+}
+```
+
+The proxy keeps the model's interface, so the chat screen calls `translate(_:)` and never learns whether the model was in memory. What the proxy controls is the subject's *lifetime*: when it's created, how many get created, and when it goes away. That's the line between a proxy and a decorator, which adds behaviour to an object someone else made.
+
+Storing the `Task` is the trick that makes concurrent callers share one load, and it's the same idea as single-flight request de-duplication in D14. Two details are easy to miss. The failure path resets to idle, so one bad load (low disk space, a corrupt download) doesn't poison the proxy for the rest of the session. And the shared `Task` is unstructured, so cancelling the first caller doesn't cancel the load the others are waiting for: if you want cancellation, count the waiters and cancel when the last one leaves.
+
+</Approach>

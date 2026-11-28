@@ -1,0 +1,342 @@
+## Why it matters
+
+Some behaviour belongs to no feature in particular: logging every request, timing it, caching responses, adding an auth header, retrying on failure. You want it on many objects without editing each one, and without a subclass for every combination. A **decorator** adds a job to an object by wrapping it in another object with the same interface. It's how most iOS networking layers grow their cross-cutting features, and "add caching to this repository without changing it" is a favourite interview task because the decorator is such a clean answer.
+
+## The idea: the same interface, one more job
+
+A decorator conforms to the same protocol as the thing it wraps, holds an instance of it, and forwards every call, doing something extra before, after or instead. Callers hold an `any ForecastService` and can't tell whether it's the real service, a decorated one, or one wrapped five times.
+
+Three properties follow from that one idea:
+
+- **Callers don't change.** Anything that accepts the protocol accepts a decorated instance.
+- **Decorators stack.** A decorator wraps "something that conforms", which can be another decorator.
+- **Each one does one job.** Logging, caching and retrying live in separate small types that can be tested alone.
+
+<Callout kind="analogy">
+
+A phone case. The phone keeps the same screen and the same buttons, and you use it exactly as before; the case adds grip, or a wallet, or a battery. You can take it off, or swap it, without touching the phone.
+
+</Callout>
+
+## Stacking decorators, and why order matters
+
+Here's a forecast service with two decorators: one that logs each call, and one that caches answers. The program asks for Leeds twice and York once, with the decorators stacked in each order.
+
+```swift run
+protocol ForecastService: Sendable {
+    func forecast(for city: String) async throws -> String
+}
+
+struct RemoteForecasts: ForecastService {
+    func forecast(for city: String) async throws -> String {
+        print("    network: GET /forecast?city=\(city)")
+        return "\(city): 14°C, showers"
+    }
+}
+
+// A decorator: the same interface, plus one more job
+struct LoggingForecasts: ForecastService {
+    let wrapped: any ForecastService
+
+    func forecast(for city: String) async throws -> String {
+        print("  log: forecast(\(city))")
+        return try await wrapped.forecast(for: city)
+    }
+}
+
+// Another decorator. It's an actor because many tasks may call it at once.
+actor CachingForecasts: ForecastService {
+    private let wrapped: any ForecastService
+    private var cache: [String: String] = [:]
+
+    init(wrapping wrapped: any ForecastService) {
+        self.wrapped = wrapped
+    }
+
+    func forecast(for city: String) async throws -> String {
+        if let cached = cache[city] { return cached }
+        let fresh = try await wrapped.forecast(for: city)
+        cache[city] = fresh
+        return fresh
+    }
+}
+
+func ask(_ service: any ForecastService) async throws {
+    for city in ["Leeds", "Leeds", "York"] {
+        _ = try await service.forecast(for: city)
+    }
+}
+
+print("Logging outside the cache:")
+try await ask(LoggingForecasts(wrapped: CachingForecasts(wrapping: RemoteForecasts())))
+
+print("Logging inside the cache:")
+try await ask(CachingForecasts(wrapping: LoggingForecasts(wrapped: RemoteForecasts())))
+```
+
+```output
+Logging outside the cache:
+  log: forecast(Leeds)
+    network: GET /forecast?city=Leeds
+  log: forecast(Leeds)
+  log: forecast(York)
+    network: GET /forecast?city=York
+Logging inside the cache:
+  log: forecast(Leeds)
+    network: GET /forecast?city=Leeds
+  log: forecast(York)
+    network: GET /forecast?city=York
+```
+
+The same two decorators answer two different questions. **Outside** the cache, the log records what callers *asked for*: three calls, one of them a hit. **Inside** the cache, it records what *reached the network*: two calls. Neither is wrong. The order is a design decision, so make it on purpose, and write it down where the stack is assembled.
+
+A useful rule of thumb: put a decorator outside another when it should see that one's effects. Metrics that report the cache hit rate go outside the cache. Retries go inside the cache (a hit never needs retrying) but outside the logging, so that each attempt is logged.
+
+## Why not subclass?
+
+Inheritance can add behaviour too: `LoggingRemoteForecasts` could subclass `RemoteForecasts` and override `forecast(for:)`. It falls apart quickly:
+
+- **Combinations multiply.** Logging, caching and retrying, in any combination, are 2³ = 8 subclasses, and every new behaviour doubles the count. Three decorators cover all eight, in any order.
+- **A subclass is welded to one base class.** `LoggingRemoteForecasts` can't log a `MockForecasts` or a `CachedForecasts`. A decorator logs anything that conforms.
+- **Swift often won't let you.** Structs and actors can't be subclassed, and well-designed classes are `final`.
+
+This is [composition over inheritance](/design/learn/sd-principles-composition) in its most practical form: behaviour is added by *holding* an object, not by *being* one.
+
+## A logging decorator for the network layer
+
+In a real app, decorators usually wrap the API client, because every feature's traffic passes through it. This one logs each request with `os.Logger`, along with its status and how long it took:
+
+```swift check
+import Foundation
+import os
+
+protocol HTTPClient: Sendable {
+    func send(_ request: URLRequest) async throws -> (Data, HTTPURLResponse)
+}
+
+struct LoggingHTTPClient: HTTPClient {
+    let wrapped: any HTTPClient
+    let logger = Logger(subsystem: "com.example.shop", category: "network")
+
+    func send(_ request: URLRequest) async throws -> (Data, HTTPURLResponse) {
+        let method = request.httpMethod ?? "GET"
+        let path = request.url?.path() ?? "?"
+        let clock = ContinuousClock()
+        let start = clock.now
+        do {
+            let (data, response) = try await wrapped.send(request)
+            let elapsed = start.duration(to: clock.now)
+            logger.info("\(method, privacy: .public) \(path, privacy: .public) → \(response.statusCode) in \(elapsed)")
+            return (data, response)
+        } catch {
+            logger.error("\(method, privacy: .public) \(path, privacy: .public) failed: \(error.localizedDescription)")
+            throw error
+        }
+    }
+}
+```
+
+It does its job and gets out of the way: the request goes through unchanged, the response comes back unchanged, and the error is logged and **rethrown**, not swallowed. It logs the path, not the full URL, because query strings often carry search terms or tokens. And it says `privacy: .public` only about values that are safe to read in a support engineer's console.
+
+Wrapping is done once, where the app is assembled:
+
+```swift
+let client: any HTTPClient = LoggingHTTPClient(wrapped: URLSession.shared)
+```
+
+Every repository that takes an `HTTPClient` now logs, and none of them changed. You'll meet the place this assembly happens, the composition root, in D21.
+
+<Callout kind="gotcha" title="iOS gotcha: unified logging hides your strings">
+
+`Logger` treats interpolated strings and objects as **private** by default: they show as `<private>` in a sysdiagnose or in Console on a device that isn't attached to Xcode. Numbers and booleans are public by default. That's the right default for user data, and a surprise the first time a log from the field reads "GET `<private>` failed". Mark only safe values `privacy: .public`, or use `privacy: .private(mask: .hash)` to correlate a value without revealing it.
+
+</Callout>
+
+## A caching decorator, and the questions it raises
+
+A cache is the classic decorator: it answers repeated questions without asking the wrapped object again. Here's a hit and a miss travelling through a logging decorator and a cache, in front of the API client:
+
+```visual sequence
+title: A miss, then a hit, through two decorators
+participants:
+  - { id: vm, label: Feed view model }
+  - { id: log, label: Logging }
+  - { id: cache, label: Cache }
+  - { id: api, label: API client }
+messages:
+  - [vm, log, "send(GET /feed)"]
+  - [log, cache, "send(GET /feed)"]
+  - [cache, api, "send(GET /feed)"]
+  - [api, cache, "200, 18 KB", { reply: true }]
+  - [cache, cache, store for 60 s]
+  - [cache, log, "200", { reply: true }]
+  - [log, vm, "200", { reply: true }]
+  - [vm, log, "send(GET /feed)"]
+  - [log, cache, "send(GET /feed)"]
+  - [cache, log, "200 (cached)", { reply: true }]
+  - [log, vm, "200", { reply: true }]
+steps:
+  - say: The first request passes through both decorators to the real client. Neither changes it.
+    upTo: 2
+  - say: The cache keeps the answer, stamped with the time it arrived, before passing it back out.
+    upTo: 4
+  - say: The logging decorator sees the response on its way back, so it can record the status and the time taken.
+    upTo: 6
+  - say: "Ten seconds later the same request is answered by the cache. The API client never hears about it, and the view model can't tell the difference."
+    upTo: 10
+```
+
+The code is short; the decisions are where the design is. A caching decorator has to answer:
+
+- **What's the key?** The URL alone, or the URL plus headers such as `Accept-Language`? Two requests that differ only in a header can deserve different answers.
+- **How long is an answer fresh?** A fixed time to live is simple. HTTP's `Cache-Control` and `ETag` let the server decide, and `URLCache` already honours them, so a decorator earns its place when you want app rules that HTTP can't express.
+- **What must never be cached?** Errors (or a blip becomes an outage), responses to POST and other writes, and anything personal once the user signs out.
+- **When is an entry wrong?** After the app writes to that resource, its cached copy is stale: drop it.
+- **How big can it get?** A dictionary grows for ever. Bound it, and empty it on a memory warning.
+- **Who calls it at once?** Many tasks do, so it's an actor. While it awaits the network, other calls run, so two misses for the same key can both fetch. That's correct, if wasteful; single-flight de-duplication fixes it in D14.
+
+You'll build exactly this decorator, with those rules, in the kata.
+
+## Keeping a decorator honest
+
+A decorator is only safe to drop in if it keeps the wrapped object's promises. That's [Liskov substitution](/design/learn/sd-solid-lsp) applied to wrappers: anything true of the plain object must stay true of the decorated one.
+
+- **Same errors.** A decorator that catches failures and returns an empty array has changed the meaning of every call. Logging and rethrowing is fine; hiding is not.
+- **Same cancellation.** If the caller's task is cancelled, the decorator must stop too, not finish a retry loop the caller has walked away from.
+- **Same side effects.** A retry decorator that retries a POST can charge a card twice. Retry only requests that are safe to repeat.
+- **Same isolation.** A decorator marked `@MainActor` quietly moves every network call's bookkeeping onto the main thread.
+
+Decorators also have costs that no amount of care removes. **Identity changes**: the decorated object is a different instance, so `===` and `ObjectIdentifier` comparisons see the wrapper. **Downcasts fail**: `client as? URLSessionClient` returns `nil` once the client is wrapped, so never reach for concrete types through a protocol. And **stack traces get deeper**, one frame per layer.
+
+## Decorating functions
+
+Swift has a lighter form of the same idea: a function that takes a function and returns one with the same signature, plus a job.
+
+```swift run
+func logged<Input, Output>(_ name: String, _ operation: @escaping (Input) -> Output) -> (Input) -> Output {
+    { input in
+        let output = operation(input)
+        print("\(name)(\(input)) = \(output)")
+        return output
+    }
+}
+
+let priceWithVAT = logged("priceWithVAT") { (pence: Int) in pence * 6 / 5 }
+let total = priceWithVAT(1000) + priceWithVAT(250)
+print("Total: \(total)")
+```
+
+```output
+priceWithVAT(1000) = 1200
+priceWithVAT(250) = 300
+Total: 1500
+```
+
+Closures make good decorators when the dependency is already a single function, as in the [higher-order seams](/design/learn/sd-functional-seams) of D07. Property wrappers are decorators for a single property: `@Clamped(0...100) var volume` adds a rule to every write, as you saw in [property wrappers and macros](/design/learn/sd-swift-design-wrappers-macros).
+
+## Trade-offs
+
+| | Edit the class | Subclass | Decorator | Interceptor chain (D33) |
+| --- | --- | --- | --- | --- |
+| Callers change | no | no | no | no |
+| Combinations | one fixed set | one class per combination | any, in any order | any, in a list |
+| Works with structs, actors, `final` | yes | no | yes | yes |
+| Test each behaviour alone | no | awkward | yes | yes |
+| Order visible | in the code | in the hierarchy | in the nesting where it's assembled | in one array |
+| Cost | the class grows every job | brittle hierarchies | identity changes, deeper stacks | a framework to build |
+
+Edit the class when the behaviour is the class's own job. Decorators win for cross-cutting concerns on a protocol with a few methods, and two to four of them stack readably. When the stack grows long, or the order changes per request, an interceptor chain (a list of steps that each pass the request on) is the same idea made explicit; you'll build one for the network layer in D33.
+
+<Callout kind="interview">
+
+**What to say:** "I'd keep the repository as it is and add a caching decorator that conforms to the same protocol, assembled in the composition root. Tests cover the cache with a fake underneath." Then talk through the decisions: the key, freshness, what not to cache, invalidation on writes, a size bound, clearing at sign-out, and concurrent misses.
+
+**What to ask:** how fresh the data must be, whether the server sends caching headers already, and whether responses differ per user.
+
+**Red flags:** a decorator that swallows errors; caching POST responses or errors; retrying non-idempotent requests; an order of decorators nobody can explain.
+
+</Callout>
+
+<Callout kind="gotcha" title="Swift gotcha: NSCache isn't Sendable">
+
+`NSCache` is documented as thread-safe and evicts under memory pressure, which makes it tempting for a caching decorator. But the SDK doesn't mark it `Sendable`, so in Swift 6 it can't be shared freely across tasks. Keep it inside the actor that is your decorator, or use a dictionary with your own size limit and clear it when `UIApplication.didReceiveMemoryWarningNotification` arrives.
+
+</Callout>
+
+## Practice
+
+The kata asks for a caching decorator over DesignKit's `HTTPClient`: GET-only, a time to live measured on an injected clock, no errors cached, writes that invalidate their URL, a reload policy for pull to refresh, and `removeAll()` for sign-out.
+
+```cards
+- id: decorator-definition
+  front: "What is a decorator?"
+  back: "An object with the same interface as the one it wraps, which forwards every call and adds one job before, after or around it. Callers can't tell it's there."
+- id: decorator-order
+  front: "Why does the order of stacked decorators matter?"
+  back: "Each decorator sees only what reaches it. Logging outside a cache records every call; inside, only the misses that reach the network."
+- id: decorator-vs-subclass
+  front: "Why prefer decorators to subclasses for cross-cutting behaviour?"
+  back: "n behaviours need 2ⁿ subclasses but only n decorators; a decorator works with any conforming type, including structs, actors and final classes."
+- id: decorator-honest
+  front: "What must a decorator preserve to be safe to drop in?"
+  back: "The wrapped object's contract: the same errors, cancellation behaviour, side effects and isolation."
+```
+
+```quiz
+- id: q1
+  type: output
+  prompt: "What does this print?"
+  code: |
+    protocol Greeting {
+        func text() -> String
+    }
+
+    struct Hello: Greeting {
+        func text() -> String { "hello" }
+    }
+
+    struct Polite: Greeting {
+        let wrapped: any Greeting
+        func text() -> String { wrapped.text() + " please" }
+    }
+
+    struct Shouting: Greeting {
+        let wrapped: any Greeting
+        func text() -> String { wrapped.text().uppercased() }
+    }
+
+    print(Polite(wrapped: Shouting(wrapped: Hello())).text())
+    print(Shouting(wrapped: Polite(wrapped: Hello())).text())
+  answer: "HELLO please\nHELLO PLEASE"
+  explain: "Each decorator works on what the inner one returns. In the first line `Shouting` runs first (it's inside), so only \"hello\" is upper-cased; in the second, `Polite` runs first and `Shouting` upper-cases the whole thing."
+- id: q2
+  type: mcq
+  prompt: "Your API client needs logging, caching and retrying. You want cache hits never to be retried, and every network attempt (including retries) to be logged. Which stack is right, outermost first?"
+  options:
+    - "Logging → Retrying → Caching → URLSession client"
+    - "Caching → Retrying → Logging → URLSession client"
+    - "Retrying → Caching → Logging → URLSession client"
+    - "Caching → Logging → Retrying → URLSession client"
+  answer: 1
+  explain: "The cache goes outside the retrier, so a hit returns before any retry logic runs. Logging goes inside the retrier, so each attempt passes through it. In the last option, logging sits outside the retrier and sees one call however many attempts happen."
+- id: q3
+  type: multi
+  prompt: "Which of these decorators break the contract of the client they wrap?"
+  options:
+    - "One that catches every error and returns an empty response instead"
+    - "One that records how long each request took"
+    - "One that keeps retrying after the caller's task has been cancelled"
+    - "One that retries a failed `POST /payments` three times"
+    - "One that adds an `X-Request-ID` header to every request"
+  answer: [0, 2, 3]
+  explain: "Hiding errors changes what callers can rely on; ignoring cancellation keeps working for a caller who has gone; retrying a payment can charge twice. Timing and adding a tracing header add behaviour without changing the meaning of a call."
+- id: q4
+  type: truefalse
+  prompt: "Once a client is wrapped in a decorator, `client as? URLSessionClient` still finds the real client underneath."
+  answer: false
+  explain: "The cast sees the outermost object, which is the decorator, so it returns `nil`. Code that downcasts through a protocol breaks as soon as anyone decorates it, which is one more reason to depend only on the protocol."
+- id: q5
+  type: recall
+  prompt: "An interviewer says: \"The product repository is slow and called from four screens. Add caching, but you can't change the repository.\" Outline your answer."
+  model: "Add a caching decorator that conforms to the repository's protocol and wraps the real one, assembled once in the composition root, so the four screens don't change. Decide the key, the freshness rule (a time to live, or server headers), what's never cached (errors, writes), invalidation when the app changes a product, a size bound and memory-warning purge, clearing at sign-out, and that it's an actor so concurrent callers are safe (with single-flight later if duplicate fetches matter). Test it with a fake repository underneath and an injected clock."
+```

@@ -1,0 +1,224 @@
+## Why it matters
+
+When an app shows thousands of similar things (pins on a map, stickers in a chat, glyphs in a text view, tiles in a game), most of what each one carries is the same as its neighbours. Duplicating it wastes memory, and on a phone memory is what gets your app terminated in the background. The **flyweight** pattern splits each object's state into the part many objects can share and the part that's theirs alone, and shares the first through a factory. "10,000 pins on a map" is a classic mobile interview question, and flyweight is one of the three tools a strong answer combines.
+
+## Intrinsic and extrinsic state
+
+Look at a map of cafés, pharmacies, parks and stations. Each pin has:
+
+- **Intrinsic state**, which is the same for every pin of its kind and doesn't depend on where the pin is: the icon, its colour, the category name. A café pin's icon is identical to every other café pin's.
+- **Extrinsic state**, which belongs to one pin: its coordinate, its title, whether it's selected.
+
+A **flyweight** is an immutable object holding intrinsic state, shared by every object that needs it. The extrinsic state stays with each pin, or is passed in when the flyweight is used. A **factory** guarantees there's only one flyweight per key, by handing out the existing one when it's asked again.
+
+<Callout kind="analogy">
+
+Movable type. A printer doesn't cast a new letter *e* for every *e* on the page. There's a tray of *e*s, and each use only adds where it goes. The letter's shape is intrinsic; its position on the page is extrinsic.
+
+</Callout>
+
+## A flyweight factory
+
+Here 10,000 pins in four categories ask a factory for their style. `PinStyle` stands in for an object that would hold a decoded icon image; a constant gives its size.
+
+```swift run
+// Intrinsic state: the same for every pin of a category, and never changed
+final class PinStyle: Sendable {
+    static let iconBytes = 120 * 120 * 4    // a decoded 120 × 120 px icon, 4 bytes per pixel
+
+    let category: String
+    let symbolName: String
+    let tint: String
+
+    init(category: String, symbolName: String, tint: String) {
+        self.category = category
+        self.symbolName = symbolName
+        self.tint = tint
+    }
+}
+
+// The flyweight factory: one shared style per category, created on first request
+final class PinStyleFactory {
+    private var styles: [String: PinStyle] = [:]
+    private let looks = ["cafe": ("cup.and.saucer.fill", "brown"), "pharmacy": ("cross.fill", "green"),
+                         "park": ("tree.fill", "teal"), "station": ("tram.fill", "blue")]
+
+    var count: Int { styles.count }
+
+    func style(for category: String) -> PinStyle {
+        if let style = styles[category] { return style }
+        let (symbol, tint) = looks[category] ?? ("mappin", "red")
+        let style = PinStyle(category: category, symbolName: symbol, tint: tint)
+        styles[category] = style
+        return style
+    }
+}
+
+// Extrinsic state: different for every pin, kept outside the flyweight
+struct Pin {
+    let latitude: Double
+    let longitude: Double
+    let title: String
+    let style: PinStyle
+}
+
+let categories = ["cafe", "pharmacy", "park", "station"]
+let factory = PinStyleFactory()
+let pins = (0..<10_000).map { index in
+    Pin(latitude: 51.5 + Double(index % 100) / 1_000,
+        longitude: -0.12 + Double(index / 100) / 1_000,
+        title: "Place \(index)",
+        style: factory.style(for: categories[index % categories.count]))
+}
+
+let distinctStyles = Set(pins.map { ObjectIdentifier($0.style) }).count
+print("\(pins.count) pins share \(distinctStyles) style objects (the factory made \(factory.count))")
+print("Icons if every pin had its own: \(pins.count * PinStyle.iconBytes / 1_000_000) MB")
+print("Icons shared through the factory: \(factory.count * PinStyle.iconBytes / 1_000) KB")
+```
+
+```output
+10000 pins share 4 style objects (the factory made 4)
+Icons if every pin had its own: 576 MB
+Icons shared through the factory: 230 KB
+```
+
+The arithmetic is the whole argument. A decoded image costs width × height × 4 bytes, whatever size the file was on disk, so one 120-pixel icon is 57.6 KB. Ten thousand copies would be over half a gigabyte for icons alone, enough to get the app terminated on many devices. Four shared copies are a rounding error. Each pin pays only for its own coordinate and title, plus an 8-byte reference to its style.
+
+## Sharing only works if nothing changes
+
+A flyweight is used by many objects at once, so changing it changes all of them. If selecting one café pin set `style.tint = "orange"`, every café on the map would turn orange. So:
+
+- **Make flyweights immutable.** `let` properties on a `final class`, as `PinStyle` has. Per-use variations (selected, dimmed) are extrinsic: pass them in when drawing, or pick a different flyweight (`"cafe-selected"`).
+- **Make them `Sendable`.** An immutable final class can be, and then Swift 6 lets you share it across tasks and actors freely, which is what a flyweight is for.
+- **Protect the factory.** The factory's dictionary *does* change. If only the UI asks for styles, mark the factory `@MainActor`; if background tasks ask too, make it an actor.
+
+Swift's value types give you a quiet form of sharing for free. `Array`, `String` and `Data` keep their contents in a reference-counted buffer and copy it only when someone writes to a shared one, so ten thousand copies of an unmodified `Data` are ten thousand small values pointing at one buffer. The flyweight pattern is still worth knowing because it makes that sharing deliberate, keyed and visible.
+
+## Apple's flyweights
+
+- **`UIImage(named:)`** looks in a system cache before loading, so asking for `"pin-cafe"` ten thousand times gives you shared image data, not ten thousand decodes. `UIImage(contentsOfFile:)` doesn't use that cache: every call loads and decodes again. That one choice of initialiser is a flyweight decision.
+- **Tagged pointers** take the idea to its limit. On 64-bit Apple platforms, small `NSNumber`, `NSDate` and short `NSString` values can be stored inside the pointer itself, so there's no object to allocate or share at all.
+
+## Flyweight, pool or cache?
+
+Three patterns reuse objects, and they're easy to confuse:
+
+| | Flyweight | Object pool | Cache |
+| --- | --- | --- | --- |
+| Used by | many objects at the same time | one user at a time, then returned | whoever asks |
+| Must be immutable | yes | no: it's reset when it's returned | ideally |
+| May be thrown away | no, or identity breaks | not usually | yes: under memory pressure, or when stale |
+| Saves | memory | creation time | recomputation or refetching |
+| iOS example | `UIImage(named:)`, a shared `PinStyle` | table and collection view cell reuse | `NSCache` of thumbnails, `URLCache` |
+
+Cell reuse, which you met in [object pools](/design/learn/sd-creational-object-pools), is a pool: a cell shows one row at a time and is reset before the next. A flyweight is never "checked out"; every user holds it at once.
+
+## How much does sharing save?
+
+Move the sliders to see when a flyweight is worth it. The saving is roughly the number of pins times the size of the shared part, so it grows with both. With small icons and few pins it hardly matters; with large icons and many pins it decides whether the map fits in memory at all.
+
+```visual estimator
+title: Memory for map pins, with and without sharing
+inputs:
+  - { id: pins, label: Pins on the map, min: 100, max: 1000000, value: 10000, scale: log, unit: pins }
+  - { id: styles, label: Distinct pin styles, min: 1, max: 100, step: 1, value: 8 }
+  - { id: iconPx, label: Icon width in pixels, min: 30, max: 300, step: 30, value: 120, unit: px }
+  - { id: perPin, label: Each pin's own data, min: 16, max: 512, step: 16, value: 96, unit: bytes }
+outputs:
+  - { id: icon, label: One decoded square icon, formula: iconPx * iconPx * 4, format: bytes }
+  - { id: unshared, label: Every pin with its own icon, formula: pins * (icon + perPin), format: bytes }
+  - { id: shared, label: Icons shared through a factory, formula: styles * icon + pins * (perPin + 8), format: bytes }
+  - { id: saved, label: Memory saved by sharing, formula: unshared - shared, format: bytes }
+  - { id: ratio, label: Times smaller, formula: round(unshared / shared), format: number }
+```
+
+## Trade-offs
+
+| | Each object owns its state | Flyweights through a factory |
+| --- | --- | --- |
+| Memory | grows with every object | shared part paid once per key |
+| Code | simplest | a factory, keys, and the intrinsic/extrinsic split |
+| Changing one object's look | change its property | pass state in, or switch it to another flyweight |
+| Concurrency | each object is independent | flyweights must be immutable; the factory needs isolation |
+| Lookup cost | none | a dictionary lookup per request |
+
+Flyweight pays off when there are many objects **and** a large shared part. Sharing a 16-byte colour between pins saves nothing: the reference to it is 8 bytes, and the reference counting costs time. Don't share state that genuinely varies, and don't build a factory for a screen that shows twenty items.
+
+<Callout kind="interview">
+
+**What to say for "show 10,000 pins on a map":** three different tools. **Flyweight** for the heavy shared parts: one image per category, not per pin. **Clustering** so the map draws a few dozen views instead of ten thousand (`MKAnnotationView.clusteringIdentifier` in MapKit). **Reuse**, a pool, for the annotation views that are on screen, plus loading only pins in the visible region. Say which problem each solves: memory per pin, number of views, and creation cost.
+
+**What to ask:** how many pins are visible at once versus loaded, how many distinct looks there are, and whether pins change appearance when selected.
+
+**Red flags:** decoding the same image per pin; a mutable shared style; a factory that's touched from several threads without isolation.
+
+</Callout>
+
+<Callout kind="gotcha" title="iOS gotcha: the file size isn't the memory size">
+
+A 12 KB PNG icon becomes width × height × 4 bytes once it's decoded for display, at the screen's scale. A 40-point icon on a 3× screen is 120 × 120 pixels: 57.6 KB in memory, nearly five times the file. Estimate memory from pixels, not from what's on disk, and share decoded images rather than decoding the same file again.
+
+</Callout>
+
+```cards
+- id: flyweight-states
+  front: "What are intrinsic and extrinsic state in the flyweight pattern?"
+  back: "Intrinsic state is the same for many objects and is shared in the flyweight (an icon, a colour). Extrinsic state belongs to one object and stays outside it (a coordinate, a title)."
+- id: flyweight-immutable
+  front: "Why must a flyweight be immutable?"
+  back: "Many objects use it at the same time, so changing it changes all of them. Per-use variations are passed in, or a different flyweight is chosen."
+- id: flyweight-vs-pool
+  front: "How does a flyweight differ from an object pool?"
+  back: "A flyweight is shared by many users at once and never changes. A pooled object is used by one user at a time and reset when it's returned, like a reused table cell."
+- id: decoded-image-size
+  front: "How much memory does a decoded image take?"
+  back: "Width × height × 4 bytes in pixels, whatever its file size. A 120 × 120 px icon is 57.6 KB."
+```
+
+```quiz
+- id: q1
+  type: estimate
+  prompt: "A map shows 50,000 pins, and each pin decodes its own 90 × 90 pixel icon at 4 bytes per pixel. Roughly how many megabytes do the icons take?"
+  answer: 1620
+  unit: MB
+  within: { factor: 2 }
+  explain: "One icon is 90 × 90 × 4 = 32,400 bytes. 50,000 of them is 1.62 billion bytes, about 1,620 MB: more than many iPhones will let one app use. Shared through a factory with, say, ten styles, the icons take about 324 KB."
+- id: q2
+  type: sort
+  prompt: "In a chat app that shows stickers, which state is intrinsic (shareable) and which is extrinsic (per use)?"
+  buckets: [Intrinsic, Extrinsic]
+  items:
+    - ["The sticker's decoded image frames", 0]
+    - ["Which message the sticker is in", 1]
+    - ["The sticker pack's name", 0]
+    - ["Its position inside the bubble", 1]
+    - ["Whether the user has reacted to that message", 1]
+    - ["The sticker's accessibility description", 0]
+  explain: "Anything that's identical wherever the sticker appears can live in one shared flyweight. Anything about this particular use (where, in which message, with what reactions) stays outside."
+- id: q3
+  type: mcq
+  prompt: "`UITableView.dequeueReusableCell(withIdentifier:for:)` is an example of which pattern?"
+  options:
+    - "Flyweight: many rows share one cell"
+    - "Object pool: a cell serves one row at a time and is reused for another after it scrolls away"
+    - "Cache: cells are evicted under memory pressure"
+    - "Proxy: the cell stands in for the row's data"
+  answer: 1
+  explain: "Each cell is checked out to one row, reset in `prepareForReuse`, and handed to the next. Flyweights are used by many at once and never change, which a cell showing different rows can't be."
+- id: q4
+  type: truefalse
+  prompt: "To highlight a selected pin, set its shared style's tint to orange."
+  answer: false
+  explain: "The style is a flyweight shared by every pin of that category, so they'd all turn orange. Selection is extrinsic: pass it in when drawing, or switch that one pin to a separate selected style."
+- id: q5
+  type: mcq
+  prompt: "A teammate proposes a flyweight factory to share a 16-byte colour value between the 200 rows of a settings screen. What's the best response?"
+  options:
+    - "Yes: every byte saved helps on a phone"
+    - "No: a reference costs 8 bytes plus reference counting, and 200 small values were never a memory problem"
+    - "Yes, but make the colour mutable so rows can change it"
+    - "No: flyweights only work for images"
+  answer: 1
+  explain: "Flyweight pays off when the shared part is large and the objects are many. Here the saving is a few kilobytes at most, and the factory adds code, keys and lookups for nothing."
+```

@@ -1,0 +1,309 @@
+## Why it matters
+
+Some rules span several objects at once: "a group chat always has at least one admin", "an expense's shares add up to its total", "a booking never puts more people in a class than it has places". An **aggregate** is the cluster of objects you change as one unit so that rules like these always hold. Where you draw it decides what one save writes, what one API call carries, what two devices can conflict over, and what's allowed to be briefly out of date. That's why it sits underneath every serious data-model discussion in an interview.
+
+## Rules that span objects
+
+Take a group chat. It has a title, a list of members, and a role for each member. One rule ties them together: **there's always at least one admin**, so someone can always add people or change settings.
+
+If the member list is an ordinary array that any code can edit, the rule is a hope:
+
+```swift
+chat.members.removeAll { $0.user == currentUser }   // what if they were the only admin?
+```
+
+Every screen that touches members has to remember the rule, and one that forgets leaves a group nobody can manage.
+
+Eric Evans's answer is the **aggregate**: a cluster of entities and values treated as one unit for changes.
+
+- One entity is the **root**. Here it's the `GroupChat`.
+- Code outside the aggregate holds references **only to the root**, never to the parts inside it.
+- Every change goes **through the root's methods**, and the root makes sure the rules (the aggregate's invariants) hold when each method returns.
+- The aggregate is **loaded and saved as a whole**, so nobody ever sees half of a change.
+
+## Drawing the boundaries
+
+The hard part is deciding what's inside. Vaughn Vernon's *Effective Aggregate Design* (2011) boils decades of experience down to four rules:
+
+1. **Put true invariants inside one boundary.** If a rule must hold at the end of every change, everything it mentions belongs in one aggregate.
+2. **Keep aggregates small.** Big ones are slow to load, conflict constantly and lock out other changes.
+3. **Refer to other aggregates by identity.** Hold a `UserID`, not a `User`.
+4. **Accept eventual consistency between aggregates.** Rules that span aggregates are brought back in line soon after, not within the same change.
+
+Step through the chat app's model with those rules in mind:
+
+```visual flow
+title: Three aggregates in a chat app
+nodes:
+  - { id: screen, label: Chat screen, kind: view, at: [0, 1] }
+  - { id: chat, label: GroupChat (root), at: [2, 0] }
+  - { id: members, label: Members and roles, at: [2, 2] }
+  - { id: message, label: Message (root), at: [4, 0] }
+  - { id: user, label: User (root), at: [4, 2] }
+groups:
+  - { id: chatAggregate, label: Group chat, nodes: [chat, members] }
+  - { id: messageAggregate, label: Message, nodes: [message] }
+  - { id: userAggregate, label: User, nodes: [user] }
+edges:
+  - [screen, chat, "add(ben)"]
+  - [screen, members, edit directly]
+  - [chat, members, checks rules]
+  - [message, chat, chatID, { style: data }]
+  - [members, user, userID, { style: data }]
+  - [message, user, senderID, { style: data }]
+steps:
+  - say: "The **group chat** aggregate: the chat is the root, and the member list with each member's role lives inside it. One rule spans them: *there's always at least one admin*."
+    show: [chatAggregate]
+  - say: "The chat screen changes membership only by asking the root: `try chat.add(ben, by: ana)`. The root checks who's asking and what it would do to the rules, then changes the members."
+    show: [screen]
+    send: [screen->chat, chat->members]
+  - say: "Code outside can't reach past the root and edit the members directly. If it could, one careless `removeAll` would leave a group with no admin, and no check would ever run."
+    send: screen->members
+    state: { members: error }
+    label: { members: not allowed }
+  - say: "A **message** is a separate aggregate. It refers to the chat by **id**, not by containing it. Messages are unbounded, change far more often, and no rule needs every message and the member list to change together."
+    show: [messageAggregate]
+    send: message->chat
+    state: { members: null }
+    label: { members: null }
+  - say: "Users are aggregates too: a profile photo changes without touching any chat. Each aggregate is loaded, saved and synced on its own, with its own version number."
+    show: [userAggregate]
+    send: [members->user, message->user]
+```
+
+Why aren't messages inside the chat aggregate? Imagine they were. Every "add a member" would load and save 50,000 messages. Two people posting at the same moment would both be editing the same aggregate, so one of them would hit a conflict. And no rule needs them there: "only members can post" is checked when a message is sent, by looking up membership, and if someone is removed a moment before their message lands, the server can reject it. That's eventual consistency between aggregates, and it's fine.
+
+## An aggregate in Swift
+
+A struct makes a natural aggregate root in Swift: the state is `private(set)`, every change is a `mutating` method that checks before it changes, and value semantics mean nobody else can hold a reference into its parts.
+
+```swift run title="GroupChat: a root that keeps its rules"
+import Foundation
+
+struct UserID: Hashable, Sendable, CustomStringConvertible {
+    let rawValue: String
+    init(_ rawValue: String) { self.rawValue = rawValue }
+    var description: String { rawValue }
+}
+
+/// A group chat's membership. The chat is the aggregate root: every change goes through it,
+/// and it keeps the rules true after each one.
+/// - Invariant: 1 to `maxMembers` members, nobody twice, and always at least one admin.
+struct GroupChat: Identifiable, Sendable {
+    enum Role: Sendable { case admin, member }
+
+    struct Member: Equatable, Sendable {
+        let user: UserID
+        var role: Role
+    }
+
+    enum Problem: Error {
+        case notAnAdmin(UserID)
+        case alreadyMember(UserID)
+        case notAMember(UserID)
+        case full
+        case lastMember
+    }
+
+    static let maxMembers = 256
+
+    let id: UUID
+    private(set) var members: [Member]      // in the order they joined
+    private(set) var version = 1           // bumped by every change; sent to the server as If-Match
+
+    init(id: UUID, createdBy creator: UserID) {
+        self.id = id
+        self.members = [Member(user: creator, role: .admin)]
+    }
+
+    mutating func add(_ user: UserID, by admin: UserID) throws {
+        try requireAdmin(admin)
+        guard !members.contains(where: { $0.user == user }) else { throw Problem.alreadyMember(user) }
+        guard members.count < Self.maxMembers else { throw Problem.full }
+        members.append(Member(user: user, role: .member))
+        version += 1
+    }
+
+    mutating func remove(_ user: UserID, by admin: UserID) throws {
+        try requireAdmin(admin)
+        guard user != admin else { return try leave(admin) }
+        guard let index = members.firstIndex(where: { $0.user == user }) else { throw Problem.notAMember(user) }
+        members.remove(at: index)
+        version += 1
+    }
+
+    mutating func leave(_ user: UserID) throws {
+        guard let index = members.firstIndex(where: { $0.user == user }) else { throw Problem.notAMember(user) }
+        guard members.count > 1 else { throw Problem.lastMember }
+        members.remove(at: index)
+        // The last admin left: the longest-standing member takes over, so the rule still holds
+        if !members.contains(where: { $0.role == .admin }) {
+            members[0].role = .admin
+        }
+        version += 1
+    }
+
+    private func requireAdmin(_ user: UserID) throws {
+        guard members.contains(Member(user: user, role: .admin)) else { throw Problem.notAnAdmin(user) }
+    }
+}
+
+let ana = UserID("ana"), ben = UserID("ben"), cy = UserID("cy"), dan = UserID("dan")
+var chat = GroupChat(id: UUID(uuidString: "0B9E8C7D-6A5F-4E3D-8C2B-1A0F9E8D7C6B")!, createdBy: ana)
+try chat.add(ben, by: ana)
+try chat.add(cy, by: ana)
+do {
+    try chat.add(dan, by: ben)
+} catch {
+    print("Refused: \(error)")
+}
+try chat.leave(ana)
+print(chat.members.map { "\($0.user): \($0.role)" }, "version \(chat.version)")
+try chat.remove(cy, by: ben)
+print(chat.members.map { "\($0.user): \($0.role)" }, "version \(chat.version)")
+```
+
+```output
+Refused: notAnAdmin(ben)
+["ben: admin", "cy: member"] version 4
+["ben: admin"] version 5
+```
+
+Notice three things.
+
+- **The rule lives in one place.** When Ana, the only admin, leaves, `leave(_:)` promotes Ben in the same change. No screen has to remember.
+- **Checks come before changes.** Each method throws before it touches anything, so a refused change leaves the aggregate exactly as it was. With a struct you can go further: apply a change to a copy, and only keep the copy if it succeeds.
+- **The version moves with every change.** That number is how the aggregate's consistency boundary meets the server's, as the next section shows.
+
+What counts as "the longest-standing member takes over" is a **product decision**, not a technical one. Another app might refuse to let the last admin leave until they've named a successor. Aggregates are where those decisions become code, so ask the product owner rather than guessing.
+
+## One aggregate, one transaction
+
+The consistency boundary is also a **transaction boundary**: one aggregate is saved in one go, and two aggregates are never saved together.
+
+- **On the device**, saving an aggregate is one atomic write: one Core Data or SwiftData save, or one file written with `.atomic`. A crash halfway through leaves the old version or the new one, never a mix.
+- **With the server**, an aggregate usually maps to one resource and one request. Its version number makes concurrent edits safe through **optimistic concurrency**: the app sends the version it started from, and the server refuses the change if someone else got there first.
+
+```http
+PATCH /chats/0B9E8C7D/members HTTP/1.1
+If-Match: "4"
+Content-Type: application/json
+
+{ "remove": ["cy"] }
+```
+
+If another device changed the chat after version 4, the server answers `412 Precondition Failed`. The app then fetches the latest chat, reapplies the user's intent if it still makes sense, or tells them what changed. The aggregate is the unit of that conflict: two people editing *different* chats never collide, and two people editing the *same* chat always find out.
+
+Changes that span aggregates (deleting an account removes the user from every chat) can't be one transaction. The server does them in steps, often by publishing an event ("user deleted") that other parts react to. You'll meet domain events in D30. On the device, you see the result arrive a moment later.
+
+## Who owns the aggregate on iOS
+
+For data shared between users, **the server owns the real aggregate**. The app keeps a copy for instant UI and offline reading, and runs the same checks for a better experience: grey out "Remove" for the last admin, refuse a duplicate before a network round trip. But the server must check again, because two phones can each believe their change is fine. If two admins on two phones remove each other at the same moment, both clients approve; the server applies one, bumps the version, and refuses the other.
+
+Inside the app, give each aggregate **one owner**: an actor, or a `@MainActor` store that holds the value and is the only thing that changes it. Value types make the pattern simple:
+
+```swift
+@MainActor @Observable
+final class ChatStore {
+    private(set) var chat: GroupChat
+    private(set) var error: GroupChat.Problem?
+
+    func add(_ user: UserID) async {
+        let base = chat.version                // the version this change starts from
+        var draft = chat                       // try the change on a copy
+        do {
+            try draft.add(user, by: currentUser)
+        } catch {
+            self.error = error as? GroupChat.Problem
+            return
+        }
+        chat = draft                           // show it at once
+        await sync(draft, ifMatch: base)       // the server re-checks; a 412 means refetch
+    }
+}
+```
+
+## How big should an aggregate be?
+
+| Boundary | Invariant safety | Conflicts | Payload per save | Offline editing | Typical mistake |
+| --- | --- | --- | --- | --- | --- |
+| One giant aggregate (a `User` holding orders, addresses, chats) | Easy: everything's inside | Constant: any change conflicts with any other | Huge | Painful merges | "It's all the user's data" |
+| Small aggregates referring by id | Rules inside each hold; rules across them catch up | Only on the same small thing | Small | Each merges on its own | Splitting a real invariant across two |
+| No aggregates (tables any code edits) | None | Hidden: last write wins, silently | Small | Silent corruption | Rules enforced only in the UI |
+
+The middle row is the default. The way to find the boundary: list the rules, and for each one ask *must this be true immediately after every change, or is "within a few seconds" fine?* Immediate rules pull objects together; eventual ones let them stay apart.
+
+<Callout kind="interview">
+
+**Say** which things change together and share a rule, and draw the boundary around them: "Membership and roles are one aggregate, saved with a version number, so two admins' edits can't both win. Messages are separate and refer to the chat by id." **Ask** which rules must hold instantly and which can catch up, and whether the server or the device is the source of truth. **Red flags:** one huge object graph synced as a blob, invariants that live only in view models, and "transactions" on the device that try to update several aggregates at once.
+
+</Callout>
+
+<Callout kind="gotcha" title="iOS gotcha: Core Data and SwiftData relationships make everything reachable">
+
+A persistence model with relationships everywhere (`chat.messages`, `message.sender.chats`) invites code to edit across aggregate boundaries, and to fault a huge graph into memory by following them. Storage can link things however it likes for queries; your domain types should still respect the boundaries. Expose the aggregate root's methods, refer to other aggregates by id, and fetch them through their own repository.
+
+</Callout>
+
+## Practice
+
+Two items practise this lesson. The kata **An expense that always adds up** has you build an aggregate root whose invariant (shares always sum to the total) survives every operation, with changes that are all or nothing. The design exercise **The domain model for booking fitness classes** asks you to draw aggregate boundaries where contention is real: a popular class fills in seconds when booking opens.
+
+```cards
+- id: aggregate-definition
+  front: "What is an aggregate?"
+  back: "A cluster of entities and values changed as one unit, with one entity as the root. Outside code refers only to the root, every change goes through its methods, and it keeps the cluster's invariants true after each change."
+- id: vernon-rules
+  front: "What are Vernon's four rules for aggregate boundaries?"
+  back: "Put true invariants inside one boundary; keep aggregates small; refer to other aggregates by identity; accept eventual consistency between them."
+- id: aggregate-transaction
+  front: "How does an aggregate meet the server?"
+  back: "Usually as one resource saved in one request, with a version number. The app sends `If-Match` with the version it started from, and the server refuses the change (412) if someone else changed it first."
+```
+
+```quiz
+- id: q1
+  type: sort
+  prompt: "In a group chat app, what belongs inside the `GroupChat` aggregate, and what's a separate aggregate referred to by id?"
+  buckets: [Inside GroupChat, Separate aggregate]
+  items:
+    - [Each member's role, 0]
+    - [The chat's title and settings, 0]
+    - [The messages, 1]
+    - [Each member's profile photo, 1]
+    - [Which message is pinned, 0]
+    - [Reactions on a message, 1]
+  explain: "Roles, title, settings and the pinned message's id change rarely and belong to the chat. Messages, their reactions and user profiles change independently, are unbounded or shared across chats, so they're separate and referenced by id."
+- id: q2
+  type: estimate
+  prompt: "If a chat's 50,000 messages (about 1 KB each) lived inside the chat aggregate, roughly how many megabytes would every \"add a member\" save have to write?"
+  answer: 50
+  unit: MB
+  explain: "50,000 × 1 KB is about 50 MB, for a change that touches one member. That's the cost of an aggregate drawn too big, before even counting the conflicts with everyone posting at once."
+- id: q3
+  type: mcq
+  prompt: "Ana and Ben are the only admins. On two phones, at the same moment, each removes the other. Both apps checked the rule locally and allowed it. What stops the group ending up with no admins?"
+  options:
+    - "Nothing: the last write wins"
+    - "The server applies one change and bumps the version; the other request carries the old version in `If-Match`, so it's refused and that app refreshes"
+    - "The apps retry until one of them succeeds"
+    - "Push notifications arrive in order"
+  answer: 1
+  explain: "The aggregate's version makes the server the referee. Each phone's check was valid for the version it saw; optimistic concurrency makes sure only one of them commits against that version."
+- id: q4
+  type: multi
+  prompt: "Which of these follow good aggregate design? Choose all that apply."
+  options:
+    - "A `Message` stores the `chatID`, not the whole `GroupChat`"
+    - "A `User` aggregate holds the user's orders, so the order total can check the user's credit limit"
+    - "A refused change leaves the aggregate exactly as it was"
+    - "Screens edit `chat.members` directly and call `validate()` afterwards"
+    - "Deleting an account removes the user from chats a little later, through an event"
+  answer: [0, 2, 4]
+  explain: "Refer by id, make changes all or nothing, and let cross-aggregate effects catch up. A giant `User` aggregate conflicts constantly, and validating after editing means the broken state existed, and could have been saved."
+- id: q5
+  type: truefalse
+  prompt: "If the server enforces a rule, there's no point checking it in the app's aggregate too."
+  answer: false
+  explain: "The server's check is the one that guarantees the rule. The app's check gives instant feedback, works offline, and saves a round trip. Duplicating a rule is a cost, but for rules users bump into, it's usually worth paying."
+```

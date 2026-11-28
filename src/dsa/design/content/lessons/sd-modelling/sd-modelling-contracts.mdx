@@ -1,0 +1,325 @@
+## Why it matters
+
+An interface says how to call something. A **contract** says what has to be true before you call it, what will be true afterwards, and what's true all the time. Every API you write makes these decisions, usually without saying so: what happens with an empty array, a negative quantity, a missing file? Writing the contract down is how you choose between crashing, throwing and returning `nil`, and interviewers ask exactly that: "what happens if the caller passes X?"
+
+## Three parts of a contract
+
+Bertrand Meyer named the idea **Design by Contract** in the 1980s, and built it into his language, Eiffel. A contract has three parts.
+
+- A **precondition** is the caller's obligation: what must be true before the call. "`removeLast()` needs a non-empty array."
+- A **postcondition** is the callee's promise: what will be true when it returns, if the precondition held. "The array is one element shorter, and you got the old last element."
+- An **invariant** is what's true of every instance whenever none of its methods is running. "An array's `count` is never negative, and its indices run from `startIndex` to `endIndex`."
+
+<Callout kind="analogy">
+
+A courier's terms of service work the same way. Your obligation: pack the parcel, keep it under 20 kg, write a real address. Their promise: it arrives within two days. Their invariant: they never open it. If you send 30 kg, they owe you nothing, and they're entitled to refuse it at the counter rather than hurt someone lifting it.
+
+</Callout>
+
+The split matters because it says **who checks what**. If a precondition is the caller's job, the callee doesn't have to handle the case gracefully; it can refuse loudly. If something is a postcondition, the caller doesn't need to double-check it.
+
+Apple's APIs make these choices constantly, and they're worth reading as contracts:
+
+| API | The contract | What breaking it does |
+| --- | --- | --- |
+| `array[i]` | Precondition: `i` is a valid index | Traps: "Index out of range" |
+| `dictionary[key]` | No precondition: a missing key is normal | Returns `nil` |
+| `array.removeLast()` | Precondition: not empty | Traps |
+| `array.popLast()` | No precondition | Returns `nil` when empty |
+| `Int("42")` | Input may be anything | Returns `nil` for "abc" |
+| `tableView.dequeueReusableCell(withIdentifier:for:)` | Precondition: the identifier was registered | Throws an Objective-C exception and crashes |
+
+Notice the pattern. When the bad case comes from **outside the program** (user input, a file, a dictionary lookup that's allowed to miss), the API returns `nil` or throws. When it can only come from **a bug in the caller** (an index you computed wrongly, a cell you forgot to register), it traps.
+
+## Where invariants hold
+
+An invariant doesn't have to be true at every instant. It has to be true at the **boundaries**: when the instance is created, and whenever a public method returns. In between, inside a method, it's allowed to be broken for a moment, as long as nobody can observe it.
+
+Swift concurrency adds a twist that catches experienced developers. Inside an actor, **every `await` is a boundary**. While one method is suspended, the actor can run another call on the same instance. If the invariant was broken at that `await`, the other call sees it broken. Step through two payments against one wallet:
+
+```visual timeline
+title: Two payments, one wallet, a check that goes stale
+unit: ms
+lanes:
+  - { id: a, label: Pay £30 (A) }
+  - { id: b, label: Pay £30 (B) }
+  - { id: balance, label: Balance }
+spans:
+  - { lane: a, from: 0, to: 40, label: "check 50 ≥ 30", tone: active }
+  - { lane: a, from: 40, to: 300, label: await charge, tone: wait }
+  - { lane: a, from: 300, to: 340, label: "−30", tone: active }
+  - { lane: b, from: 100, to: 140, label: "check 50 ≥ 30", tone: active }
+  - { lane: b, from: 140, to: 400, label: await charge, tone: wait }
+  - { lane: b, from: 400, to: 440, label: "−30", tone: error }
+  - { lane: balance, from: 0, to: 300, label: £50, tone: ok }
+  - { lane: balance, from: 300, to: 400, label: £20, tone: ok }
+  - { lane: balance, from: 400, to: 500, label: "−£10", tone: error }
+markers:
+  - { at: 40, label: A suspends }
+  - { at: 100, label: B runs }
+steps:
+  - { at: 20, say: "Payment A checks the balance: £50 covers £30." }
+  - { at: 60, say: "A awaits the payment gateway. At this `await` the actor is free to run other calls." }
+  - { at: 120, say: "Payment B runs on the same actor and checks the balance. It's still £50, because A hasn't subtracted anything yet." }
+  - { at: 320, say: "A's charge succeeds and it subtracts £30. The balance is £20." }
+  - { at: 420, say: "B's charge succeeds too, and it subtracts £30 from £20. The invariant *balance is never negative* is broken, and both checks passed." }
+```
+
+The actor did its job: no two pieces of code touched `balance` at the same time, so there's no data race. The bug is a **logic race**: B's check was true when it ran and false by the time B acted on it. Here's the code that does that, and a fix:
+
+```swift
+actor Wallet {
+    private var balance: Int
+
+    func pay(_ amount: Int, via gateway: some PaymentGateway) async throws {
+        guard balance >= amount else { throw WalletError.insufficientFunds }
+        try await gateway.charge(amount)   // another pay(_:via:) can run here
+        balance -= amount                  // ...so the guard above may no longer be true
+    }
+}
+```
+
+The fix keeps the invariant true at the suspension point: take the money first, and give it back if the charge fails.
+
+```swift run title="Keep the invariant true at every await"
+import Foundation
+
+enum WalletError: Error {
+    case insufficientFunds
+}
+
+protocol PaymentGateway: Sendable {
+    func charge(_ pence: Int) async throws
+}
+
+struct SlowGateway: PaymentGateway {
+    func charge(_ pence: Int) async throws {
+        try await Task.sleep(for: .milliseconds(20))
+    }
+}
+
+/// - Invariant: `balance` is never negative.
+actor Wallet {
+    private(set) var balance: Int
+
+    init(balance: Int) {
+        self.balance = balance
+    }
+
+    /// - Postcondition: on success, `balance` is `amount` lower; on failure, it's unchanged.
+    func pay(_ amount: Int, via gateway: some PaymentGateway) async throws {
+        guard balance >= amount else { throw WalletError.insufficientFunds }
+        balance -= amount              // reserve first: the invariant holds at the await
+        do {
+            try await gateway.charge(amount)
+        } catch {
+            balance += amount          // the charge failed, so give it back
+            throw error
+        }
+    }
+}
+
+let wallet = Wallet(balance: 5_000)
+async let first: Void = wallet.pay(3_000, via: SlowGateway())
+async let second: Void = wallet.pay(3_000, via: SlowGateway())
+var refused = 0
+do { try await first } catch { refused += 1 }
+do { try await second } catch { refused += 1 }
+print("Payments refused: \(refused) of 2")
+print("Balance: £\(await wallet.balance / 100)")
+```
+
+```output
+Payments refused: 1 of 2
+Balance: £20
+```
+
+Whichever payment reaches the actor second sees £20, and is refused. The rule for actors: **re-check after every `await`, or make sure the state is consistent before you suspend.** You'll go deeper into actor reentrancy in D22.
+
+## Choosing how to enforce a contract
+
+For every condition, you have a menu. Pick from the top when you can.
+
+1. **Make it impossible with types.** A non-optional parameter can't be `nil`. An enum can't hold a sixth state. A `Quantity` that can only be built from 1 to 10 can't be zero. The compiler checks every caller, forever. The rest of this module is about this option.
+2. **Return `nil` or throw.** When the bad case comes from outside your code (user input, the network, a file, the server's JSON), it isn't a bug, it's Tuesday. Make it part of the postcondition: "returns `nil` if the text isn't a number", "throws `.expired` if the session is over".
+3. **Trap with `precondition`.** When the bad case can only mean a bug in the calling code, and carrying on would corrupt state or produce wrong results. Crashing near the bug is kinder than corrupting a user's data three screens later.
+4. **Check in debug builds only, with `assert`.** When the check is too expensive to ship, such as verifying that an array is sorted before a binary search, which costs more than the search.
+5. **Document it.** When it can't be checked at all ("the closure must not call back into this object"). Write it in the doc comment, then look for a design that removes it.
+
+Swift's tools behave differently in debug and release builds, and the difference is part of the decision:
+
+| Tool | Debug build (`-Onone`) | Release build (`-O`) | Use it for |
+| --- | --- | --- | --- |
+| Types | Checked at compile time | Checked at compile time | Anything you can express |
+| `Optional`, `throws` | Handled by the caller | Handled by the caller | Expected failures |
+| `precondition(_:_:)` | Traps and prints your message | Still traps, but your message isn't kept | Broken contracts at API boundaries |
+| `assert(_:_:)`, `assertionFailure(_:)` | Traps | Removed entirely | Expensive checks, internal sanity checks |
+| `fatalError(_:)` | Traps and prints your message | Traps and prints your message | Code that must be unreachable |
+
+(In `-Ounchecked` builds even `precondition` is removed, which is why almost nobody uses that setting.)
+
+## Writing contracts down
+
+Swift's documentation markup has callouts for all three parts, and Xcode shows them in Quick Help: `- Precondition:`, `- Postcondition:` and `- Invariant:`. Here's a small type with a full contract, and code that enforces it:
+
+```swift run title="RecentSearches, with its contract"
+import Foundation
+
+/// The last few things the user searched for.
+/// - Invariant: at most `limit` terms, newest first, and no term twice (ignoring case).
+struct RecentSearches {
+    let limit: Int
+    private(set) var terms: [String] = []
+
+    /// - Precondition: `limit` is at least 1. Anything less is a bug in the code that made it.
+    init(limit: Int) {
+        precondition(limit >= 1, "RecentSearches needs room for at least one term")
+        self.limit = limit
+    }
+
+    /// Records a search. Blank text comes from the user, so it's ignored, not treated as a bug.
+    /// - Postcondition: if `term` isn't blank, it's `terms.first`, trimmed, and appears only once.
+    mutating func record(_ term: String) {
+        let trimmed = term.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return }
+        terms.removeAll { $0.caseInsensitiveCompare(trimmed) == .orderedSame }
+        terms.insert(trimmed, at: 0)
+        if terms.count > limit {
+            terms.removeLast(terms.count - limit)
+        }
+        assert(keepsInvariant, "RecentSearches broke its invariant")
+    }
+
+    private var keepsInvariant: Bool {
+        terms.count <= limit && Set(terms.map { $0.lowercased() }).count == terms.count
+    }
+}
+
+var recent = RecentSearches(limit: 3)
+for search in ["swift", "SwiftUI", "   ", "Swift", "combine", "async"] {
+    recent.record(search)
+    print("\"\(search)\" -> \(recent.terms)")
+}
+```
+
+```output
+"swift" -> ["swift"]
+"SwiftUI" -> ["SwiftUI", "swift"]
+"   " -> ["SwiftUI", "swift"]
+"Swift" -> ["Swift", "SwiftUI"]
+"combine" -> ["combine", "Swift", "SwiftUI"]
+"async" -> ["async", "combine", "Swift"]
+```
+
+Each kind of condition got a different tool. A `limit` of zero can only come from a programmer, so it's a `precondition`. Blank text comes from a user, so it's handled. The invariant is checked by an `assert` after every change, which costs nothing in release builds and catches a broken `record` in every debug run and test.
+
+## Contracts and substitution
+
+When you write a protocol, you're writing a contract for every conformer. A conformer may **accept more** (weaker preconditions) and **promise more** (stronger postconditions), but never the reverse. A `Cache` protocol whose doc says "`value(for:)` returns what you last stored, until you remove it" is broken by a conformer that evicts at random, even though it compiles. That's the Liskov substitution principle, and you'll meet it properly in D04. For now: the compiler checks a conformer's signatures, not its contract, so write the contract on the protocol.
+
+## Trust boundaries
+
+The most important contract decision is where your **trust boundary** sits. Inside your own module, code is written by your team and covered by your tests, so preconditions are reasonable. Outside it, nothing is guaranteed:
+
+- the server's JSON, which another team changes, and which older or newer server versions shape differently;
+- anything the user types, pastes or picks;
+- deep links and universal links, which anyone can craft;
+- files, the Keychain and `UserDefaults`, which can be missing, old or corrupt;
+- other processes: extensions, widgets, App Intents.
+
+Data crossing that boundary is never a precondition. Validate it, convert it into types that can only hold valid values, and handle what fails. A `try!` or a force unwrap on decoded JSON is a precondition imposed on a server you don't control.
+
+## Trade-offs
+
+| Enforcement | Caught when | Cost in release | Burden on callers | Right for |
+| --- | --- | --- | --- | --- |
+| Types | Compile time | None | Build the type first | Rules you can express in a type |
+| `Optional` or `throws` | Runtime, handled | A branch | Must handle every call | Failures that come from outside |
+| `precondition` | Runtime, crash | A cheap check | None, if they follow the contract | Bugs in calling code at an API boundary |
+| `assert` | Debug runs and tests | None | None | Expensive or internal checks |
+| Documentation only | Code review, if anyone reads it | None | Must read and remember | Rules you can't check, until you redesign |
+
+Throwing for every programmer error is a common overcorrection: every call site gains a `try` for something that "can't happen", and real errors drown among them. Trapping on outside input is the opposite mistake, and it's the one that shows up as crash reports.
+
+<Callout kind="interview">
+
+**Say** the contract when you present an API: "`page(after:)` takes a cursor from the previous page. An expired cursor throws `.cursorExpired`, and the screen restarts from the top." Say which failures are expected (thrown) and which are bugs (preconditions). **Ask** what callers can rely on: ordering, idempotency, whether results can be stale. **Red flags:** force-unwrapping or `try!` on network data, APIs where nobody can say what happens with empty input, and actor methods that check a condition, `await`, then act on the old check.
+
+</Callout>
+
+<Callout kind="gotcha" title="Swift gotcha: assert vanishes in release builds, side effects and all">
+
+`assert` and `assertionFailure` are removed from release builds, including whatever expression you passed them. `assert(cache.removeExpired() > 0)` removes expired entries in debug builds and does nothing in the App Store build, so the bug only appears for users. Keep side effects out of assertions: do the work, store the result, then assert on it.
+
+</Callout>
+
+## Practice
+
+The kata **An expense that always adds up** is a contract exercise in disguise: every operation has preconditions (a positive total, at least one participant), a postcondition (a refused change leaves the expense untouched) and an invariant (the shares add up to the total) that must hold after every call.
+
+```cards
+- id: pre-post-inv
+  front: "Precondition, postcondition, invariant: who's responsible for each?"
+  back: "The caller makes the precondition true. The callee guarantees the postcondition if it did. The type keeps the invariant true at every public boundary: after `init` and whenever a method returns."
+- id: trap-or-throw
+  front: "When should an API trap, and when should it throw or return nil?"
+  back: "Trap (`precondition`) when the bad case can only be a bug in the calling code. Throw or return `nil` when it comes from outside: user input, files, the network, the server's JSON."
+- id: actor-await-boundary
+  front: "Why is every `await` inside an actor method a contract boundary?"
+  back: "While the method is suspended, the actor can run other calls on the same instance. The invariant must hold at the `await`, and any check made before it must be re-checked after it."
+```
+
+```quiz
+- id: q1
+  type: sort
+  prompt: "How should each condition be enforced?"
+  buckets: ["Trap (`precondition`)", "Throw or return nil", "Make it impossible with a type"]
+  items:
+    - ["A page size of 0 passed by your own feed code", 0]
+    - ["A promo code the user typed that doesn't exist", 1]
+    - ["A JSON field that's missing from the server's response", 1]
+    - ["A screen state that's both loading and failed at once", 2]
+    - ["A deep link with an order id that isn't a number", 1]
+    - ["A quantity that must be 1 to 10, used throughout the cart", 2]
+  explain: "Your own code passing a nonsensical page size is a bug: trap. User input, server data and deep links come from outside: handle them. Rules used everywhere, like screen states and quantities, are best made unrepresentable."
+- id: q2
+  type: mcq
+  prompt: "In release builds, what happens when `precondition(index >= 0, \"negative index\")` fails?"
+  options:
+    - "Nothing: preconditions are removed in release"
+    - "The app traps, but the message \"negative index\" isn't kept"
+    - "It throws an error the caller can catch"
+    - "It logs the message and continues"
+  answer: 1
+  explain: "`precondition` is still checked in `-O` builds, so the app stops at the bug, but the custom message is dropped. `assert` is the one that's removed entirely; `fatalError` keeps its message."
+- id: q3
+  type: bug
+  prompt: "This actor's invariant is that a seat is never held by two people. Which line makes it possible to break?"
+  code: |
+    actor SeatMap {
+        private var holds: [String: UUID] = [:]
+
+        func hold(_ seat: String, for user: UUID, using api: SeatAPI) async throws {
+            guard holds[seat] == nil else { throw SeatError.taken }
+            try await api.reserve(seat, for: user)
+            holds[seat] = user
+        }
+    }
+  answer: 6
+  explain: "The `await` on line 6 lets another `hold` for the same seat run after the guard has passed. Both guards see the seat free. Record the hold before awaiting (and remove it if the API call fails), or re-check after the await."
+- id: q4
+  type: truefalse
+  prompt: "Because the server should always send valid JSON, it's reasonable to decode it with `try!`."
+  answer: false
+  explain: "The server is outside your trust boundary: other teams change it, and old and new versions disagree. A `try!` turns their mistake into your crash. Decode with `try`, handle the error, and keep showing what you had."
+- id: q5
+  type: mcq
+  prompt: "`protocol TokenStore` says: \"`token()` returns the last token you saved, until `clear()` is called.\" A teammate writes `MemoryTokenStore`, which also clears itself whenever the app gets a memory warning. What's wrong?"
+  options:
+    - "Nothing: it compiles, so it conforms"
+    - "It weakens the protocol's postcondition, so code that relies on the contract breaks after a memory warning"
+    - "Memory warnings can't be observed in Swift"
+    - "Protocols can't have postconditions"
+  answer: 1
+  explain: "A conformer may promise more than the protocol, never less. The compiler checks only signatures, so the contract must be written on the protocol, and reviewers must check conformers against it."
+```

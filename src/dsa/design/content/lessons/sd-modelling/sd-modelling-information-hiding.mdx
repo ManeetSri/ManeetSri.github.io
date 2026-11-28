@@ -1,0 +1,339 @@
+## Why it matters
+
+Some decisions in an app are certain to change: where the auth token is stored, which analytics vendor you use, the shape of the API's JSON, whether you persist with Core Data or SwiftData. If every screen knows those decisions, every change touches every screen. Information hiding puts each decision behind one boundary, so a change lands in one file. Interviewers probe it with one question: "how would you swap X for Y?"
+
+## Parnas: hide the decisions likely to change
+
+In 1972 David Parnas published a short paper with a big idea. He took one small program (an index of titles, the "KWIC" index) and split it into modules two ways.
+
+- **By steps:** read the input, shift the words, sort, print. Each module is one stage of the flowchart, and they all share the same data layout in memory.
+- **By decisions:** one module owns how lines are stored, one owns how they're shifted, one owns sorting. Each module hides a *design decision* from the others, behind an interface.
+
+Both versions work. The difference shows up when something changes. Change the storage format in the first version and every stage breaks, because they all read the shared layout. In the second, one module changes and the rest never notice. Parnas's rule: **start from the decisions that are hard or likely to change, and give each one a module that keeps it secret.**
+
+In an iOS app, the secrets worth keeping look like this:
+
+| Decision | Likely to change because… | Hide it in |
+| --- | --- | --- |
+| Where the auth token lives | Security reviews, a move to the Keychain | A `TokenStore` |
+| The API's JSON shape | The backend team, versioning | Decodable DTOs inside the API client |
+| The persistence framework | Core Data to SwiftData, or to a file | A repository |
+| The analytics vendor | Contracts, privacy rules | An `Analytics` interface |
+| Image caching policy | Memory pressure, new screens | The image pipeline |
+
+## A change that ripples, and one that doesn't
+
+Here's the token decision played out both ways:
+
+```visual flow
+title: Moving the auth token to the Keychain
+nodes:
+  - { id: defaults, label: UserDefaults, kind: store, at: [1.5, 0] }
+  - { id: login, label: Sign-in, kind: view, at: [0, 1] }
+  - { id: api, label: API client, kind: service, at: [1, 1] }
+  - { id: push, label: Push setup, kind: service, at: [2, 1] }
+  - { id: settings, label: Settings, kind: view, at: [3, 1] }
+  - { id: tokens, label: TokenStore, kind: service, at: [1.5, 2.5] }
+  - { id: keychain, label: Keychain, kind: store, at: [1.5, 4] }
+edges:
+  - [login, defaults]
+  - [api, defaults]
+  - [push, defaults]
+  - [settings, defaults]
+  - [login, tokens]
+  - [api, tokens]
+  - [push, tokens]
+  - [settings, tokens]
+  - [tokens, keychain, SecItem]
+steps:
+  - say: "Four parts of the app read and write the token straight from `UserDefaults`, each with its own copy of the key `\"authToken\"`."
+    show: [login, api, push, settings, defaults]
+    send: [login->defaults, api->defaults, push->defaults, settings->defaults]
+  - say: "A security review says tokens belong in the **Keychain**: `UserDefaults` is a plain property list that ends up in backups. Every one of the four has to change, and each change is a chance to miss one."
+    state: { login: error, api: error, push: error, settings: error }
+  - say: "Now the same app, designed by decision. The four callers know only a `TokenStore` that answers *what's the token?* and *save this one*."
+    reset: true
+    show: [login, api, push, settings, tokens]
+    send: [login->tokens, api->tokens, push->tokens, settings->tokens]
+  - say: "The move to the Keychain happens inside `TokenStore`, in one file. The callers don't change, and none of them can get the key wrong."
+    show: [keychain]
+    send: tokens->keychain
+    state: { tokens: active }
+    label: { tokens: one change }
+```
+
+The interface for that secret is tiny:
+
+```swift check title="TokenStore.swift"
+import Foundation
+import Security
+
+/// Somewhere safe to keep the signed-in user's access token. Callers don't know or care where.
+protocol TokenStore: Sendable {
+    func token() throws -> String?
+    func save(_ token: String) throws
+    func clear() throws
+}
+
+struct KeychainError: Error {
+    let status: OSStatus
+}
+
+struct KeychainTokenStore: TokenStore {
+    private let service = "com.example.shop.auth"
+    private let account = "accessToken"
+
+    private var baseQuery: [String: Any] {
+        [kSecClass as String: kSecClassGenericPassword,
+         kSecAttrService as String: service,
+         kSecAttrAccount as String: account]
+    }
+
+    func token() throws -> String? {
+        var query = baseQuery
+        query[kSecReturnData as String] = true
+        query[kSecMatchLimit as String] = kSecMatchLimitOne
+        var result: CFTypeRef?
+        let status = SecItemCopyMatching(query as CFDictionary, &result)
+        if status == errSecItemNotFound { return nil }
+        guard status == errSecSuccess, let data = result as? Data else { throw KeychainError(status: status) }
+        return String(decoding: data, as: UTF8.self)
+    }
+
+    func save(_ token: String) throws {
+        try clear()
+        var query = baseQuery
+        query[kSecValueData as String] = Data(token.utf8)
+        // Readable after the first unlock (so background refresh works), and never restored to another device
+        query[kSecAttrAccessible as String] = kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly
+        let status = SecItemAdd(query as CFDictionary, nil)
+        guard status == errSecSuccess else { throw KeychainError(status: status) }
+    }
+
+    func clear() throws {
+        let status = SecItemDelete(baseQuery as CFDictionary)
+        guard status == errSecSuccess || status == errSecItemNotFound else { throw KeychainError(status: status) }
+    }
+}
+```
+
+`TokenStore` hides three decisions at once: *where* the token lives (the Keychain), *how* it gets there (the `SecItem` C API and its dictionaries), and *what format* it's stored in (UTF-8 bytes). Callers see "there's a token, or there isn't". A test can use an in-memory `TokenStore` and never touch the Keychain at all.
+
+Notice what the interface doesn't hide: `throws`. The Keychain can fail (a locked device, a missing entitlement), and callers need to know.
+
+## Encapsulation: data and the rules that protect it, together
+
+Information hiding is the design principle: decide what to hide. **Encapsulation** is the mechanism: bundle data with the code that's allowed to change it, and use access control to keep everyone else out.
+
+Swift gives you the tools. `private` and `fileprivate` hide a member from other types; `internal` (the default) hides it from other modules; `package` (Swift 5.9) shares it between the targets of one package without making it public; `public` and `open` publish it. The one you'll reach for most in models is `private(set)`: anyone can read, only the type can write.
+
+```swift run title="A playlist that keeps its own rules"
+import Foundation
+
+struct Track: Hashable {
+    let id: String
+    let title: String
+    let seconds: Int
+}
+
+/// A playlist the user builds. Its rules: no track twice, and at most 500 tracks.
+struct Playlist {
+    static let maxTracks = 500
+
+    enum Problem: Error {
+        case alreadyAdded(String)
+        case full
+    }
+
+    let name: String
+    private(set) var tracks: [Track] = []
+
+    init(name: String) {
+        self.name = name
+    }
+
+    mutating func add(_ track: Track) throws {
+        guard !tracks.contains(track) else { throw Problem.alreadyAdded(track.title) }
+        guard tracks.count < Self.maxTracks else { throw Problem.full }
+        tracks.append(track)
+    }
+
+    mutating func remove(_ track: Track) {
+        tracks.removeAll { $0 == track }
+    }
+
+    // Derived, not stored, so it can never disagree with the tracks
+    var duration: Duration {
+        .seconds(tracks.reduce(0) { $0 + $1.seconds })
+    }
+}
+
+let intro = Track(id: "t1", title: "Warm-up", seconds: 245)
+let tempo = Track(id: "t2", title: "Tempo", seconds: 180)
+
+var run = Playlist(name: "Morning run")
+try run.add(intro)
+try run.add(tempo)
+do {
+    try run.add(intro)
+} catch {
+    print("Refused: \(error)")
+}
+print("\(run.name): \(run.tracks.map(\.title)), \(run.duration.formatted(.time(pattern: .minuteSecond)))")
+run.remove(intro)
+print("After removing: \(run.tracks.map(\.title))")
+```
+
+```output
+Refused: alreadyAdded("Warm-up")
+Morning run: ["Warm-up", "Tempo"], 7:05
+After removing: ["Tempo"]
+```
+
+Because `tracks` is `private(set)`, the only way to add a track is `add(_:)`, which checks both rules. Code elsewhere that tries to skip the checks doesn't compile:
+
+```text title="What you'll see"
+run.tracks.append(tempo)
+error: cannot use mutating member on immutable value: 'tracks' setter is inaccessible
+```
+
+That's the point of encapsulation: an invariant that's checked in one place, and can't be bypassed from anywhere else. Without it, "no duplicates" is a hope that every caller remembers to check.
+
+## Tell, don't ask
+
+Encapsulation changes how callers talk to an object. Without it, they *ask* for its data and make the decision themselves:
+
+```swift
+if playlist.tracks.count < 500 && !playlist.tracks.contains(track) {
+    playlist.tracks.append(track)
+}
+```
+
+With it, they *tell* the object what they want and let it decide: `try playlist.add(track)`. The rule lives with the data it protects, and a second screen that adds tracks gets the same rule for free. You'll meet this as a principle of its own, with the Law of Demeter, in D03.
+
+## The anaemic domain model
+
+The opposite of encapsulation has a name. Martin Fowler called it the **anaemic domain model**: types that are bags of `var` properties with no behaviour, and the rules that should protect them scattered through services, managers and view models.
+
+```swift
+struct Order {
+    var status: String
+    var items: [Item]
+    var paidAt: Date?
+}
+
+// In OrdersViewModel, CheckoutViewModel and the push handler, each slightly different:
+if order.status == "placed" && order.paidAt == nil { … }
+```
+
+You can spot one by its symptoms: models with no methods; types named `OrderManager` or `OrderHelper` full of `if order.status == …`; the same rule written in two view models that have quietly drifted apart; bugs where some code path set a field nobody else expected to change.
+
+An anaemic model isn't always wrong. Some types *should* be dumb:
+
+- **DTOs** that mirror the server's JSON exist to be decoded, not to hold rules. (D25 separates them from domain models.)
+- **View state** is a snapshot for rendering.
+- In an app where the **server owns every rule** and the client only displays, a rich client model duplicates logic that already lives on the backend.
+
+The trouble starts when a type *does* have rules, and they live everywhere except in the type.
+
+## What not to hide
+
+Hiding too much is a failure too.
+
+- **Don't hide what callers must plan for.** A repository that swallows network errors and returns an empty array makes "you have no orders" and "we couldn't load your orders" look the same. Waiting, failure, cancellation and threading belong in the interface.
+- **Watch for information leakage.** John Ousterhout uses this name for one decision known by two modules. If the date format `"yyyy-MM-dd"` appears in both the encoder that saves drafts and the decoder that loads them, changing one silently breaks the other. One decision, one owner.
+- **Don't hide behind a mirror.** A `TokenStoreProtocol` whose methods are `setUserDefaultsValue(_:forKey:)` hides nothing: the decision leaks through the method names. Name the interface for what callers need, not for how it works today.
+
+## Trade-offs
+
+| Approach | Effort | Protects invariants | Changing the hidden decision | Testability | Good for |
+| --- | --- | --- | --- | --- | --- |
+| Open data: `var` everywhere | None | No | Every caller changes | Simple, but rules are tested in many places | DTOs, view state, prototypes |
+| `private(set)` plus methods | Low | Yes, inside the type | Inside the type | Test the type's methods directly | Domain models with rules |
+| A protocol in front | Medium | Yes | One conformer changes | Swap in a fake | Storage, network, vendors |
+| A separate module with a small `public` API | Higher | Yes, enforced by the compiler across modules | Inside the module | Test the module through its API | Big features, shared code, SDKs |
+
+Most apps need all four. The skill is matching them to the decision: open data for snapshots, encapsulation for rules, a protocol for anything with an external dependency, and module boundaries once a team or feature is big enough to deserve one (D61).
+
+<Callout kind="interview">
+
+**Say** which decisions you're hiding, and why they're likely to change: "Storage sits behind a repository, so we can move from Core Data to SwiftData without touching the screens." **Ask** what's likely to change: a new backend, a second vendor, an offline mode. That tells you where boundaries pay. **Red flags:** framework types crossing layers (an `NSManagedObject` in a view, a `URLResponse` in a view model), the same storage key or JSON field name in several files, and rules that live only in view models.
+
+</Callout>
+
+<Callout kind="gotcha" title="iOS gotcha: managed objects leak the persistence framework into every layer">
+
+Passing `NSManagedObject`s or SwiftData `@Model` objects to your views is convenient, and it ties the whole UI to that framework and its threading rules. A managed object belongs to its context's queue, and touching it from another thread can crash or corrupt data. SwiftData models aren't `Sendable`; you pass a `PersistentIdentifier` between actors instead. If you want to change frameworks one day, keep them behind a repository that hands out plain structs.
+
+</Callout>
+
+## Practice
+
+The review **An anaemic ticket order** shows a model with every symptom from this lesson: rules living in a view model, invariants anyone can break, and decisions spread across the file. Find what's wrong, decide what matters most, and plan how to move the rules into the model.
+
+```cards
+- id: parnas-rule
+  front: "What did Parnas say a module should be built around?"
+  back: "A design decision that's hard or likely to change. The module keeps that decision secret behind an interface, so a change stays inside it."
+- id: hiding-vs-encapsulation
+  front: "What's the difference between information hiding and encapsulation?"
+  back: "Information hiding is the principle: decide which decisions to keep secret. Encapsulation is the mechanism: bundle data with the code allowed to change it, and use access control such as `private(set)` to keep everyone else out."
+- id: anaemic-model
+  front: "What's an anaemic domain model, and when is it fine?"
+  back: "Types that are bags of `var`s with the rules scattered elsewhere. Fine for DTOs, view state, or a client where the server owns every rule; a problem once the type has rules of its own."
+```
+
+```quiz
+- id: q1
+  type: mcq
+  prompt: "Your analytics calls look like `Mixpanel.mainInstance().track(event: \"checkout_started\")` in 40 files. Legal says you must switch vendors next quarter. What would Parnas have done differently?"
+  options:
+    - "Used a more popular vendor"
+    - "Put the vendor decision behind one `Analytics` interface, with event names defined in one place, so switching changes one conformer"
+    - "Written a comment above each call saying which vendor it uses"
+    - "Called the vendor from a background thread"
+  answer: 1
+  explain: "The vendor is a decision likely to change, so it deserves a module that keeps it secret. Defining the events in one place also stops the same string being spelled 40 ways."
+- id: q2
+  type: bug
+  prompt: "This model is supposed to keep the rule \"a draft's word count is never negative and matches its text\". Which line lets other code break that rule?"
+  code: |
+    struct Draft {
+        let id: UUID
+        var text: String
+        var wordCount: Int
+
+        init(id: UUID, text: String) {
+            self.id = id
+            self.text = text
+            self.wordCount = text.split(separator: " ").count
+        }
+    }
+  answer: 4
+  explain: "`wordCount` is a stored `var`, so any code can set it to anything, and changing `text` doesn't update it. Make it a computed property derived from `text`, so it can never disagree. (Line 3 is fine: changing the text is allowed.)"
+- id: q3
+  type: multi
+  prompt: "Which of these are symptoms of an anaemic domain model? Choose all that apply."
+  options:
+    - "An `OrderHelper` full of `if order.status == \"placed\"` checks"
+    - "A `Decodable` DTO that mirrors the server's JSON field for field"
+    - "The same refund rule implemented in two view models, slightly differently"
+    - "`Order` has methods like `cancel()` that throw when it's too late"
+    - "Any code can set `order.paidAt` without changing `order.status`"
+  answer: [0, 2, 4]
+  explain: "Rules outside the type, duplicated rules and unprotected fields are the symptoms. A dumb DTO is fine because it has no rules of its own, and `cancel()` that checks its own rule is the cure, not the disease."
+- id: q4
+  type: mcq
+  prompt: "`OrdersRepository.orders()` returns `[Order]` and, when the request fails, returns `[]`. What's wrong with that?"
+  options:
+    - "Nothing: it hides the network, which is the point"
+    - "It hides a failure callers need to plan for: the screen can't tell \"no orders\" from \"couldn't load\""
+    - "It should return `nil` instead"
+    - "Arrays are slow"
+  answer: 1
+  explain: "Information hiding is about hiding decisions, not consequences. Make it `async throws` so the screen can show an error and a retry button instead of a misleading empty state."
+- id: q5
+  type: recall
+  prompt: "What is information leakage, and how do you fix it? Give an iOS example."
+  model: "One design decision known by two or more modules, so changing it in one place silently breaks the others. Example: the draft file's date format written into both the code that saves drafts and the code that loads them. Fix it by giving the decision one owner, such as a single `DraftStore` that does both, or one shared `Codable` type with its strategy in one place."
+```

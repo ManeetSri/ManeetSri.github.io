@@ -1,0 +1,242 @@
+## Why it matters
+
+Every module charges its callers a price: the interface they have to learn and get right. What they get back is the functionality behind it. A deep module gives a lot for a small price; a shallow one charges almost as much as it gives. When an interviewer asks you to design an image loader or a networking layer, the interface is most of what they're grading.
+
+## Modules and interfaces
+
+A **module** is any unit of code with an interface and an implementation: a function, a type, a protocol and its conformers, a Swift package target, a framework, a backend service. The ideas in this lesson apply at every size.
+
+A module's **interface** is everything a caller has to know to use it correctly. That's more than its signatures:
+
+- **The formal part** is what the compiler checks: names, parameter and return types, `throws`, `async`, generic constraints, `@MainActor`, `Sendable`.
+- **The informal part** is everything else a caller relies on: what happens when the item is missing, whether results come back in order, how expensive a call is, whether you must call `start()` before `send()`, which errors to expect.
+
+The informal part is where most bugs live, because nothing checks it. Swift's recent history is a story of moving it into the formal part. "Only call this on the main thread" used to be a comment; now it's `@MainActor`, and the compiler enforces it. "This closure may run on another thread" is `@Sendable`. "This throws only `DecodingError`" is typed throws (Swift 6). When you can turn a sentence in a doc comment into a type, do.
+
+## Deep and shallow modules
+
+John Ousterhout's *A Philosophy of Software Design* (2018) gives a picture for this. Draw each module as a rectangle: its width is the interface (the cost to callers), its area is the functionality it provides. **Deep** modules are narrow and tall: a little interface hiding a lot. **Shallow** modules are wide and flat: their interface is nearly as complicated as what they do.
+
+Apple's best APIs are deep:
+
+- `URLSession.data(for:)`: one method, behind which sit connection pooling, HTTP/2 and HTTP/3, TLS, redirects, cookies, caching, proxies and authentication challenges.
+- `JSONDecoder().decode(_:from:)`: one call that walks any `Decodable` type and reports errors with the exact path that failed.
+- `UserDefaults`: `set` and `value(forKey:)`, while it handles caching in memory, writing to disk atomically and sharing through App Groups.
+- SwiftUI's `List`: cell reuse, diffing, accessibility, swipe actions and selection, from a collection and a closure.
+
+App code, on the other hand, is full of shallow modules. Step through a pattern you've probably seen:
+
+```visual flow
+title: Four layers that hide nothing, and one that hides a lot
+nodes:
+  - { id: vm, label: Profile screen, kind: view, at: [0, 0] }
+  - { id: manager, label: UserManager, at: [2, 0] }
+  - { id: service, label: UserService, at: [4, 0] }
+  - { id: repository, label: UserRepository, at: [4, 1.5] }
+  - { id: client, label: APIClient, at: [2, 1.5] }
+  - { id: profile, label: ProfileRepository, at: [0, 3], w: 1.5 }
+  - { id: session, label: URLSession, kind: external, at: [2.5, 3] }
+edges:
+  - [vm, manager, "user(id:)"]
+  - [manager, service, "user(id:)"]
+  - [service, repository, "user(id:)"]
+  - [repository, client, "user(id:)"]
+  - [vm, profile, "profile(id:)"]
+  - [profile, session, "data(for:)"]
+steps:
+  - say: "The profile screen asks a `UserManager` for the user."
+    show: [vm, manager]
+    send: vm->manager
+  - say: "Which asks a `UserService`, with the same method and the same argument."
+    show: [service]
+    send: manager->service
+  - say: "Which asks a `UserRepository`, which asks the `APIClient`. Four calls, and not one decision made between them. Each layer is a **pass-through**: its interface is as big as its implementation."
+    show: [repository, client]
+    send: [service->repository, repository->client]
+  - say: "The cost is real. A new field means editing four signatures. Debugging means stepping through four files. And none of them hides anything a caller could otherwise get wrong."
+    state: { manager: error, service: error, repository: error }
+  - say: "The deep version: one `ProfileRepository` with one method, `profile(id:) async throws`. Behind it sit a disk cache, joining duplicate requests, retrying with backoff, decoding, and mapping DTOs to the domain model."
+    reset: true
+    show: [vm, profile]
+    send: vm->profile
+    label: { profile: "cache · dedupe · retry" }
+  - say: "It's built on `URLSession`, itself a deep module. Two layers, each hiding a lot behind a little."
+    show: [session]
+    send: profile->session
+    state: { profile: ok }
+```
+
+Shallow modules aren't harmless. Each one adds a name to learn, a file to open and a signature to keep in step, and pays back nothing. Ousterhout calls the habit of splitting code into many tiny classes *classitis*. It often comes from good intentions ("small classes are good", "every layer needs a protocol") applied without asking what each piece hides.
+
+## A deep module in Swift
+
+Here's a small, deep image loader. Its whole interface is one method. Behind it: a cache, and *request coalescing*, which means that when three views ask for the same URL at once, only one download happens and all three share it.
+
+```swift run title="One method, a lot behind it"
+import Foundation
+
+actor ImageLoader {
+    private var cache: [URL: Data] = [:]
+    private var inFlight: [URL: Task<Data, any Error>] = [:]
+    private let fetch: @Sendable (URL) async throws -> Data
+
+    init(fetch: @escaping @Sendable (URL) async throws -> Data) {
+        self.fetch = fetch
+    }
+
+    /// The image data at `url`: from memory if we have it, joining a download already
+    /// in flight if there is one, and downloading it otherwise.
+    func data(for url: URL) async throws -> Data {
+        if let cached = cache[url] { return cached }
+        if let running = inFlight[url] { return try await running.value }
+
+        let task = Task { try await fetch(url) }
+        inFlight[url] = task
+        defer { inFlight[url] = nil }
+        let data = try await task.value
+        cache[url] = data
+        return data
+    }
+}
+
+actor DownloadCounter {
+    private(set) var count = 0
+    func increment() { count += 1 }
+}
+
+let downloads = DownloadCounter()
+let loader = ImageLoader { url in
+    await downloads.increment()
+    try await Task.sleep(for: .milliseconds(20))
+    return Data(repeating: 0, count: 4_096)
+}
+
+let avatar = URL(string: "https://cdn.example.com/avatars/sam.jpg")!
+async let header = loader.data(for: avatar)
+async let comment = loader.data(for: avatar)
+async let sidebar = loader.data(for: avatar)
+let sizes = try await [header, comment, sidebar].map(\.count)
+print("Three views got \(sizes) bytes from \(await downloads.count) download")
+
+let later = try await loader.data(for: avatar)
+print("A fourth view got \(later.count) bytes; downloads so far: \(await downloads.count)")
+```
+
+```output
+Three views got [4096, 4096, 4096] bytes from 1 download
+A fourth view got 4096 bytes; downloads so far: 1
+```
+
+Callers can't get coalescing wrong, because they never see it. They can't forget to check the cache, because the loader does it. That's what "pull complexity downward" means: when either the module or its callers have to deal with something, it's usually better for the module to do it once than for every caller to do it.
+
+The interface still says what matters: `async` (it can wait), `throws` (it can fail), and it's an actor (safe to call from anywhere). The fetch function is injected, which makes it testable, as the example shows.
+
+## Designing an interface that's deep
+
+A few habits that help.
+
+- **Make the common case simple.** Most callers of an image loader want "the image at this URL". Give them that, and let rarer needs (a target size, a priority) be parameters with defaults: `func image(for url: URL, size: CGSize? = nil)`. Swift's default arguments are a deep-interface tool.
+- **Prefer a few general methods to many special ones.** A settings store with `value(for key:)` and `set(_:for:)` is deeper than one with `saveTheme`, `saveLastTab`, `saveSortOrder` and fifty siblings, each a new thing to learn and maintain. Typed keys can keep the general version safe.
+- **Define errors out of existence where you can.** If deleting a draft that's already gone simply leaves "no draft with this id", callers never write a `catch` for it. `Set.insert(_:)` returns whether it inserted rather than failing on a duplicate; `Dictionary`'s subscript returns `nil` for a missing key. Only do this when callers genuinely don't need to know: hiding a failed payment is not a simplification.
+- **Write the call site first.** Before implementing anything, write the three lines a caller would write. If they're awkward to read, the interface is wrong, however clean the implementation.
+
+## The interface you don't see in the types
+
+Some of the most important parts of an interface are behaviours:
+
+- **Ordering requirements.** "Call `configure(apiKey:)` before `track(_:)`" is temporal coupling, and you'll meet it properly in D03. A deeper design makes the wrong order impossible: take the key in `init`, so there's no unconfigured instance to misuse.
+- **Threading and isolation.** Mark it with `@MainActor`, make the type an actor, or require `Sendable`, so the compiler checks it.
+- **Cost.** If a property does a database fetch every time it's read, callers will read it in a loop. Make expensive things look expensive: a method, `async`, a name like `fetchAll()`.
+- **What happens at the edges.** Empty input, a missing item, cancellation. Say it in the doc comment until you can say it in a type.
+
+## Module boundaries at app scale
+
+The same reasoning applies to Swift packages. A feature package's interface is its `public` declarations. A `Payments` package whose public surface is one `PaymentSheet` view and one `PaymentResult` enum is deep; one that makes forty internal types `public` so other modules can reach in is shallow, and can never change those types again without breaking someone. Swift 5.9's `package` access level lets targets inside one package share code without publishing it to the whole app. You'll design these boundaries in D61.
+
+## Trade-offs
+
+| Kind of module | Cost to callers | What it hides | Effort to build | When it fits |
+| --- | --- | --- | --- | --- |
+| Deep module (`ImageLoader.data(for:)`) | Low | A lot: caching, coalescing, retries | Higher, once | Anything used from many places |
+| Thin wrapper over a framework | About the same as the framework | Little; maybe a seam for tests | Low | Isolating a vendor you expect to replace |
+| Pass-through layer | Same as the layer below, plus a file | Nothing | Low, but ongoing | Rarely; delete it or give it a job |
+| Many special-purpose methods | High: many things to learn | Each hides a little | Grows with every feature | Tiny, stable APIs only |
+| One "kitchen sink" type with dozens of options | High: hard to know which matter | A lot, but badly organised | High | Better split into a simple core plus options with defaults |
+
+A thin wrapper is a fair price when it buys something specific, such as replacing a vendor later or making tests fast. A pass-through layer that buys nothing is the one to remove.
+
+<Callout kind="interview">
+
+**Say** the public API first, with a call-site example, before any internals: "The feed screen calls `try await feed.page(after: cursor)`; everything about caching and retries is behind that." **Ask** who calls the component, how often, from which actor, and what they must be able to configure. **Red flags:** an interface with a dozen required parameters and no defaults, "Manager to Service to Repository" stacks that forward the same call, and an API that only makes sense once you've read its implementation.
+
+</Callout>
+
+<Callout kind="gotcha" title="Swift gotcha: a protocol for every type">
+
+A common habit is to give every class a protocol (`UserServiceProtocol`) with exactly one real conformer, so tests can mock it. That doubles the shallow interfaces: two declarations to keep in step, and a protocol that mirrors one implementation rather than describing what callers need. A test seam is a good reason for an abstraction, but it doesn't need to be a mirror. Name the protocol for the role the caller needs (D04), use a closure or a struct of closures (D07), or test the deep module through its real interface with a fake underneath, as the image loader above does with `fetch`.
+
+</Callout>
+
+```cards
+- id: deep-module
+  front: "What makes a module deep?"
+  back: "A small interface hiding a lot of functionality, like `URLSession.data(for:)`. A shallow module's interface is nearly as complex as what it does, so it costs callers almost as much as it gives."
+- id: pass-through
+  front: "What's a pass-through layer, and what should you do with one?"
+  back: "A layer that forwards the same call, with the same arguments, to the layer below and makes no decisions of its own. Give it a real job (caching, mapping, policy) or remove it."
+- id: informal-interface
+  front: "Give three parts of an interface the type signatures don't show."
+  back: "Ordering requirements (call A before B), threading or isolation, cost, and behaviour at the edges such as a missing item or cancellation. Move them into types where you can: `@MainActor`, actors, `init` parameters."
+```
+
+```quiz
+- id: q1
+  type: sort
+  prompt: "Deep or shallow?"
+  buckets: [Deep, Shallow]
+  items:
+    - ["`URLSession.data(for:)`", 0]
+    - ["`JSONDecoder().decode(_:from:)`", 0]
+    - ["A `UserService.user(id:)` that only calls `api.user(id:)`", 1]
+    - ["A `Log` type whose six methods forward to `os.Logger` with the same arguments", 1]
+    - ["An `ImageLoader.data(for:)` with caching and request coalescing", 0]
+    - ["A `SettingsStore` with a separate save and load method for each of 40 settings", 1]
+  explain: "Deep modules hide a lot behind a little. The shallow ones either forward without deciding anything, or make callers learn one method per case."
+- id: q2
+  type: multi
+  prompt: "Which of these are part of an `AnalyticsClient`'s interface, formal or informal? Choose all that apply."
+  options:
+    - "`func track(_ event: Event)`"
+    - "You must call `configure(apiKey:)` before the first `track`"
+    - "The name of the private queue it batches events on"
+    - "Events are sent in batches of 50, so the last few may be lost if the app is killed"
+    - "It's `@MainActor`"
+    - "The variable names inside `flush()`"
+  answer: [0, 1, 3, 4]
+  explain: "Anything a caller relies on is interface: signatures, ordering rules, isolation, and behaviour like possible event loss. Private names are implementation, free to change."
+- id: q3
+  type: mcq
+  prompt: "`DraftStore.delete(id:)` is called when a draft might already have been deleted on another device. Which design is deepest, if callers don't care whether it was there?"
+  options:
+    - "Throw `DraftError.notFound`, so callers must `catch` it"
+    - "Return `Bool` and expect callers to check it"
+    - "Succeed either way: afterwards there's no draft with that id"
+    - "Crash with `precondition`, because deleting a missing draft is a bug"
+  answer: 2
+  explain: "Defining the error out of existence makes every caller simpler, and the result they care about (the draft is gone) holds either way. If some caller did need to know, a `@discardableResult` Bool would be the gentle compromise."
+- id: q4
+  type: mcq
+  prompt: "An SDK must be set up with `Tracker.shared.configure(apiKey:)` before `Tracker.shared.track(_:)`. Calls made earlier are silently dropped. What's the deeper design?"
+  options:
+    - "Log a warning when `track` is called too early"
+    - "Take the key in `init`, so there's no unconfigured tracker to call: `let tracker = Tracker(apiKey: key)`"
+    - "Document the order in the README"
+    - "Make `configure` `async`"
+  answer: 1
+  explain: "The ordering rule was part of the informal interface. Moving the key into `init` makes the wrong order impossible to write, which is always better than a warning or a document."
+- id: q5
+  type: truefalse
+  prompt: "Adding a protocol in front of every class makes a design deeper."
+  answer: false
+  explain: "Depth is about how much an interface hides. A protocol that mirrors its only conformer hides nothing and adds a second declaration to maintain. Protocols earn their place when they describe a role several types play, or a seam you really need."
+```

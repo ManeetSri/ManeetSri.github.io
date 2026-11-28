@@ -1,0 +1,252 @@
+<Brief>
+
+You're the iOS lead at a chain of 300 gyms. Members book group classes (spin, yoga, HIIT) in the app. Before the team builds the screens, you're designing the **domain model** they'll all share: the types, the rules they enforce, who owns which state, and how it meets the server.
+
+The rules the business has given you:
+
+- Every class session has a **capacity**, such as 24 bikes. When it's full, members can join a **waitlist**. A cancellation promotes the first person on the waitlist automatically, until 2 hours before the class starts.
+- Booking opens **7 days ahead, at 07:00 studio time**. The popular classes fill within a minute.
+- Members have one of two plans: **Unlimited**, or **Credits** (8 a month; a class costs one, and a free cancellation gives it back).
+- Cancelling **12 hours or more** before the start is free. Later than that is a **late cancellation**: credit members lose the credit, and unlimited members pay a £5 fee. Not turning up (a **no-show**) counts as a late cancellation.
+- A member can't hold **two bookings that overlap** in time.
+- Members **check in** by showing a QR code at the front desk, and it has to work without signal: many studios are in basements.
+
+Scale: 250,000 members, about 6,000 classes a day across the chain, and the busiest classes booked by several hundred people in the first minute after 07:00. The server is the source of truth. Besides the booking screens, the app shows upcoming bookings in a **widget** and the next class in a **Live Activity**.
+
+Design the domain model as a component: its public types and operations, how each rule is enforced and by whom, what state exists and who owns it, and how it fails. Spend about 40 minutes.
+
+</Brief>
+
+```workspace
+template: component
+minutes: 40
+```
+
+<ModelAnswer section="requirements">
+
+**Who uses the model:** the timetable (availability for each class), the class screen (book, join the waitlist, cancel, with the consequences spelled out first), My bookings, the widget and Live Activity, check-in, and the notification that says "you're off the waitlist".
+
+**What it must do:**
+
+- Express every rule so the UI can **explain** it *before* the tap: "Opens Tuesday at 07:00", "You'll lose a credit", "Clashes with Yoga at 18:00".
+- Never show a place as booked until the **server has confirmed** it.
+- Work **offline** for reading bookings and showing the QR code; booking and cancelling need the network.
+- Be `Sendable` value types, so the widget, App Intents and the app share them through an App Group.
+
+**Questions that change the model:** Can members book for a friend? Is there spot selection (bike 14)? Is waitlist promotion automatic, or an offer that expires? Do credits roll over? Does the app charge the late fee, or does billing? I'll assume no friends, no spots, automatic promotion, no rollover, and fees charged by billing.
+
+**Out of scope:** payments, the instructor app, spot selection (but don't design it out).
+
+</ModelAnswer>
+
+<ModelAnswer section="api">
+
+Entities have typed ids; statuses and plans are enums whose cases carry their own data; the rules are pure functions that return a **reason**, never a bare `Bool`.
+
+```swift
+struct Studio: Identifiable, Sendable {           // value-like: rarely changes
+    let id: ID<Studio>
+    let name: String
+    let timeZone: TimeZone
+}
+
+struct ClassSession: Identifiable, Sendable {     // read model of a server aggregate
+    let id: ID<ClassSession>
+    let studio: Studio
+    let title: String                             // "Spin 45"
+    let interval: DateInterval                    // absolute start and end
+    let opensForBooking: Date                     // computed by the server, in studio time
+    var availability: Availability
+}
+
+enum Availability: Sendable {
+    case open(placesLeft: Int)
+    case full(waitlistLength: Int)
+    case closed                                   // started, cancelled by the studio, or past
+}
+
+struct Booking: Identifiable, Sendable {          // the member's own aggregate
+    let id: ID<Booking>
+    let session: ID<ClassSession>
+    let interval: DateInterval                    // copied, so clashes can be checked offline
+    var status: BookingStatus
+}
+
+enum BookingStatus: Sendable {
+    case confirmed(CheckInPass)                   // signed token for the QR code
+    case waitlisted(position: Int)
+    case cancelled(CancellationOutcome)
+    case attended
+    case noShow(Penalty)
+}
+
+enum Membership: Sendable {
+    case unlimited
+    case credits(remaining: Int, renewsOn: Date)
+    case suspended
+}
+
+enum Penalty: Sendable { case creditLost, fee(Money) }
+enum CancellationOutcome: Sendable { case free(creditReturned: Bool), late(Penalty), byStudio }
+
+enum Eligibility: Equatable, Sendable {
+    case canBook
+    case canJoinWaitlist(position: Int)
+    case notOpenYet(opensAt: Date)
+    case alreadyBooked(ID<Booking>)
+    case clashes(with: ID<Booking>)
+    case noCreditsLeft(renewsOn: Date)
+    case membershipSuspended
+    case closed
+}
+
+enum BookingPolicy {
+    static func eligibility(for session: ClassSession, membership: Membership, bookings: [Booking], now: Date) -> Eligibility
+    static func cancellation(of booking: Booking, session: ClassSession, membership: Membership, now: Date) -> CancellationOutcome
+}
+```
+
+At the call site, the class screen reads like the rules:
+
+```swift
+switch BookingPolicy.eligibility(for: session, membership: membership, bookings: store.bookings, now: clock.now) {
+case .canBook: primaryButton = .book
+case .canJoinWaitlist(let position): primaryButton = .joinWaitlist(position: position)
+case .notOpenYet(let opensAt): note = "Opens \(studioTime(opensAt, at: session.studio))"
+case .clashes(let other): note = "Clashes with \(title(of: other))"
+// …and the other cases, with no default
+}
+```
+
+</ModelAnswer>
+
+<ModelAnswer section="internals">
+
+**Aggregates, drawn around the invariants:**
+
+- **The class session** owns capacity, the confirmed count and the waitlist order. "Never more confirmed than capacity" and "promote the first waitlisted member on a cancellation" must hold *immediately*, under heavy contention, so this aggregate lives on the server only. The app gets a read model: `Availability`, with the time it was fetched. It never holds other members' bookings, which would be a privacy problem and a lot of data.
+- **Each booking** is the member's own small aggregate, referring to its session by id. It copies the session's interval, so the clash rule works offline.
+- **Membership** (the credit balance) is a third aggregate on the server. Spending a credit on booking and returning it on a free cancellation spans booking and membership; the server does both in one transaction, and the app shows the result.
+
+**The cross-aggregate rules** (clashes, credits, the booking window, late cancellation) live in `BookingPolicy`: pure functions of the session snapshot, the membership, the member's bookings and `now`. The app uses them to explain and to avoid pointless requests; the server runs the same rules and has the final word.
+
+**How "Book" flows through it:**
+
+1. The class screen already shows `.canBook`, from the policy.
+2. The tap calls `BookingStore.book(session:)`, which sets that button to `.inProgress` and sends `POST /sessions/:id/bookings` with an `Idempotency-Key` (a UUID made for this tap).
+3. The server answers `201` with a confirmed or waitlisted booking, or `409` with a reason (`session_full` with a waitlist position, `not_open`, `clash`, `no_credits`).
+4. The store inserts the booking, updates the session's availability and the membership from the response, writes the cache, and reloads the widget's timeline.
+
+**Time:** every instant is a `Date`. Each studio carries its `TimeZone`; class times are shown in studio time ("07:00, London"), which is what a travelling member needs. The server computes `opensForBooking`, and the app keeps an offset from the server's clock for countdowns, so a phone set five minutes fast doesn't show "Book" too early.
+
+</ModelAnswer>
+
+<ModelAnswer section="concurrency">
+
+**The state:** the member's `[Booking]`, `Membership`, and session snapshots for the days on screen, each with when it was fetched.
+
+**One owner:** a `@MainActor @Observable BookingStore` holds them as values and is the only thing that changes them. Screens read snapshots and send intents. If App Intents or background refresh also change bookings, the writes go through an actor that owns the cache, and the store observes it.
+
+**No optimistic booking.** At 07:00 a large share of booking attempts on a popular class will fail, so showing "Booked" before the server confirms would lie to many people every morning. The button shows an in-progress state instead, and the tap is idempotent, so retrying after a timeout can't double-book. Cancellation is low-contention, but its outcome (free or late) is decided by the server's clock, so the app waits for that too; it's quick.
+
+**Server truth wins.** Waitlist promotions arrive by push notification and on every refresh. The store replaces its bookings with the server's list rather than merging, because the device never originates a booking state on its own.
+
+**Sharing:** bookings and check-in passes are written as one `Codable` file in the App Group container after every change, which the widget and Live Activity read. The pass is a signed token, not a secret, so it doesn't need the Keychain, and the front desk can verify it offline.
+
+</ModelAnswer>
+
+<ModelAnswer section="failure">
+
+- **The class fills between seeing and tapping:** `409 session_full` with a waitlist position; the screen offers the waitlist straight away rather than showing an error.
+- **Tapping a moment before 07:00:** the app hides "Book" until server time says it's open; if the server still says `not_open`, show the countdown again.
+- **Timeouts and double taps:** the same idempotency key for the same tap, so a retry returns the existing booking.
+- **Offline:** bookings and QR codes come from the cache, labelled with when they were last updated. Book and cancel are disabled, with the reason. Don't queue bookings for later: a queued booking at 07:00 would almost certainly fail, and the member would think they had a place.
+- **Near the 12-hour line:** the confirmation sheet states the consequence ("You'll lose 1 credit"). The server decides with its own clock and returns the outcome, which the app shows as final.
+- **Time zones and DST:** "12 hours before" is measured between instants. "7 days ahead at 07:00" is computed with a `Calendar` in the studio's time zone: on a clock-change weekend it isn't 168 hours.
+- **The studio cancels a class:** a push and a status of `.cancelled(.byStudio)` with the credit returned; the widget updates.
+- **A status from a newer server:** decoding fails for that booking; keep the last known version and refresh, rather than guessing.
+- **Membership suspended or out of credits mid-week:** eligibility says why, and links to the plan.
+
+</ModelAnswer>
+
+<ModelAnswer section="testing">
+
+- **`BookingPolicy` as table tests**, with `now` passed in: every `Eligibility` case, plus the boundaries: exactly 12 hours before (free), one second later (late), the instant booking opens, a booking that ends exactly when another starts (no clash), and a clock-change weekend in `Europe/London`.
+- **Decoding tests** for every booking status from recorded JSON, and for an unknown one.
+- **Store tests** against a stub `BookingAPI` protocol: a `409 session_full` becomes a waitlist offer; a retry after a timeout reuses the idempotency key; the server's cancellation outcome is the one shown.
+- **Mapping tests** from `Eligibility` to button and note text, so every reason has words a member understands.
+
+</ModelAnswer>
+
+<ModelAnswer section="tradeoffs">
+
+- **A rich client model or a thin one?** The thin option is for the server to send `eligibility` with each session and the app to display it. It's simpler and never drifts, but it can't explain anything offline, and it costs a round trip to re-evaluate after every change. I chose a rich model for instant explanations, and limited the drift: the server also sends its verdict with each session, which wins when present, and the policy's numbers (12 hours, 2 hours) come from server config rather than constants.
+- **No optimistic booking**, because the contention makes optimism dishonest. Cancelling could be optimistic later, if it proves slow.
+- **The session as a read model, not an aggregate on the device**, for privacy and size. The cost: the app can't explain *why* a waitlist position changed, only that it did.
+- **Plain value types with a store, not SwiftData models edited directly.** The rules stay testable without a database, and the cache is one small file. SwiftData earns its place if history grows to years of bookings with search.
+- **Evolution:** spot selection adds a `Spot` value and a seat-map read model; booking for a friend adds a guest to `Booking`; family plans make `Membership` belong to an account with several members.
+
+</ModelAnswer>
+
+```rubric
+- id: rules
+  label: Turned the business rules into explicit decisions
+  skill: requirements
+  look_for:
+    - Lists capacity and the waitlist, the booking window, credits, late cancellation and clashes as separate rules
+    - Says for each rule whether the app, the server, or both enforce it
+    - Asks at least two questions that change the model, such as spot selection, booking for friends or how promotion works
+- id: types
+  label: Modelled states and values so illegal ones can't exist
+  skill: data
+  look_for:
+    - Booking status as an enum with associated data (confirmed with a pass, waitlisted with a position, cancelled free or late, attended, no-show)
+    - Membership as an enum (unlimited, or credits with a count), not flags
+    - Eligibility returned as a reason the UI can explain, not a Bool
+    - Typed ids, and a Money type for the fee
+- id: boundaries
+  label: Drew aggregate boundaries that match the invariants and the contention
+  skill: architecture
+  look_for:
+    - Capacity and the waitlist belong to a session aggregate that only the server changes
+    - The app holds an availability snapshot, not other members' bookings
+    - Rules that span aggregates (clashes, credits) live in a policy the server re-checks
+- id: time
+  label: Got time right
+  skill: client
+  look_for:
+    - Instants stored as Date, with the studio's TimeZone used for the booking window and for display
+    - The 12-hour rule measured between instants, and the 07:00 rule computed with a Calendar in studio time
+    - Doesn't trust the device clock for when booking opens
+- id: failure
+  label: Handled contention, retries and offline honestly
+  skill: offline
+  look_for:
+    - Nothing shown as booked until the server confirms it
+    - A class that fills between viewing and tapping becomes a waitlist offer
+    - An idempotency key, so a retried booking can't double-book
+    - Bookings and the QR code work offline; booking is disabled offline, not queued
+- id: testing
+  label: Made the rules testable
+  skill: testing
+  look_for:
+    - The rules as pure functions with the time passed in
+    - Tests at the boundaries, such as exactly 12 hours, the instant booking opens and a clock-change weekend
+- id: tradeoffs
+  label: Weighed a rich client model against a thin one
+  skill: tradeoffs
+  look_for:
+    - Names the cost of duplicating rules on the client, and a way to limit drift
+    - Explains why optimistic booking is wrong for a contended class
+```
+
+<Pitfalls>
+
+- Holding the whole class roster (other members' bookings) on the device so the app can check capacity itself: it's private data, it's large, and it's stale within seconds at 07:00.
+- Showing "Booked" optimistically for a class that fills in a minute.
+- `canBook: Bool`: the UI then can't say *why* not, so every screen guesses.
+- Storing times as studio-local strings, or computing "7 days ahead" as 7 × 24 hours.
+- Booleans for status (`isWaitlisted`, `isCancelled`, `isLate`) that allow a booking to be waitlisted and attended at once.
+- Queueing a booking made offline and sending it later as if the place were still free.
+
+</Pitfalls>

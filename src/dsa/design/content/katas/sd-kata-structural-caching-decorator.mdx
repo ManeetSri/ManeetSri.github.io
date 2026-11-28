@@ -1,0 +1,92 @@
+The feed screen, the profile screen and three widgets all call the same endpoints, often seconds apart. Instead of adding caching to each caller, or to the API client itself, write a decorator: an `HTTPClient` that wraps any other `HTTPClient` and answers repeated GET requests from memory while they're fresh.
+
+`CachingClientDecorator.CachingHTTPClient(wrapping:ttl:clock:)`, with `send(_:) async throws -> (Data, HTTPURLResponse)` and `removeAll()`
+
+- **What's cached.** Only GET requests, keyed by the URL's `absoluteString`, and only responses with a status from 200 to 299. Error statuses and thrown errors are passed back to the caller unchanged and never stored.
+- **Freshness.** A stored response is fresh for `ttl`, measured on `clock` from when it arrived. A fresh response is returned without calling the wrapped client. Once `ttl` has passed (exactly `ttl` counts as passed), fetch again and store the new response.
+- **Other methods.** A request with any other method (POST, PUT, PATCH, DELETE) goes straight to the wrapped client, and removes the cached response for its URL: it may have changed the resource.
+- **Reloading.** A GET whose `cachePolicy` is `.reloadIgnoringLocalCacheData` (pull to refresh) always goes to the wrapped client, and its response replaces the cached one.
+- **Transparency.** Requests reach the wrapped client unchanged, headers and all. `removeAll()` forgets everything: the app calls it at sign-out.
+
+## Examples
+
+With `ttl` of 60 seconds, and a server that answers `v1`, `v2`, `v3`… to successive requests:
+
+| Requests | Answers | Requests the server sees |
+| --- | --- | --- |
+| GET /feed, then GET /feed 59 s later | `v1`, `v1` | 1 |
+| GET /feed, then GET /feed 60 s later, then again | `v1`, `v2`, `v2` | 2 |
+| GET /feed, GET /profile, GET /feed | `v1`, `v2`, `v1` | 2 |
+| GET /cart, POST /cart, GET /cart | `v1`, `v2`, `v3` | 3 |
+| GET /feed, GET /feed with `.reloadIgnoringLocalCacheData`, GET /feed | `v1`, `v2`, `v2` | 2 |
+| GET /feed answered `503`, then GET /feed answered `200` | `503`, then the body | 2 |
+
+## Constraints
+
+- The decorator is an `actor`, because many tasks call it at once. While it awaits the wrapped client, other calls run, so two misses for the same URL may both reach the network. That's allowed here: removing it is single-flight de-duplication, which you'll build in D14.
+- Use the injected clock, never `Date()` or `ContinuousClock`: the tests use `TestClock` and move time with `advance(by:)`.
+- `C.Instant` has `duration(to:)`, and `clock.now` gives the current instant.
+
+<Hints>
+<Hint>
+Store an entry per key holding the data, the response and the instant it was stored. A response is fresh while `entry.storedAt.duration(to: clock.now) < ttl`.
+</Hint>
+<Hint>
+`request.httpMethod` is `"GET"` for a new `URLRequest`, but compare it case-insensitively, and treat `nil` as GET.
+</Hint>
+<Hint>
+Read the clock *after* the wrapped client answers, not before: the response is as old as its arrival, not as old as its request.
+</Hint>
+</Hints>
+
+## Solutions
+
+<Approach title="A dictionary of stamped responses, behind the same interface" time="O(1) per request, plus the network" space="O(number of URLs cached)">
+
+```swift
+public actor CachingHTTPClient<C: Clock>: HTTPClient where C.Duration == Swift.Duration {
+    private struct Entry {
+        let data: Data
+        let response: HTTPURLResponse
+        let storedAt: C.Instant
+    }
+
+    private let base: any HTTPClient
+    private let ttl: Swift.Duration
+    private let clock: C
+    private var entries: [String: Entry] = [:]
+
+    public init(wrapping base: any HTTPClient, ttl: Swift.Duration, clock: C) {
+        self.base = base
+        self.ttl = ttl
+        self.clock = clock
+    }
+
+    public func send(_ request: URLRequest) async throws -> (Data, HTTPURLResponse) {
+        guard let key = request.url?.absoluteString else { return try await base.send(request) }
+        guard (request.httpMethod ?? "GET").uppercased() == "GET" else {
+            entries[key] = nil
+            return try await base.send(request)
+        }
+        if request.cachePolicy != .reloadIgnoringLocalCacheData, let entry = entries[key] {
+            if entry.storedAt.duration(to: clock.now) < ttl { return (entry.data, entry.response) }
+            entries[key] = nil
+        }
+        let (data, response) = try await base.send(request)
+        if (200..<300).contains(response.statusCode) {
+            entries[key] = Entry(data: data, response: response, storedAt: clock.now)
+        }
+        return (data, response)
+    }
+
+    public func removeAll() {
+        entries.removeAll()
+    }
+}
+```
+
+Because the decorator *is* an `HTTPClient`, nothing that uses one has to change: the composition root wraps the real client once, and every caller gets caching. The same shape gives you logging, metrics or auth headers, each in its own small type.
+
+The rules are the part worth discussing in an interview. Caching only successful GETs keeps errors from sticking; dropping the entry on a write keeps the user from seeing their own change undone; `removeAll()` at sign-out keeps one account's data from being served to the next. What this decorator doesn't do is just as telling: it ignores `Cache-Control` and `ETag`, has no size limit, and keys only by URL, so two users' requests for `/me` would share an entry if it weren't cleared. URLSession's own `URLCache` honours HTTP caching headers for you; a decorator like this earns its place when you want app-level rules that HTTP can't express, such as "the feed is fresh for a minute, whatever the server says".
+
+</Approach>

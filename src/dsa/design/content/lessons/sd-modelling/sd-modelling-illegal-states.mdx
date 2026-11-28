@@ -1,0 +1,468 @@
+## Why it matters
+
+A surprising share of crashes and "that can't happen" UI glitches come from models that can hold states the product never allows: a spinner and an error on screen at once, an order marked paid with no payment attached, two sheets trying to present together. If a type can't represent a state, no code path can produce it, and the compiler checks every `switch` over it. Interviewers listen for this when you describe screen state: "I'd model it as an enum, so loading and failed can't both be true" is a sentence that signals experience.
+
+## Counting the states a type can hold
+
+Types combine in two ways, and they count differently.
+
+- A **struct** (or tuple) is a *product* type: it holds one value of *each* of its properties, so the number of possible shapes **multiplies**. Two `Bool`s give 2 × 2 = 4 shapes.
+- An **enum** is a *sum* type: it holds *one* of its cases, so the shapes **add**. An enum with four cases has four shapes (plus whatever each case's associated values carry).
+
+Here's a screen model you've probably written:
+
+```swift
+struct FeedViewState {
+    var isLoading: Bool
+    var error: (any Error)?
+    var posts: [Post]?
+}
+```
+
+Counting only *whether* each property is set, that's 2 × 2 × 2 = 8 shapes. The product team allows four: nothing yet, loading, loaded, failed. The other four (loading *and* failed, failed *with* posts, not loading with no posts and no error…) are bugs waiting for a code path. Every view that reads this struct has to decide what to show for them, and each view decides differently.
+
+Play with the numbers. Each `Bool` or optional doubles the shapes; the product's states only grow by one at a time:
+
+```visual estimator
+title: How many states can your screen model hold?
+inputs:
+  - { id: flags, label: Bool properties, min: 0, max: 10, step: 1, value: 3 }
+  - { id: optionals, label: Optional properties, min: 0, max: 10, step: 1, value: 2 }
+  - { id: legal, label: States the product allows, min: 1, max: 20, step: 1, value: 5 }
+outputs:
+  - { id: shapes, label: Shapes the struct can hold, formula: 2 ^ (flags + optionals) }
+  - { id: illegal, label: Shapes that should never happen, formula: "max(0, shapes - legal)" }
+  - { id: share, label: Share of shapes that are bugs (per cent), formula: round(illegal / shapes * 100) }
+  - { id: cases, label: Shapes an enum with one case per state holds, formula: legal }
+```
+
+Three flags and two optionals is a small, ordinary view model, and over 80% of what it can hold is wrong. An enum with one case per allowed state holds exactly the allowed states, and nothing else.
+
+## Apple's own lesson: from three optionals to one result
+
+Before Swift concurrency, every `URLSession` data task finished with a completion handler of type `(Data?, URLResponse?, Error?) -> Void`. Three optionals: eight combinations. The documentation explained which ones could actually happen, and every caller wrote defensive code for the rest:
+
+```swift
+URLSession.shared.dataTask(with: url) { data, response, error in
+    if let error { … }
+    guard let data, let response else { … }   // "can't happen", but the type allows it
+}
+```
+
+The `async` version is `func data(from url: URL) async throws -> (Data, URLResponse)`. You get data *and* a response, or an error, and nothing else is expressible. The illegal combinations didn't need documenting any more, because they stopped existing. `Result<Success, Failure>` makes the same move for callback APIs, and `AsyncImage` hands its content closure an `AsyncImagePhase`: `.empty`, `.success(Image)` or `.failure(Error)`, never an image and an error together.
+
+## Enums with associated values
+
+The tool for this in Swift is an enum whose cases carry exactly the data that state has. A photo upload, for example:
+
+```swift run title="Each state carries only its own data"
+import Foundation
+
+enum UploadError: Error {
+    case offline
+    case tooLarge
+    case rejected(status: Int)
+}
+
+enum UploadState {
+    case queued
+    case uploading(progress: Double)
+    case paused(resumeData: Data)
+    case failed(UploadError, attempts: Int)
+    case done(URL)
+
+    var label: String {
+        switch self {
+        case .queued: "Waiting to upload"
+        case .uploading(let progress): "Uploading \(Int(progress * 100))%"
+        case .paused: "Paused"
+        case .failed(.offline, _): "Waiting for a connection"
+        case .failed(.tooLarge, _): "This photo is too large to upload"
+        case .failed(_, let attempts) where attempts >= 3: "Upload failed. Tap to try again"
+        case .failed: "Retrying…"
+        case .done: "Uploaded"
+        }
+    }
+
+    var canCancel: Bool {
+        switch self {
+        case .queued, .uploading, .paused, .failed: true
+        case .done: false
+        }
+    }
+}
+
+let states: [UploadState] = [
+    .queued,
+    .uploading(progress: 0.5),
+    .paused(resumeData: Data()),
+    .failed(.offline, attempts: 1),
+    .failed(.rejected(status: 503), attempts: 1),
+    .failed(.rejected(status: 503), attempts: 3),
+    .done(URL(string: "https://cdn.example.com/p/91.jpg")!),
+]
+for state in states {
+    print(state.label, state.canCancel ? "· can cancel" : "")
+}
+```
+
+```output
+Waiting to upload · can cancel
+Uploading 50% · can cancel
+Paused · can cancel
+Waiting for a connection · can cancel
+Retrying… · can cancel
+Upload failed. Tap to try again · can cancel
+Uploaded
+```
+
+Look at what can't go wrong. There's no `progress` to read while paused, so nobody shows a stale percentage. Resume data exists only in `.paused`, so you can't resume something that never paused. A finished upload has a URL; nothing else does, so there's no `remoteURL!` anywhere in the app.
+
+And when someone adds a case, the compiler finds every place that needs a decision:
+
+```text title="What you'll see after adding case cancelled"
+error: switch must be exhaustive
+note: add missing case: '.cancelled'
+```
+
+That error is the feature. With the struct of flags, a new state is a new combination nobody's code handles, and you find out from a bug report.
+
+## When one enum is the wrong shape
+
+Enums model things that are **mutually exclusive**. Not everything is. A feed that's refreshing still shows its old posts; a failed refresh shows the old posts *and* a banner. Force that into one enum and the cases multiply:
+
+```swift
+enum FeedScreen {
+    case loading
+    case loaded([Post])
+    case refreshing([Post])
+    case failed(any Error)
+    case failedWithStalePosts([Post], any Error)
+    case offlineWithStalePosts([Post])
+}
+```
+
+Three cases carry `[Post]`, so every piece of code that wants the posts has to switch over all of them. The trouble is that two independent questions are tangled together: *what do we have?* and *what's happening now?* Independent questions get independent properties. Use a struct for the dimensions that combine freely, and an enum for each dimension whose options exclude each other:
+
+```swift check title="FeedState.swift"
+import Foundation
+
+struct Post: Identifiable {
+    let id: UUID
+    let text: String
+}
+
+struct FeedState {
+    enum Activity {
+        case idle
+        case loading
+        case failed(any Error)
+    }
+
+    /// What we have: the last posts we loaded, kept while refreshing or after a failure
+    var posts: [Post] = []
+    /// What's happening now: exactly one of these at a time
+    var activity: Activity = .idle
+
+    var showsFullScreenSpinner: Bool {
+        if case .loading = activity { posts.isEmpty } else { false }
+    }
+}
+```
+
+Now "failed, with old posts" is representable because it's a real product state, and "loading and failed" still isn't. The rule of thumb: **an enum for exclusive options, a struct for independent ones, and nest them**. Making illegal states unrepresentable is about matching the type's shape to the product's, not about using enums everywhere.
+
+## More ways to make bad states impossible
+
+Enums are the main tool, but not the only one.
+
+- **Put data inside the state that owns it.** Instead of `var user: User?`, `var token: String?` and `var isSignedIn: Bool`, write `enum Session { case signedOut; case signedIn(User, token: AccessToken) }`. A signed-in session without a token can't be built.
+- **Encode "at least one".** A checkout that needs at least one item can take a `NonEmpty` collection (Point-Free's `swift-nonempty` package, or your own `struct NonEmpty<Element> { var first: Element; var rest: [Element] }`), so the empty case doesn't exist.
+- **Validate once, in an initialiser.** `ClosedRange` refuses to exist with a lower bound above its upper bound. Your own value types can do the same: you'll build them in the next lessons.
+- **Make the state part of the type.** With *typestate*, a generic parameter records the state, and methods only exist in the right one:
+
+```swift check title="Typestate: only drafts can be edited"
+import Foundation
+
+enum Draft {}
+enum Submitted {}
+
+struct ExpenseClaim<State> {
+    let id: UUID
+    private(set) var amountPence: Int
+
+    fileprivate init(id: UUID, amountPence: Int) {
+        self.id = id
+        self.amountPence = amountPence
+    }
+}
+
+extension ExpenseClaim where State == Draft {
+    init(id: UUID) {
+        self.init(id: id, amountPence: 0)
+    }
+
+    mutating func setAmount(_ pence: Int) {
+        amountPence = pence
+    }
+
+    func submit() -> ExpenseClaim<Submitted> {
+        ExpenseClaim<Submitted>(id: id, amountPence: amountPence)
+    }
+}
+
+var claim = ExpenseClaim<Draft>(id: UUID())
+claim.setAmount(4_250)
+let submitted = claim.submit()
+// submitted.setAmount(1) doesn't compile: Submitted claims have no setAmount
+```
+
+Typestate catches misuse at compile time, but it has a real cost: drafts and submitted claims are different types, so they can't share an array without erasing the difference, and storing or decoding them needs care. It suits small, high-stakes flows (a payment that must be confirmed before it's captured) more than everyday screens. In Swift 6, `~Copyable` types add another tool, values that can only be used once, which you'll meet in D06.
+
+## Exhaustive switches, and when to add a default
+
+An exhaustive `switch` over your own enum is a to-do list the compiler keeps for you. A `default:` throws the list away: add a case later and every `default:` silently swallows it. Avoid `default` in switches over enums you own.
+
+Enums you *don't* own are different. Enums from Apple's C and Objective-C frameworks can gain cases in any iOS release, and Swift warns when you switch over one without `@unknown default`:
+
+```swift check ios title="Handling a case Apple hasn't added yet"
+import UserNotifications
+
+func canShowAlerts(_ status: UNAuthorizationStatus) -> Bool {
+    switch status {
+    case .authorized, .provisional, .ephemeral:
+        return true
+    case .denied, .notDetermined:
+        return false
+    @unknown default:
+        // A future iOS adds a status: treat it as "no", and the compiler will warn us to decide
+        return false
+    }
+}
+```
+
+This one has already grown twice: `.provisional` arrived in iOS 12 and `.ephemeral` (for App Clips) in iOS 14. `@unknown default` handles the future case at runtime, and still gives you a compiler warning listing the known cases you haven't handled, which a plain `default` never would.
+
+## Illegal states at the boundary
+
+Your server probably doesn't send enums. It sends flat JSON with a status string and some fields that may or may not be present. The place to turn that into an enum is the **boundary**, as you decode: check the combination once, and either produce a valid case or reject the data. Alexis King called this approach **parse, don't validate**: instead of checking data and passing the unchecked version along, convert it into a type that can only hold checked data.
+
+```swift run title="Decoding a flat payload into an enum"
+import Foundation
+
+enum PaymentState: Equatable {
+    case pending
+    case authorised(amountPence: Int)
+    case declined(reason: String)
+}
+
+extension PaymentState: Decodable {
+    private enum Keys: String, CodingKey {
+        case state
+        case amountPence = "amount_pence"
+        case reason
+    }
+
+    init(from decoder: any Decoder) throws {
+        let json = try decoder.container(keyedBy: Keys.self)
+        switch try json.decode(String.self, forKey: .state) {
+        case "pending":
+            self = .pending
+        case "authorised":
+            self = .authorised(amountPence: try json.decode(Int.self, forKey: .amountPence))
+        case "declined":
+            self = .declined(reason: try json.decode(String.self, forKey: .reason))
+        case let other:
+            throw DecodingError.dataCorruptedError(forKey: .state, in: json, debugDescription: "Unknown state \(other)")
+        }
+    }
+}
+
+let payloads = [
+    #"{"state": "authorised", "amount_pence": 1999}"#,
+    #"{"state": "declined", "reason": "insufficient_funds", "amount_pence": null}"#,
+    #"{"state": "authorised"}"#,
+    #"{"state": "chargeback"}"#,
+]
+for json in payloads {
+    do {
+        print("OK: \(try JSONDecoder().decode(PaymentState.self, from: Data(json.utf8)))")
+    } catch DecodingError.keyNotFound(let key, _) {
+        print("Rejected: no \(key.stringValue)")
+    } catch DecodingError.dataCorrupted(let context) {
+        print("Rejected: \(context.debugDescription)")
+    } catch {
+        print("Rejected: \(error)")
+    }
+}
+```
+
+```output
+OK: authorised(amountPence: 1999)
+OK: declined(reason: "insufficient_funds")
+Rejected: no amount_pence
+Rejected: Unknown state chargeback
+```
+
+The last payload raises a design question you must answer for every server enum: **what does an older app do with a state a newer server invents?** Throwing (as here) keeps the enum honest, and the screen keeps showing the last state it understood. Adding a `case unknown(String)` keeps the app working but forces every `switch` to handle "something we can't describe". Choose per field: an unknown payment state should probably stop and ask the server; an unknown badge colour can fall back to grey.
+
+## SwiftUI: one sheet at a time
+
+Presentation state is a classic source of illegal states. Three booleans for three sheets, plus an optional for the selected item:
+
+```swift
+@State private var isEditing = false
+@State private var isSharing = false
+@State private var isShowingSettings = false
+@State private var selectedItem: Item?
+```
+
+That's 2 × 2 × 2 × 2 = 16 shapes for four legal ones (nothing, editing an item, sharing an item, settings). Set two flags at once and SwiftUI presents only one sheet and logs a warning; set `isEditing` with no selected item and the sheet has nothing to edit. One optional enum fixes both:
+
+```swift check ios title="ItemsView.swift"
+import SwiftUI
+
+struct Item: Identifiable {
+    let id: UUID
+    var name: String
+}
+
+struct ItemsView: View {
+    /// At most one sheet, and each sheet carries exactly the data it needs
+    enum Sheet: Identifiable {
+        case edit(Item)
+        case share(Item)
+        case settings
+
+        var id: String {
+            switch self {
+            case .edit(let item): "edit-\(item.id)"
+            case .share(let item): "share-\(item.id)"
+            case .settings: "settings"
+            }
+        }
+    }
+
+    let items: [Item]
+    @State private var sheet: Sheet?
+
+    var body: some View {
+        List(items) { item in
+            Text(item.name)
+                .swipeActions {
+                    Button("Edit") { sheet = .edit(item) }
+                    Button("Share") { sheet = .share(item) }
+                }
+        }
+        .toolbar {
+            Button("Settings") { sheet = .settings }
+        }
+        .sheet(item: $sheet) { sheet in
+            switch sheet {
+            case .edit(let item): Text("Editing \(item.name)")
+            case .share(let item): Text("Sharing \(item.name)")
+            case .settings: Text("Settings")
+            }
+        }
+    }
+}
+```
+
+Five shapes (`nil` plus four cases), five legal states. You'll take this further with navigation routes in D20.
+
+## Trade-offs
+
+| Model | Illegal states possible | Adding a new state | Boilerplate | Codable effort | Fits |
+| --- | --- | --- | --- | --- | --- |
+| Flags and optionals | Many, growing as 2ⁿ | Easy to add, easy to forget to handle | Lowest | Synthesized | Truly independent settings |
+| One enum with associated values | None between cases | The compiler lists every switch to update | Some: switches, computed properties | Usually hand-written | Mutually exclusive states |
+| Struct of independent parts, each an enum | Only real combinations | Clear where it goes | Moderate | Mixed | Screens with data plus activity |
+| Typestate generics | Caught at compile time | A new type and its methods | High | Awkward | Small, high-stakes flows |
+
+<Callout kind="interview">
+
+**Say** how you'd model screen state, and why: "The screen state is an enum (loading, loaded, empty, failed) so we can't show a spinner and an error together. While refreshing we keep the old items, so items and activity are separate properties." **Ask** which states can coexist (can you be offline *and* showing stale data?) before choosing the shape. **Red flags:** a view model with five booleans, `default:` in switches over your own enums, force unwraps that exist because a field "is always set in that state".
+
+</Callout>
+
+<Callout kind="gotcha" title="Swift gotcha: synthesized Codable for enums picks a format you didn't choose">
+
+Since Swift 5.5 the compiler will synthesize `Codable` for enums with associated values, encoding `.uploading(progress: 0.5)` as `{"uploading":{"progress":0.5}}` and an unlabelled value as `{"failed":{"_0":…}}`. That rarely matches your API, and renaming a case or a label changes the format, so data you saved last release stops decoding. For anything that leaves the process (the network, disk, an App Group), write `init(from:)` and `encode(to:)` yourself, or decode a DTO and convert it.
+
+</Callout>
+
+## Practice
+
+The kata **A ride's status as an enum** is this whole lesson in one exercise: a ride-hailing app's server sends flat JSON, and you decode it into an enum whose cases carry exactly their own data, reject impossible combinations at the boundary, encode it back, and answer questions with exhaustive switches.
+
+```cards
+- id: product-vs-sum
+  front: "Why does a struct of flags hold so many more states than an enum?"
+  back: "A struct is a product type, so its shapes multiply (each Bool or optional doubles them). An enum is a sum type, so its shapes add: one per case."
+- id: enum-or-struct
+  front: "When is a single enum the wrong model for screen state?"
+  back: "When some parts are independent, such as the posts you have and what's happening now. Use a struct for the independent dimensions and an enum for each set of mutually exclusive options."
+- id: unknown-default
+  front: "When do you write `@unknown default`, and when do you avoid `default`?"
+  back: "`@unknown default` for enums you don't own that can gain cases (Apple's C and Objective-C enums). Avoid `default` on your own enums, so adding a case makes the compiler list every switch to update."
+```
+
+```quiz
+- id: q1
+  type: estimate
+  prompt: "A screen model has `isLoading: Bool`, `isEmpty: Bool`, `items: [Item]?` and `error: Error?`. Counting only whether each optional is set, how many shapes can it hold?"
+  answer: 16
+  unit: shapes
+  within: { percent: 1 }
+  explain: "Four two-way choices: 2 × 2 × 2 × 2 = 16. The product probably allows four or five (loading, empty, loaded, failed), so most of the 16 are bugs nothing prevents."
+- id: q2
+  type: mcq
+  prompt: "A video player can be playing, paused or buffering, and separately it can be muted or not. Which model fits?"
+  options:
+    - "`enum PlayerState { case playing, paused, buffering, playingMuted, pausedMuted, bufferingMuted }`"
+    - "A struct with `isPlaying`, `isPaused`, `isBuffering` and `isMuted` booleans"
+    - "A struct with `playback: Playback` (an enum of playing, paused, buffering) and `isMuted: Bool`"
+    - "`isMuted` stored as an associated value on every case"
+  answer: 2
+  explain: "Playback states exclude each other, so they're an enum. Muting is independent of playback, so it's its own property. The six-case enum tangles two dimensions; the four booleans allow playing and paused at once."
+- id: q3
+  type: bug
+  prompt: "The team just added `case refunded` to `OrderStatus`. Which line will quietly mishandle it, with no compiler warning?"
+  code: |
+    func badgeColour(for status: OrderStatus) -> Color {
+        switch status {
+        case .placed: .blue
+        case .shipped: .orange
+        case .delivered: .green
+        default: .gray
+        }
+    }
+  answer: 6
+  explain: "`default` catches `.refunded` along with anything else added later, so the compiler can't point out that refunded orders need a decision. Without it, adding the case would be a compile error right here."
+- id: q4
+  type: multi
+  prompt: "Which changes remove illegal states? Choose all that apply."
+  options:
+    - "Replacing `user: User?` and `token: String?` with `enum Session { case signedOut; case signedIn(User, token: AccessToken) }`"
+    - "Adding a comment saying `token` is non-nil whenever `user` is"
+    - "Replacing three sheet booleans with one optional `Sheet` enum"
+    - "Replacing `(Data?, URLResponse?, Error?)` with `async throws -> (Data, URLResponse)`"
+    - "Adding `assert(user == nil || token != nil)` in the view model"
+  answer: [0, 2, 3]
+  explain: "The enum, the optional sheet enum and the async API change the type so bad combinations can't be built. A comment or an assertion leaves them representable and only notices them, or doesn't."
+- id: q5
+  type: mcq
+  prompt: "Your app decodes `delivery_status` into an enum. Next month the server starts sending a new status, `\"held_at_depot\"`, which this version of the app has never heard of. What's the most important thing to decide now?"
+  options:
+    - "Nothing: Swift enums handle new cases automatically"
+    - "What the old app does with a status it doesn't know: reject it and keep the last known status, or decode it into an `unknown` case the UI can show safely"
+    - "Whether to make the enum `@frozen`"
+    - "Whether to use `default` in every switch"
+  answer: 1
+  explain: "Old app versions stay installed for years, so unknown values will arrive. Decide per field: keeping the last known state is safest for things like payments, while a neutral `unknown` presentation suits informational badges."
+- id: q6
+  type: truefalse
+  prompt: "Making illegal states unrepresentable means modelling every screen as a single enum."
+  answer: false
+  explain: "It means matching the type's shape to the product's. Exclusive options are an enum; independent ones are separate properties; most real screens nest one inside the other."
+```

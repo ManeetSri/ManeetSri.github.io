@@ -1,0 +1,225 @@
+## Why it matters
+
+Some jobs need several objects working in the right order. Posting a photo means resizing and encoding it, asking the server where to put it, sending the bytes, then confirming the post. If every screen does that choreography itself, every screen gets it slightly wrong. A **facade** gives the whole subsystem one simple front door. It's also how you design the public surface of a module or an SDK, which interviewers probe the moment you say "and that would be its own module".
+
+## What a facade is
+
+A facade is an object with a small, task-shaped interface that coordinates several objects behind it. It adds no new capability: anything it does, a caller could do by using the subsystem directly. What it adds is **order, defaults and vocabulary**: the right calls in the right sequence, with sensible settings, named after what the caller wants rather than how it's done.
+
+Two properties separate a good facade from a bad one:
+
+- **It's thin.** It coordinates; it doesn't hold business rules or state of its own.
+- **It's a convenience, not a wall.** The subsystem underneath stays reachable for the caller who needs more, unless you decide otherwise.
+
+<Callout kind="analogy">
+
+A hotel concierge. You say "a table for two at eight, and a taxi there". They phone the restaurant, book the car and tell the doorman. You could do each of those yourself, and for an unusual request you still can; the concierge just makes the common case one sentence.
+
+</Callout>
+
+## Facades you already use
+
+Apple's frameworks are full of them, and each one shows both properties.
+
+- **`NSPersistentContainer`** (iOS 10). Before it, a Core Data stack meant loading an `NSManagedObjectModel` from the bundle, creating an `NSPersistentStoreCoordinator`, working out a store URL, adding a SQLite store, and creating contexts on the right queues. Now it's `NSPersistentContainer(name:)` and `loadPersistentStores`. The coordinator and model are still there as properties for the cases the facade doesn't cover.
+- **`URLSession.shared.data(from:)`**. One call stands in for session configuration, a task, its delegate and the response. Create your own `URLSession` with a configuration when you need timeouts, caching rules or background transfers.
+- **`AVPlayer`**. `AVPlayer(url:)` and `play()` hide asset loading, item status and rendering. `currentItem` gives you the `AVPlayerItem` when you need buffering details or tracks.
+- **`PHPickerViewController`** and SwiftUI's `PhotosPicker`. Choosing photos is one presentation, and because the picker runs out of process, the app doesn't even need photo library permission.
+
+## Building one: posting a photo
+
+Here's the subsystem for posting a photo: a compressor, an API with two endpoints, and storage that accepts the bytes. Each part is small and testable on its own. The facade is the last type: one call, shaped like the task.
+
+```swift check ios
+import UIKit
+
+struct UploadTicket: Decodable, Sendable {
+    let uploadURL: URL
+    let photoID: String
+}
+
+// The subsystem: each part is small and can be tested on its own
+struct ImageCompressor: Sendable {
+    func jpegData(from image: UIImage, maxDimension: CGFloat, quality: CGFloat) -> Data? {
+        let scale = min(1, maxDimension / max(image.size.width, image.size.height))
+        let size = CGSize(width: image.size.width * scale, height: image.size.height * scale)
+        let format = UIGraphicsImageRendererFormat()
+        format.scale = 1
+        let resized = UIGraphicsImageRenderer(size: size, format: format).image { _ in
+            image.draw(in: CGRect(origin: .zero, size: size))
+        }
+        return resized.jpegData(compressionQuality: quality)
+    }
+}
+
+protocol PhotoAPI: Sendable {
+    func requestUpload(byteCount: Int) async throws -> UploadTicket
+    func confirmUpload(photoID: String, caption: String) async throws -> URL
+}
+
+protocol BlobStorage: Sendable {
+    func put(_ data: Data, to url: URL) async throws
+}
+
+enum PhotoUploadError: Error {
+    case unreadableImage
+}
+
+// The facade: one call, the steps in the right order, sensible defaults
+struct PhotoUploader: Sendable {
+    let compressor: ImageCompressor
+    let api: any PhotoAPI
+    let storage: any BlobStorage
+
+    func upload(_ image: UIImage, caption: String) async throws -> URL {
+        guard let data = compressor.jpegData(from: image, maxDimension: 2048, quality: 0.8) else {
+            throw PhotoUploadError.unreadableImage
+        }
+        let ticket = try await api.requestUpload(byteCount: data.count)
+        try await storage.put(data, to: ticket.uploadURL)
+        return try await api.confirmUpload(photoID: ticket.photoID, caption: caption)
+    }
+}
+```
+
+The composer screen's view model now makes one call, `try await uploader.upload(image, caption: caption)`, and three things moved out of it: the **order** (you can't confirm before the bytes arrive), the **defaults** (2048 pixels and 80% quality, decided once for the whole app) and the **vocabulary** (the view model talks about posting a photo, not about tickets and blobs).
+
+```visual sequence
+title: One call in, four steps behind the facade
+participants:
+  - { id: vm, label: Composer }
+  - { id: up, label: PhotoUploader }
+  - { id: comp, label: Compressor }
+  - { id: api, label: Photo API }
+  - { id: store, label: Storage }
+messages:
+  - [vm, up, "upload(image, caption)"]
+  - [up, comp, jpegData]
+  - [comp, up, 1.2 MB, { reply: true }]
+  - [up, api, requestUpload]
+  - [api, up, ticket, { reply: true }]
+  - [up, store, PUT bytes]
+  - [store, up, "200", { reply: true }]
+  - [up, api, confirmUpload]
+  - [api, up, post URL, { reply: true }]
+  - [up, vm, post URL, { reply: true }]
+steps:
+  - say: The composer asks for what it wants, in its own words. It knows nothing about tickets or storage.
+    upTo: 0
+  - say: The facade resizes and encodes first, with the app's chosen size and quality.
+    upTo: 2
+  - say: "The server hands out a **ticket**: where to put the bytes, and the id to confirm later."
+    upTo: 4
+  - say: The bytes go straight to storage. Only after that succeeds does the facade confirm the post.
+    upTo: 8
+  - say: The composer gets one answer, or one error. The order of the steps can't be got wrong, because only the facade knows it.
+    upTo: 9
+```
+
+The facade's own code holds no rules: it doesn't decide who may post or how many photos are allowed. If those rules appear, they belong in the domain layer, and the facade calls them.
+
+## Facade or god object?
+
+A facade is easy to grow and hard to shrink. Every team has met the end state: an `AppManager` with forty methods over unrelated subsystems, its own caches, and rules nobody else can find. Watch for these signs:
+
+- **It decides things.** "Free users can post ten photos a day" is a business rule, not coordination.
+- **It holds state** that other parts of the app read, such as a cache of posts.
+- **Every feature changes it**, because it has become the only way to reach anything.
+
+The fix is the one you'd guess: one facade per task area (posting, playback, sign-in), with rules in domain types the facade calls. You'll meet the god object as a smell in D15.
+
+A facade is also not a mediator, though the two are often confused. A facade is one-way: callers use it, and the subsystem behind it doesn't know it exists. A mediator, which you'll meet in D13, coordinates peers that talk *to each other* through it.
+
+## Facades as module boundaries
+
+When a subsystem becomes a Swift package, its `public` API *is* its facade. `PhotoUploader` is public; the compressor, the API client and the storage type can stay `internal`. [Access control](/design/learn/sd-swift-design-access-control) turns "the subsystem stays reachable" from a default into a decision you make per type.
+
+A good module facade usually offers two doors:
+
+- **A convenient one** for the common case: an initialiser that builds the real compressor, API client and storage with sensible defaults.
+- **A complete one** for tests and unusual callers: the memberwise initialiser above, taking every part as a dependency.
+
+Apple calls this **progressive disclosure**: the simple thing is simple, and the complicated thing is possible. `URLSession.shared` and `URLSession(configuration:)` are the two doors of one subsystem.
+
+## Trade-offs
+
+| | Callers use the subsystem directly | A thin facade | A facade that hides everything |
+| --- | --- | --- | --- |
+| The common case | several calls, easy to get the order wrong | one call | one call |
+| Unusual cases | anything is possible | use the parts directly | impossible without changing the facade |
+| Testability | each caller mocks several parts | mock the facade, or test it with fake parts | mock the facade |
+| When the subsystem changes | every caller changes | the facade changes | the facade changes |
+| Risk | duplicated, inconsistent choreography | the facade gathering rules and state | a lowest-common-denominator API |
+
+Skip the facade when there's one caller and two steps: it's indirection with no payoff. A thin facade wins as soon as a sequence is repeated or easy to get wrong. Hiding the subsystem completely is right for a module's internals, where you want the freedom to change them, as long as the facade covers what callers really need.
+
+<Callout kind="interview">
+
+**What to say:** when you propose a component in a design (image loading, uploads, playback), name its facade and its one or two methods: "the rest of the app sees `PhotoUploader.upload(_:caption:)` and nothing else". It shows you're designing for callers, and it gives you a seam for tests.
+
+**What to ask:** what callers need most often (that's the facade's API) and what the rare cases are (that's the escape hatch, or the second door).
+
+**Red flags:** a facade that's a singleton with hidden state; one that swallows errors to look simple (returning `nil` instead of saying why the upload failed); one whose signatures expose the internal types it was meant to hide.
+
+</Callout>
+
+<Callout kind="gotcha" title="iOS gotcha: a main-actor facade does its heavy lifting on the main thread">
+
+It's tempting to mark a facade `@MainActor` because only view models call it, and new Xcode 26 app targets make every type main-actor isolated by default anyway (SE-0466). Then `jpegData(from:)` resizes a 48-megapixel photo on the main thread, and scrolling stutters. Keep a facade that does real work off the main actor: make it `nonisolated` or an actor. One more Swift 6.2 detail: with the setting that makes `nonisolated async` functions run on their caller's actor (SE-0461, also on in new Xcode 26 projects), mark the heavy method `@concurrent` so it really leaves the main actor.
+
+</Callout>
+
+## Practice
+
+The architecture review for this module puts a facade at the centre: an `Analytics` front over two trackers, an adapter and two decorators. Look for what a facade should guarantee for every call, and doesn't.
+
+```cards
+- id: facade-definition
+  front: "What does a facade add to a subsystem?"
+  back: "Order, defaults and vocabulary: one task-shaped call that runs the right steps in the right sequence with sensible settings. It adds no new capability."
+- id: facade-good-properties
+  front: "What two properties make a facade good?"
+  back: "It's thin (coordination, no business rules or state of its own) and it's a convenience, not a wall (the subsystem stays reachable where you choose)."
+- id: facade-vs-god-object
+  front: "What are the signs a facade is turning into a god object?"
+  back: "It makes business decisions, holds state other parts read, and changes with every feature because it's the only way to reach anything."
+```
+
+```quiz
+- id: q1
+  type: mcq
+  prompt: "Which of these is a facade?"
+  options:
+    - "`NSPersistentContainer`, which sets up the model, coordinator, store and contexts behind one initialiser"
+    - "A `LoggingHTTPClient` that conforms to `HTTPClient` and logs every request before forwarding it"
+    - "A type that makes a vendor's SDK conform to your app's `AnalyticsTracking` protocol"
+    - "A proxy that loads a translation model the first time it's used"
+  answer: 0
+  explain: "A facade offers a new, simpler interface over several objects. The logging client keeps the same interface and adds behaviour (a decorator), the third changes one object's interface to fit yours (an adapter), and the fourth controls when its subject exists (a proxy)."
+- id: q2
+  type: multi
+  prompt: "Your `CheckoutService` facade has grown over two years. Which of these suggest it's becoming a god object?"
+  options:
+    - "It works out the free-delivery threshold itself"
+    - "It calls the basket, payment and order services in the right order"
+    - "Every new feature adds a method to it"
+    - "It exposes the payment service for the one screen that manages saved cards"
+    - "It keeps recent orders in a dictionary that other screens read"
+  answer: [0, 2, 4]
+  explain: "Rules, shared state and constant growth are the signs. Calling services in order is exactly a facade's job, and exposing a part of the subsystem for an unusual caller is a deliberate escape hatch, not a smell."
+- id: q3
+  type: truefalse
+  prompt: "A facade should make the objects behind it unreachable, so callers can't misuse them."
+  answer: false
+  explain: "A facade is a convenience: the classic pattern leaves the subsystem usable for callers who need more, as `NSPersistentContainer` does with its coordinator. Hiding the internals is a separate choice, made with access control at a module boundary, and it's worth making only when the facade covers what callers really need."
+- id: q4
+  type: mcq
+  prompt: "The photo-posting facade is marked `@MainActor` because only view models call it. Users who post large photos from the camera see the app freeze for half a second. What's the most likely cause?"
+  options:
+    - "The network requests run on the main thread"
+    - "The synchronous resize and JPEG encoding run on the main actor, blocking the UI"
+    - "`async` functions always run on the main thread in Swift 6"
+    - "The facade is a struct, so the image is copied"
+  answer: 1
+  explain: "URLSession's async calls suspend rather than block, but `jpegData(from:)` is synchronous CPU work, and on a main-actor facade it runs on the main thread. Move the work off the main actor: make the facade `nonisolated` or an actor (and mark the method `@concurrent` if your target runs `nonisolated async` functions on the caller's actor). `UIImage` is a reference type, so passing it doesn't copy the pixels."
+```
