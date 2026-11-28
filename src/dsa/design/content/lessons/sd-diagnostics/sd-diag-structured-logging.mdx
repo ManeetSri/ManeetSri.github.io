@@ -1,0 +1,362 @@
+## Why it matters
+
+Unified logging is perfect for one device in your hand. It doesn't answer "how many users hit this error since Tuesday?" or "show me everything that happened in this user's session before checkout failed", because its logs stay on the phone. For that, apps ship a small stream of **structured** events to a backend where they can be searched, counted and joined with server logs. Doing it well is a design problem with real costs: battery, data, storage, and above all privacy. Interviewers who ask you to design a logging SDK spend most of the time here.
+
+## From sentences to events
+
+A log line written for people is a sentence: "Couldn't load orders after 3 attempts (timeout)". A **structured** log line is an event: a stable name, a level and named fields.
+
+```swift run
+import Foundation
+
+/// One structured event: a stable name, a level, and typed fields, inside an envelope every event shares
+struct LogEvent: Encodable {
+    enum Level: String, Encodable {
+        case info, notice, error, fault
+    }
+
+    // The envelope: who, where, when, in which order
+    let session: String
+    let seq: Int
+    let app: String
+    let os: String
+    // The event itself
+    let event: String
+    let level: Level
+    let fields: [String: String]
+}
+
+let encoder = JSONEncoder()
+encoder.outputFormatting = [.sortedKeys, .withoutEscapingSlashes]
+
+let events = [
+    LogEvent(session: "s-91c2", seq: 41, app: "5.2.0 (812)", os: "iOS 18.4", event: "orders.load_failed", level: .error,
+             fields: ["kind": "unavailable", "endpoint": "/orders", "request_id": "r-7f3a", "attempts": "3"]),
+    LogEvent(session: "s-91c2", seq: 42, app: "5.2.0 (812)", os: "iOS 18.4", event: "orders.cache_served", level: .info,
+             fields: ["age_s": "5400", "count": "12"]),
+]
+for event in events {
+    print(String(decoding: try encoder.encode(event), as: UTF8.self))
+}
+```
+
+```output
+{"app":"5.2.0 (812)","event":"orders.load_failed","fields":{"attempts":"3","endpoint":"/orders","kind":"unavailable","request_id":"r-7f3a"},"level":"error","os":"iOS 18.4","seq":41,"session":"s-91c2"}
+{"app":"5.2.0 (812)","event":"orders.cache_served","fields":{"age_s":"5400","count":"12"},"level":"info","os":"iOS 18.4","seq":42,"session":"s-91c2"}
+```
+
+Each part earns its place:
+
+- **A stable event name** (`orders.load_failed`) is what dashboards count and alerts watch. Name events like API endpoints: `feature.what_happened`, past tense, never containing data.
+- **Fields instead of interpolation.** `"attempts": "3"` can be filtered and graphed; "after 3 attempts" buried in a sentence can't. Values that vary go in fields, never in the name: `orders.load_failed` with `kind`, not `orders.load_failed_unavailable`.
+- **An envelope on every event:** app version and build, OS version, session id and a sequence number. When a bug appears only in build 812 on iOS 18.4, the envelope is how you know.
+- **A sequence number** gives the true order within a session even when clocks jump or uploads arrive out of order.
+
+## Correlation: one story across many lines
+
+Structured logs pay off when you can follow one story across events, sessions and systems:
+
+- **Session id.** A random id generated per app session, not per user, ties together everything one run of the app did. It isn't an identity, so it's far less sensitive than a user id.
+- **Request id.** Send one with each API request (an `X-Request-ID` header, or whatever your backend's tracing uses), and log it on both sides. A support ticket with a request id leads straight to the server's logs for that call. The [propagation lesson](/design/learn/sd-diag-propagation) carried it inside the error for exactly this reason.
+- **User id, only when you must.** If support needs to find a user's sessions, log a keyed hash of the user id rather than the id or the email, and declare it.
+
+## Privacy once logs leave the phone
+
+`Logger`'s `privacy:` annotations protect values *in unified logging*. Once you write your own events to a file and upload them, they protect nothing: whatever you put in a field reaches your backend, your log vendor, and everyone with access to either. Shipping logs is **collecting data**, and three things follow.
+
+1. **Classify every field.** Each field is public (your vocabulary: event names, error kinds, endpoint paths, counts), hashed (needed to correlate, never to read), redacted (keep that it existed, not its value) or dropped. Make the classification part of the field's declaration, not something each call site remembers.
+2. **Defend in depth at the formatter.** Some keys are never allowed through whatever the call site says (`password`, `token`, `authorization`, `cookie`), and public strings are scanned for things that look like email addresses or long digit runs, such as card and phone numbers. Truncate long values: a 10 KB server error body in a log field is both a privacy and a cost problem.
+3. **Declare it.** Diagnostics you collect must appear in your App Store privacy details (Crash Data, Performance Data, Other Diagnostic Data) and, from the SDKs that collect them, in privacy manifests' `NSPrivacyCollectedDataTypes`. If events can be linked to a user, the label must say so. D50 covers the rules; the design consequence is that every new field is a privacy decision.
+
+The **log formatter** kata builds exactly this redaction layer.
+
+## A pipeline on the device
+
+Feature code shouldn't know where its logs go. Give it one small, synchronous API, and fan out behind it: every event to unified logging for local debugging, and the shippable ones, already redacted, to files an uploader sends later:
+
+```swift check title="Diagnostics.swift"
+import Foundation
+import os
+
+struct DiagnosticEvent: Sendable, Encodable {
+    enum Level: Int, Sendable, Encodable, Comparable {
+        case debug, info, notice, error, fault
+        static func < (lhs: Level, rhs: Level) -> Bool { lhs.rawValue < rhs.rawValue }
+    }
+    let name: String
+    let level: Level
+    let fields: [String: String]     // already redacted by the time a sink sees them
+}
+
+protocol DiagnosticSink: Sendable {
+    func write(_ event: DiagnosticEvent) async
+}
+
+/// Every event goes to unified logging, for Xcode, Console and sysdiagnose
+struct UnifiedLogSink: DiagnosticSink {
+    let logger: Logger
+
+    func write(_ event: DiagnosticEvent) async {
+        let type: OSLogType = switch event.level {
+        case .debug: .debug
+        case .info: .info
+        case .notice: .default
+        case .error: .error
+        case .fault: .fault
+        }
+        let fields = event.fields.sorted { $0.key < $1.key }.map { "\($0.key)=\($0.value)" }.joined(separator: " ")
+        logger.log(level: type, "\(event.name, privacy: .public) \(fields, privacy: .public)")
+    }
+}
+
+/// Notice and above go to rotating JSON-lines files that an uploader ships later
+actor ShippingFileSink: DiagnosticSink {
+    private let directory: URL
+    private let maxFileBytes: Int
+    private let maxFiles: Int
+    private let minimumLevel: DiagnosticEvent.Level
+    private let encoder = JSONEncoder()
+    private var handle: FileHandle?
+    private var bytesInFile = 0
+    private(set) var dropped = 0
+
+    init(directory: URL, maxFileBytes: Int = 256_000, maxFiles: Int = 8, minimumLevel: DiagnosticEvent.Level = .notice) {
+        self.directory = directory
+        self.maxFileBytes = maxFileBytes
+        self.maxFiles = maxFiles
+        self.minimumLevel = minimumLevel
+        encoder.outputFormatting = .sortedKeys
+    }
+
+    func write(_ event: DiagnosticEvent) async {
+        guard event.level >= minimumLevel, var line = try? encoder.encode(event) else { return }
+        line.append(0x0A)
+        if handle == nil || bytesInFile + line.count > maxFileBytes { rotate() }
+        do {
+            try handle?.write(contentsOf: line)
+            bytesInFile += line.count
+        } catch {
+            dropped += 1           // logging must never take the app down; count what was lost
+        }
+    }
+
+    private func rotate() {
+        try? handle?.close()
+        let fileManager = FileManager.default
+        let existing = ((try? fileManager.contentsOfDirectory(at: directory, includingPropertiesForKeys: nil)) ?? [])
+            .filter { $0.pathExtension == "jsonl" }
+            .sorted { $0.lastPathComponent < $1.lastPathComponent }
+        // Over budget: delete the oldest files first
+        for old in existing.prefix(max(0, existing.count - maxFiles + 1)) {
+            try? fileManager.removeItem(at: old)
+        }
+        let name = String(format: "%013.0f.jsonl", Date().timeIntervalSince1970 * 1000)
+        let url = directory.appendingPathComponent(name)
+        fileManager.createFile(atPath: url.path, contents: nil)
+        handle = try? FileHandle(forWritingTo: url)
+        bytesInFile = 0
+    }
+}
+
+/// What feature code calls: synchronous, never blocks, and redacts once before fanning out
+final class Diagnostics: Sendable {
+    private let continuation: AsyncStream<DiagnosticEvent>.Continuation
+    private let redact: @Sendable ([String: String]) -> [String: String]
+
+    init(sinks: [any DiagnosticSink], redact: @escaping @Sendable ([String: String]) -> [String: String]) {
+        // Under pressure, keep the newest events and drop the oldest
+        let (events, continuation) = AsyncStream.makeStream(of: DiagnosticEvent.self, bufferingPolicy: .bufferingNewest(1_000))
+        self.continuation = continuation
+        self.redact = redact
+        // One consumer, so every sink sees events in the order they were recorded
+        Task {
+            for await event in events {
+                for sink in sinks {
+                    await sink.write(event)
+                }
+            }
+        }
+    }
+
+    deinit {
+        continuation.finish()
+    }
+
+    func record(_ name: String, _ level: DiagnosticEvent.Level, _ fields: [String: String] = [:]) {
+        continuation.yield(DiagnosticEvent(name: name, level: level, fields: redact(fields)))
+    }
+}
+```
+
+The decisions that matter:
+
+- **`record` is synchronous and can't fail.** Logging is called from everywhere, including the main thread and `deinit`, so it can't make callers `await`, throw, or wait on disk. It hands the event to a stream, the [producer–consumer](/design/learn/sd-resilience-producer-consumer) shape, and returns.
+- **The buffer drops the oldest under pressure.** If a bug logs in a tight loop, `.bufferingNewest(1_000)` keeps memory bounded and the most recent events, which are the ones that explain what happened next.
+- **Redaction happens once, before any sink.** No sink can forget it, and because the fields are already safe, the unified-logging sink can mark them `.public`. That's the one place this is acceptable.
+- **The file sink has a budget.** A fixed number of files of a fixed size, oldest deleted first, and a count of anything dropped. A logging pipeline without a budget eventually fills a user's phone.
+- **Failing to log is not an error.** `dropped` is counted, and can itself be reported, but nothing throws.
+
+## Shipping it
+
+Follow one event from a feature to the backend:
+
+```visual flow
+title: A structured event's journey
+layers:
+  - { label: iPhone, rows: [0, 2] }
+  - { label: Backend, rows: 4 }
+nodes:
+  - { id: feature, label: Feature code, kind: client, at: [0, 0] }
+  - { id: facade, label: Diagnostics, kind: service, at: [2, 0] }
+  - { id: unified, label: Unified logging, kind: store, at: [4, 0] }
+  - { id: files, label: JSONL files, kind: store, at: [2, 2] }
+  - { id: uploader, label: Uploader, kind: service, at: [4, 2] }
+  - { id: ingest, label: Ingestion API, kind: service, at: [4, 4] }
+  - { id: search, label: Log search, kind: db, at: [2, 4] }
+edges:
+  - [feature, facade, record]
+  - [facade, unified, every event]
+  - [facade, files, notice+]
+  - [files, uploader, batch]
+  - [uploader, ingest, upload, { style: async }]
+  - [ingest, search, index]
+steps:
+  - say: "Checkout fails, and the view model calls `record(\"checkout.failed\", .error, …)`. The call returns at once."
+    show: [feature, facade]
+    send: feature->facade
+  - say: "The facade redacts the fields once, then every event goes to **unified logging** for Xcode, Console and sysdiagnose."
+    send: facade->unified
+  - say: "Events at `notice` and above are appended to a capped, rotating **JSON-lines file** in Application Support."
+    send: facade->files
+    state: { files: wait }
+  - say: "Later, at a good moment (the app coming to the foreground, a background task, Wi-Fi), the **uploader** takes closed files in a batch."
+    send: files->uploader
+  - say: "It compresses and uploads them, deleting each file only once the server has confirmed it. A failed upload leaves the files for next time."
+    send: uploader->ingest
+    state: { files: null, ingest: ok }
+  - say: "The backend validates the schema and indexes events by session and request id, so support can pull up one session's story."
+    send: ingest->search
+```
+
+Four policies make the pipeline affordable:
+
+- **What to ship.** Not everything. A common policy: `error` and `fault` always, with the few dozen events before them for context; `notice` from a sample of sessions; `info` only when a remote flag turns on verbose logging for one installation that support is investigating, with the user's agreement; `debug` never.
+- **When to send.** In batches, never one request per event: each request wakes the radio. Piggyback on moments the app is already using the network, and use a background `URLSession` upload task from the file for anything large, so it survives suspension. Set `allowsConstrainedNetworkAccess = false` so Low Data Mode is respected.
+- **How much to keep.** A hard cap on disk (a few megabytes), deletion of the oldest first, and lower levels dropped before higher ones. Diagnostics are best-effort: losing old logs is fine, filling the disk is not. (Analytics events that drive business decisions need stronger delivery guarantees; that's D55.)
+- **How long to keep it on the server.** A retention period, such as 30 days, and a way to delete a user's data when they ask.
+
+Before building it, do the arithmetic. Move the sliders to see what a policy costs:
+
+```visual estimator
+title: Shipping logs for 2 million daily users
+inputs:
+  - { id: dau, label: Daily active users, min: 10000, max: 100000000, value: 2000000, scale: log, unit: users }
+  - { id: sessions, label: Sessions per user per day, min: 1, max: 20, step: 1, value: 4 }
+  - { id: sample, label: Share of sessions shipped, min: 0, max: 100, step: 1, value: 10, unit: "%" }
+  - { id: events, label: Shipped events per session, min: 0, max: 500, step: 10, value: 40 }
+  - { id: bytes, label: Bytes per event as JSON, min: 100, max: 2000, step: 50, value: 400, unit: B }
+  - { id: ratio, label: Compression ratio, min: 1, max: 15, step: 1, value: 6 }
+outputs:
+  - { id: shipped, label: Sessions shipped per day, formula: dau * sessions * sample / 100, format: si }
+  - { id: perDay, label: Events per day, formula: shipped * events, format: si }
+  - { id: perSecond, label: Events per second at ingestion, formula: perDay / 86400, format: si, unit: /s }
+  - { id: raw, label: Raw JSON per day, formula: perDay * bytes, format: bytes, unit: /day }
+  - { id: wire, label: Uploaded per day, formula: raw / ratio, format: bytes, unit: /day }
+  - { id: perSession, label: Upload per shipped session, formula: events * bytes / ratio, format: bytes }
+  - { id: stored, label: Stored for 30 days, formula: raw * 30, format: bytes }
+```
+
+At the defaults, a few kilobytes per shipped session is nothing for one phone, while the backend ingests hundreds of events a second and stores hundreds of gigabytes a month. Shipping every session instead of 10% multiplies all of it by ten, which is why sampling is the first lever.
+
+## Trade-offs
+
+| Shipping policy | Debugging power | Cost (battery, data, storage) | Privacy exposure | When it wins |
+| --- | --- | --- | --- | --- |
+| Everything, always | Highest | Highest, on every user | Highest | Small betas and internal builds |
+| Errors and faults only, with context | Good for failures; blind to slowness | Low | Low | The default for most production apps |
+| A sample of sessions at `notice` | Good statistical picture | Proportional to the sample | Medium | Large apps that want trends, not every session |
+| On demand, for one installation | Full detail for one case | Only for that user | Consented and scoped | Support investigations of "it only happens to me" |
+| Nothing: rely on crash reports and MetricKit | Crashes and metrics only | None | None | Apps with no backend, or very strict privacy requirements |
+
+Most production apps combine the second, third and fourth.
+
+<Callout kind="interview">
+
+**Say:** "A synchronous facade redacts once and fans out: everything to `Logger`, and notice-and-above, already redacted, to capped JSON-lines files. An uploader ships closed files in compressed batches at good moments, with errors always shipped, a sample of sessions otherwise, and verbose logging on demand for one installation. Events carry a session id, a sequence number and request ids, so we can join them with server logs."
+
+**Ask:** what will support do with these logs, and how quickly? Which fields are personal data? Is there consent for diagnostics, and is it in the privacy label?
+
+**Red flags:** an upload per log line; no cap on the files; `Logger` privacy annotations assumed to protect shipped logs; user emails in fields; and event names with data in them, which make every name unique and every dashboard useless.
+
+</Callout>
+
+<Callout kind="gotcha" title="iOS gotcha: where the log files live">
+
+Write log files to Application Support (or Caches, if losing them is fine), not Documents: Documents is backed up to iCloud, and shows in the Files app if the app turns on file sharing. Mark the directory with `isExcludedFromBackup`. And mind data protection: files default to "complete until first user authentication", which background code can write to while the phone is locked. Give log files `.complete` protection and every write from a background task after the device locks will fail.
+
+</Callout>
+
+## Practice
+
+The **log formatter** kata implements the redaction rules: per-field privacy, keys that are always dropped, public strings scanned for emails and long numbers, hashing for correlation, and a size budget. The **diagnostics pipeline** design exercise puts this lesson's pipeline beside crash reports and breadcrumbs for an app with 2 million daily users.
+
+```cards
+- id: structured-event
+  front: "What makes a log line structured?"
+  back: "A stable event name, a level and named fields, inside an envelope (app version, OS, session id, sequence number) that every event shares. Varying data goes in fields, never in the name."
+- id: shipped-privacy
+  front: "Why don't Logger's privacy annotations protect logs you ship yourself?"
+  back: "They apply to unified logging only. Whatever your own events contain reaches your backend, so you need your own rules: classify each field, deny dangerous keys, scan and truncate, and declare the collection."
+- id: shipping-policy
+  front: "What's a sensible default policy for shipping logs from production?"
+  back: "Errors and faults always, with recent context; a sample of sessions at notice; verbose logging only on demand for one consenting installation; debug never. Batched, compressed and capped on disk."
+- id: facade-sync
+  front: "Why should a logging facade's record call be synchronous and non-throwing?"
+  back: "It's called from everywhere, including the main thread. It hands events to a bounded buffer consumed by one task, which keeps order, drops the oldest under pressure and never makes callers wait."
+```
+
+```quiz
+- id: q1
+  type: mcq
+  prompt: "Which event name is best?"
+  options:
+    - "`Order 8812 failed for maneet@example.com`"
+    - "`orders.load_failed_timeout_attempt_3`"
+    - "`orders.load_failed`, with fields `kind`, `attempts` and `request_id`"
+    - "`ERROR`"
+  answer: 2
+  explain: "A stable name can be counted and alerted on; the details belong in fields. Data in the name makes every event unique (and can leak personal data); a bare level says nothing."
+- id: q2
+  type: estimate
+  prompt: "2 million daily users, 4 sessions each, every session shipped, 40 events per session of 400 bytes. Roughly how much raw JSON arrives per day, in GB?"
+  answer: 128
+  unit: GB
+  within: { factor: 1.5 }
+  explain: "2M × 4 = 8M sessions; × 40 = 320M events; × 400 B = 128 GB a day before compression, nearly 4 TB a month. Sampling 10% of sessions cuts that to about 13 GB."
+- id: q3
+  type: multi
+  prompt: "Which belong in a structured event's envelope, sent with every event? Choose all that apply."
+  options:
+    - "App version and build number"
+    - "A session id generated per app session"
+    - "The user's email address"
+    - "A sequence number within the session"
+    - "The device's precise location"
+  answer: [0, 1, 3]
+  explain: "Version, session id and sequence let you slice by release and reconstruct one session in order. Email and precise location are personal data with no diagnostic need in every event."
+- id: q4
+  type: truefalse
+  prompt: "If a field is logged with `privacy: .private` in `Logger`, it's also redacted in the JSON events your app uploads."
+  answer: false
+  explain: "Logger's privacy annotations affect unified logging only. Your own events are whatever you encode, so redaction must happen in your pipeline, before any sink."
+- id: q5
+  type: mcq
+  prompt: "The upload of a batch of log files fails halfway. What should the uploader do?"
+  options:
+    - "Delete the files anyway; logs are best-effort"
+    - "Keep the files and retry later, deleting each only after the server confirms it, within the disk cap"
+    - "Retry immediately in a loop until it works"
+    - "Show the user an alert"
+  answer: 1
+  explain: "Delete only what the server acknowledged, retry at the next good moment, and let the disk cap drop the oldest files if it never succeeds. Tight retry loops waste battery, and users shouldn't hear about diagnostics uploads."
+```

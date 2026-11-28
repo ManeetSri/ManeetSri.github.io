@@ -1,0 +1,145 @@
+<Brief>
+
+This is the account screen of a subscription app. Support has three kinds of complaint about it: some people's app crashes as soon as they open Account, name changes "don't stick" even though the app said **Saved**, and an alert saying only "Something went wrong" appears at odd moments. A security review has also flagged the app's logs. Review it as you would a pull request: what's wrong, what matters most, and how you'd fix it.
+
+```swift check ios title="AccountViewController.swift"
+import UIKit
+
+struct Account: Decodable {
+    let email: String
+    let displayName: String
+    let plan: String
+}
+
+enum Plan: String { case free, plus, family }
+
+final class AccountViewController: UIViewController {
+    private let nameField = UITextField()
+    private let planLabel = UILabel()
+    private var loadTask: Task<Void, Never>?
+    var token = ""
+    var uploadAvatar: (UIImage, String) async throws -> Void = { _, _ in }
+
+    override func viewDidLoad() {
+        super.viewDidLoad()
+        loadTask = Task { await load() }
+    }
+
+    override func viewDidDisappear(_ animated: Bool) {
+        super.viewDidDisappear(animated)
+        loadTask?.cancel()
+    }
+
+    private func load() async {
+        var request = URLRequest(url: URL(string: "https://api.example.com/me")!)
+        request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
+        print("Loading account with token \(token)")
+        do {
+            let (data, _) = try await URLSession.shared.data(for: request)
+            let account = try! JSONDecoder().decode(Account.self, from: data)
+            print("Loaded account for \(account.email)")
+            nameField.text = account.displayName
+            planLabel.text = plan(from: account.plan).rawValue.capitalized
+        } catch {
+            showAlert(title: "Error", message: "Something went wrong.")
+        }
+    }
+
+    private func plan(from raw: String) -> Plan {
+        guard let plan = Plan(rawValue: raw) else { fatalError("Unknown plan \(raw)") }
+        return plan
+    }
+
+    @objc private func saveTapped() {
+        let name = nameField.text ?? ""
+        assert(!name.trimmingCharacters(in: .whitespaces).isEmpty, "A name is required")
+        Task {
+            var request = URLRequest(url: URL(string: "https://api.example.com/me")!)
+            request.httpMethod = "PATCH"
+            request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
+            request.httpBody = try? JSONEncoder().encode(["displayName": name])
+            _ = try? await URLSession.shared.data(for: request)
+            showAlert(title: "Saved")
+        }
+    }
+
+    func avatarPicked(_ image: UIImage) {
+        _ = Task { try await uploadAvatar(image, token) }
+    }
+
+    private func showAlert(title: String, message: String? = nil) {
+        let alert = UIAlertController(title: title, message: message, preferredStyle: .alert)
+        alert.addAction(UIAlertAction(title: "OK", style: .default))
+        present(alert, animated: true)
+    }
+}
+```
+
+</Brief>
+
+```workspace
+template: critique
+minutes: 25
+```
+
+```findings
+- id: crash-on-response
+  title: Any unexpected response crashes the app
+  severity: high
+  lines: "33-34"
+  detail: "The status code is thrown away and the body goes straight into `try!`. An expired token's 401, a 500's error page, or a renamed field from the server all crash every user who opens Account. Server data is input: check the status, decode with `try`, and map failures to the screen's error state."
+- id: trap-on-new-plan
+  title: A new plan on the server crashes everyone on it
+  severity: high
+  lines: "37, 43-45"
+  detail: "`fatalError` on an unknown plan string treats the server's data as a programmer error. The day the backend adds a `student` plan, every student's app crashes here, and no app update can arrive in time. Decode unknown values to an `.unknown` case, show something neutral, and record a fault so you notice."
+- id: secrets-in-logs
+  title: Logs the bearer token and the user's email
+  severity: high
+  lines: "31, 35"
+  detail: "The token is a credential: anyone who sees a console log, a CI artefact or a pasted bug report can act as the user. The email is personal data. `print` is also useless in release builds. Never log tokens; use `Logger` with private or hashed values for anything about the user."
+- id: save-swallowed
+  title: Shows Saved whether or not the save worked
+  severity: high
+  lines: "55-57"
+  detail: "Both `try?`s discard failures, and the response's status is never checked, so offline, a 401 or a 500 all end in a Saved alert. Users believe their change was stored and only find out later. Check the outcome, keep the edit on failure, and say what happened with a way to retry."
+- id: generic-alert
+  title: One generic alert for every failure, including cancellation
+  severity: medium
+  lines: "25, 38-39"
+  detail: "Offline, an expired session and a server fault all produce the same \"Something went wrong\" with only OK. Worse, leaving the screen cancels `loadTask`, `URLSession` throws `URLError.cancelled`, and the alert is presented by a controller that's disappearing. Ignore cancellation, and map each failure to its own message and action: retry, sign in again, or wait for the network."
+- id: assert-validation
+  title: Validates the name with assert, which release builds skip
+  severity: medium
+  lines: "50"
+  detail: "In an App Store build the `assert` isn't evaluated, so an empty or blank name is sent to the server. User input needs real validation with an inline message next to the field, before any request."
+- id: lost-avatar-error
+  title: Avatar upload errors disappear
+  severity: medium
+  lines: "62"
+  detail: "The throwing task's error is stored in a task nobody reads, and `_ =` silences the compiler's warning about exactly that. A failed upload leaves the old avatar with no message and no log. Handle the error inside the task: show it on the avatar, and log it."
+- id: no-diagnostics
+  title: Failures leave no trace for the team
+  severity: low
+  lines: "38-39, 56"
+  detail: "No failure is logged with its cause, the request id or the screen, and nothing is reported, so support can't tell which of the problems a user hit. Log once where each error is handled, at a level that matches the outcome, and report the bug-kind failures as non-fatals."
+```
+
+<ReferenceReview>
+
+**Most important first.** Two crashes and a leak come before everything else. Opening Account crashes on any response the app didn't expect, because the status is ignored and the body goes into `try!`, and it will crash for every user on a plan the server adds later, because `fatalError` treats server data as a programmer error. Neither can be fixed quickly once shipped: the server change that triggers them can happen any day. Meanwhile the logs contain the user's bearer token and email, which is a security issue regardless of crashes.
+
+**The pattern underneath** is that every failure has the same treatment: crash, swallow or one generic alert. There's no taxonomy. Cancellation gets an alert, a failed save gets a success message, an invalid name is "validated" by code that doesn't run in release, and nothing is recorded, so the team learns about each problem from support.
+
+**How I'd fix it, in small steps:**
+
+1. Remove both `print`s now. If logs containing tokens may have left developers' machines (CI artefacts, pasted bug reports), treat those tokens as leaked and revoke them. Add a `Logger` with an `account` category, and mark only our own vocabulary public.
+2. Make the screen survive any response: an `AccountRepository` that checks the status, decodes with `try`, and throws a typed `AccountError` (`.offline`, `.sessionExpired`, `.unavailable`, `.contractBroken`, `.cancelled`). Decode `plan` with an `.unknown` case and record a fault for unknown values.
+3. Give the view controller a view model with a state enum (loading, loaded, failed) and a presentation mapping from `AccountError` to a message and one action. Return quietly on `.cancelled`.
+4. Make saving honest: validate the name inline before sending; the repository's `update(displayName:)` throws; the screen shows Saved only on success and keeps the edit with a retry on failure.
+5. Handle the avatar upload's error inside its task, showing it on the avatar and logging it once.
+6. Log each handled failure once in the view model with its chain and request id, and report contract and unknown-plan failures as non-fatals with stable codes.
+
+**Tests to add:** the repository against stubbed responses (200 with a known and an unknown plan, 401, 500 with an HTML body, malformed JSON, cancellation); the presentation mapping for every `AccountError`; the view model's states for load success, failure and cancellation; and the save flow for a blank name, a failed request and a successful one.
+
+</ReferenceReview>

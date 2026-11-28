@@ -1,0 +1,223 @@
+<Brief>
+
+You're on the iOS team of a running-club app. Growth wants a new **sign-up onboarding**, built in the unidirectional style the team already uses (TCA 1.x, in two existing features). It has five steps:
+
+1. **Username**, checked for availability as the user types, with suggestions when it's taken.
+2. **Email**, then a 6-digit code sent by email, entered on the next screen. The code can be resent after 30 seconds.
+3. **Password**, with local rules and a check against known breached passwords.
+4. **Profile**: name, an optional home city and an optional photo, which uploads in the background.
+5. **Interests**, and the notification permission prompt.
+
+Then *Create account*.
+
+What the product team cares about:
+
+- **Conversion.** Every step's drop-off is measured, and Growth wants to **A/B test the step order** (for example, profile before password) from remote config, without an app release.
+- **No bad accounts.** Nobody may finish with a username that's taken or an email that isn't verified.
+- **Resume.** Users switch to Mail to fetch their code, and iOS sometimes terminates the app meanwhile. Coming back should land them where they were.
+- **Bad networks.** A failed check must never trap someone on a step.
+
+Scale and constraints: about 60,000 sign-ups a day, with marketing pushes that bring ten times that for an hour or two; roughly 30% of people who start don't finish. The username availability endpoint is shared with the website and rate-limited to 100 requests a second in total. The backend exists: endpoints for availability, sending and confirming email codes, a k-anonymity breached-password check, and account creation. iOS 17 and later; four iOS engineers.
+
+Design the feature's client architecture, with the async validation and resume in detail. Spend about 40 minutes.
+
+</Brief>
+
+```workspace
+template: feature
+minutes: 40
+```
+
+<ModelAnswer section="requirements">
+
+Questions that change the design:
+
+- **Which steps can the experiment reorder?** Email must be verified before the account is created, and the code step must follow the email step. Assume the remote config is an ordered list of step ids, validated on the client against those two rules.
+- **What if a username is taken between the check and *Create account*?** The server is the authority; the client must be able to send the user back to that step.
+- **How long should a half-finished onboarding survive, and how long is a code valid?** Assume 24 hours and 10 minutes.
+- **Can users go back and change earlier answers?** Yes, and nothing they typed should be lost.
+- **Out of scope:** social sign-in, account recovery, the web flow.
+
+Requirements:
+
+- **Functional:** the five steps in a configurable order, with Back preserving every answer; live username availability with suggestions; email code entry with a resend countdown; password rules plus a breach check; an optional photo that uploads in the background; account creation; resume after termination.
+- **Non-functional:** validation feedback within about half a second of the user pausing; no optional check (breach, photo) ever blocks progress; funnel analytics per step and variant; the password and code are never written to disk or logs; every step testable without a network or real time; validation results announced to VoiceOver, not shown by colour alone.
+
+</ModelAnswer>
+
+<ModelAnswer section="estimates">
+
+- **Sign-ups:** 60,000 a day is about 0.7 a second on average. Allow 3× for the evening peak and 10× for a campaign: around **20 a second** at worst. With 30% abandoning, about 86,000 people start each day.
+- **Availability checks without a debounce:** a 9-character username typed letter by letter is 9 checks per person. At 20 people a second that's **180 requests a second**, nearly double the shared rate limit of 100, before the website's traffic.
+- **With a 300 ms debounce:** people type at roughly 150–250 ms per key, so most bursts collapse into 2–3 checks: about **50 requests a second** at the worst peak. The debounce isn't polish; it's what keeps the feature inside its rate limit.
+- **Other traffic** is one or two requests per step, negligible. The photo is resized on device to about 1,080 px (around 300 KB) before uploading.
+- **Draft on disk:** under 2 KB per person.
+
+</ModelAnswer>
+
+<ModelAnswer section="architecture">
+
+- **On the device:** an `OnboardingFeature` (TCA) presented full screen by the app root whenever there's no session. Each step is a child feature. Dependencies: an `OnboardingClient` (availability, send code, confirm code, password check, create account), a `PhotoUploader` on a background `URLSession`, a `DraftStore`, remote config for the step order, analytics, the clock and UUIDs.
+- **On the server:** the existing endpoints. Account creation re-validates everything (unique username, verification token, password policy). Client-side validation is for speed and feel; the server decides.
+- **The data flow:** a step validates its own input, locally and asynchronously, then sends `delegate(.completed(output))`. The flow merges the output into its `Draft`, saves the draft, works out the next step from the configured order and pushes it. The last step's completion starts account creation with an idempotency key; success sends `delegate(.finished(session))` to the app root, which replaces onboarding with the main app.
+
+</ModelAnswer>
+
+<ModelAnswer section="client">
+
+- **The flow owns the order, the draft and the navigation.** `OnboardingFeature.State` holds `draft: Draft`, `order: [Step]` (from remote config, falling back to a compiled-in default), `path: StackState<Path.State>`, the submission status and an `@Presents` alert.
+- **Steps are children that know nothing about their position.** `Path` is a `@Reducer enum` with `username`, `email`, `code`, `password`, `profile` and `interests`. Each step's state holds its field and its validation status; it's created prefilled from the draft; and it reports only through delegate actions. A step never knows what comes next, which is what makes the order an experiment rather than a refactor.
+- **Stack-based navigation,** because the order is data: the flow builds pushes from `order`, and restoring is building a `StackState` from the draft. Back is the system's pop; the draft keeps what was entered, so a step pushed again is prefilled.
+- **Validation status is an enum keyed by the text it's about:** `idle`, `checking(text)`, `available(text)`, `taken(text, suggestions)`, `invalid(reason)`, `unknown(text)`. *Next* is enabled only when the status is about the current text.
+- **Each step declares only the dependencies it uses** (`@Dependency(\.onboardingClient)`, `\.continuousClock`), so tests override exactly those. The flow is tested non-exhaustively for the wiring; each step exhaustively on its own.
+
+</ModelAnswer>
+
+<ModelAnswer section="api">
+
+```http
+GET  /v1/usernames/{name}/availability
+     → 200 {"available": true}
+     → 200 {"available": false, "suggestions": ["ana_runs", "ana.k"]}
+     → 429 (Retry-After: 2)
+
+POST /v1/email-verifications            {"email": "…"}
+     → 201 {"verificationId": "v_81", "resendAfter": 30, "expiresIn": 600}
+POST /v1/email-verifications/v_81/confirm   {"code": "482913"}
+     → 200 {"emailToken": "…"}
+     → 422 {"error": "wrong_code", "attemptsLeft": 2}
+     → 410 {"error": "expired"}
+
+POST /v1/password-checks                {"sha1Prefix": "21BD1"}
+     → 200 {"suffixes": ["0018A45C4D1DEF81644B54AB7F969B88D65", …]}
+
+POST /v1/accounts                       Idempotency-Key: 6F0C…
+     {"username": "…", "emailToken": "…", "password": "…", "profile": {…}, "interests": […], "photoUploadId": "u_7"}
+     → 201 {"session": {…}}
+     → 409 {"field": "username", "suggestions": […]}
+     → 422 {"errors": [{"field": "password", "code": "too_common"}]}
+```
+
+The password check sends only the first five characters of the password's SHA-1 hash and compares suffixes on the device, so the password never leaves it before account creation. Account creation is idempotent by key: a retry after a timeout can't create two accounts.
+
+</ModelAnswer>
+
+<ModelAnswer section="data">
+
+- **`Draft: Codable`**: a version number, username, email, verification id, profile fields, photo upload id, interests, the furthest completed step, the idempotency key once created, and `updatedAt`. A JSON file in Application Support with file protection; deleted on success; ignored after 24 hours or if its version is unknown.
+- **Never persisted:** the password and the code. The short-lived email token goes in the Keychain, not the draft.
+- **In memory:** the TCA state, including `StackState`, which is rebuilt from the draft on launch rather than saved itself.
+- **Remote config:** the step order, cached with a compiled-in default, and validated (email before code, both before creation) before use. An invalid order falls back to the default and is reported.
+- **Analytics:** `onboarding_step_viewed` and `onboarding_step_completed` with step, position and variant. No usernames or emails.
+
+</ModelAnswer>
+
+<ModelAnswer section="deepdive">
+
+**1. Username availability that can't show a stale answer.**
+
+- `textChanged(text)` normalises (lowercase, trim) and runs local rules first: 3–20 characters, letters, digits and underscores. If they fail, the status becomes `invalid(reason)` and the step returns `.cancel(id: CancelID.availability)`, so no request is made.
+- Otherwise it sets `checking(text)` and returns a `.run` that sleeps 300 ms on the injected clock, calls `availability(text)` and sends `availabilityResponse(text, result)`, marked `.cancellable(id: CancelID.availability, cancelInFlight: true)`. Typing cancels the sleeping check: the debounce *is* the cancellation.
+- The response carries the text it answers, and the reducer ignores it unless it matches the current text: defence in depth on top of cancellation.
+- Tapping a suggestion sets the text and checks immediately, with no sleep.
+- A network error or a 429 sets `unknown(text)` with "We'll check this when you finish", and *Next* stays enabled. A 429 is retried once after its `Retry-After`.
+- At *Create account*, a 409 makes the flow pop back to the username step (`path.pop(from:)` to that element's id, or rebuild the path), prefilled, with the server's suggestions. The user loses nothing else.
+
+**2. The code step's resend countdown.** On appear, the step starts `.run { for await _ in clock.timer(interval: .seconds(1)) { await send(.tick) } }` with an id; at zero it stops and enables *Resend*. Popping the step cancels the timer automatically, because stack elements' effects are cancelled when they leave the stack. The code field uses `.textContentType(.oneTimeCode)`, so AutoFill can offer the code from Mail, and six digits submit automatically.
+
+**3. Resume after termination.** Every step completion saves the draft (an effect). On launch the app root checks for a fresh draft; the flow rebuilds `path` by taking `order` up to the first incomplete step and creating each step's state from the draft. Because navigation is state, restoring is constructing one value. The password isn't saved, so someone resuming after the password step is taken back to it, with a line saying why.
+
+**4. Creating the account exactly once.** The idempotency key comes from the `uuid` dependency when *Create account* is first tapped, and goes into the draft. Timeouts and 5xx responses retry with backoff and the same key, including after a relaunch, so a lost response can't produce a second account.
+
+</ModelAnswer>
+
+<ModelAnswer section="failure">
+
+- **Offline during availability:** `unknown`, continue allowed; the server's check at creation decides.
+- **Rate limited (429):** honour `Retry-After` once, then fall back to `unknown`. The debounce keeps this rare.
+- **Code not arriving:** *Resend* after the countdown; a different email goes back to the email step. Wrong code: show attempts left. Expired (410): offer to resend.
+- **Breach check fails:** warn only if it answered; never block on its absence.
+- **Photo upload fails:** the account is created without it; the upload retries in the background and is attached later.
+- **Create account:** 409 returns to the username step; 422 returns to the field's step with the server's message; timeouts and 5xx retry with the same idempotency key; a relaunch mid-submit retries from the draft.
+- **Security and privacy:** the password and code never reach disk, logs or analytics. Actions that carry them are redacted in debug logging such as `_printChanges()`. The email token sits in the Keychain; the draft file is protected; analytics carry no personal data.
+- **Accessibility:** status changes are announced with `AccessibilityNotification.Announcement` ("Username available"), and errors are text, not just a red border.
+
+</ModelAnswer>
+
+<ModelAnswer section="tradeoffs">
+
+- **TCA over a homemade store or MVVM with a coordinator.** The team already knows it, and this feature is exactly where it pays: debounced validation with cancellation, timers bound to screens, navigation that must be rebuilt from data, and flows that need exhaustive tests. The cost is ceremony across six small features; a step template (state, actions, delegate, view, test) keeps it consistent.
+- **A stack over a tree.** The order is data, so each step can't own "what's next" the way a tree would require. The price is that a stack can hold nonsense, so the flow builds paths only from a validated `order`, and tests cover each variant.
+- **The flow owns the draft, explicitly,** rather than steps writing to an `@Shared(.fileStorage)` value. It's a little more code, and it keeps steps reusable (the same username step can serve "change username" later) and the persistence rule in one place.
+- **Client validation for feel, server validation for truth.** The client can always be wrong about availability; the design makes being wrong cheap (a return to one step) rather than impossible.
+- **Evolution:** social sign-in becomes an alternative first step that fills the draft; the step order could become fully server-driven; at ten times the traffic, the availability check can move to a cached negative list at the edge, which is the server team's concern, and the client's debounce still applies.
+
+</ModelAnswer>
+
+```rubric
+- id: scope
+  label: Pinned down the rules that shape the flow
+  skill: requirements
+  look_for:
+    - Which steps the experiment may reorder, and the constraints on order (email before code, both before creation)
+    - What happens when the username is taken at submit time
+    - How long a half-finished onboarding and a code stay valid
+    - That optional checks must never block progress
+- id: numbers
+  label: Used numbers to justify the debounce
+  skill: estimation
+  look_for:
+    - Peak sign-ups per second, including the campaign spike
+    - Availability checks per user with and without a debounce
+    - A comparison with the shared 100 requests-a-second limit
+- id: tree
+  label: A feature tree with clear ownership
+  skill: client
+  look_for:
+    - Each step a child feature that knows nothing about its position or the next step
+    - The flow owns the draft and the step order; steps report through delegate actions
+    - Navigation as state, with a reasoned choice of stack or tree
+    - Steps declare only the dependencies they use
+- id: validation
+  label: Async validation that can't show a stale answer
+  skill: architecture
+  look_for:
+    - A debounce implemented as a sleep inside a cancellable effect with cancel-in-flight
+    - Responses tagged with the text they answer, ignored when it has changed
+    - Next enabled only for a result about the current text
+    - The server re-checks at creation, with a path back to the right step
+- id: resilience
+  label: Failure, resume and idempotency
+  skill: offline
+  look_for:
+    - A failed or rate-limited check degrades to "unknown" rather than blocking
+    - A draft persisted without the password or code, and a path rebuilt from it on launch
+    - Account creation with a stored idempotency key, retried safely after a timeout or relaunch
+    - Code expiry and resend handled
+- id: tests
+  label: Deterministic tests
+  skill: testing
+  look_for:
+    - A test clock for the debounce and the resend countdown
+    - A stubbed client, with only the endpoints each test expects
+    - Exhaustive tests per step, and non-exhaustive tests for the flow's wiring and each order variant
+    - The uuid dependency, so the idempotency key is predictable
+- id: costs
+  label: Named what the design costs
+  skill: tradeoffs
+  look_for:
+    - The ceremony of TCA across several small features, and how to contain it
+    - What a stack gives up compared with a tree
+    - Why the draft is owned explicitly rather than shared
+```
+
+<Pitfalls>
+
+- Checking availability on every keystroke with no cancellation, so results arrive out of order and the rate limit is exceeded at the first campaign.
+- Steps that push the next step themselves, which makes the remote step order impossible without rewriting them.
+- Saving the password (or the code) in the draft so that resume "just works".
+- Treating a successful availability check as a guarantee, with no plan for a 409 at creation.
+- An `isLoading` flag per step instead of a status that says which text it's about, so a late answer for an old text enables *Next*.
+- A non-idempotent account creation retried after a timeout, creating duplicate accounts.
+
+</Pitfalls>

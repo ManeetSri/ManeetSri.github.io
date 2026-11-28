@@ -1,0 +1,357 @@
+## Why it matters
+
+[Error modelling and typed throws](/design/learn/sd-swift-design-errors) showed what `throws(E)` means and when it pays. Real app code is asynchronous, though: it starts tasks, runs task groups, wraps callback SDKs and stores outcomes for later. Typed errors survive some of those constructs and are erased to `any Error` by others, and the places where that happens decide where a typed error can live in your architecture. Knowing them is the difference between typed throws that helps and typed throws you fight all week.
+
+## Where typed errors belong in an app
+
+A rule of thumb that holds up in most codebases:
+
+- **Infrastructure** (the API client, the database wrapper, a vendor SDK's adapter) throws untyped errors, or its own small error type. It calls Foundation, which throws `any Error`, and its error set changes as the transport does.
+- **Feature boundaries** (repositories, use cases) throw **typed** feature errors, such as `throws(FeedError)`. This is where errors are classified by what callers can do, so a closed, exhaustive set pays off.
+- **Presentation** (view models) catches the typed error, switches over it exhaustively and turns it into view state. Nothing throws past it.
+
+The boundary between the untyped world and the typed one is a `do`/`catch` that maps every error into the feature's type. Because the function promises `throws(FeedError)`, the compiler won't let anything else escape, including errors you forgot about:
+
+```swift check
+import Foundation
+
+struct Post: Decodable, Sendable {
+    let id: Int
+}
+
+enum FeedError: Error {
+    case cancelled
+    case offline
+    case sessionExpired
+    case unavailable
+    case contractBroken
+}
+
+struct RemoteFeed: Sendable {
+    let session: URLSession
+    let url: URL
+
+    func latest() async throws(FeedError) -> [Post] {
+        let data: Data
+        let response: URLResponse
+        do {
+            (data, response) = try await session.data(from: url)
+        } catch let error as URLError {
+            switch error.code {
+            case .cancelled: throw .cancelled
+            case .notConnectedToInternet, .networkConnectionLost: throw .offline
+            default: throw .unavailable
+            }
+        } catch is CancellationError {
+            throw .cancelled
+        } catch {
+            throw .unavailable
+        }
+
+        switch (response as? HTTPURLResponse)?.statusCode ?? 0 {
+        case 200..<300: break
+        case 401: throw .sessionExpired
+        default: throw .unavailable
+        }
+
+        do {
+            return try JSONDecoder().decode([Post].self, from: data)
+        } catch {
+            throw .contractBroken
+        }
+    }
+}
+```
+
+Look at the `.cancelled` case. With untyped `throws`, cancellation would pass straight through as `CancellationError`. A function that throws only `FeedError` can't do that, so **typed throws forces cancellation into your error model**. That's a good thing: every caller now has to decide what cancellation means, and the usual answer, "stop quietly", is written down in a `switch` rather than forgotten.
+
+## Typed errors through async code
+
+Plain `async` functions take typed throws exactly as synchronous ones do: `func latest() async throws(FeedError) -> [Post]`. So do protocol requirements, and the conformance rules are friendly to tests: a function that throws less satisfies a requirement that throws more. A stub that can't fail conforms with no `throws` at all, because a non-throwing function is, in effect, `throws(Never)`.
+
+The constructs that start or join *other* tasks are a different story. As of Swift 6.4, these still erase the error to `any Error`:
+
+| Construct | Error type you get | Why it matters |
+| --- | --- | --- |
+| A direct `try await` call | The callee's typed error | Typed all the way |
+| `do throws(E) { … }` | `E` in the `catch` | Typed, and explicit |
+| A generic function with `throws(E)` | `E`, whatever the caller's is | Typed pass-through |
+| `for try await` over `some AsyncSequence<Element, E>` | `E` | Typed, since Swift 6.0 gave `AsyncSequence` a `Failure` type |
+| `Result<T, E>` and `get()` | `E` | Typed, and storable |
+| `Task { … }` and `task.value` | `any Error`: `Task`'s failure type is `any Error` or `Never` | Erased |
+| `async let` | `any Error` | Erased |
+| `withThrowingTaskGroup` | `any Error` | Erased |
+| `withCheckedThrowingContinuation` | `any Error` | Erased |
+| `AsyncThrowingStream` | `any Error`: its initialisers require it | Erased |
+
+When a typed error has to cross one of the erasing constructs, carry it **as a value**: the task returns a `Result` and never throws, and the caller unwraps it with `get()`, which throws the typed error again.
+
+Here the feed starts loading during launch, before the first screen exists, and the screen awaits it later:
+
+```swift run
+struct Post: Sendable {
+    let id: Int
+}
+
+enum FeedError: Error {
+    case offline
+    case sessionExpired
+}
+
+protocol FeedRepository: Sendable {
+    func latest() async throws(FeedError) -> [Post]
+}
+
+// Not throwing at all still satisfies `throws(FeedError)`: it's `throws(Never)`, a subtype
+struct CannedFeed: FeedRepository {
+    let posts: [Post]
+    func latest() async -> [Post] { posts }
+}
+
+// A stub configured with an outcome: storing one is what Result is for
+struct StubFeed: FeedRepository {
+    let outcome: Result<[Post], FeedError>
+    func latest() async throws(FeedError) -> [Post] { try outcome.get() }
+}
+
+// Starts loading the feed during launch; the first screen awaits it later
+final class FeedPrefetch: Sendable {
+    private let task: Task<Result<[Post], FeedError>, Never>
+
+    init(repository: any FeedRepository) {
+        // A Task can't throw a typed error, so this one never throws: it returns a Result
+        task = Task {
+            do throws(FeedError) {
+                return .success(try await repository.latest())
+            } catch {
+                return .failure(error)
+            }
+        }
+    }
+
+    func posts() async throws(FeedError) -> [Post] {
+        try await task.value.get()     // `get()` rethrows the stored FeedError, still typed
+    }
+}
+
+func headline(_ prefetch: FeedPrefetch) async -> String {
+    do throws(FeedError) {
+        return "\(try await prefetch.posts().count) new posts"
+    } catch {
+        switch error {                 // a FeedError, so no default is needed
+        case .offline: return "Offline: showing saved posts"
+        case .sessionExpired: return "Sign in to see new posts"
+        }
+    }
+}
+
+let repositories: [any FeedRepository] = [
+    CannedFeed(posts: [Post(id: 1), Post(id: 2), Post(id: 3)]),
+    StubFeed(outcome: .failure(.offline)),
+    StubFeed(outcome: .failure(.sessionExpired)),
+]
+for repository in repositories {
+    print(await headline(FeedPrefetch(repository: repository)))
+}
+```
+
+```output
+3 new posts
+Offline: showing saved posts
+Sign in to see new posts
+```
+
+Two details carry the design. The task's type, `Task<Result<[Post], FeedError>, Never>`, says in the signature that it can't fail and what it produces, so nothing is erased. And `posts()` hides the trick: callers see an ordinary `async throws(FeedError)` function.
+
+<Callout kind="gotcha" title="Swift gotcha: write do throws(E) inside closures">
+
+In a function body, a plain `do` usually infers its error type from what the body throws. Inside a closure, such as the one passed to `Task` or `addTask`, it doesn't: the `catch` gets `any Error`, and `return .failure(error)` fails to compile against `Result<[Post], FeedError>`. Writing `do throws(FeedError)` fixes it and makes the intent visible.
+
+</Callout>
+
+## Result's four jobs in app code
+
+`throws` is for control flow: stop here and let the caller handle it. `Result` is for when an outcome has to be **kept**, passed around or counted. In app code that comes up in four places.
+
+1. **Carrying a typed error through an erasing construct,** as in the prefetch above.
+2. **Configuring test doubles.** `StubFeed(outcome: .failure(.offline))` is a complete test double in one line, and the test reads like the scenario it checks.
+3. **Bridging callback APIs.** Many SDKs still deliver `(Result<Value, SDKError>) -> Void`. `withCheckedThrowingContinuation` resumes with it directly (`continuation.resume(with: result)`), though the error comes out as `any Error`, so map it into your feature's type in the adapter.
+4. **Partial failure.** When a batch of independent operations runs, you usually want every outcome, not just the first failure.
+
+The fourth deserves a closer look, because the default tool does the wrong thing. In `withThrowingTaskGroup`, the first child error you `try await` is thrown out of the group, and a group that exits by throwing **cancels the remaining children**. For "charge the card, then create the order", that's what you want. For a photo backup, one oversized photo shouldn't cancel the other forty. Make each child return a `Result` instead:
+
+```swift run
+struct Photo: Sendable {
+    let name: String
+    let megabytes: Int
+}
+
+enum UploadError: Error {
+    case tooLarge(limitMB: Int)
+    case unsupportedFormat
+}
+
+func upload(_ photo: Photo) async throws(UploadError) -> String {
+    if !photo.name.hasSuffix(".heic") && !photo.name.hasSuffix(".jpg") { throw .unsupportedFormat }
+    if photo.megabytes > 25 { throw .tooLarge(limitMB: 25) }
+    return "photos/\(photo.name)"
+}
+
+// Every child returns a Result, so one failure doesn't cancel the other uploads
+func uploadAll(_ photos: [Photo]) async -> [Result<String, UploadError>] {
+    await withTaskGroup(of: (Int, Result<String, UploadError>).self) { group in
+        for (index, photo) in photos.enumerated() {
+            group.addTask {
+                do throws(UploadError) {
+                    return (index, .success(try await upload(photo)))
+                } catch {
+                    return (index, .failure(error))
+                }
+            }
+        }
+        var results = [Result<String, UploadError>?](repeating: nil, count: photos.count)
+        for await (index, result) in group {
+            results[index] = result      // children finish in any order; keep the input's order
+        }
+        return results.compactMap { $0 }
+    }
+}
+
+let photos = [
+    Photo(name: "beach.heic", megabytes: 4),
+    Photo(name: "panorama.heic", megabytes: 60),
+    Photo(name: "scan.tiff", megabytes: 9),
+    Photo(name: "dinner.jpg", megabytes: 3),
+]
+let results = await uploadAll(photos)
+for (photo, result) in zip(photos, results) {
+    switch result {
+    case .success(let path): print("\(photo.name): uploaded to \(path)")
+    case .failure(.tooLarge(let limit)): print("\(photo.name): larger than \(limit) MB")
+    case .failure(.unsupportedFormat): print("\(photo.name): format not supported")
+    }
+}
+let uploaded = results.filter { (try? $0.get()) != nil }.count
+print("\(uploaded) of \(photos.count) uploaded")
+```
+
+```output
+beach.heic: uploaded to photos/beach.heic
+panorama.heic: larger than 25 MB
+scan.tiff: format not supported
+dinner.jpg: uploaded to photos/dinner.jpg
+2 of 4 uploaded
+```
+
+The group itself is non-throwing (`withTaskGroup`), each failure stays typed, and the screen can say exactly what happened: "2 of 4 uploaded. 1 photo is too large; 1 isn't a supported format." That's a far better message than the first error that happened to arrive.
+
+### The small API worth knowing
+
+- `Result { try something() }` (`init(catching:)`) captures a throwing call, and with typed throws its failure type is the closure's error type.
+- `get()` turns a `Result` back into a throwing call, typed.
+- `map` transforms the success; `mapError` translates the failure, which is a neat way to cross a layer: `result.mapError(FeedError.init)`.
+- `flatMap` chains a second step that can fail with the same error type.
+
+Don't put a `Result` in view state. As [view-state enums](/design/learn/sd-state-view-state) argued, the screen wants a presentable state (`.failed(message:)`), not a raw outcome it has to interpret in the view.
+
+## Trade-offs
+
+| Where | Style | Why | What it costs |
+| --- | --- | --- | --- |
+| API client, persistence, SDK adapters | Untyped `throws`, or a small infrastructure error | Built on Foundation's untyped errors; the set changes with the transport | Callers must map at the feature boundary |
+| Repositories and use cases | `throws(FeatureError)` | Exhaustive handling where errors are classified; tests pin every case | Every new case breaks callers' switches, which is usually the point |
+| Work that crosses `Task`, `async let` or task groups | Children return `Result<T, E>`; the caller calls `get()` | Keeps the error typed through erasure; enables partial failure | A little ceremony at the boundary |
+| View models | Catch, switch, produce view state | Nothing throws past presentation | None: this is where errors end |
+| Public modules other teams depend on | Untyped `throws` with a documented error type | Adding a case doesn't break every client | No exhaustive checking for clients |
+
+<Callout kind="interview">
+
+**Say:** "Repositories throw typed feature errors, so view models handle every case exhaustively, including cancellation. Infrastructure stays untyped, and the repository maps at the boundary. Where work crosses a `Task` or a task group, which erase typed errors, children return a `Result`, which also gives us partial failure for batch work."
+
+**Ask:** should one failure cancel the rest of the batch, or should every item report its own outcome? Which errors does the caller actually branch on?
+
+**Red flags:** typed throws on every function, including the networking layer, so every new `URLError` case means a refactor; `Result` used everywhere instead of `throws`, so code nests `switch` statements for no gain; and a throwing task group for independent work, which cancels thirty uploads because one failed.
+
+</Callout>
+
+## Practice
+
+The **error ladder** kata asks you to wrap a typed-throwing transport call in a function that throws the feature's typed error, then map that error to what the screen shows.
+
+```cards
+- id: typed-where
+  front: "In an app's layers, where do typed throws usually pay off?"
+  back: "At feature boundaries: repositories and use cases throw a typed feature error that view models switch over exhaustively. Infrastructure stays untyped and is mapped at that boundary."
+- id: typed-erased
+  front: "Which concurrency constructs erase a typed error to `any Error`?"
+  back: "`Task` (and its `value`), `async let`, `withThrowingTaskGroup`, `withCheckedThrowingContinuation` and `AsyncThrowingStream`. Carry the error through them as a `Result` and call `get()`."
+- id: throwing-group-cancels
+  front: "What happens to the other children when one child of a throwing task group fails?"
+  back: "If the error propagates out of the group, the remaining children are cancelled. For independent work, return a `Result` from each child in a non-throwing `withTaskGroup`."
+- id: typed-cancellation
+  front: "Why does typed throws force you to model cancellation?"
+  back: "A function that throws only `FeedError` can't let `CancellationError` escape, so the error type needs a `.cancelled` case, and every caller decides what it means (usually: stop quietly)."
+```
+
+```quiz
+- id: q1
+  type: mcq
+  prompt: "`func load() async throws(LoadError) -> Feed`. What's the type of `let task = Task { try await load() }`?"
+  options:
+    - "`Task<Feed, LoadError>`"
+    - "`Task<Feed, any Error>`"
+    - "`Task<Result<Feed, LoadError>, Never>`"
+    - "`Task<Feed, Never>`"
+  answer: 1
+  explain: "A `Task`'s failure type is either `any Error` or `Never`, so a throwing closure gives `Task<Feed, any Error>`, and `task.value` throws `any Error`. To keep the typed error, make the closure return `Result<Feed, LoadError>`."
+- id: q2
+  type: multi
+  prompt: "Inside `do { … } catch { … }`, which of these give a `catch` whose `error` is still `LoadError`? Choose all that apply."
+  options:
+    - "`try await load()` called directly"
+    - "`async let feed = load()`, then `try await feed`"
+    - "`try await someTask.value.get()` where `someTask` is a `Task<Result<Feed, LoadError>, Never>`"
+    - "`for try await item in stream`, where `stream` is `some AsyncSequence<Item, LoadError>`"
+    - "`try await withThrowingTaskGroup(of: Feed.self) { … }`"
+  answer: [0, 2, 3]
+  explain: "Direct calls, `Result.get()` and typed async sequences keep the error typed. `async let` and throwing task groups erase it to `any Error`."
+- id: q3
+  type: mcq
+  prompt: "A backup feature uploads 40 photos in a `withThrowingTaskGroup` and iterates with `for try await`. Photo 3 is too large. What happens?"
+  options:
+    - "Photo 3 fails; the other 39 carry on"
+    - "The error propagates out of the group, which cancels the uploads still running"
+    - "The group waits for all 40, then throws the first error"
+    - "It doesn't compile"
+  answer: 1
+  explain: "The first error thrown out of the group's body ends it, and a group that exits by throwing cancels its remaining children. For independent work, have each child return a `Result` in a non-throwing group."
+- id: q4
+  type: truefalse
+  prompt: "A test stub whose `latest()` doesn't throw at all can conform to a protocol requiring `func latest() async throws(FeedError) -> [Post]`."
+  answer: true
+  explain: "A non-throwing function is, in effect, `throws(Never)`, and a function that throws less can satisfy a requirement that throws more."
+- id: q5
+  type: output
+  prompt: "What does this print?"
+  code: |
+    enum CheckError: Error { case tooShort, banned }
+
+    func check(_ name: String) throws(CheckError) -> String {
+        if name.count < 3 { throw .tooShort }
+        if name == "admin" { throw .banned }
+        return name.lowercased()
+    }
+
+    let outcomes = ["Al", "Maneet", "admin"].map { name in
+        Result { () throws(CheckError) -> String in try check(name) }
+    }
+    for outcome in outcomes {
+        switch outcome {
+        case .success(let name): print("ok \(name)")
+        case .failure(.tooShort): print("too short")
+        case .failure(.banned): print("banned")
+        }
+    }
+  answer: "too short\nok maneet\nbanned"
+  explain: "`Result(catching:)` keeps the closure's typed error, so each outcome is a `Result<String, CheckError>` and the switch over its failure cases is exhaustive."
+```

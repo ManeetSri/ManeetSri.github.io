@@ -1,0 +1,172 @@
+A shop's catalogue screen loads products a page at a time: the first page on appear, the next when the last row scrolls into view, and a fresh first page on pull to refresh. Each of those can fail on its own, and they can overlap. Write the view model, with a view state that tells the screen exactly what to draw: the first load, the empty and failed screens, a footer for the next page, and a refresh that never blanks the rows.
+
+`PagedCatalogScreen.ViewModel`: `state: ViewState`, `load() async`, `loadMore() async` and `refresh() async`
+
+The view model is `@MainActor @Observable` and fetches pages through `CatalogLoading.page(after:)`: `nil` asks for the first page, and each page returns the cursor for the next one, or `nil` on the last.
+
+- **First load.** `load()` from `.idle` or `.failed` shows `.loading` and asks for the first page. A page with products shows `.loaded` with footer `.more` (there's a next cursor) or `.end` (there isn't). A page with no products shows `.empty`. A failure shows `.failed(message:)`. In any other state, `load()` does nothing.
+- **Next page.** `loadMore()` works only while loaded, not refreshing, with footer `.more` or `.failed`. It sets the footer to `.loadingMore` and asks for the page after the current cursor. On success it **appends** the products, skipping any whose id is already in the list (servers shift pages when items are added), and sets the footer from the new cursor. On failure it keeps every row and sets the footer to `.failed(message:)`; calling `loadMore()` again retries the same cursor.
+- **Refresh.** `refresh()` while loaded sets `isRefreshing`, clears any `banner`, keeps the rows, and asks for the first page. On success the new page **replaces** the rows and paging starts again from its cursor; if it has no products, the state becomes `.empty`. On failure the rows stay, `isRefreshing` goes back to false and `banner` says why. Refreshing while already refreshing does nothing. From `.empty` or `.failed`, `refresh()` behaves like a first load.
+- **Overlap.** A refresh may start while a page is loading. That page belongs to the list being replaced: the footer goes back to `.more` at once, and the page is **ignored** when it arrives. `loadMore()` during a refresh does nothing.
+- **Messages.** `URLError(.notConnectedToInternet)` shows `offlineMessage`; every other failure shows `failureMessage`.
+- **Cancellation isn't failure.** A cancelled first load goes back to `.idle`. A cancelled page sets the footer back to `.more`. A cancelled refresh stops refreshing without a banner. (`CancellationError` or `URLError(.cancelled)`.)
+
+## Examples
+
+Pages are written as the product ids they hold and their next cursor.
+
+| Calls and answers, in order | `state` afterwards |
+| --- | --- |
+| `load()`, then 1–3 with cursor `p2` | `.loaded`: 1–3, footer `.more` |
+| … `loadMore()` (in flight) | 1–3, footer `.loadingMore`; the request was for `p2` |
+| … 4–6 with no cursor | 1–6, footer `.end` |
+| `load()`, then nothing, no cursor | `.empty` |
+| `load()`, then offline | `.failed(message: "You're offline.")` |
+| loaded 1–3, `loadMore()`, then a timeout | 1–3, footer `.failed(message: "Couldn't load products.")` |
+| loaded 1–3, `loadMore()`, then 3–5 | 1–5: product 3 isn't added twice |
+| loaded 1–3, `refresh()` (in flight) | 1–3, footer `.more`, refreshing |
+| … 10–11 with cursor `q2` | 10–11, footer `.more`; the next `loadMore()` asks for `q2` |
+| loaded 1–3, `refresh()`, then offline | 1–3, footer `.more`, banner `"You're offline."` |
+| loaded 1–3, `loadMore()`, `refresh()`, then 4–6 for `p2` | 1–3, still refreshing: the page was for the old list |
+
+## Constraints
+
+- The view state is what the screen draws. The cursor is the view model's bookkeeping: keep it private.
+- The tests hold every request open and answer them in the order they choose, including out of order, then compare whole `ViewState` values.
+- Foundation and Observation only.
+
+<Hints>
+<Hint>
+Guard each method on the current state first: `guard case .loaded(var loaded) = state, !loaded.isRefreshing else { return }`. Most of the rules are about which calls are allowed when.
+</Hint>
+<Hint>
+For stale pages, keep a private `generation` counter. A first load and a refresh bump it; every request remembers the value it started with, and after the `await`, an answer whose generation no longer matches changes nothing.
+</Hint>
+<Hint>
+After the `await`, read `state` again rather than reusing the copy you made before it. The world may have moved on while you were suspended.
+</Hint>
+<Hint>
+`var seen = Set(existing.map(\.id))` and `seen.insert(product.id).inserted` skip duplicates while keeping the order.
+</Hint>
+</Hints>
+
+## Solutions
+
+<Approach title="Guarded transitions, private bookkeeping and a generation per list" time="O(rows + page) per page" space="O(rows)">
+
+```swift
+@MainActor
+@Observable
+public final class ViewModel {
+    public private(set) var state: ViewState = .idle
+
+    private let catalog: any CatalogLoading
+    private var nextCursor: String?
+    private var generation = 0
+
+    public init(catalog: any CatalogLoading) {
+        self.catalog = catalog
+    }
+
+    public func load() async {
+        switch state {
+        case .idle, .failed: await loadFirstPage()
+        case .loading, .empty, .loaded: return
+        }
+    }
+
+    public func loadMore() async {
+        guard case .loaded(var loaded) = state, !loaded.isRefreshing, let cursor = nextCursor else { return }
+        switch loaded.footer {
+        case .more, .failed: break
+        case .loadingMore, .end: return
+        }
+        loaded.footer = .loadingMore
+        state = .loaded(loaded)
+        let started = generation
+
+        do {
+            let page = try await catalog.page(after: cursor)
+            guard started == generation, case .loaded(var latest) = state else { return }
+            var seen = Set(latest.products.map(\.id))
+            for product in page.products where seen.insert(product.id).inserted {
+                latest.products.append(product)
+            }
+            nextCursor = page.nextCursor
+            latest.footer = page.nextCursor == nil ? .end : .more
+            state = .loaded(latest)
+        } catch {
+            guard started == generation, case .loaded(var latest) = state else { return }
+            latest.footer = PagedCatalogScreen.message(for: error).map { .failed(message: $0) } ?? .more
+            state = .loaded(latest)
+        }
+    }
+
+    public func refresh() async {
+        switch state {
+        case .loaded(var loaded):
+            guard !loaded.isRefreshing else { return }
+            loaded.isRefreshing = true
+            loaded.banner = nil
+            if loaded.footer == .loadingMore { loaded.footer = .more }
+            state = .loaded(loaded)
+            generation += 1
+            let started = generation
+
+            do {
+                let page = try await catalog.page(after: nil)
+                guard started == generation else { return }
+                show(firstPage: page)
+            } catch {
+                guard started == generation, case .loaded(var latest) = state else { return }
+                latest.isRefreshing = false
+                latest.banner = PagedCatalogScreen.message(for: error)
+                state = .loaded(latest)
+            }
+        case .empty, .failed:
+            await loadFirstPage()
+        case .idle, .loading:
+            return
+        }
+    }
+
+    private func loadFirstPage() async {
+        state = .loading
+        generation += 1
+        let started = generation
+        do {
+            let page = try await catalog.page(after: nil)
+            guard started == generation else { return }
+            show(firstPage: page)
+        } catch {
+            guard started == generation else { return }
+            state = PagedCatalogScreen.message(for: error).map { .failed(message: $0) } ?? .idle
+        }
+    }
+
+    private func show(firstPage page: Page) {
+        var seen = Set<Int>()
+        let products = page.products.filter { seen.insert($0.id).inserted }
+        nextCursor = page.nextCursor
+        state = products.isEmpty ? .empty : .loaded(Loaded(products: products, footer: page.nextCursor == nil ? .end : .more))
+    }
+}
+
+static func message(for error: any Error) -> String? {
+    if error is CancellationError { return nil }
+    guard let error = error as? URLError else { return failureMessage }
+    switch error.code {
+    case .cancelled: return nil
+    case .notConnectedToInternet: return offlineMessage
+    default: return failureMessage
+    }
+}
+```
+
+The shape of `ViewState` does a lot of the work. Rows, footer, refreshing and banner only exist inside `.loaded`, so a spinner over an empty screen or a footer under an error can't be written down. The footer is its own little state machine (more, loading more, failed, end), so a failure at the bottom of the list never touches the rows above it.
+
+The `generation` is the part most solutions miss. A main-actor view model doesn't block while it waits: the user can pull to refresh while page 2 is on its way. Without the check, page 2 of the **old** list would be appended to page 1 of the **new** one, a bug that only shows on slow networks and is miserable to reproduce. Cancelling the old task works too, if the view model keeps a handle to it; the counter is simpler to get right, and it covers loaders that ignore cancellation.
+
+Keeping the cursor out of `ViewState` is a choice, not a rule. A pure reducer (as in D19's reading list kata) has nowhere else to keep it, so it goes in the state. A view model has private storage, and the view never draws a cursor, so leaving it out keeps the tests' expected states about what users see.
+
+</Approach>

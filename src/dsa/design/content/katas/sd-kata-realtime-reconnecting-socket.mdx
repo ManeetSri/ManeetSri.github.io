@@ -1,0 +1,118 @@
+A live connection on a phone dies many times a day, often without a word. Build the client that keeps one alive: it connects over an injected transport, resubscribes after every reconnect, pings when the connection is due a heartbeat, replaces connections that go quiet, and backs off between failures without hammering a server that keeps accepting and dropping it.
+
+`RealtimeReconnectingSocket.Client(transport:clock:policy:onEvent:)`, an actor with `start()`, `stop()`, `subscribe(_:)`, `unsubscribe(_:)` and `state`.
+
+- **`start()`** connects. Calling it again, or after `stop()`, does nothing.
+- **On every new connection**, set `state` to `.connected` and send `.subscribe(topic)` for every current topic, in the order they were first added.
+- **`subscribe` and `unsubscribe`** update the topic list at any time (subscribing twice to a topic does nothing; unsubscribing from an unknown one does nothing). While connected, also send the frame at once.
+- **Events:** call `onEvent(topic, body)` for every `.event` frame received.
+- **Heartbeat:** while connected, wait `pingInterval`, send `.ping`, then wait `pongTimeout`. If no frame of any kind arrived since the ping, the connection is dead: close it. Otherwise, start the next cycle.
+- **Failures:** when `connect()` throws, `receive()` throws, or the heartbeat declares the connection dead, close it (if open), set `state` to `.waiting(retry: n, delay: d)`, sleep `d` on the clock, then connect again with `state` `.connecting`.
+- **Backoff:** `n` counts failures in a row from 0, and `d` is `policy.jitter(min(cap, base × 2ⁿ))`. A connection that **delivered at least one frame** was healthy: the next failure after it starts a fresh row at `n = 0`. A connection that opened and died without delivering anything is just another failure in the row.
+- **`stop()`** closes the open connection, cancels any wait, sets `state` to `.stopped`, and nothing reconnects afterwards.
+
+## Examples
+
+| Situation (base 1 s, cap 4 s) | What the client does |
+| --- | --- |
+| `subscribe("match:1")`, `subscribe("match:2")`, then `start()` | Connects once and sends `.subscribe("match:1")`, `.subscribe("match:2")` |
+| Connected, then `subscribe("match:3")` | Sends `.subscribe("match:3")` at once, and again after every reconnect |
+| `connect()` fails four times, then succeeds | `.waiting(retry: 0, delay: 1 s)`, `retry: 1, 2 s`, `retry: 2, 4 s`, `retry: 3, 4 s`, then `.connected` |
+| A connection opens after one failure, then drops before delivering anything | `.waiting(retry: 1, delay: 2 s)`: the row continues |
+| A connection delivers an event, then drops | `.waiting(retry: 0, delay: 1 s)`: a fresh row |
+| Connected with `pingInterval` 25 s, `pongTimeout` 10 s | Pings at 25 s; a pong keeps it; the next ping is 35 s later; a ping with no reply closes it 10 s after |
+| `stop()` while connected or waiting | Closes the connection or cancels the wait; `.stopped`; no more attempts |
+
+## Constraints
+
+- Wait only on the injected clock (`clock.sleep(for:)`), never `Task.sleep`: the tests drive a `TestClock` by hand.
+- A pending `receive()` does **not** return when its task is cancelled, just like `URLSessionWebSocketTask.receive()`. Closing the connection is what ends it.
+- Hold at most one connection at a time.
+- Swift 6 mode: the client is an actor, and everything it shares must be `Sendable`.
+
+<Hints>
+<Hint>
+Let one task own the connection's whole life: a loop of connect, serve, wait. Keep the retry count as a local variable of that loop, and start the task in `start()`.
+</Hint>
+<Hint>
+Serving a connection is two jobs racing: a receive loop and the heartbeat. In `withTaskGroup`, take whichever finishes first, cancel the group, and close the connection, so a receive that ignores cancellation still ends.
+</Hint>
+<Hint>
+Keep a counter of frames heard. The heartbeat reads it before sending the ping and again after `pongTimeout`; if it hasn't moved, the connection is dead. The receive loop can return whether it heard anything, which is your "healthy" flag.
+</Hint>
+<Hint>
+After every `await` in the loop, check `Task.isCancelled` before touching `state`, so a `stop()` that arrives during a connect or a wait isn't overwritten by `.connected` or `.waiting`.
+</Hint>
+</Hints>
+
+## Solutions
+
+<Approach title="One owning task: connect, race receive against heartbeat, back off" time="O(topics) per connect" space="O(topics)">
+
+```swift
+private func run() async {
+    var retry = 0
+    while !Task.isCancelled {
+        state = .connecting
+        var healthy = false
+        if let opened = try? await transport.connect() {
+            if Task.isCancelled {
+                await opened.close()
+                return
+            }
+            connection = opened
+            framesHeard = 0
+            state = .connected
+            for topic in topics {
+                try? await opened.send(.subscribe(topic))
+            }
+            healthy = await serve(opened)
+            connection = nil
+            await opened.close()
+        }
+        if Task.isCancelled { return }
+        if healthy { retry = 0 }
+        let delay = policy.delay(retry: retry)
+        state = .waiting(retry: retry, delay: delay)
+        do {
+            try await clock.sleep(for: delay)
+        } catch {
+            return
+        }
+        retry += 1
+    }
+}
+
+/// Runs until the connection drops or stops answering; returns whether it delivered any frame
+private func serve(_ connection: any Connection) async -> Bool {
+    await withTaskGroup(of: Bool.self) { group in
+        group.addTask { await self.receiveLoop(connection) }
+        group.addTask { await self.heartbeat(connection) }
+        var healthy = false
+        if let first = await group.next() { healthy = healthy || first }
+        group.cancelAll()
+        await connection.close()
+        for await result in group { healthy = healthy || result }
+        return healthy
+    }
+}
+
+private func heartbeat(_ connection: any Connection) async -> Bool {
+    do {
+        while true {
+            try await clock.sleep(for: policy.pingInterval)
+            let before = framesHeard
+            try await connection.send(.ping)
+            try await clock.sleep(for: policy.pongTimeout)
+            if framesHeard == before { break }
+        }
+    } catch {}
+    return false
+}
+```
+
+`stop()` sets `.stopped`, cancels the owning task (which cancels the heartbeat's sleep or the backoff's) and closes the open connection (which ends the pending receive). Because the loop checks for cancellation after every suspension, nothing it does afterwards can resurrect the connection.
+
+Resetting on "delivered a frame" rather than on "connected" is what stops a server that accepts and immediately closes connections from being hit at the base rate forever. A stricter rule resets only after the connection has stayed up for some time, at the cost of another timer. In production, `jitter` would be full jitter from a random number generator, and the client would also refuse to reconnect after an authentication failure until the token is refreshed; both are small additions to this loop.
+
+</Approach>

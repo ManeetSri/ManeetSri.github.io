@@ -1,0 +1,363 @@
+## Why it matters
+
+Many live features only need the server to talk: scores, prices, delivery updates, notifications, build logs, and the token-by-token answer of a chat assistant. **Server-Sent Events** (SSE) do exactly that over one ordinary HTTP response that never quite finishes. They pass through proxies, CDNs and HTTP/2 like any other request, they have resumption built into the format, and they're the reason most AI chat APIs stream the way they do. iOS has no built-in SSE client, so knowing the format well enough to write one is a practical skill as well as an interview one.
+
+## One response that keeps going
+
+The client makes a normal `GET` with `Accept: text/event-stream`. The server answers `200` with `Content-Type: text/event-stream`, and then, instead of finishing, keeps writing **events** into the body for as long as the connection lasts:
+
+```http
+GET /matches/841/live HTTP/1.1
+Accept: text/event-stream
+
+HTTP/1.1 200 OK
+Content-Type: text/event-stream
+Cache-Control: no-store
+
+retry: 5000
+: keep-alive
+
+event: score
+id: 41
+data: {"home": 1, "away": 0}
+
+data: Half time.
+data: Back in 15 minutes.
+
+```
+
+The format is deliberately tiny. Each line is a `field: value` pair, and a **blank line ends an event**:
+
+| Line | Meaning |
+| --- | --- |
+| `data: …` | The event's payload. Several `data` lines in one event are joined with newlines. |
+| `event: …` | The event's type; `message` if there's none. |
+| `id: …` | An id for resuming. It sticks: later events without an `id` keep the last one. |
+| `retry: …` | How many milliseconds to wait before reconnecting. |
+| `: …` | A comment, ignored. Servers send one every 15–30 seconds as a heartbeat. |
+
+Unknown fields are ignored, so the format can grow without breaking old clients. Everything is UTF-8 text; binary data has to be encoded (Base64, or a URL to fetch).
+
+## Resumption is built in
+
+The `id` field is what makes SSE more than "a slow download". When the connection drops, the client reconnects with the last id it saw in a `Last-Event-ID` header, and a server that keeps recent events replays everything after it. A browser's `EventSource` does this automatically, waiting the `retry` delay first. On iOS you write that loop yourself.
+
+```visual timeline
+title: An SSE stream drops in a tunnel and resumes
+unit: s
+lanes:
+  - { id: server, label: Server }
+  - { id: conn, label: Connection }
+  - { id: app, label: App }
+spans:
+  - { lane: conn, from: 0, to: 9, label: stream 1, tone: ok }
+  - { lane: server, from: 2, to: 2.5, label: id 41, tone: active }
+  - { lane: app, from: 2.2, to: 3, label: "1–0" }
+  - { lane: server, from: 5.5, to: 6, label: heartbeat }
+  - { lane: conn, from: 9, to: 12, label: lost, tone: error }
+  - { lane: server, from: 10, to: 10.5, label: id 42, tone: active }
+  - { lane: conn, from: 12, to: 14, label: retry wait, tone: wait }
+  - { lane: conn, from: 14, to: 20, label: "stream 2 · Last-Event-ID: 41", tone: ok }
+  - { lane: server, from: 14.2, to: 14.7, label: replay 42, tone: active }
+  - { lane: app, from: 14.5, to: 15.3, label: "2–0" }
+markers:
+  - { at: 9, label: tunnel }
+steps:
+  - { at: 0, say: "The app opens the stream. It's an ordinary `GET`, so it goes through the same proxies, load balancers and HTTP/2 connection as every other request." }
+  - { at: 2.5, say: "Event **41** arrives with the first goal. The app remembers its id." }
+  - { at: 6, say: "Nothing to report for a while, so the server writes a comment line. It keeps every idle timeout on the path from closing a healthy stream." }
+  - { at: 10.5, say: "The train enters a tunnel. Event **42** is written on the server, but never reaches the phone." }
+  - { at: 12, say: "The app notices the stream has ended and waits the `retry` delay, plus jitter, before reconnecting." }
+  - { at: 15, say: "It reconnects with `Last-Event-ID: 41`. The server replays **42**, and the score is right without a separate catch-up request." }
+```
+
+Replay needs the server to keep a short history per stream: the last few minutes of events in Redis or a log, keyed so that "everything after 41" is a cheap lookup. If the client is too far behind (its id has aged out), the server should say so, for example with a `reset` event, and the app fetches a fresh snapshot over the normal API. You'll design that handshake properly in the ordering lesson later in this module.
+
+A server can also tell a client to stop reconnecting. The SSE standard says `204 No Content` means "don't reconnect", which is a sensible convention for your own client too: the user signed out, or the match is over.
+
+## SSE on iOS
+
+`URLSession.bytes(for:)` (iOS 15 and later) gives you the body as an `AsyncSequence` of bytes as they arrive, which is everything an SSE client needs. The parser is a small state machine: collect bytes into a line, act on each line, and dispatch an event at each blank line.
+
+```swift run title="EventStream.swift"
+import Foundation
+
+struct ServerEvent: Equatable, Sendable {
+    var type = "message"
+    var data = ""
+    var id: String?
+}
+
+/// Turns the bytes of a text/event-stream into events, as they arrive
+struct EventStreamParser {
+    /// The id to send back as Last-Event-ID when reconnecting
+    private(set) var lastEventID: String?
+    /// How long the server asked clients to wait before reconnecting
+    private(set) var retry: Duration?
+    private var line: [UInt8] = []
+    private var afterCarriageReturn = false
+    private var type = ""
+    private var dataLines: [String] = []
+
+    mutating func feed(_ byte: UInt8) -> ServerEvent? {
+        // A line ends at \n, \r or \r\n; count \r\n once
+        if byte == UInt8(ascii: "\n"), afterCarriageReturn {
+            afterCarriageReturn = false
+            return nil
+        }
+        afterCarriageReturn = byte == UInt8(ascii: "\r")
+        guard byte == UInt8(ascii: "\n") || byte == UInt8(ascii: "\r") else {
+            line.append(byte)
+            return nil
+        }
+        defer { line.removeAll(keepingCapacity: true) }
+        return process(String(decoding: line, as: UTF8.self))
+    }
+
+    private mutating func process(_ line: String) -> ServerEvent? {
+        if line.isEmpty { return dispatch() }     // a blank line ends the event
+        if line.hasPrefix(":") { return nil }     // a comment, usually a heartbeat
+        var field = Substring(line)
+        var value: Substring = ""
+        if let colon = line.firstIndex(of: ":") {
+            field = line[..<colon]
+            value = line[line.index(after: colon)...]
+            if value.hasPrefix(" ") { value = value.dropFirst() }
+        }
+        switch field {
+        case "event": type = String(value)
+        case "data": dataLines.append(String(value))
+        case "id": lastEventID = String(value)
+        case "retry": if let milliseconds = Int(value) { retry = .milliseconds(milliseconds) }
+        default: break                            // unknown fields are ignored, so the format can grow
+        }
+        return nil
+    }
+
+    private mutating func dispatch() -> ServerEvent? {
+        defer {
+            type = ""
+            dataLines = []
+        }
+        guard !dataLines.isEmpty else { return nil }
+        return ServerEvent(type: type.isEmpty ? "message" : type, data: dataLines.joined(separator: "\n"), id: lastEventID)
+    }
+}
+
+/// Streams events from an endpoint. To resume after a drop, call it again with the last event's id.
+func events(from url: URL, lastEventID: String?, session: URLSession = .shared) -> AsyncThrowingStream<ServerEvent, any Error> {
+    AsyncThrowingStream { continuation in
+        let task = Task {
+            var request = URLRequest(url: url)
+            request.setValue("text/event-stream", forHTTPHeaderField: "Accept")
+            if let lastEventID { request.setValue(lastEventID, forHTTPHeaderField: "Last-Event-ID") }
+            do {
+                let (bytes, response) = try await session.bytes(for: request)
+                guard (response as? HTTPURLResponse)?.statusCode == 200 else { throw URLError(.badServerResponse) }
+                var parser = EventStreamParser()
+                // Byte by byte, not bytes.lines: lines skips empty lines, and they're what end an event
+                for try await byte in bytes {
+                    if let event = parser.feed(byte) { continuation.yield(event) }
+                }
+                continuation.finish()
+            } catch {
+                continuation.finish(throwing: error)
+            }
+        }
+        continuation.onTermination = { _ in task.cancel() }
+    }
+}
+
+// What a live-score endpoint might send: a heartbeat, two scores and a two-line message
+let stream = """
+retry: 5000
+: keep-alive
+
+event: score
+id: 41
+data: {"home": 1, "away": 0}
+
+data: Half time.
+data: Back in 15 minutes.
+
+event: score
+id: 42
+data: {"home": 2, "away": 0}
+
+
+"""
+var parser = EventStreamParser()
+for byte in stream.utf8 {
+    if let event = parser.feed(byte) {
+        print("[\(event.type) · id \(event.id ?? "none")] \(event.data)")
+    }
+}
+print("Reconnect with Last-Event-ID \(parser.lastEventID ?? "none"), after \(parser.retry ?? .seconds(3))")
+```
+
+```output
+[score · id 41] {"home": 1, "away": 0}
+[message · id 41] Half time.
+Back in 15 minutes.
+[score · id 42] {"home": 2, "away": 0}
+Reconnect with Last-Event-ID 42, after 5.0 seconds
+```
+
+Notice the second event: it has no `id` line, yet it reports 41. That's the standard's rule, and it's why resuming from "the last id" works even when the server only numbers some events.
+
+Around `events(from:lastEventID:)` sits the reconnect loop you'll build in the reconnection lesson: when the stream ends or throws, wait the `retry` delay with jitter, then call it again with the last id. Cancelling the consuming task cancels the `Task` inside, which cancels the URLSession request, so a view's `.task` cleans the stream up when the screen goes away.
+
+<Callout kind="gotcha" title="iOS gotcha: bytes.lines skips blank lines">
+
+`URLSession.AsyncBytes` has a tempting `lines` property, but the `AsyncLineSequence` behind it doesn't emit empty lines, and in SSE the empty line is what ends an event. A parser built on `lines` never knows where one event stops and the next begins, and merges them. Iterate the bytes and split lines yourself, as above.
+
+</Callout>
+
+## What SSE needs from the network
+
+A stream that never finishes upsets anything that expects HTTP responses to be short:
+
+- **Buffering.** Proxies and some servers buffer responses before sending them on, so events arrive in clumps or not at all. Turn buffering off for event streams: nginx honours an `X-Accel-Buffering: no` response header, and compression middleware must flush after every event.
+- **Idle timeouts.** URLSession gives up on a task that receives nothing for `timeoutIntervalForRequest` (60 seconds by default); load balancers and proxies often close idle connections after 60 seconds too. The heartbeat comment keeps all of them happy. Send one every 15–30 seconds.
+- **Connections.** Over HTTP/1.1 each stream occupies a whole TCP connection, and URLSession allows only `httpMaximumConnectionsPerHost` (6 by default) per host, so two streams plus image downloads can queue requests behind each other. Over HTTP/2 and HTTP/3 a stream is one of many multiplexed on a single connection, which is where SSE is at its best.
+- **Caching.** Mark the response `Cache-Control: no-store`, so no cache along the way tries to store an endless body.
+
+On the server, an idle SSE client is one open response. Event-driven servers hold tens or hundreds of thousands of them per machine. The work is in **fan-out**: when one score changes, every server holding a stream for that match must hear about it, usually through a pub/sub layer such as Redis or NATS behind the HTTP tier. You'll build that in the live-scores exercise for this module.
+
+## Streaming responses beyond SSE
+
+SSE is one of a family of "the response arrives in pieces" designs:
+
+- **AI chat responses.** OpenAI's and Anthropic's APIs both stream generated text as SSE events, a few tokens per event, so the app can render the answer as it's written. Each event is a typed JSON delta; the app appends deltas to the message it shows.
+- **NDJSON** (newline-delimited JSON): one JSON object per line over a chunked response. Simpler than SSE, but with no ids, no resumption and no standard for heartbeats.
+- **gRPC server streaming**: typed protobuf messages over HTTP/2. Strong contracts and efficient encoding, at the cost of a gRPC stack in the app (you met it in [serialisation formats and gRPC](/design/learn/sd-api-serialisation)).
+- **GraphQL subscriptions**, which run over a WebSocket or SSE transport underneath.
+
+### Streaming a chat answer into SwiftUI
+
+The client side of a streamed answer is a loop that appends as events arrive. Keep the parsing off the main actor and hop only to update the text:
+
+```swift check ios title="AnswerModel.swift"
+import SwiftUI
+
+@MainActor @Observable
+final class AnswerModel {
+    private(set) var text = ""
+    private(set) var isStreaming = false
+
+    /// `deltas` yields text fragments decoded from the stream's events, off the main actor
+    func show(_ deltas: some AsyncSequence<String, any Error> & Sendable) async {
+        isStreaming = true
+        defer { isStreaming = false }
+        do {
+            for try await delta in deltas {
+                text += delta
+            }
+        } catch {
+            text += "\n\nThe answer was interrupted. Try again."
+        }
+    }
+}
+```
+
+Appending on every event is fine for a few dozen events a second. If a server sends hundreds, coalesce them (collect deltas for 50 ms, then append once) so SwiftUI isn't re-rendering a long `Text` on every token, using the throttling you met in [debounce, throttle and coalesce](/design/learn/sd-resilience-debounce-throttle).
+
+## Trade-offs
+
+| | Long polling | SSE | WebSocket |
+| --- | --- | --- | --- |
+| Direction | Server to client, one answer per request | Server to client, continuous | Both ways |
+| Built on | Plain HTTP | Plain HTTP, `text/event-stream` | HTTP upgrade, then its own framing |
+| Overhead per event | A whole response and a new request | A few bytes of framing | A few bytes of framing |
+| Resumption | Cursor in each request | `Last-Event-ID`, built into the format | Yours to design |
+| Binary data | Yes | No: text only | Yes |
+| Through proxies and CDNs | Yes | Yes, if buffering is off | Usually, on 443; some proxies block upgrades |
+| HTTP/2 multiplexing | Yes | Yes | Rarely (needs RFC 8441 support on both ends) |
+| iOS client | URLSession | URLSession plus your own parser | `URLSessionWebSocketTask` |
+
+SSE wins whenever the traffic is server to client: feeds, scores, progress, AI responses. It reuses your HTTP stack, auth headers and infrastructure, and resumption comes free with the format. When the client sends often too (chat with typing indicators, games, collaborative editing), a WebSocket's two-way channel is worth its extra complexity. The client's occasional actions don't force a WebSocket, though: SSE for the stream plus ordinary `POST`s for actions is a perfectly good design.
+
+<Callout kind="interview">
+
+**Say** why SSE fits: "Updates only flow from server to client, so I'll stream them as server-sent events. It's plain HTTP, so it reuses our auth, our HTTP/2 connection and our load balancers, and `Last-Event-ID` gives us resumption: on reconnect the server replays what was missed." **Ask** whether the backend can keep a few minutes of history per stream for replay, and whether anything on the path buffers responses. **Red flags:** parsing with `lines`, no heartbeat (streams die at the first 60-second idle timeout), and reaching for WebSockets for a stream that only flows one way.
+
+</Callout>
+
+<Callout kind="gotcha" title="iOS gotcha: a stream isn't a background transfer">
+
+A background `URLSession` is for downloads and uploads that finish; it doesn't deliver a stream's bytes to a suspended app. Like any foreground connection, an SSE stream stops when the app is suspended. Close it when the scene goes to the background, and resume with `Last-Event-ID` when it comes back.
+
+</Callout>
+
+## Practice
+
+The design exercise **"Live score updates for 5 million fans"** is SSE's home ground: one-way updates to millions of phones, resumption after every tunnel, and a fan-out tier behind the streams. Decide how one stream carries several matches and how a client resumes each of them.
+
+```cards
+- id: sse-format
+  front: "What ends an event in a text/event-stream, and what does a line starting with a colon mean?"
+  back: "A blank line ends an event. A line starting with a colon is a comment, which servers send as a heartbeat."
+- id: last-event-id
+  front: "How does an SSE client resume after a dropped connection?"
+  back: "It reconnects with the last id it saw in a Last-Event-ID header, and the server replays every event after it, or tells the client to fetch a snapshot if it's too far behind."
+- id: sse-lines-gotcha
+  front: "Why shouldn't an SSE parser on iOS use URLSession.AsyncBytes.lines?"
+  back: "AsyncLineSequence skips empty lines, and the empty line is what ends an SSE event. Iterate the bytes and split lines yourself."
+- id: sse-vs-ws
+  front: "When is SSE a better choice than a WebSocket?"
+  back: "When data flows server to client: it's plain HTTP (auth, HTTP/2, proxies all work), has resumption built in, and client actions can still go as ordinary POSTs."
+```
+
+```quiz
+- id: q1
+  type: trace
+  prompt: "How many events does this stream deliver to the app?"
+  code: |
+    : hello
+
+    data: one
+
+    event: ping
+
+    data: two
+    data: three
+
+  answer: "2"
+  explain: "`data: one` is an event. The `event: ping` block has no data, so the standard says nothing is dispatched. `two` and `three` are one event with two data lines, joined as \"two\\nthree\". The comment is ignored."
+- id: q2
+  type: mcq
+  prompt: "An SSE stream works on Wi-Fi in the office but dies after exactly one minute on quiet evenings. What's the most likely fix?"
+  options:
+    - "Switch to WebSockets"
+    - "Have the server send a comment line every 15–30 seconds"
+    - "Raise the app's maximum connections per host"
+    - "Send events as binary"
+  answer: 1
+  explain: "A stream that goes quiet for 60 seconds hits URLSession's default request timeout, or a load balancer's or proxy's idle timeout. A heartbeat comment keeps the connection busy enough to survive them all."
+- id: q3
+  type: multi
+  prompt: "Which of these does SSE give you without extra protocol design? Choose all that apply."
+  options:
+    - "Resumption from the last event the client saw"
+    - "A server-suggested reconnection delay"
+    - "Sending binary frames"
+    - "Multiplexing on an existing HTTP/2 connection"
+    - "Messages from the client to the server on the same stream"
+  answer: [0, 1, 3]
+  explain: "`id` with `Last-Event-ID` gives resumption, and `retry` suggests a delay. Because it's ordinary HTTP, it multiplexes over HTTP/2. It's text-only and one-way: the client sends with separate requests."
+- id: q4
+  type: mcq
+  prompt: "Your SSE client stores the id of each event it handles. A burst arrives: events with ids 41 and 42, then a heartbeat comment, then the connection drops. What should the next request send?"
+  options:
+    - "No Last-Event-ID: start fresh"
+    - "Last-Event-ID: 41"
+    - "Last-Event-ID: 42"
+    - "Last-Event-ID: 43"
+  answer: 2
+  explain: "Send the id of the last event the app actually handled. The server replays everything after it; comments carry no id and don't change it."
+- id: q5
+  type: truefalse
+  prompt: "An app that streams AI answers over SSE must switch to a WebSocket so the user can send their next question."
+  answer: false
+  explain: "Each question can be an ordinary POST whose response is the stream. One-way streaming plus normal requests for actions is a common and simpler design."
+```

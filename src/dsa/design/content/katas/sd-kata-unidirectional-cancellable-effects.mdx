@@ -1,0 +1,104 @@
+A reducer that returns its side effects as values stays pure, but something still has to run them: start the async work, feed the actions it sends back into the reducer, and stop work that's no longer wanted. That runtime is what makes a search screen correct when the user types faster than the network answers. Write it: a store that runs `.run` effects as tasks, cancels them by id, and drops whatever a cancelled effect tries to send.
+
+`UnidirectionalEffectStore.Store`: `init(initialState:reducer:)`, `send(_:)` and `runningEffects`
+
+The reducer has the shape `(inout State, Action) -> Effect<Action>`, and `Effect` is given:
+
+- **`.none`**: nothing to do.
+- **`.send(action)`**: send `action` straight away, before `send` returns.
+- **`.run(id:cancelInFlight:operation:)`**: start `operation` in a new task, passing it a `Send` it can call to send actions back. `id` and `cancelInFlight` default to `nil` and `false`.
+- **`.cancel(id:)`**: cancel every running effect with that id.
+- **`.merge(effects)`**: perform each effect in order.
+
+What the store must do:
+
+- **`send(action)`** runs the reducer at once on the main actor, then performs the effect it returned.
+- **Running.** Each `.run` starts a `Task`. When `cancelInFlight` is true and there's an id, first cancel every running effect with that id. An effect that throws, or ends because it was cancelled, simply finishes.
+- **Cancelling.** A cancelled effect stops counting as running immediately, and any action it sends afterwards is dropped (`Send` already checks `Task.isCancelled` for you).
+- **Bookkeeping.** `runningEffects` counts effects that have started and haven't finished or been cancelled. When an effect finishes, it must remove *itself*, and nothing else.
+
+## Examples
+
+The tests drive a search screen whose `queryChanged` returns a search effect with id `"search"` and `cancelInFlight: true`, which waits 300 ms on a test clock and then sends `resultsLoaded`.
+
+| Actions and time | Results that arrive | `runningEffects` afterwards |
+| --- | --- | --- |
+| `queryChanged("dune")`, wait 300 ms | `"dune"` | 0 |
+| `queryChanged("d")`, 100 ms, `"du"`, 100 ms, `"dun"`, wait 300 ms | only `"dun"` | 0 |
+| `queryChanged("dune")`, `clearTapped` (which returns `.cancel(id: "search")`), wait 1 s | none | 0, straight after `clearTapped` |
+| `startTimer` (a loop that sends `tick` every second), wait 3 s, `stopTimer` | 3 ticks, and no more | 1, then 0 |
+| `appeared`, which merges two effects without ids | both | 0 |
+
+## Constraints
+
+- The store is `@MainActor`. Effects run off the main actor and come back to it through `Send`.
+- Tests use DesignKit's `TestClock`, so nothing waits in real time. A cancelled `TestClock.sleep` throws `CancellationError` at once.
+- The subtle case: cancel the search for `"du"` and start one for `"dune"`, and the `"du"` task finishes a moment *later*. When it cleans up, the `"dune"` search must still be running and still cancellable by its id.
+
+<Hints>
+<Hint>
+Keep a dictionary of running effects keyed by a token you generate for each one (a counter is fine), holding the effect's optional id and its `Task`. Cancelling by id loops over the entries with that id.
+</Hint>
+<Hint>
+A `Task` created in a `@MainActor` method runs its closure on the main actor, but it can't start until the method returns. So you can store the task in the dictionary before it runs, and its last line can remove its own token.
+</Hint>
+<Hint>
+Keying the dictionary by `EffectID` instead of a token is the classic bug: the cancelled task's cleanup runs after its replacement has been stored under the same id, and removes it. The replacement can then never be cancelled.
+</Hint>
+</Hints>
+
+## Solutions
+
+<Approach title="A table of running tasks, keyed by a token per effect" time="O(1) to start an effect, O(r) to cancel by id with r running" space="O(r)">
+
+```swift
+private var running: [Int: (id: EffectID?, task: Task<Void, Never>)] = [:]
+private var nextToken = 0
+
+public func send(_ action: Action) {
+    let effect = reducer(&state, action)
+    perform(effect)
+}
+
+private func perform(_ effect: Effect<Action>) {
+    switch effect {
+    case .none:
+        break
+    case .send(let action):
+        send(action)
+    case .run(let id, let cancelInFlight, let operation):
+        if cancelInFlight, let id { cancel(id) }
+        nextToken += 1
+        let token = nextToken
+        let send = Send<Action> { [weak self] action in self?.send(action) }
+        let task = Task { [weak self] in
+            try? await operation(send)
+            self?.finished(token)
+        }
+        running[token] = (id, task)
+    case .cancel(let id):
+        cancel(id)
+    case .merge(let effects):
+        effects.forEach(perform)
+    }
+}
+
+private func cancel(_ id: EffectID) {
+    for (token, entry) in running where entry.id == id {
+        entry.task.cancel()
+        running[token] = nil
+    }
+}
+
+private func finished(_ token: Int) {
+    running[token] = nil
+}
+```
+
+This is the shape of TCA's effect runtime, and of the Elm runtime before it: the reducer decides, as a value, and only the store touches tasks. Every cancellation rule lives in one place, so features can't get it wrong one by one, and a test can check what a reducer *asked for* without running anything.
+
+`cancelInFlight` gives you "latest wins" for free: debounce a search by sleeping inside the effect, and a new keystroke cancels the sleeping one before it ever calls the network. Cancellation is cooperative, though. It stops a task at its next suspension point that checks, such as `clock.sleep` or `URLSession`'s async methods, which is why `Send` also refuses to deliver from a cancelled task: a late answer can't sneak back in after the user has moved on.
+
+`[weak self]` means an effect never keeps a dismissed feature's store alive. A production store would also cancel everything in flight when the feature goes away, which is what TCA does when presented state is set to `nil`.
+
+</Approach>

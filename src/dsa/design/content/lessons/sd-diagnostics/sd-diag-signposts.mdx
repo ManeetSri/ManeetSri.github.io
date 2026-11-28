@@ -1,0 +1,232 @@
+## Why it matters
+
+Logs tell you *what* happened. When the complaint is "the feed is slow", you need to know *how long* each part took, and which part grew. **Signposts** mark the start and end of intervals in your own code, and Instruments draws them on a timeline next to CPU, network and the main thread. The same names can then be measured in performance tests and collected from users' devices by MetricKit, so one set of markers serves the lab and the field. In interviews, they're the concrete answer to "how would you find out why this screen got slower?"
+
+## Intervals and events
+
+A signpost is a log record with a name and a meaning:
+
+- An **interval** has a beginning and an end: "Load feed", "Decode", "Avatar". Instruments shows it as a bar with its duration.
+- An **event** is a single moment: "Cache miss", "Response received", "Retry".
+
+Since iOS 15, `OSSignposter` is the Swift API. It shares its machinery with `Logger`: a subsystem and category, cheap records, messages built with the same interpolation and privacy rules. Here's a feed load marked up:
+
+```swift check
+import Foundation
+import os
+
+struct Post: Decodable, Sendable {
+    let id: Int
+    let avatarURL: URL
+}
+
+protocol FeedAPI: Sendable {
+    func feedData() async throws -> Data
+    func image(at url: URL) async throws -> Data
+}
+
+extension OSSignposter {
+    // Points of Interest: these intervals get their own track in Instruments
+    static let feed = OSSignposter(subsystem: "com.example.social", category: .pointsOfInterest)
+}
+
+func loadFeed(api: any FeedAPI) async throws -> [Post] {
+    let signposter = OSSignposter.feed
+    let id = signposter.makeSignpostID()
+    let state = signposter.beginInterval("Load feed", id: id)
+    // Ends on every path, including a throw
+    defer { signposter.endInterval("Load feed", state) }
+
+    let data = try await api.feedData()
+    signposter.emitEvent("Response", id: id, "\(data.count) bytes")
+
+    return try signposter.withIntervalSignpost("Decode feed", id: signposter.makeSignpostID(), "\(data.count) bytes") {
+        try JSONDecoder().decode([Post].self, from: data)
+    }
+}
+
+func loadAvatars(for posts: [Post], api: any FeedAPI) async -> [Int: Data] {
+    await withTaskGroup(of: (Int, Data?).self) { group in
+        for post in posts {
+            group.addTask {
+                let signposter = OSSignposter.feed
+                // Overlapping intervals with the same name need their own ids
+                let state = signposter.beginInterval("Avatar", id: signposter.makeSignpostID(), "post \(post.id)")
+                let data = try? await api.image(at: post.avatarURL)
+                signposter.endInterval("Avatar", state, "\(data?.count ?? 0) bytes")
+                return (post.id, data)
+            }
+        }
+        var avatars: [Int: Data] = [:]
+        for await (id, data) in group {
+            avatars[id] = data
+        }
+        return avatars
+    }
+}
+```
+
+The pieces:
+
+- **`beginInterval` returns an `OSSignpostIntervalState`,** which you pass to `endInterval`. It's a value, so it can be held across `await`s, stored in a property, or ended in a `defer` so a thrown error still closes the interval.
+- **`withIntervalSignpost`** wraps a synchronous closure (it can throw, but it can't be `async`). For async work, use begin, end and `defer`.
+- **Names are `StaticString`s:** literals, fixed at compile time, and the begin and end must use the same one. The optional message after them is an ordinary log message, so `"\(data.count) bytes"` records a value per interval.
+- **The category `.pointsOfInterest`** puts intervals on Instruments' Points of Interest track, which appears in most templates. Use it for the handful of journeys you care about; give detailed, per-layer signposts their own categories, which show under the os_signpost instrument.
+
+## Seeing it
+
+In Instruments, the intervals line up against everything else that happened at the same time. Step through what one feed load looks like:
+
+```visual timeline
+title: One feed load, as signposts
+unit: ms
+lanes:
+  - { id: feed, label: Load feed }
+  - { id: net, label: Network }
+  - { id: decode, label: Decode feed }
+  - { id: a1, label: Avatar }
+  - { id: a2, label: Avatar }
+spans:
+  - { lane: feed, from: 0, to: 640, label: Load feed, tone: active }
+  - { lane: net, from: 20, to: 540, label: GET /feed, tone: wait }
+  - { lane: decode, from: 540, to: 630, label: 40 posts }
+  - { lane: a1, from: 640, to: 780, label: post 1, tone: ok }
+  - { lane: a2, from: 640, to: 1100, label: post 2, tone: error }
+markers:
+  - { at: 540, label: Response }
+  - { at: 640, label: Posts on screen }
+steps:
+  - { at: 0, say: "The user opens the feed. **Load feed** begins: the interval you'll compare between releases." }
+  - { at: 540, say: "The network takes 520 ms of it. The **Response** event marks the moment the bytes arrived, with their size in its message." }
+  - { at: 630, say: "Decoding 40 posts takes 90 ms. If this runs on the main thread, it's also a 90 ms hitch: Instruments shows both on the same timeline." }
+  - { at: 780, say: "Posts are on screen at 640 ms. Avatars load concurrently, **each in its own interval with its own id**." }
+  - { at: 1100, say: "One avatar takes 460 ms. Because each interval has its own id, Instruments pairs every end with the right beginning; with a shared id, the bars would be wrong." }
+```
+
+## Ids: which beginning does this end belong to?
+
+When two intervals with the same name overlap, the system needs to know which end goes with which beginning. That's what the **signpost id** is for.
+
+- **`makeSignpostID()`** returns a fresh id. Use one per interval whenever intervals of that name can overlap: image downloads, concurrent requests, cells being configured.
+- **`.exclusive`** says intervals of this name never overlap, such as app launch or a single serial sync. It's simpler, and wrong the moment two do overlap.
+- **`makeSignpostID(from: object)`** derives an id from an object's identity, which is handy when the begin and end happen in different places that both have the object (a view controller's appearance, say).
+
+Passing the `OSSignpostIntervalState` from begin to end, as the example does, keeps the pairing right without you tracking ids by hand.
+
+## Cheap enough to leave in
+
+When nobody is recording, a signpost costs about as much as a log call that isn't enabled, so you can leave them in release builds. Check `signposter.isEnabled` before computing anything expensive for a message, and use `OSSignposter.disabled` to switch a component's signposts off entirely, for example in tests or an extension with a tight memory limit.
+
+## From the lab to the field
+
+The same interval names can be measured at three distances from the user:
+
+1. **Instruments,** on your own device, to understand *why* something is slow.
+2. **Performance tests,** to stop it getting slower. `XCTOSSignpostMetric(subsystem:category:name:)` measures your interval in an XCTest `measure(metrics:)` block, so CI can compare "Load feed" against a baseline on every merge.
+3. **MetricKit,** to see what users experience. Signposts emitted through `mxSignpost(_:log:name:)`, with a log handle from `MXMetricManager.makeLogHandle(category:)`, are aggregated into the daily `MXMetricPayload` as `signpostMetrics`: a count and a histogram of durations per name.
+
+```swift check ios title="FeedPerformanceTests.swift"
+import XCTest
+
+final class FeedPerformanceTests: XCTestCase {
+    func testFeedLoad() {
+        let loadFeed = XCTOSSignpostMetric(subsystem: "com.example.social", category: "PointsOfInterest", name: "Load feed")
+        let app = XCUIApplication()
+        measure(metrics: [loadFeed]) {
+            app.launch()
+            app.tabBars.buttons["Feed"].tap()
+        }
+    }
+}
+```
+
+That's why signpost names deserve the same care as API names. Dashboards, test baselines and alerts depend on them, so renaming "Load feed" to "Feed load" silently breaks the history you'd compare against.
+
+### What to mark
+
+- **User-visible journeys,** from the user's action to useful content: launch to first content, tap to the next screen being interactive, a keystroke to search results. These are the intervals you put budgets on.
+- **The expensive steps inside them:** network, decoding, database queries, image processing, layout of a complex cell. When a journey gets slower, these tell you which step grew.
+- **Waits:** time spent queued behind a lock, an actor or a serial queue often explains a slow interval that does little work itself.
+
+Don't signpost everything. A few dozen well-named intervals are readable; thousands of tiny ones bury the answer and, sent through MetricKit, exceed what it will aggregate.
+
+## Trade-offs
+
+| Option | Detail | Works in the field | Cost | When it wins |
+| --- | --- | --- | --- | --- |
+| `OSSignposter` intervals | Exact, alongside system activity in Instruments | Only while recording, unless sent through MetricKit | Near zero when not recording | Understanding why something is slow |
+| Timestamps in log lines | Rough; you subtract by hand | In a sysdiagnose | A log line each | A quick check without Instruments |
+| `XCTOSSignpostMetric` | Statistical, on a fixed device | No: CI only | Test time | Catching regressions before release |
+| `mxSignpost` + MetricKit | Daily histograms from real users | Yes, about a day later | Small | Budgets and trends across devices |
+| Your own timing events in analytics | Whatever you send | Yes, within minutes | Payload, battery, privacy review | Fast rollout signals and business metrics |
+
+<Callout kind="interview">
+
+**Say:** "I'd put signposts around the user-visible journey and the expensive steps inside it, with stable names. Instruments shows me where the time goes, an `XCTOSSignpostMetric` test guards it in CI, and MetricKit's signpost metrics show the real distribution from users."
+
+**Ask:** which journey are we trying to make faster, and what's its budget? Is the regression on all devices or only older ones?
+
+**Red flags:** measuring with `Date()` subtraction and `print`; one shared id for overlapping intervals; renaming signposts casually; and profiling only on the simulator or in a debug build.
+
+</Callout>
+
+<Callout kind="gotcha" title="iOS gotcha: an interval that never ends">
+
+An interval begun on one path and ended only on the success path stays open forever when the work throws or is cancelled, and Instruments shows a bar running to the end of the trace. End intervals in a `defer`, as `loadFeed` does, and remember that `withIntervalSignpost` can't take an `async` closure.
+
+</Callout>
+
+## Practice
+
+The **diagnostics pipeline** design exercise asks where signposts fit beside logs, crash reports and breadcrumbs in an app with 2 million daily users, and which of them leave the device.
+
+```cards
+- id: signpost-vs-log
+  front: "What does a signpost give you that a log line doesn't?"
+  back: "Duration and timing: intervals with a beginning and an end, drawn by Instruments on the same timeline as CPU, network and the main thread."
+- id: signpost-ids
+  front: "When does an interval need its own signpost id?"
+  back: "Whenever intervals with the same name can overlap, such as concurrent downloads. `makeSignpostID()` gives a fresh one; `.exclusive` is only for intervals that never overlap."
+- id: signpost-field
+  front: "How do the same signposts reach CI and real users?"
+  back: "`XCTOSSignpostMetric` measures a named interval in performance tests; `mxSignpost` with a MetricKit log handle aggregates intervals from users' devices into the daily payload."
+```
+
+```quiz
+- id: q1
+  type: mcq
+  prompt: "Ten avatar downloads run at once, each wrapped in `beginInterval(\"Avatar\", id: .exclusive)`. What goes wrong?"
+  options:
+    - "Nothing: `.exclusive` is the default and always safe"
+    - "Instruments can't tell which end belongs to which beginning, so the durations are wrong"
+    - "The app crashes when two intervals overlap"
+    - "Only the first download is recorded"
+  answer: 1
+  explain: "`.exclusive` promises that intervals of this name never overlap. Concurrent downloads break that promise; give each its own `makeSignpostID()`, or pass each interval's state to its end."
+- id: q2
+  type: truefalse
+  prompt: "You can wrap an `async` network call in `signposter.withIntervalSignpost(\"Fetch\") { … }`."
+  answer: false
+  explain: "`withIntervalSignpost` takes a synchronous closure. For async work, call `beginInterval`, then end it with the returned state, ideally in a `defer`."
+- id: q3
+  type: sort
+  prompt: "Which tool answers each question best?"
+  buckets: [Instruments with signposts, XCTOSSignpostMetric in CI, MetricKit signpost metrics]
+  items:
+    - [Why does the feed take 2 seconds on my iPhone?, 0]
+    - [Did this pull request make the feed slower?, 1]
+    - [How long does the feed take for users on older iPhones?, 2]
+    - [Is decoding blocking the main thread while the feed loads?, 0]
+    - [Is the p90 load time still within budget across last week's users?, 2]
+  explain: "Instruments explains a single trace in detail, CI tests compare a fixed device against a baseline on every change, and MetricKit aggregates what users actually experienced."
+- id: q4
+  type: mcq
+  prompt: "A teammate renames the signpost \"Load feed\" to \"Feed loaded\" for consistency. What's the main risk?"
+  options:
+    - "Signposts can't contain the word \"loaded\""
+    - "Performance-test baselines and MetricKit dashboards keyed by the old name lose their history"
+    - "Instruments stops showing Points of Interest"
+    - "It needs a new privacy manifest entry"
+  answer: 1
+  explain: "Interval names are a contract with every test, dashboard and alert that measures them. Rename them like an API: deliberately, with a plan for the history."
+```

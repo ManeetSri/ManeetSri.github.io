@@ -1,0 +1,100 @@
+A chat server numbers every message in a conversation 1, 2, 3… and delivers them at least once, so the app sees duplicates, the occasional message overtaken by the next, and gaps where something was lost. Write the buffer that sits between the socket and the screen: it hands messages to the app in order and exactly once, waits a moment before asking for what's missing, and knows when to give up and ask for a snapshot instead.
+
+`RealtimeSequenceBuffer.Buffer(after:gapTimeout:capacity:)`, with `receive(_:at:)`, `tick(at:)` and `resume(after:at:)`, each returning `[Action]`.
+
+- **In order:** a message numbered `lastDelivered + 1` is delivered at once, followed by every waiting message that now continues the run. Each `.deliver` comes out in sequence order.
+- **Duplicates:** a message at or below `lastDelivered`, or one already waiting, is dropped and counted in `duplicates`.
+- **Gaps:** a message further ahead waits. A gap opens at the time the first message starts waiting, and stays open until nothing is waiting; delivering part of the backlog doesn't restart it.
+- **Resend:** `tick(at:)` returns nothing until the gap has been open for `gapTimeout`. Then it returns one `.resend(range)` for each run of missing numbers between `lastDelivered + 1` and the highest waiting number, lowest first, and asks again every `gapTimeout` while the gap stays open. When the gap closes, a later gap waits a full `gapTimeout` from when it opens.
+- **Resync:** if more than `capacity` messages would be waiting, return `[.resync]` once and stop delivering and asking for resends. While resyncing, keep the `capacity` highest-numbered messages you've seen and drop the lowest, so whatever arrives during the snapshot fetch isn't lost.
+- **Resume:** `resume(after: snapshot, at:)` means the app applied a snapshot covering everything up to `snapshot`. Drop waiting messages it covers, continue from `snapshot + 1` (delivering any run that follows), and leave resyncing. A gap that remains opens at the resume's time.
+
+## Examples
+
+| Arrivals (`gapTimeout` 2 s) | Actions |
+| --- | --- |
+| 1, 2 | `deliver 1`; `deliver 2` |
+| 3, 2, then 1 | nothing; nothing; `deliver 1, 2, 3` |
+| 1, 1 again | `deliver 1`; nothing, and `duplicates` is 1 |
+| 1 at 0 s, then 3 and 6 at 1 s; `tick` at 2.999 s, then at 3 s | nothing; then `resend 2...2` and `resend 4...5` |
+| `capacity` 3: 3, 4, 5, then 6 | nothing three times; then `resync` |
+| …then `resume(after: 5)` while holding 6, 7, 8 | `deliver 6, 7, 8` |
+
+## Constraints
+
+- Sequence numbers are positive integers with no gaps on the server; `after` is the last one already applied (0 for a fresh conversation).
+- Times are offsets from a fixed start, as `Duration`. They never go backwards.
+- `capacity` is at least 1.
+- Keep it a value type: no clocks, timers or tasks inside. The app calls `tick(at:)` from its own timer.
+
+<Hints>
+<Hint>
+Keep waiting messages in a dictionary keyed by sequence number. Delivering is a loop: while the dictionary has `lastDelivered + 1`, remove it, emit it and move on.
+</Hint>
+<Hint>
+Two optional times are enough for the resend timer: when the gap opened, and when you last asked. `tick` compares `now` with the later of the two.
+</Hint>
+<Hint>
+To find missing ranges, walk from `lastDelivered + 1` up to the highest waiting number and collect the runs of numbers that aren't in the dictionary.
+</Hint>
+</Hints>
+
+## Solutions
+
+<Approach title="A dictionary of waiting messages, drained from the next expected number" time="O(1) amortised per message; O(gap) per resend" space="O(capacity)">
+
+```swift
+public mutating func receive(_ message: Message, at now: Duration) -> [Action] {
+    guard message.seq > lastDelivered, buffered[message.seq] == nil else {
+        duplicates += 1
+        return []
+    }
+    buffered[message.seq] = message
+    if resyncing {
+        trimToCapacity()
+        return []
+    }
+    if message.seq == lastDelivered + 1 {
+        return drain(at: now)
+    }
+    if buffered.count > capacity {
+        resyncing = true
+        gapOpenedAt = nil
+        lastAskedAt = nil
+        trimToCapacity()
+        return [.resync]
+    }
+    if gapOpenedAt == nil { gapOpenedAt = now }
+    return []
+}
+
+public mutating func tick(at now: Duration) -> [Action] {
+    guard !resyncing, let opened = gapOpenedAt else { return [] }
+    guard now - (lastAskedAt ?? opened) >= gapTimeout else { return [] }
+    lastAskedAt = now
+    return missingRanges().map(Action.resend)
+}
+
+private mutating func drain(at now: Duration) -> [Action] {
+    var actions: [Action] = []
+    while let next = buffered.removeValue(forKey: lastDelivered + 1) {
+        actions.append(.deliver(next))
+        lastDelivered += 1
+    }
+    if buffered.isEmpty {
+        gapOpenedAt = nil
+        lastAskedAt = nil
+    } else if gapOpenedAt == nil {
+        gapOpenedAt = now
+    }
+    return actions
+}
+```
+
+`resume(after:at:)` sets `lastDelivered` to the snapshot, filters the dictionary to keys above it, clears the resync and timer state, and calls `drain(at:)`.
+
+The grace period is the important judgement call. Over one TCP connection messages can't overtake each other, but they can across reconnects, gateways and the push-then-fetch path, and a resend request for a message that was merely late costs the server work for nothing. Two seconds absorbs reordering without leaving a visible gap for long. Asking by ranges keeps a resend request small however many messages are missing, and the resync limit bounds both memory and the time it would take to fill a huge gap one message at a time.
+
+Keep the buffer a value type with time passed in: it has no threads, timers or I/O, so the tests are plain function calls, and the app can drive it from an actor, a reducer or a test with equal ease.
+
+</Approach>

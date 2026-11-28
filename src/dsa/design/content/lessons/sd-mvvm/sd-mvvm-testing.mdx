@@ -1,0 +1,365 @@
+## Why it matters
+
+Testability is the reason MVP and MVVM exist. A screen's rules (when Save is enabled, what a failure says, what happens on a double tap) are the bugs users actually report, and once they live in a plain class they can be checked in milliseconds on a Mac. But view model tests have their own traps: async work that finishes "sometime", tests that sleep and flake, outcomes nobody checks, leaks nobody notices. This lesson is the toolkit, and interviewers increasingly ask for it in detail: "how would you test that the spinner shows while saving?"
+
+## What to test, and what not to
+
+A view model test drives intents and checks state and outcomes. Worth covering, for most screens:
+
+- **Each intent's effect on the state:** load leads to loaded, empty or failed; retry recovers.
+- **Display values:** formatting, pluralisation, which message for which error, with a fixed locale and time zone.
+- **In-flight behaviour:** the spinner shows while a request runs; a second tap is ignored.
+- **Outcomes:** the route or callback fires, with the right value, exactly once, and not on failure.
+- **Cancellation and stale answers:** leaving the screen isn't a failure; a late answer doesn't overwrite a newer one.
+- **Lifetimes:** the view model (or the coordinator holding it) is freed when the screen goes.
+
+Not worth a unit test: that SwiftUI renders a `ProgressView` for `.loading` (a snapshot or a preview shows that), or that `URLSession` works (the repository's own tests, with a stubbed transport, cover the networking layer).
+
+## Test doubles in Swift
+
+Swift has no runtime mocking, so doubles are small hand-written types behind the protocols the view model already depends on. Four kinds, from the simplest:
+
+| Double | What it does | A Swift shape | Use it for |
+| --- | --- | --- | --- |
+| **Stub** | returns canned answers | a struct conforming to the protocol | most loads: "given these orders…" |
+| **Spy** | records what it was asked | an actor with a `requests` array | checking what was sent, and how often |
+| **Fake** | a working, simple implementation | an in-memory repository | flows that read back what they wrote |
+| **Mock** | pre-programmed expectations that fail the test | a framework, or a spy plus `#expect` | rarely: spies are clearer |
+
+Prefer stubs and fakes, and assert on the view model's state rather than on how it talked to its dependencies. A test that checks "called `fetch` twice with page 2" breaks when you add caching; a test that checks "page 2's products are on screen" doesn't.
+
+## Controlling async: the gated stub
+
+To see the spinner, the test must look **while** the request is in flight. A stub that answers at once makes that moment vanish, and `Task.sleep` in a test makes it slow and flaky. The fix is a stub that **suspends until the test releases it**, built from a continuation:
+
+```swift check group=follow title="FollowButtonViewModelTests.swift"
+import Foundation
+import Observation
+import Testing
+
+protocol FollowService: Sendable {
+    func setFollowing(_ following: Bool, userID: String) async throws
+}
+
+@MainActor
+@Observable
+final class FollowButtonViewModel {
+    private(set) var isFollowing: Bool
+    private(set) var isBusy = false
+    private(set) var errorMessage: String?
+
+    private let userID: String
+    private let service: any FollowService
+    private let onFollowed: @MainActor (String) -> Void
+
+    init(userID: String, isFollowing: Bool, service: any FollowService, onFollowed: @escaping @MainActor (String) -> Void) {
+        self.userID = userID
+        self.isFollowing = isFollowing
+        self.service = service
+        self.onFollowed = onFollowed
+    }
+
+    func tapped() async {
+        guard !isBusy else { return }
+        let wanted = !isFollowing
+        isFollowing = wanted                              // optimistic: the button flips at once
+        isBusy = true
+        defer { isBusy = false }
+        do {
+            try await service.setFollowing(wanted, userID: userID)
+            errorMessage = nil
+            if wanted { onFollowed(userID) }              // e.g. offer notifications for this creator
+        } catch {
+            isFollowing = !wanted                         // roll back
+            errorMessage = "Couldn't update. Try again."
+        }
+    }
+}
+
+/// Records each request and holds it open until the test answers it
+actor GatedFollowService: FollowService {
+    private(set) var requests: [Bool] = []
+    private var waiting: [CheckedContinuation<Void, any Error>] = []
+
+    func setFollowing(_ following: Bool, userID: String) async throws {
+        requests.append(following)
+        try await withCheckedThrowingContinuation { continuation in
+            waiting.append(continuation)
+        }
+    }
+
+    /// Does nothing if no request is waiting, so a broken view model fails the test instead of hanging it
+    func succeed() {
+        guard !waiting.isEmpty else { return }
+        waiting.removeFirst().resume()
+    }
+
+    func fail(_ error: any Error) {
+        guard !waiting.isEmpty else { return }
+        waiting.removeFirst().resume(throwing: error)
+    }
+}
+
+/// Gives other tasks on this actor a chance to run, so a started task can reach the stub
+func settle() async {
+    for _ in 0..<50 { await Task.yield() }
+}
+
+@MainActor
+struct FollowButtonViewModelTests {
+    @Test func followingFlipsAtOnceAndIgnoresTapsInFlight() async {
+        let service = GatedFollowService()
+        let model = FollowButtonViewModel(userID: "u1", isFollowing: false, service: service) { _ in }
+
+        let tap = Task { await model.tapped() }           // tap, the way the button would
+        await settle()
+        #expect(model.isFollowing)                        // optimistic
+        #expect(model.isBusy)                             // and in flight
+
+        await model.tapped()                              // a second tap while busy returns at once
+        #expect(await service.requests == [true])
+
+        await service.succeed()
+        await tap.value
+        #expect(model.isFollowing && !model.isBusy)
+    }
+
+    @Test func aFailedFollowRollsBackAndSaysSo() async {
+        let service = GatedFollowService()
+        let model = FollowButtonViewModel(userID: "u1", isFollowing: false, service: service) { _ in }
+
+        let tap = Task { await model.tapped() }
+        await settle()
+        await service.fail(URLError(.timedOut))
+        await tap.value
+
+        #expect(!model.isFollowing)
+        #expect(model.errorMessage == "Couldn't update. Try again.")
+    }
+}
+```
+
+Every step happens in an order the test chooses. Nothing waits on real time, so the test runs in a millisecond and gives the same answer every run.
+
+```visual timeline
+title: A gated test, step by step
+lanes:
+  - { id: test, label: Test }
+  - { id: model, label: View model }
+  - { id: stub, label: Gated stub }
+spans:
+  - { lane: test, from: 0, to: 0.4, label: start the tap }
+  - { lane: model, from: 0.4, to: 0.8, label: flip + busy, tone: active }
+  - { lane: stub, from: 0.8, to: 3, label: held open, tone: wait }
+  - { lane: test, from: 1, to: 1.6, label: "#expect busy", tone: ok }
+  - { lane: test, from: 1.8, to: 2.4, label: second tap }
+  - { lane: test, from: 2.6, to: 3, label: succeed() }
+  - { lane: model, from: 3, to: 3.4, label: not busy, tone: ok }
+  - { lane: test, from: 3.6, to: 4.2, label: "#expect done", tone: ok }
+markers:
+  - { at: 0.8, label: awaiting }
+  - { at: 3, label: released }
+steps:
+  - { at: 0.4, say: "The test starts the tap in a `Task`, as a button would, then calls `settle()` to let it run." }
+  - { at: 0.9, say: "The view model flips the button, sets `isBusy`, and awaits the stub, which **doesn't answer**. The main actor is free again." }
+  - { at: 1.6, say: "So the test can look at the in-flight state, which with an instant stub would already be gone." }
+  - { at: 2.4, say: "A second tap returns at once because `isBusy` is set. The stub's `requests` proves only one request went out." }
+  - { at: 3.4, say: "The test releases the request. The view model resumes on the main actor and clears `isBusy`." }
+  - { at: 4.2, say: "`await tap.value` waits for the first tap to finish, and the test checks the final state." }
+```
+
+Two cautions about `settle()`. It yields a fixed number of times, which is enough for a task to start and reach an actor, but it isn't a guarantee for long chains of hops; a gate that **signals** when a request arrives (an `AsyncStream` the stub writes to) is more robust for complex flows. And it only works because the stub is held: never use `settle()` to wait for real work to finish.
+
+## Time: inject the clock
+
+A view model that debounces, times out or counts down ("Resend code in 0:30") depends on time. Give it `any Clock<Duration>` and use `clock.sleep(for:)`; production passes `ContinuousClock()`, tests pass a clock they control. The course's companion package provides one, `TestClock` in DesignKit, as [The companion Swift package](/design/learn/sd-orientation-companion) described:
+
+```swift
+@Test @MainActor func resendUnlocksAfterThirtySeconds() async {
+    let clock = TestClock()
+    let model = VerifyCodeViewModel(clock: clock, sender: StubSender())
+    let countdown = Task { await model.startCountdown() }
+    await settle()
+    #expect(model.resendText == "Resend in 0:30")
+
+    clock.advance(by: .seconds(30))
+    await countdown.value
+    #expect(model.canResend)
+}
+```
+
+Thirty seconds pass in no time at all, and a test of "the timer stops when the screen goes" is the same test with a cancellation in the middle.
+
+## Outcomes: recorded, counted, never assumed
+
+Routes and callbacks are easy to forget in tests, and "fires exactly once" is precisely the bug that ships. Swift Testing's `confirmation` counts them:
+
+```swift check group=follow title="Checking outcomes"
+@MainActor
+@Test func followingReportsOnceAndAFailureNotAtAll() async {
+    let service = GatedFollowService()
+
+    await confirmation("followed", expectedCount: 1) { followed in
+        let model = FollowButtonViewModel(userID: "u1", isFollowing: false, service: service) { _ in followed() }
+        let tap = Task { await model.tapped() }
+        await settle()
+        await service.succeed()
+        await tap.value
+    }
+
+    await confirmation("followed", expectedCount: 0) { followed in
+        let model = FollowButtonViewModel(userID: "u2", isFollowing: false, service: service) { _ in followed() }
+        let tap = Task { await model.tapped() }
+        await settle()
+        await service.fail(URLError(.notConnectedToInternet))
+        await tap.value
+    }
+}
+
+@MainActor
+@Test func aViewReadingIsFollowingWillUpdate() async {
+    let service = GatedFollowService()
+    let model = FollowButtonViewModel(userID: "u1", isFollowing: false, service: service) { _ in }
+
+    await confirmation("invalidated") { invalidated in
+        withObservationTracking {
+            _ = model.isFollowing                         // what a button's body would read
+        } onChange: {
+            invalidated()
+        }
+        let tap = Task { await model.tapped() }
+        await settle()
+        await service.succeed()
+        await tap.value
+    }
+}
+```
+
+The second test checks something unit tests usually miss: that a view **reading** `isFollowing` would be told it changed. That's the contract with SwiftUI, and it breaks quietly if someone moves the value into an `@ObservationIgnored` property or a cache.
+
+When the view model reports through a closure, a recorder works too: `var routes: [Route] = []` and `onRoute: { routes.append($0) }`, then `#expect(routes == [.saved])`. Asserting the whole array checks "exactly once" for free.
+
+## Lifetimes: prove it's freed
+
+Leaks in MVVM come from closures: a view model's callback capturing a coordinator, a `sink` capturing `self`. A weak reference makes it a one-line test:
+
+```swift
+@Test @MainActor func finishingTheFlowFreesIt() {
+    weak var released: ReturnsCoordinator?
+    do {
+        let coordinator = ReturnsCoordinator { _ in }
+        released = coordinator
+        coordinator.itemsChosen([101])
+        _ = coordinator.root                    // touch the lazily created view model and its closure
+    }
+    #expect(released == nil)
+}
+```
+
+Write one per flow; it catches the strong capture that code review missed.
+
+## Testing an MVP presenter
+
+The same tools apply, with one addition: the view is a **spy** that records calls, as [MVP and the passive view](/design/learn/sd-mvvm-mvp) showed. Its weakness is ordering. Prefer asserting on the calls an interaction **added** (clear the log after loading), or on the last value of each kind, over a full sequence, unless the order is the requirement.
+
+## Beyond unit tests
+
+View model tests check rules. Three other kinds of test check everything else, and the view model makes each of them easier:
+
+- **Previews** show every state by constructing the view model with a stub: loading, empty, failed, a long name. [Previews as a design tool](/design/learn/sd-swiftui-previews) covered them; they're the quickest visual check, though nothing fails automatically.
+- **Snapshot tests** (Point-Free's swift-snapshot-testing is the common library) render a view for a given state and compare it with a recorded image, catching layout regressions in each state, Dynamic Type size and dark mode.
+- **UI tests** (XCUITest) drive the real app. They're slow and brittle, so keep them for a few journeys that must never break: sign in, checkout.
+
+## Trade-offs
+
+| | View model unit tests | Snapshot tests | UI tests (XCUITest) | Manual testing |
+| --- | --- | --- | --- | --- |
+| What they check | rules, states, outcomes | how each state looks | whole journeys on a device | anything, once |
+| Speed | milliseconds | ~100 ms per image | seconds to minutes | slowest |
+| Flakiness | none, if time and async are controlled | font and OS changes | timing, animations, network | human |
+| Cost to maintain | low | re-record on design changes | high | every release |
+| Wins for | most of the suite | design-heavy screens | a handful of critical paths | exploring |
+
+<Callout kind="interview">
+
+**What to say:** "I test view models against protocol stubs on the main actor. For in-flight states I use a gated stub that holds the request until the test releases it, so I can assert the spinner and the double-tap guard; for time I inject a clock. I check outcomes with `confirmation` or a recorder, including that failures don't route, and I add a weak-reference test per flow. Snapshot tests cover how states look, and a few UI tests cover critical journeys."
+
+**What to ask:** "What do our flaky tests have in common?" The answer is nearly always real time or real networking.
+
+**Red flags:** `Task.sleep` or `XCTestExpectation` timeouts used to wait for a view model; tests that only check the happy path; asserting on every call a dependency received; no test for "fires once"; view models that can't be built without the real app.
+
+</Callout>
+
+<Callout kind="gotcha" title="Swift gotcha: Swift Testing runs tests in parallel">
+
+Swift Testing runs tests concurrently by default. A view model that reaches a singleton or a `static` cache shares it between tests, and they pass alone and fail together. Inject the dependency instead; for a suite that truly must share something, mark it `.serialized`.
+
+</Callout>
+
+<Callout kind="gotcha" title="Swift gotcha: a sleep in a test is a bug waiting">
+
+`try await Task.sleep(for: .milliseconds(100))` "to let the load finish" passes on your Mac and fails on a busy CI machine. Every wait in a view model test should be on something the test controls: a gated stub, a test clock, or `await` on the task itself.
+
+</Callout>
+
+## Practice
+
+All three of this module's katas are view model tests in disguise: their test files are written exactly as this lesson describes. **An MVP recipe presenter with a spy view** tests a presenter with a recording view. **An input/output sign-in view model** uses a gated authenticator to check the in-flight state and the double tap. **A paginated catalogue view model** answers requests out of order to prove that stale pages are dropped. Read the tests after solving each one; they're the other half of the lesson.
+
+```cards
+- id: testing-what
+  front: "What should view model tests cover?"
+  back: "Each intent's effect on state, display values with a fixed locale, in-flight behaviour, outcomes (once, and not on failure), cancellation and stale answers, and that the screen's objects are freed."
+- id: testing-gated
+  front: "How do you test what a view model shows while a request is in flight?"
+  back: "Use a gated stub that suspends on a continuation until the test releases it: start the intent in a Task, settle, assert the in-flight state, release, then await the task."
+- id: testing-doubles
+  front: "Stub, spy or fake: which to prefer?"
+  back: "Stubs and fakes, asserting on the view model's state. Spies when what was sent matters. Assertions on every call a dependency got break whenever the implementation changes."
+- id: testing-outcomes
+  front: "How do you check that a route fires exactly once, and not on failure?"
+  back: "Swift Testing's confirmation with expectedCount 1 and 0, or a recorder whose whole array is compared."
+```
+
+```quiz
+- id: q1
+  type: mcq
+  prompt: "You need to check that Save shows a spinner while the request runs. Which test design is deterministic?"
+  options:
+    - "Call `save()` in a Task, sleep 50 ms, check `isSaving`"
+    - "Use a stub that answers at once, and check `isSaving` after `await save()`"
+    - "Use a stub that holds the request until the test releases it; start `save()` in a Task, settle, check `isSaving`, release, await the task"
+    - "Make `isSaving` public and set it from the test"
+  answer: 2
+  explain: "The gated stub makes the in-flight moment last as long as the test needs. Sleeping races the scheduler, an instant stub skips the moment entirely, and setting the flag from the test tests nothing."
+- id: q2
+  type: sort
+  prompt: "Which test double is each?"
+  buckets: [Stub, Spy, Fake]
+  items:
+    - ["A struct whose `orders()` returns three fixed orders", 0]
+    - ["An actor that records every request it receives", 1]
+    - ["An in-memory repository that returns what was saved to it", 2]
+    - ["A service that always throws `URLError(.timedOut)`", 0]
+  explain: "Stubs answer with canned values, including canned failures. Spies record what they were asked. Fakes are simple but working implementations, so a test can write and then read."
+- id: q3
+  type: multi
+  prompt: "Which make view model tests flaky? Choose all that apply."
+  options:
+    - "`Task.sleep` to wait for work to finish"
+    - "A shared singleton the view model reaches for, with tests running in parallel"
+    - "Formatting dates with the machine's current locale and time zone"
+    - "A gated stub released by the test"
+    - "`confirmation(expectedCount: 1)` around the intent"
+  answer: [0, 1, 2]
+  explain: "Real time, shared state and the machine's settings all vary between runs and machines. A gated stub and confirmation are under the test's control."
+- id: q4
+  type: truefalse
+  prompt: "A test that asserts on the exact list of calls a view model made to its repository is a good way to make refactoring safe."
+  answer: false
+  explain: "It pins the implementation, so adding a cache or batching requests breaks it while the screen behaves the same. Assert on the state and outcomes users see; check calls only when they're the requirement, such as \"only one save request\"."
+- id: q5
+  type: recall
+  prompt: "Describe how you'd test a 30-second \"Resend code\" countdown without waiting 30 seconds."
+  model: "Inject `any Clock<Duration>` into the view model and have it sleep on that clock. In the test, pass a controllable test clock, start the countdown in a Task, settle, check the initial text, advance the clock by 30 seconds, await the task, and check that resend is enabled."
+```

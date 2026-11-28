@@ -1,0 +1,286 @@
+## Why it matters
+
+Teams adopt MVVM to escape the massive view controller, and two years later they have massive view models: the same 1,800 lines, now with `@Published` instead of `IBOutlet`. Nothing in the pattern stops it, because a view model is the natural place for "one more thing the screen needs". Knowing the symptoms, finding the seams, and splitting without breaking the screen is everyday senior work, and "how would you split this?" is a favourite interview follow-up to any MVVM answer.
+
+## How it happens
+
+A product page starts small: load the product, show it, add to basket. Then, one sprint at a time: variants and their prices, an image gallery that follows the variant, a delivery estimate, reviews with a summary and a filter, recommendations, a wishlist button, sharing, three A/B tests and analytics on every tap. Each addition was reasonable. Each went into `ProductPageViewModel`, because that's where the screen's logic lives.
+
+The result has a recognisable shape:
+
+- **It imports UIKit or SwiftUI,** for a colour here and an alert there.
+- **It navigates:** pushes the reviews screen, presents the share sheet.
+- **It holds business rules:** "free delivery over £40", "members see the sale price".
+- **Its `init` takes ten or more dependencies,** and a test of one rule needs stubs for all of them.
+- **Its properties fall into groups that never meet:** the gallery code never reads the review filter.
+- **Every feature touches it,** so pull requests conflict and nobody owns it.
+
+The last two are the most telling, because they say the class has **several reasons to change**: it has low cohesion, and that's what you can measure.
+
+## Find the seams: a cohesion map
+
+List the view model's stored properties across the top and its methods down the side, and mark which method reads or writes which property. Groups of methods that share properties with each other, and not with anyone else, are the seams.
+
+| | `images` | `selectedImage` | `variant` | `price` | `stockText` | `reviews` | `reviewFilter` | `isInBasket` |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| `showImage(at:)` | ● | ● | | | | | | |
+| `selectVariant(_:)` | ● | ● | ● | ● | ● | | | |
+| `refreshStock()` | | | ● | | ● | | | |
+| `loadReviews()` | | | | | | ● | | |
+| `setReviewFilter(_:)` | | | | | | ● | ● | |
+| `addToBasket()` | | | ● | | | | | ● |
+
+Three clusters fall out: **gallery** (images and the selected image), **buying** (variant, price, stock, basket) and **reviews** (reviews and their filter). Only `selectVariant` crosses a boundary: choosing the blue jacket changes the images *and* the price. That crossing is a rule of the whole page, and it stays in the page's view model. Everything else can move.
+
+You don't need a tool for this. Ten minutes with the file and a table like this one is usually enough to see the shape, and it turns "this class is too big" into a plan a reviewer can check.
+
+## Where each piece goes
+
+Most massive view models need the same five moves, in roughly this order of payoff:
+
+1. **Business rules go down, into the domain.** "Free delivery over £40" becomes a pure function on a domain type, `DeliveryPromise.estimate(for:basketTotal:now:)`, which the basket screen and the server's rules can share and tests can check in a line.
+2. **Data access goes down, into repositories.** Request building, decoding and caching leave the view model, which asks for a `Product` and gets one.
+3. **Formatting goes sideways, into small value types.** A `PriceFormatter` or a `ReviewSummary` struct, with an injected locale, holds the string-building and is reused by every screen that shows prices.
+4. **Navigation goes out, to the coordinator.** "Show all reviews" becomes an outcome; the coordinator decides how.
+5. **Regions become child view models.** Each cluster from the cohesion map gets its own view model, owned by the page's view model, which keeps only the rules that cross regions.
+
+```visual flow
+title: Splitting a product page view model
+nodes:
+  - { id: page, label: Product page view model, kind: service, at: [2, 0], w: 1.5 }
+  - { id: coordinator, label: Coordinator, kind: service, at: [4.5, 0] }
+  - { id: gallery, label: Gallery, kind: service, at: [0, 2] }
+  - { id: buying, label: Buying, kind: service, at: [2, 2] }
+  - { id: reviews, label: Reviews, kind: service, at: [4, 2] }
+  - { id: rules, label: DeliveryPromise, kind: plain, at: [2, 3.5] }
+  - { id: repo, label: Repositories, kind: store, at: [4, 3.5] }
+groups:
+  - { id: children, label: Child view models, nodes: [gallery, buying, reviews] }
+edges:
+  - [page, gallery, owns]
+  - [page, buying, owns]
+  - [page, reviews, owns]
+  - [buying, rules, asks]
+  - [reviews, repo, loads]
+  - [page, coordinator, outcomes, { style: async }]
+steps:
+  - say: "Before: one view model with 1,800 lines, fourteen dependencies and every reason to change."
+    show: [page]
+    state: { page: error }
+    label: { page: "1,800 lines" }
+  - say: "The cohesion map's three clusters become **child view models**. Each owns its region's state and has a single reason to change."
+    show: [children]
+    state: { page: null }
+    label: { page: null }
+  - say: "Rules and data move below them: the delivery promise becomes a pure domain type, and loading goes through repositories. Neither is a view model's job."
+    show: [rules, repo]
+  - say: "Navigation leaves as **outcomes** for the coordinator: \"show all reviews\", \"share this product\"."
+    show: [coordinator]
+    send: page->coordinator
+  - say: "What's left in the page view model is the rule that crosses regions: choosing a variant updates the gallery and the price. The children never talk to each other."
+    send: [page->gallery, page->buying]
+    state: { page: ok }
+    label: { page: coordinates }
+```
+
+## The page view model after the split
+
+The parent owns its children as `let` properties and coordinates the one cross-region rule. Each child is small, and so is each child's view.
+
+```swift check title="ProductPageViewModel.swift"
+import Foundation
+import Observation
+
+struct Variant: Identifiable, Equatable, Sendable {
+    let id: String
+    let colour: String
+    let imageNames: [String]
+    let pricePence: Int
+}
+
+@MainActor
+@Observable
+final class GalleryViewModel {
+    private(set) var imageNames: [String] = []
+    private(set) var selectedIndex = 0
+
+    func show(_ names: [String]) {
+        imageNames = names
+        selectedIndex = 0
+    }
+
+    func select(_ index: Int) {
+        guard imageNames.indices.contains(index) else { return }
+        selectedIndex = index
+    }
+}
+
+@MainActor
+@Observable
+final class BuyingViewModel {
+    private(set) var variant: Variant?
+    private(set) var priceText = ""
+    private let formatPrice: (Int) -> String
+
+    init(formatPrice: @escaping (Int) -> String) {
+        self.formatPrice = formatPrice
+    }
+
+    func show(_ variant: Variant) {
+        self.variant = variant
+        priceText = formatPrice(variant.pricePence)
+    }
+}
+
+@MainActor
+@Observable
+final class ProductPageViewModel {
+    let gallery = GalleryViewModel()
+    let buying: BuyingViewModel
+    private(set) var variants: [Variant] = []
+    private let onShowAllReviews: () -> Void
+
+    init(formatPrice: @escaping (Int) -> String, onShowAllReviews: @escaping () -> Void) {
+        buying = BuyingViewModel(formatPrice: formatPrice)
+        self.onShowAllReviews = onShowAllReviews
+    }
+
+    func show(variants: [Variant]) {
+        self.variants = variants
+        if let first = variants.first { variantSelected(first.id) }
+    }
+
+    /// The one rule that spans regions: a new variant changes the images and the price
+    func variantSelected(_ id: Variant.ID) {
+        guard let variant = variants.first(where: { $0.id == id }) else { return }
+        gallery.show(variant.imageNames)
+        buying.show(variant)
+    }
+
+    func allReviewsTapped() {
+        onShowAllReviews()
+    }
+}
+```
+
+Three details make the composition work:
+
+- **Children are `let`.** The reference never changes, so a view that reads `page.buying.priceText` depends on the buying model's `priceText` alone, not on the gallery. Each region re-renders on its own changes.
+- **Children don't know each other or the parent.** Cross-region rules go through the parent, which acts as a mediator. A child that needs to tell the parent something gets a closure, like any other outcome.
+- **The views follow the same split.** `ProductPageView` passes `page.gallery` to `GalleryView`, `page.buying` to `BuyingPanel`. Each child view is previewable with its own small model.
+
+## Splitting safely
+
+A massive view model is usually under-tested, so the split is a refactor without a net. Build one first:
+
+1. **Characterisation tests** around what the screen shows today, as [Refactoring safely: characterisation tests and small steps](/design/learn/sd-refactoring-characterisation-tests) described: feed fixed data, record the outputs, and assert they don't change.
+2. **One extraction per pull request.** Move the delivery rule this week, the gallery next week. Each step ships and is easy to review.
+3. **Keep the old surface while you move.** The page view model can forward `var priceText: String { buying.priceText }` until every view reads the child directly, so the view and the view model don't have to change in the same step.
+4. **Delete the forwarding** once nothing uses it, or the parent becomes a massive view model of forwards.
+
+## The opposite failure
+
+Splitting can overshoot. A view model per label, children that only forward their parent's properties, a `ProductPageTitleFormatterProvider`: each type is tiny and the screen is now spread across twenty files that must change together. The test for an extraction is the one the cohesion map gives: **does this piece have its own state and its own reason to change?** A cluster with state, behaviour and a separate owner is worth a type. Twenty lines that always change with their neighbours aren't, however long the file looks.
+
+## Trade-offs
+
+| | One view model | Child view models per region | View model plus domain and formatters | A view model per component |
+| --- | --- | --- | --- | --- |
+| Size of each type | large and growing | small | medium | tiny |
+| Cross-region rules | anywhere | in the parent | in the view model | scattered, or need a bus |
+| Re-render scope | whole screen reads one model | per region | whole screen | per component |
+| Merge conflicts | constant | rare | fewer | rare |
+| Ceremony | none | a class per region | a few value types | a great deal |
+| Wins for | small screens | rich screens with independent regions | screens whose bulk is rules and formatting | almost never |
+
+The columns aren't exclusive: most large screens end up with child view models **and** rules and formatting moved out.
+
+<Callout kind="interview">
+
+**What to say:** "I'd map which methods use which properties; the clusters are the child view models, and what crosses them stays in the parent as coordination. Business rules move to domain types, data to repositories, formatting to small value types, navigation to the coordinator. I'd put characterisation tests in first and move one piece per pull request."
+
+**What to ask:** "Which parts change most often, and who owns them?" A region owned by another team is the first thing to extract.
+
+**Red flags:** "split it into five files" with no idea where the boundaries are; children that reach into each other; a parent that re-creates children on every change; a rewrite instead of steps.
+
+</Callout>
+
+<Callout kind="gotcha" title="Swift gotcha: a child view model in a computed property">
+
+`var buying: BuyingViewModel { BuyingViewModel(variant: selectedVariant) }` looks like derived state, but it creates a new object on every read. Its state (a quantity the user chose, a request in flight) vanishes each time, and every view holding the old one is now watching an object nobody updates. Child view models are stored, usually as `let`, and told about changes.
+
+</Callout>
+
+<Callout kind="gotcha" title="iOS gotcha: one region's failure shouldn't blank the page">
+
+Loading every region with one `async let` group and one `catch` means a failing reviews endpoint takes the whole product page down. Let each child load its own region, from its own `.task` or its own method, with its own failed state. The product still sells when the reviews service is down.
+
+</Callout>
+
+## Practice
+
+**Review: the event view model that does everything** is a compact massive view model: it holds its view controller, navigates, calls the network, applies a business rule and formats by hand. Write the split plan as this lesson suggests: what moves where, in which order, with which tests first.
+
+```cards
+- id: massive-symptoms
+  front: "What are the signs of a massive view model?"
+  back: "UI imports, navigation, business rules, ten-plus dependencies, groups of properties that never meet, and every feature's pull request touching the same file."
+- id: massive-cohesion-map
+  front: "How do you find where to split a view model?"
+  back: "Map which methods read or write which properties. Clusters that share only among themselves become child view models; what crosses clusters stays in the parent."
+- id: massive-moves
+  front: "Where do the pieces of a massive view model go?"
+  back: "Business rules to the domain, data access to repositories, formatting to value types, navigation to the coordinator, and regions to child view models."
+- id: massive-overshoot
+  front: "When is extracting a type not worth it?"
+  back: "When the piece has no state or reason to change of its own: it would only forward, and the screen would be spread across files that always change together."
+```
+
+```quiz
+- id: q1
+  type: mcq
+  prompt: "In a product page view model, `selectVariant(_:)` updates the images, the price and the stock text. After splitting into gallery and buying child view models, where should it live?"
+  options:
+    - "In the gallery view model, which tells the buying view model"
+    - "In the buying view model, which holds a reference to the gallery"
+    - "In the page view model, which updates both children"
+    - "Duplicated in both children"
+  answer: 2
+  explain: "It's a rule that spans regions, so the parent coordinates it, as a mediator. Children that reach into each other recreate the tangle the split was meant to remove."
+- id: q2
+  type: order
+  prompt: "Put the steps of splitting a massive view model in a safe order."
+  lines:
+    - "Write characterisation tests around what the screen shows today"
+    - "Map which methods use which properties to find the clusters"
+    - "Move one cluster into a child view model, forwarding the old properties"
+    - "Point the views at the child, and delete the forwarding"
+    - "Repeat for the next cluster in a separate pull request"
+  explain: "Tests first, because the split is a refactor; then a plan; then one move at a time, each shippable, with the forwarding removed before it becomes clutter."
+- id: q3
+  type: multi
+  prompt: "Which of these should leave the view model entirely, rather than move into a child view model? Choose all that apply."
+  options:
+    - "\"Free delivery over £40\""
+    - "The selected image index in the gallery"
+    - "Building the product request and decoding the response"
+    - "Pushing the all-reviews screen"
+    - "The text of the price label"
+  answer: [0, 2, 3]
+  explain: "Business rules go to the domain, data access to a repository and navigation to the coordinator. The selected image and the price text are screen state and presentation, which belong in a (child) view model."
+- id: q4
+  type: truefalse
+  prompt: "A file over 500 lines is reason enough to split a view model into child view models."
+  answer: false
+  explain: "Length is a prompt to look, not a reason. Split along clusters with their own state and their own reason to change; cutting by line count produces children that only forward and change together."
+- id: q5
+  type: mcq
+  prompt: "After the split, the reviews endpoint fails and the whole product page shows an error. What's the likely design flaw?"
+  options:
+    - "The child view models are `let` properties"
+    - "All regions load in one task with one `catch`, so any failure fails the page"
+    - "The reviews view model should be a struct"
+    - "The page view model should import SwiftUI to show partial errors"
+  answer: 1
+  explain: "Independent regions need independent loading and failure states. Let each child load its own data and show its own error, so the product can still be bought."
+```

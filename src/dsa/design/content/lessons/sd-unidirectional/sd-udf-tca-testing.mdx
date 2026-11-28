@@ -1,0 +1,344 @@
+## Why it matters
+
+Most tests check what their author remembered to check. A view model test asserts that `results` is set after a search, and never notices that `isLoading` stayed `true`, that an analytics call fired twice, or that a timer kept running after the screen closed. TCA's `TestStore` inverts that: a test passes only if it accounts for **everything** the feature did, every state change, every action its effects sent back and every effect still running. That's the feature TCA teams cite most when asked why they chose it, and the one interviewers expect you to explain precisely, including when exhaustiveness hurts.
+
+## A first test
+
+Here's a test of the debounced book search from [TCA: effects and dependencies](/design/learn/sd-udf-tca-effects), written with Swift Testing:
+
+```swift
+import ComposableArchitecture
+import Testing
+
+@MainActor
+struct BookSearchTests {
+    @Test
+    func typingQuicklySearchesOnceForTheLatestQuery() async {
+        let clock = TestClock()
+        let store = TestStore(initialState: BookSearch.State()) {
+            BookSearch()
+        } withDependencies: {
+            $0.continuousClock = clock
+            $0.bookClient.search = { query in
+                #expect(query == "dune")
+                return [.dune]
+            }
+        }
+
+        await store.send(.queryChanged("dun")) {
+            $0.query = "dun"
+            $0.isSearching = true
+        }
+        await clock.advance(by: .milliseconds(100))
+        await store.send(.queryChanged("dune")) {
+            $0.query = "dune"
+        }
+        await clock.advance(by: .milliseconds(300))
+        await store.receive(\.searchResponse.success) {
+            $0.isSearching = false
+            $0.results = [.dune]
+        }
+    }
+}
+```
+
+Read it as a script of the feature's behaviour:
+
+- **`TestStore(initialState:reducer:withDependencies:)`** runs the real reducer with dependencies the test controls: a `TestClock` that only moves when told to, and a search endpoint that returns Dune and checks it was asked for the right query.
+- **`send(action) { … }`** sends an action and describes, in the closure, how the state should **change**. The closure receives a copy of the previous state; the store applies the reducer for real and compares.
+- **`clock.advance(by:)`** moves time. 100 ms after "dun" the user types "dune", which cancels the first search while it's still sleeping, so the search endpoint is only ever called for "dune".
+- **`receive(\.searchResponse.success) { … }`** waits for the action the effect sends back, matches it by case key path, and checks the state change it causes.
+- **The end of the test is an assertion too.** When the test returns, the store checks that no effects are still running and no received actions went unasserted.
+
+## What "exhaustive" means
+
+By default, a `TestStore` fails the test when any of these happen:
+
+| If the test… | The store reports |
+| --- | --- |
+| describes a state change that doesn't match, or misses one | The difference between expected and actual state, field by field |
+| sends a new action while actions from effects are waiting | The received actions it hasn't asserted |
+| receives an action other than the one the feature sent | Both actions |
+| ends with effects still running | Which action started the effect that's still running |
+| ends with actions it never received | Those actions |
+| triggers a dependency it didn't override | The unimplemented endpoint, by name |
+
+Forget `$0.isSearching = true` in the first `send`, and the test fails with a diff like this (abridged):
+
+```text title="What you'll see"
+A state change does not match expectation: …
+
+      BookSearch.State(
+        query: "dun",
+        results: [],
+    −   isSearching: false,
+    +   isSearching: true,
+        errorMessage: nil
+      )
+
+(Expected: −, Actual: +)
+```
+
+The closure-as-change design is what keeps tests short: a test of a 40-field feature mentions only the fields an action touched, yet a change to any other field still fails it. Here's the mechanism without the library:
+
+```swift run title="Expected state from the test, actual state from the reducer"
+struct SearchState: Equatable {
+    var query = ""
+    var results: [String] = []
+    var isSearching = false
+}
+
+func reduce(_ state: inout SearchState, query: String) {
+    state.query = query
+    state.isSearching = query.count >= 2
+}
+
+/// The fields that differ, the way a test store explains a failure
+func differences<T>(_ expected: T, _ actual: T) -> [String] {
+    zip(Mirror(reflecting: expected).children, Mirror(reflecting: actual).children).compactMap { want, got in
+        let (wanted, actual) = (String(describing: want.value), String(describing: got.value))
+        return wanted == actual ? nil : "\(want.label ?? "?"): expected \(wanted), actual \(actual)"
+    }
+}
+
+/// Applies the test's description of the change to a copy of the previous state, then compares
+func check(_ name: String, query: String, _ describe: (inout SearchState) -> Void) {
+    let previous = SearchState()
+    var actual = previous
+    reduce(&actual, query: query)
+    var expected = previous
+    describe(&expected)
+    if expected == actual {
+        print("passed: \(name)")
+    } else {
+        print("failed: \(name)")
+        differences(expected, actual).forEach { print("  \($0)") }
+    }
+}
+
+check("describes every change", query: "dun") {
+    $0.query = "dun"
+    $0.isSearching = true
+}
+check("forgets isSearching", query: "dun") {
+    $0.query = "dun"
+}
+check("expects results too early", query: "dun") {
+    $0.query = "dun"
+    $0.isSearching = true
+    $0.results = ["Dune"]
+}
+```
+
+```output
+passed: describes every change
+failed: forgets isSearching
+  isSearching: expected false, actual true
+failed: expects results too early
+  results: expected ["Dune"], actual []
+```
+
+## Watch a test run
+
+```visual sequence
+title: An exhaustive test of the debounced search
+participants:
+  - { id: test, label: Test }
+  - { id: store, label: TestStore }
+  - { id: reducer, label: BookSearch }
+  - { id: clock, label: TestClock }
+messages:
+  - [test, store, "send(.queryChanged(\"dun\"))", { say: "The test sends an action and describes the change: `query` and `isSearching`." }]
+  - [store, reducer, reduce]
+  - [reducer, store, "new state + effect", { reply: true, say: "The store runs the real reducer, compares the state with the test's description, and starts the search effect." }]
+  - [store, clock, sleep 300 ms, { async: true, say: "The effect sleeps on the **test clock**, which doesn't move on its own. Nothing happens until the test says time has passed." }]
+  - [test, store, "send(.queryChanged(\"dune\"))", { say: "100 ms of test time later, a second keystroke. Its effect cancels the sleeping one; the test asserts only that `query` changed." }]
+  - [test, clock, advance 300 ms, { say: "The test advances the clock. The second effect wakes and calls the search endpoint, which the test overrode to return Dune." }]
+  - [clock, store, "searchResponse(.success)", { reply: true, say: "The effect sends its result back. The store holds it as a **received action** the test must account for." }]
+  - [test, store, "receive(\\.searchResponse.success)", { say: "The test receives it and describes the change: results set, no longer searching." }]
+  - { note: "End of test: no effects running, no actions left unreceived.", over: [test, store] }
+steps:
+  - { say: "Set-up: a TestStore running the real reducer with a TestClock and a stubbed search.", upTo: -1 }
+  - { say: "The first keystroke: one action in, one state change described, one effect started.", upTo: 3 }
+  - { say: "Typing again cancels the first search before it ever reached the network.", upTo: 4 }
+  - { say: "Time moves only when the test says so, and the effect's answer becomes a received action.", upTo: 6 }
+  - { say: "Receiving it closes the loop. When the test returns, the store checks nothing is left over.", upTo: 8 }
+```
+
+## Controlling time
+
+Two clocks from Point-Free's swift-clocks cover almost every test:
+
+- **`ImmediateClock`** makes every sleep return at once. Use it when timing is incidental: a feature that waits a second before showing a hint, where the test cares about the hint, not the second.
+- **`TestClock`** only moves when the test calls `advance(by:)` (or `run()`, which runs it to the last pending sleep). Use it when timing *is* the behaviour: debounces, timeouts, countdowns, retry schedules.
+
+Other sources of nondeterminism get the same treatment: `$0.uuid = .incrementing` makes `uuid()` return `00000000-0000-0000-0000-000000000000`, then `…0001`, and so on, and `$0.date.now = Date(timeIntervalSince1970: 1_800_000_000)` fixes the time. A test can then state exactly which note was created, with which id and timestamp.
+
+## Testing navigation and long-living effects
+
+Navigation is state, so it's tested like state. Here's the note sheet from [TCA: tree-based and stack-based navigation](/design/learn/sd-udf-tca-navigation), saved and dismissed:
+
+```swift
+@Test
+func savingANoteAddsItAndDismissesTheSheet() async {
+    let store = TestStore(
+        initialState: BookDetail.State(
+            book: .dune,
+            destination: .addNote(AddNote.State(bookID: Book.dune.id))
+        )
+    ) {
+        BookDetail()
+    } withDependencies: {
+        $0.uuid = .incrementing
+        $0.date.now = Date(timeIntervalSince1970: 1_800_000_000)
+    }
+
+    await store.send(\.destination.addNote.binding.text, "Arrakis") {
+        $0.destination?.addNote?.text = "Arrakis"
+    }
+    await store.send(\.destination.addNote.saveButtonTapped)
+    await store.receive(\.destination.addNote.delegate) {
+        $0.notes = [
+            Note(id: UUID(0), bookID: Book.dune.id, text: "Arrakis", createdAt: Date(timeIntervalSince1970: 1_800_000_000)),
+        ]
+    }
+    await store.receive(\.destination.dismiss) {
+        $0.destination = nil
+    }
+}
+```
+
+The case key paths reach through the presentation: `\.destination.addNote.saveButtonTapped` is the child's action, wrapped as the parent sees it. The two `receive`s are the child's effect at work, the delegate message and then the `dismiss()` call, and asserting `destination = nil` proves the sheet closed. In a stack, elements are addressed by their id, which is deterministic in tests (0, 1, 2…): `store.send(\.path[id: 0].detail.authorButtonTapped)`.
+
+Long-living effects need one more step. An effect that observes a stream never finishes on its own, so a test that starts it must end it:
+
+```swift
+let task = await store.send(.task)
+await store.receive(\.finishedCountChanged) { $0.finishedCount = 3 }
+await task.cancel()
+```
+
+Without the last line, the test fails with "an effect is still running", which is exactly the bug it would be in the app if no view lifetime or id ever cancelled it.
+
+## Non-exhaustive tests
+
+Exhaustiveness is ideal for a leaf feature. For an integration test of a whole tab, where the question is "does tapping Dune on the shelf push its detail?", asserting every child's every state change is noise, and it breaks whenever a child changes internally. TCA lets you relax it per store:
+
+```swift
+store.exhaustivity = .off
+await store.send(.shelf(.rows(.element(id: Book.dune.id, action: .openTapped))))
+await store.skipReceivedActions()
+#expect(store.state.path.count == 1)
+```
+
+With exhaustivity off, the closures assert only what they mention, unasserted actions and effects are allowed, and `skipReceivedActions()` and `skipInFlightEffects()` discard what you don't care about. `.off(showSkippedAssertions: true)` still lists everything you skipped, as warnings rather than failures, which helps when a test starts failing for reasons you can't see.
+
+## What `TestStore` doesn't test
+
+It tests the feature's logic, which is most of what matters, but not all of it:
+
+- **The view.** Whether a button sends the right action, a binding is wired to the right field, or the layout works: previews, snapshot tests and a few UI tests cover that.
+- **Live dependencies.** The test overrode `bookClient`; the real client's decoding and request building need their own tests, against recorded responses.
+- **Performance.** A reducer that's correct but slow passes every test. Measure it on device, which the next lessons come back to.
+
+## Trade-offs
+
+| | Exhaustive `TestStore` | Non-exhaustive `TestStore` | Plain reducer tests on values | UI tests |
+| --- | --- | --- | --- | --- |
+| Catches unasserted changes | Yes, all of them | Only what you assert | Only what you assert | Only what's visible |
+| Effects and timing | Run with controlled dependencies and clocks | Same, with skipping | Not run: effects compared as values, if they are values | Real, and slow |
+| Brittleness | Breaks when internals change | Breaks only on asserted behaviour | Low | High |
+| Speed | Milliseconds | Milliseconds | Microseconds | Seconds to minutes |
+| Wins for | Leaf features and anything with tricky async behaviour | Integration across features | Small pure reducers outside TCA | A few critical end-to-end journeys |
+
+<Callout kind="interview">
+
+**Say** "Each test sends actions and describes how the state should change; the store runs the real reducer with controlled dependencies, a test clock and incrementing UUIDs, and fails on any change I didn't describe, any action I didn't receive and any effect still running at the end. For integration tests across features I turn exhaustivity off and assert only the outcome." **Ask** what the team's test pyramid looks like, since TestStore tests replace most view model tests but not UI or client tests. **Red flags:** `Task.sleep` in a test, tests that pass only with real time, and exhaustivity turned off everywhere to make failures go away.
+
+</Callout>
+
+<Callout kind="gotcha" title="Swift gotcha: don't paste the diff back into the test">
+
+When a test fails, the diff shows the actual state, and it's tempting to copy those values into the closure until it passes. That turns the test into a recording of whatever the code does, bugs included. Read the diff as a question (should `isSearching` really still be `true` here?) and decide what the feature *should* do before changing either side.
+
+</Callout>
+
+<Callout kind="gotcha" title="Swift gotcha: TestStore lives on the main actor">
+
+`TestStore` is `@MainActor`, like `Store`. Mark the suite or each test `@MainActor`, or the compiler rejects every `send` and `receive`. It also means a test that blocks the main actor stalls the store's effects; await the clock and the store, and never use `sleep` or semaphores in a test.
+
+</Callout>
+
+## Practice
+
+**[An exhaustive test store](/design/practice/sd-kata-unidirectional-test-store)**: build a small `TestStore` yourself, with expected-versus-actual state, a queue of received actions, and failures for everything a test forgets. You'll see exactly why sending before receiving is an error, and why finishing with an effect still running must fail.
+
+```cards
+- id: teststore-checks
+  front: "What does an exhaustive TestStore fail a test for?"
+  back: "A state change that doesn't match or wasn't described; sending while received actions are unasserted; receiving the wrong action; effects still running at the end; actions never received; and calling an unimplemented dependency."
+- id: closure-as-change
+  front: "What does the closure passed to `send` or `receive` receive, and why?"
+  back: "A copy of the previous state, which the test changes into the expected state. Tests describe only what changed, yet any other change still fails the comparison."
+- id: test-clocks
+  front: "ImmediateClock or TestClock?"
+  back: "ImmediateClock when timing is incidental: every sleep returns at once. TestClock when timing is the behaviour (debounce, timeouts, countdowns): it moves only when the test advances it."
+- id: exhaustivity-off
+  front: "When should you turn exhaustivity off?"
+  back: "For integration tests across features, where asserting every child's internal changes is noise and breaks on refactors. Assert the outcome, skip received actions and in-flight effects."
+```
+
+```quiz
+- id: q1
+  type: mcq
+  prompt: "A test sends `.task`, which starts observing a stream of finished counts, receives one update, and ends. It fails with \"an effect is still running\". What's the right fix?"
+  options:
+    - "Turn exhaustivity off for the test"
+    - "Keep the `StoreTask` returned by `send(.task)` and `await task.cancel()` before the test ends"
+    - "Add `await clock.run()` at the end"
+    - "Make the stream finish after one value in the live client"
+  answer: 1
+  explain: "The effect is meant to run as long as the view does, so the test plays the view's part and cancels it. Turning exhaustivity off would hide the same mistake in places where it is a bug."
+- id: q2
+  type: multi
+  prompt: "With default exhaustivity, which of these fail the test? Choose all that apply."
+  options:
+    - "A `send` closure that doesn't mention a field the action changed"
+    - "Sending a second action while the first action's response is waiting to be received"
+    - "An effect that calls an endpoint the test didn't override"
+    - "A state field the action didn't change and the closure didn't mention"
+    - "Ending the test while a debounced search is still sleeping on the test clock"
+  answer: [0, 1, 2, 4]
+  explain: "Every change, every received action, every dependency used and every running effect must be accounted for. A field that didn't change needs no mention: the closure describes changes."
+- id: q3
+  type: sort
+  prompt: "Which clock suits each test?"
+  buckets: [ImmediateClock, TestClock]
+  items:
+    - [A tip banner that appears one second after the screen loads; the test checks the tip's text, 0]
+    - [A search that must not fire until 300 ms after the last keystroke, 1]
+    - [A countdown that shows 3 then 2 then 1, 1]
+    - [A save that waits briefly before showing a checkmark; the test checks the saved data, 0]
+    - [A request that times out after 10 seconds, 1]
+  explain: "If the test only cares what happens after a wait, an immediate clock removes the wait. If the timing itself is the behaviour, a test clock lets the test step through it."
+- id: q4
+  type: order
+  prompt: "Put the steps of a test of the debounced search in order."
+  lines:
+    - "Create a TestStore with a TestClock and a stubbed search endpoint"
+    - "Send `queryChanged(\"dun\")` and describe the state change"
+    - "Advance the clock 100 ms and send `queryChanged(\"dune\")`"
+    - "Advance the clock 300 ms"
+    - "Receive `searchResponse.success` and describe the results"
+    - "Return: the store checks nothing is still running or unreceived"
+  explain: "Control the world first, then alternate between what the user does, what time does, and what the feature sends back, describing each change."
+- id: q5
+  type: truefalse
+  prompt: "With `exhaustivity = .off`, a `send` closure that sets one field still fails the test if that field ends up different."
+  answer: true
+  explain: "Non-exhaustive tests still check what you assert; they only stop insisting that you assert everything. That's what makes them useful for integration tests."
+- id: q6
+  type: recall
+  prompt: "An interviewer says exhaustive tests sound brittle. How do you respond?"
+  model: "They are brittle on purpose for leaf features: any behaviour change, including an accidental one, must show up in a test. For integration tests across features I turn exhaustivity off and assert outcomes, so internal refactors of children don't break them. The brittleness is concentrated where it catches bugs, and the closures describe only changes, so tests stay short."
+```

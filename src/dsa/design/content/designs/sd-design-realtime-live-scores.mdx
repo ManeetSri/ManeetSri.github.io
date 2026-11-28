@@ -1,0 +1,197 @@
+<Brief>
+
+You're on the platform team of a football app. Today, match screens poll `GET /v1/matches/{id}.json` every 30 seconds, and fans complain that friends watching on TV cheer half a minute before the app shows the goal. Product wants **live score updates**: goals, cards, substitutions, the score and the match clock, plus statistics such as possession and shots.
+
+What matters:
+
+- **Fast:** a goal should reach a phone with the match screen open within **2 seconds** of the data provider reporting it (95th percentile).
+- **Right:** scores must never go backwards or double. The provider sometimes sends duplicates, and corrections (a goal ruled out by VAR, a scorer changed).
+- **Everywhere:** fans who aren't in the app get alerts for teams they follow, and the match they follow most can sit on the lock screen.
+
+The numbers:
+
+- **5 million concurrent users** at the Saturday peak, during a cup final.
+- About **1,200 matches** live at that moment worldwide, but heavily skewed: half the viewers are on the final alone.
+- A **sports data provider** sends events to your webhook: a few per match per minute, plus statistics every 10 seconds.
+- iOS, Android and web clients. App versions from the last two years are still in use, and they only know the polling endpoint.
+- Six backend engineers, one cloud provider, and a finance team that reads the bill.
+
+Design the backend for live updates, and what the apps need from it. Spend about 45 minutes.
+
+</Brief>
+
+```workspace
+template: system
+minutes: 45
+```
+
+<ModelAnswer section="requirements">
+
+Questions worth asking: what latency counts (from provider to screen, in the foreground)? Which updates matter most (goals and cards versus statistics)? Is there anything interactive, such as chat or predictions, now or soon? Are we allowed to make old app versions poll for ever? Do we need authentication to watch scores?
+
+- **Functional:** live match state (score, status, clock, events) for any match a client is viewing or following; statistics; goal and card alerts for followed teams; a Live Activity for one match; catch-up when a client reconnects; corrections that fix the score everywhere.
+- **Non-functional:** p95 provider-to-screen under 2 s for foreground users; no lost, doubled or backwards scores; survive a gateway or zone failure and deploys during matches without a visible outage; cheap enough at 5M concurrent; old clients keep working.
+- **Traffic shape:** one-way (server to client), extremely read-heavy, very bursty (a goal in the final), and predictable: we know every kick-off time in advance.
+- **Out of scope:** video, betting, chat (but don't design it out), the provider integration's internals.
+
+</ModelAnswer>
+
+<ModelAnswer section="estimates">
+
+- **Connections:** 5M concurrent. At a conservative 50,000 per gateway instance (an event-loop server; about 20–50 KB of memory per TLS connection, so 1–2.5 GB), that's 100 gateways, plus about 50% headroom for deploys and reconnect storms: **~150 gateways** across regions.
+- **Ingest:** 1,200 matches × (a statistics update every 10 s plus a few events a minute) ≈ **150 events a second**. Trivial.
+- **Steady fan-out:** if each viewer gets about one coalesced update every 10 s, 5M ÷ 10 = **500,000 messages a second**, about 100 MB/s (under 1 Gbit/s) at ~200 bytes each, framing included.
+- **Burst fan-out:** a goal in the final goes to 2.5M viewers within 2 s, so ~1.25M messages a second for a moment, about **8,000 a second per gateway**: fine if each gateway serialises the message once.
+- **Heartbeats:** pinging every 25 s when quiet would be 5M ÷ 25 = 200,000 a second, so heartbeats only on quiet connections; busy streams prove themselves.
+- **Reconnect storm:** losing a region or a botched deploy sends up to 5M reconnects. Spread over 30 s with jitter, that's **~170,000 TLS handshakes a second**: the real capacity limit, not the steady state.
+- **Snapshot reads:** 5M fans opening the app around kick-off over ~5 minutes is ~17,000 requests a second for match state; with a 1-second CDN TTL the origin sees about one request per match per second per edge location.
+- **Legacy pollers:** if 10% of users are on old versions, 500,000 ÷ 30 s ≈ 17,000 requests a second, all CDN hits.
+- **Pushes:** a goal for a club with 5M followers is 5M APNs and FCM sends; a Live Activity broadcast is one push per channel.
+
+</ModelAnswer>
+
+<ModelAnswer section="architecture">
+
+Two paths: **write once, fan out in tiers**.
+
+1. **Ingest service** receives the provider's webhooks, verifies them, deduplicates by the provider's event id, applies corrections, and assigns each match a **sequence number** per change. It writes the new match state and the event, in that order, to the store and the event log.
+2. **Match state store:** Redis (replicated) holds each match's current state and its recent events; Postgres keeps the durable history. The **snapshot API** (`GET /v2/matches/{id}`) reads from Redis and sits behind the **CDN** with a 1-second TTL.
+3. **Live router** consumes the event log (Kafka, partitioned by match id so each match stays in order), **coalesces** statistics to at most one update per match per few seconds (score events pass straight through), and publishes the match's full state on a pub/sub fabric (NATS or Redis pub/sub), topic `match.{id}`.
+4. **Edge gateways** in each region terminate client connections (SSE over HTTP/2), keep their clients' subscriptions in memory, subscribe to `match.{id}` **once per gateway** when the first local client asks for it, and write each message to their local subscribers. They hold no data: everything can be rebuilt from the state store.
+5. **Notification service** consumes key events and sends goal and card alerts to followers through APNs and FCM, plus Live Activity updates through one APNs broadcast channel per match.
+6. **Global load balancing** sends clients to the nearest healthy region's L4 load balancer, with idle timeouts longer than the heartbeat.
+
+Fan-out per goal is then: one write, one publish, about 150 gateway deliveries, and local socket writes: the expensive multiplication happens at the edge, spread across machines.
+
+</ModelAnswer>
+
+<ModelAnswer section="api">
+
+- **Snapshot:** `GET /v2/matches/{id}` returns `{"id": "841", "seq": 1042, "status": "live", "minute": 67, "home": {…}, "away": {…}, "events": [last 20]}` with an `ETag`. CDN-cached for 1 s, with `stale-while-revalidate` so a burst never reaches the origin.
+- **Catch-up:** `GET /v2/matches/{id}/events?after=1042` returns missed events, or `410 Gone` when the position is older than the retained history, meaning "fetch the snapshot".
+- **Live stream:** `GET /v2/live?matches=841,902&resume=841:1042,902:77` as **server-sent events**. Each event is `event: state` with `data:` the full match state and its `seq`, or `event: reset` telling the client to refetch a snapshot. Per-match resume positions replace a single `Last-Event-ID`, because one stream carries several independently numbered matches. Comment heartbeats every 25 s.
+- **Changing subscriptions:** the client opens a new stream with the new list and resume positions, then closes the old one. On HTTP/2 that's a new stream on the existing connection, not a new handshake, and navigation between matches is rare enough for that to be cheap.
+- **Compatibility:** every message has a `type` and a version; clients ignore types they don't know; fields are only ever added. `/v1/matches/{id}.json` stays for old apps, served from the same state.
+
+</ModelAnswer>
+
+<ModelAnswer section="data">
+
+- **Match state** (Redis hash per match, replicated): id, `seq`, status, minute, kick-off time, score, a small "last events" list, `updatedAt`, and a provider-freshness flag. Written only by ingest.
+- **Event log:** Kafka topic partitioned by match id (order per match), kept for 7 days for replays and debugging; the last ~500 events per match also kept in a capped Redis stream for fast catch-up.
+- **Durable history:** Postgres tables for matches and events, for match pages after the final whistle and for audits.
+- **Dedupe:** provider event ids with a TTL of a few hours in Redis, checked by ingest.
+- **Subscriptions:** only in gateway memory. If a gateway dies its clients reconnect and resubscribe; nothing to recover.
+- **Followers and devices:** Postgres tables of who follows which team, push tokens per device, and each match's Live Activity channel id.
+
+Everything is keyed and partitioned by match id. The hot match is hot for reads, not writes: its write rate is a few events a second, so one partition is fine; the read fan-out is the gateways' job.
+
+</ModelAnswer>
+
+<ModelAnswer section="scale">
+
+What breaks first, and what we do about it:
+
+1. **The goal burst in the final.** Each gateway serialises the message once and writes the same bytes to every subscriber, in batches; per-connection buffers are bounded so one slow phone can't hold memory.
+2. **Reconnect storms.** We know when matches start, so we **scale ahead of kick-off** instead of reacting. Deploys drain gateways gradually with randomised reconnect hints; TLS session resumption keeps handshakes cheap; gateways refuse new streams with `503` and `Retry-After` when saturated rather than falling over.
+3. **Snapshot stampede at kick-off.** The CDN's 1-second TTL plus request collapsing means one origin fetch per match per second per location.
+4. **Push fan-out for big clubs.** Notification workers read follower lists in pages and send over many HTTP/2 connections to APNs; a full 5M fan-out takes on the order of a minute, which is acceptable for alerts, while the Live Activity uses one broadcast push per update.
+5. **At 10×** (50M concurrent, a World Cup): add a regional relay tier between the fabric and the gateways so no single fabric node serves 1,500 gateways, and consider HTTP/3 for faster reconnects on lossy networks.
+
+</ModelAnswer>
+
+<ModelAnswer section="failure">
+
+- **A gateway dies:** its clients reconnect with jitter to the others and resume from their per-match sequence numbers; if they're too far behind, the stream sends `reset` and they fetch a snapshot. No data is lost, because gateways hold none.
+- **The pub/sub fabric fails:** gateways fall back to reading state from Redis once a second for each match they serve: degraded but still live.
+- **The provider is late or down:** state carries `updatedAt` and a freshness flag, and apps show "updates delayed" rather than a confident stale score. An operations tool can enter scores by hand for the biggest matches.
+- **Duplicates and corrections:** ingest deduplicates by provider id; a correction is a new event with a higher sequence number carrying the corrected state, so every client converges on it. Because clients apply full state with "newer `seq` wins", duplicates and reordering are harmless. Alerts send a correction only when a goal is ruled out.
+- **Slow clients:** if a connection's buffer fills, the gateway drops intermediate states for that client and keeps the latest per match (state is self-healing); if it stays behind, it's disconnected and resyncs.
+- **Watching it:** client-reported provider-to-screen latency (sampled), connections and reconnects per gateway, fan-out lag from the router, CDN hit ratio, push delivery rates. Alert on latency, not just on errors.
+- **Abuse:** scores are public, but streams still need an app token for rate limiting, per-IP connection limits, and DDoS protection at the edge.
+
+</ModelAnswer>
+
+<ModelAnswer section="client">
+
+- **Foreground:** on opening a match, render the cached state, fetch the snapshot from the CDN, then open **one** SSE stream for the matches on screen plus followed ones, with resume positions. Apply updates keyed by match id when `seq` is newer. Parse the stream bytes yourself (not `AsyncBytes.lines`).
+- **Background:** close the stream when the scene leaves the foreground; reopen with resume positions when it's active again.
+- **Alerts:** APNs alerts for followed teams' goals and cards, chosen in the app's preferences, with a collapse id per match so a stack of goal alerts collapses to the latest.
+- **Lock screen:** a Live Activity for one followed match, started with `pushType: .channel(…)` (iOS 18 broadcast push), so the server sends one push per update to the match's channel instead of one per device. The match clock is rendered on the device from the kick-off time, not pushed every minute; minor updates go at low priority to stay within the system's update budget.
+- **Battery and data:** heartbeat comments every 25 s only matter on quiet streams; statistics coalesced server-side; in Low Power Mode or Low Data Mode, ask for score events only.
+- **Old versions and odd networks:** old apps keep polling `/v1` through the CDN. If a stream fails to deliver anything (some proxies buffer), the app falls back to polling the snapshot every 10 s and says "updates may be delayed".
+
+</ModelAnswer>
+
+<ModelAnswer section="tradeoffs">
+
+- **SSE over WebSockets:** traffic is one-way; SSE is plain HTTP, multiplexes on HTTP/2, works through the same edge, auth and tooling as the rest of the API, and has resumption built into the format. If chat or live predictions arrive, add WebSockets on the same gateways for those features.
+- **Full state over deltas:** each message is a little bigger, but duplicates, reordering and lost messages stop being correctness bugs, and corrections are just newer states.
+- **Persistent connections over CDN polling:** polling a CDN-cached file every 5 seconds would be far cheaper and simpler (the CDN absorbs a million requests a second) but averages 2–3 s of extra staleness and costs a radio wake-up per poll. For the top tier of the product, a goal within 2 s is the feature. Polling remains the degraded mode and the legacy path.
+- **Build or buy:** managed real-time services (Ably, PubNub, Pusher) can hold millions of connections and would save the gateway tier, priced per connection-minute and message. With six engineers that's a serious option: keep ingest, state and snapshots in-house and put fan-out behind an interface so it can move.
+- **Evolution:** personalised streams (fantasy points per user) would move some fan-out logic into the gateways; WebTransport over HTTP/3 could replace SSE once clients and CDNs support it widely.
+
+</ModelAnswer>
+
+```rubric
+- id: scope
+  label: Pinned down latency, traffic shape and correctness
+  skill: requirements
+  look_for:
+    - A latency target for foreground users, separate from background alerts
+    - One-way, read-heavy, bursty and predictable traffic called out
+    - Duplicates and corrections from the provider treated as requirements
+- id: numbers
+  label: Estimated the numbers that size the system
+  skill: estimation
+  look_for:
+    - Concurrent connections turned into a gateway count with headroom
+    - The fan-out burst of a goal in the biggest match
+    - Reconnect storms or TLS handshakes as a capacity limit, or heartbeat load
+- id: fanout
+  label: Fanned out in tiers, with a snapshot path beside the stream
+  skill: architecture
+  look_for:
+    - Ingest writes once; pub/sub to gateways; gateways write to local connections
+    - Gateways subscribe once per match, not once per client
+    - A CDN-cached snapshot endpoint for opening and reconnecting
+- id: ordering
+  label: Made scores impossible to double or reverse
+  skill: data
+  look_for:
+    - A per-match sequence number assigned at ingest
+    - Full state with "newer sequence wins", or deltas with explicit dedupe
+    - Catch-up or resume after reconnect, with a reset to snapshot when too far behind
+- id: resilience
+  label: Survived storms, failures and slow clients
+  skill: offline
+  look_for:
+    - Jittered reconnects, gradual drains and capacity scaled ahead of kick-off
+    - A degraded mode when the fabric or provider fails, shown honestly in the app
+    - Bounded per-connection buffers with conflation for slow clients
+- id: mobile
+  label: Designed for how phones actually behave
+  skill: client
+  look_for:
+    - Connection closed in the background, with APNs alerts and a Live Activity instead
+    - One stream per app, resuming with per-match positions
+    - Old app versions and blocked streams fall back to polling
+- id: tradeoffs
+  label: Weighed the real alternatives
+  skill: tradeoffs
+  look_for:
+    - SSE versus WebSockets for one-way traffic
+    - Persistent connections versus CDN polling, with the latency and cost difference
+    - Build versus buy for the connection tier
+```
+
+<Pitfalls>
+
+- A WebSocket per screen, or a design that keeps connections open while the app is in the background.
+- Sizing only the steady state, and missing the goal burst and the reconnect storm after a deploy.
+- Fanning out from one central service to 5 million sockets instead of in tiers.
+- Pushing deltas ("home +1") with no sequence numbers, so a duplicate or a VAR correction leaves wrong scores on screen.
+- Sending a Live Activity push per device per minute to tick the match clock.
+- Forgetting the old app versions that only know how to poll.
+
+</Pitfalls>

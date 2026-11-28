@@ -1,2 +1,36 @@
 // Katas for D24 · Errors, logging & diagnostics
-export default [];
+export default [
+    {
+        id: 'sd-kata-diagnostics-error-ladder',
+        kind: 'problem',
+        title: 'An error ladder from transport to screen',
+        difficulty: 'easy',
+        patterns: ['networking', 'swift', 'ui'],
+        lessons: ['sd-diag-propagation', 'sd-diag-typed-throws', 'sd-diag-error-ux', 'sd-diag-error-taxonomy'],
+        swiftTest: 'DiagErrorLadderTests',
+        lists: [],
+        minutes: 25,
+    },
+    {
+        id: 'sd-kata-diagnostics-log-redactor',
+        kind: 'problem',
+        title: 'A log formatter that redacts',
+        difficulty: 'medium',
+        patterns: ['observability', 'privacy'],
+        lessons: ['sd-diag-structured-logging', 'sd-diag-logger'],
+        swiftTest: 'DiagLogRedactorTests',
+        lists: [],
+        minutes: 35,
+    },
+    {
+        id: 'sd-kata-diagnostics-breadcrumb-trail',
+        kind: 'problem',
+        title: 'A breadcrumb trail that survives a crash',
+        difficulty: 'medium',
+        patterns: ['observability', 'concurrency', 'persistence'],
+        lessons: ['sd-diag-crash-reporting'],
+        swiftTest: 'DiagBreadcrumbTrailTests',
+        lists: [],
+        minutes: 35,
+    },
+];

@@ -1,2 +1,36 @@
 // Katas for D27 · MVP & MVVM
-export default [];
+export default [
+    {
+        id: 'sd-kata-mvvm-recipe-presenter',
+        kind: 'problem',
+        title: 'An MVP recipe presenter with a spy view',
+        difficulty: 'medium',
+        patterns: ['ui', 'architecture', 'testing'],
+        lessons: ['sd-mvvm-mvp', 'sd-mvvm-testing'],
+        swiftTest: 'MVPRecipeDetailTests',
+        lists: [],
+        minutes: 30,
+    },
+    {
+        id: 'sd-kata-mvvm-sign-in-io',
+        kind: 'problem',
+        title: 'An input/output sign-in view model',
+        difficulty: 'medium',
+        patterns: ['ui', 'state', 'testing'],
+        lessons: ['sd-mvvm-input-output', 'sd-mvvm-testing'],
+        swiftTest: 'InputOutputSignInTests',
+        lists: [],
+        minutes: 30,
+    },
+    {
+        id: 'sd-kata-mvvm-paged-catalog',
+        kind: 'problem',
+        title: 'A paginated catalogue view model',
+        difficulty: 'hard',
+        patterns: ['state', 'ui', 'concurrency'],
+        lessons: ['sd-mvvm-view-state', 'sd-mvvm-testing'],
+        swiftTest: 'PagedCatalogScreenTests',
+        lists: [],
+        minutes: 40,
+    },
+];

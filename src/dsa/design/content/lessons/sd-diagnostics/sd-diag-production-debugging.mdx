@@ -1,0 +1,289 @@
+## Why it matters
+
+Sooner or later a release goes out and something breaks for people you can't see, on devices you don't have, in situations you never tested. You can't attach a debugger to their phones, and you can't roll the app back. What you can do is work through a disciplined loop: notice quickly, stop the damage, narrow down what's different about the affected users, then fix forward and confirm it worked. This lesson turns the module's tools into that loop. "Users say the app crashes since the update: walk me through what you do" is one of the most revealing questions a senior interview can ask.
+
+## The loop
+
+Every production investigation follows the same steps, in this order:
+
+1. **Detect.** A signal says something is wrong, ideally before users tell you.
+2. **Triage.** How bad, how many, since when, and who exactly?
+3. **Mitigate.** Stop the damage spreading, even before you know the cause.
+4. **Diagnose.** Find the cause: reproduce it, or explain it from evidence.
+5. **Fix and verify.** Ship the fix, and confirm with the same signal that raised the alarm.
+6. **Learn.** Make this class of problem cheaper next time.
+
+The order matters most at step 3. The instinct is to find the bug first. But while you read code, the phased release keeps reaching more phones. Mitigation first, diagnosis second.
+
+## Detect: signals that fire before the reviews
+
+Good signals compare a **rate** for the **new release** against the previous one, so they work at 1% of a rollout as well as at 100%:
+
+- **Crash-free users and sessions per version,** from your crash reporter. Alert when the new build is clearly worse than the last one at the same stage of rollout.
+- **Error events by name,** from structured logs: `checkout.failed` per thousand sessions, by app version.
+- **Server metrics split by app version.** Send the version in every request (in the `User-Agent` or a header), and a backend dashboard can show that `POST /orders` fails for 5.2.0 and not for 5.1.3. Often the fastest signal of all.
+- **Business metrics:** conversion through checkout, sign-ups per session. A bug that crashes nothing can still break a flow.
+- **MetricKit and Organizer,** for hangs, launch time and terminations. They're slower (daily), so they catch regressions, not incidents.
+- **People:** support tickets, App Store reviews, social media. Valuable, but by the time they arrive the problem has reached many users.
+
+## Triage: what's different about the affected users?
+
+The most powerful question in production debugging is **"what changed?"** An app release is the obvious suspect, but not the only one: a server deploy, a remote-config change, a vendor SDK's backend, a new iOS release, an expired certificate, or simply the calendar (a time-zone change, a leap day, the first week of a new year).
+
+The second is **"who is affected?"** Slice the reports by every dimension you have: app version, OS version, device model, locale and region, network type, account type, feature flags. A slice matters when it's **over-represented**: its share of the crashes is far above its share of all sessions. A big group with a big share of crashes is just a big group.
+
+```swift run
+import Foundation
+
+// Where does this crash concentrate? Compare each group's share of the crashes with its share of sessions.
+// A group with 4% of sessions and 58% of crashes is a lead; one with 31% of each is just a big group.
+struct Slice {
+    let dimension: String
+    let value: String
+    let sessionShare: Double     // share of all 5.2.0 sessions
+    let crashShare: Double       // share of this crash's reports
+}
+
+let slices = [
+    Slice(dimension: "device", value: "iPhone 15", sessionShare: 0.31, crashShare: 0.30),
+    Slice(dimension: "device", value: "iPhone 12", sessionShare: 0.12, crashShare: 0.13),
+    Slice(dimension: "os", value: "iOS 18.4", sessionShare: 0.64, crashShare: 0.66),
+    Slice(dimension: "locale", value: "en_GB", sessionShare: 0.71, crashShare: 0.06),
+    Slice(dimension: "locale", value: "de_DE", sessionShare: 0.04, crashShare: 0.58),
+    Slice(dimension: "locale", value: "fr_FR", sessionShare: 0.03, crashShare: 0.33),
+    Slice(dimension: "network", value: "cellular", sessionShare: 0.38, crashShare: 0.40),
+]
+
+// Lift: how many times more often a group appears among the crashes than among all sessions
+let ranked = slices
+    .map { (slice: $0, lift: $0.crashShare / $0.sessionShare) }
+    .sorted { $0.lift > $1.lift }
+
+for (slice, lift) in ranked {
+    let flag = lift >= 3 ? "  <- look here" : ""
+    let percent = Int((slice.crashShare * 100).rounded())
+    print("\(slice.dimension)=\(slice.value): \(percent)% of crashes, lift \(String(format: "%.1f", lift))\(flag)")
+}
+```
+
+```output
+locale=de_DE: 58% of crashes, lift 14.5  <- look here
+locale=fr_FR: 33% of crashes, lift 11.0  <- look here
+device=iPhone 12: 13% of crashes, lift 1.1
+network=cellular: 40% of crashes, lift 1.1
+os=iOS 18.4: 66% of crashes, lift 1.0
+device=iPhone 15: 30% of crashes, lift 1.0
+locale=en_GB: 6% of crashes, lift 0.1
+```
+
+Most of these crashes come from iOS 18.4 and from cellular, but so do most sessions: those slices tell you nothing. German and French users are 7% of sessions and 91% of the crashes. Both locales write numbers with a decimal comma, which is a strong lead before anyone has opened the code. Crash services and log search tools show these breakdowns; knowing to read them as **shares compared with the population** is the skill.
+
+Triage also sets **severity**, the second axis from [the taxonomy](/design/learn/sd-diag-error-taxonomy): how many users, which flow, and whether data or money is at risk. A crash on launch for 2% of users is an incident; a crash in an obscure settings screen for 0.01% can wait for the next release.
+
+## Mitigate: stop it spreading
+
+You can't roll an App Store release back: people who updated keep the new build, and the store won't serve them the old one. So mitigation means levers that work **without** a new binary, which is why they have to be built before you need them:
+
+| Lever | How fast | Who it helps | What it needs in advance |
+| --- | --- | --- | --- |
+| Pause the phased release | Minutes | People not yet updated automatically | Releasing with phased release on |
+| Turn off a feature with a flag or kill switch | Minutes | Everyone, at their next config fetch | The risky code behind a remote flag (D54) |
+| Fix or roll back on the server | Minutes to hours | Everyone, if the trigger is server-side | Server changes that don't need the app |
+| Change remote config to avoid the trigger | Minutes | Everyone | Behaviour that's configurable |
+| Ship a hotfix and request an expedited review | Hours to a day or two | Everyone, as they update | A release branch you can build from quickly |
+| Require a minimum version | Next launch | Everyone on the broken build, by forcing an update | A version check at launch that you've shipped before |
+
+A phased release spreads an update to people with automatic updates over seven days (1%, 2%, 5%, 10%, 20%, 50%, 100%), and can be paused for up to 30 days in total. That's why release-over-release alerts matter: catch the problem at 1% and pausing protects the other 99%.
+
+Step through an incident that goes well:
+
+```visual timeline
+title: The 5.2.0 checkout crash, first ten hours
+unit: min
+lanes:
+  - { id: store, label: App Store }
+  - { id: crashes, label: Crash rate }
+  - { id: team, label: Team }
+  - { id: config, label: Remote config }
+spans:
+  - { lane: store, from: 0, to: 60, label: "5.2.0 phased · 1%", tone: active }
+  - { lane: store, from: 60, to: 600, label: rollout paused, tone: wait }
+  - { lane: crashes, from: 0, to: 20, label: normal, tone: ok }
+  - { lane: crashes, from: 20, to: 80, label: "5.2.0: 3% of sessions", tone: error }
+  - { lane: crashes, from: 80, to: 600, label: back to normal, tone: ok }
+  - { lane: team, from: 40, to: 70, label: triage }
+  - { lane: team, from: 80, to: 250, label: diagnose }
+  - { lane: team, from: 250, to: 340, label: hotfix + tests }
+  - { lane: team, from: 340, to: 600, label: in review, tone: wait }
+  - { lane: config, from: 70, to: 600, label: new price parser off, tone: active }
+markers:
+  - { at: 40, label: alert }
+  - { at: 340, label: 5.2.1 submitted }
+steps:
+  - { at: 0, say: "5.2.0 starts its phased release at 1% of people with automatic updates." }
+  - { at: 40, say: "Crash-free sessions for 5.2.0 are far below 5.1.3's at the same stage, and the **alert** fires. Nobody has emailed support yet." }
+  - { at: 60, say: "Triage shows one new crash in checkout. Before anyone reads code, the rollout is **paused**: the other 99% stay on 5.1.3." }
+  - { at: 80, say: "The new price parser shipped behind a flag, so turning it off fixes everyone on 5.2.0 within minutes, at their next config fetch." }
+  - { at: 250, say: "With the bleeding stopped, the team diagnoses calmly: the crash slices point to decimal-comma locales, and the breadcrumbs end at `price.parsed`." }
+  - { at: 340, say: "The hotfix, with tests in German and French locales, is submitted with a request for **expedited review**." }
+  - { at: 600, say: "When 5.2.1 is approved, it gets its own phased release, and the same per-version signal confirms the fix." }
+```
+
+## Diagnose: from evidence to cause
+
+With the damage contained, gather evidence before forming theories:
+
+- **The crash report:** the exception type and the symbolicated top frames say *what* failed and where.
+- **Breadcrumbs:** the trail before the crash says *how* the app got there.
+- **Structured events for the session:** search by session id for everything that session did, and by request id for the server's side of each call.
+- **The slices from triage:** who is over-represented.
+- **The diff:** every change between the last good release tag and this one, including dependency and SDK updates, server deploys and config changes in the same window.
+
+Here the evidence lines up: crashes in `CheckoutModel.applyDiscount` with `EXC_BREAKPOINT`, the last breadcrumb `price.parsed`, German and French locales, and a diff that replaced a hand-written parser with `NumberFormatter`. The new code parsed the server's `"12.50"` with the **user's** locale, where `.` isn't the decimal separator, got `nil`, and force-unwrapped it:
+
+```swift check
+import Foundation
+
+// What shipped: server data parsed in the user's locale, then force-unwrapped.
+// In de_DE and fr_FR, "12.50" doesn't parse, so this traps.
+func discountedPriceAsShipped(_ serverText: String) -> Decimal {
+    let formatter = NumberFormatter()
+    formatter.numberStyle = .decimal                   // Locale.current
+    return formatter.number(from: serverText)!.decimalValue
+}
+
+enum PriceError: Error {
+    case unreadable(String)
+}
+
+// The fix: machine-readable text is parsed in a fixed locale, and bad input is an error, not a trap
+func discountedPrice(_ serverText: String) throws(PriceError) -> Decimal {
+    guard let value = Decimal(string: serverText, locale: Locale(identifier: "en_US_POSIX")) else {
+        throw .unreadable(serverText)
+    }
+    return value
+}
+```
+
+Two of this module's rules would have prevented it: data from a server is input, so it's validated rather than force-unwrapped; and machine-readable text is parsed in a fixed locale (`en_US_POSIX`), never the user's. The user's locale is for what people read and type.
+
+### When you can't reproduce it
+
+Often you can't. Then make the device you can't see reproduce it for you, or tell you more:
+
+- **Match the conditions:** the exact build from TestFlight or the App Store, the same OS and device class, the locale, region and time zone, a nearly full disk, Low Power Mode, the largest Dynamic Type size, a slow or lossy network with the Network Link Conditioner, and the app being backgrounded mid-operation.
+- **Turn up the logging for one installation.** A remote flag, scoped to an installation id that support has (with the user's agreement), switches the structured logger to ship `info` for a day.
+- **Ask for a sysdiagnose** when the problem involves the system: networking, push, background tasks, the watchdog.
+- **Ship a diagnostic release.** Add breadcrumbs and a non-fatal report at the suspected point in the next release, so the next occurrence explains itself. It's slow, so it's the last resort, which is why good breadcrumbs matter before an incident.
+
+## Fix and verify
+
+Fix on a branch cut from the release tag, not from the main branch, so the hotfix carries only the fix. Add the test that would have caught it, here the price parser run under several locales, and keep the change minimal: a hotfix that also ships three unrelated features is a new release with new risks.
+
+Then **verify with the signal that detected it**: crash-free users for 5.2.1 against 5.1.3 at the same stage of its own phased release, and the `price.parse_failed` count from the new error path. If the fix replaced a crash with a handled error, that count tells you whether the bad input still arrives, and from where.
+
+## Learn
+
+After the incident, write a short, blameless review: what happened, when it was detected and how, what mitigated it, the root cause, and what made it possible. The action items should make this **class** of problem cheaper, not just this instance:
+
+- a test or a lint rule (no force unwraps on parsed data; a CI run in a decimal-comma locale);
+- an alert that would have fired sooner;
+- a flag around the next risky change;
+- a runbook entry: who can pause a release, where the kill switches are, how to request expedited review.
+
+D48 takes incident response and reliability practice further, on the backend as well as the app.
+
+## Trade-offs
+
+| Approach to a production bug | Speed | Certainty | Cost | When it wins |
+| --- | --- | --- | --- | --- |
+| Mitigate first (pause, flag), then diagnose | Fast relief | Cause found later, calmly | Needs levers built in advance | Anything affecting many users |
+| Reproduce locally, then fix | Slow if conditions are rare | High | Engineering time | Bugs you can trigger on a test device |
+| Diagnose from evidence (slices, crumbs, logs) | Fast, if the evidence exists | Medium to high | Good instrumentation beforehand | Bugs tied to conditions you can't recreate |
+| Diagnostic release | Days | High, eventually | A release cycle | Rare bugs with too little evidence |
+| Hotfix without understanding | Fast | Low: may not fix it, may add bugs | A release | Never; at least confirm the mechanism |
+
+<Callout kind="interview">
+
+**Say:** "First I confirm the scope from per-version crash and error rates, and mitigate: pause the phased release, turn off the feature's flag or fix it server-side. Then I diagnose from evidence: symbolicated stacks, breadcrumbs, the session's structured events and server logs by request id, and which slices are over-represented compared with the population. The fix is a minimal hotfix with the missing test, and I verify with the same per-version signal."
+
+**Ask:** what changed, and when: app, server, config or vendor? Can we pause the rollout? Is the risky code behind a flag?
+
+**Red flags:** starting with the code instead of the scope; no way to stop the spread; reading "most crashes are on iOS 18" as a lead when most users are on iOS 18; and a hotfix shipped without confirming the cause.
+
+</Callout>
+
+<Callout kind="gotcha" title="iOS gotcha: pausing a phased release doesn't stop everyone">
+
+Phased release only controls *automatic* updates. Anyone who opens the App Store and taps Update gets the new build at once, paused or not, and new downloads get it too. Pausing slows the spread; it doesn't contain it. That's why the kill switch in the timeline mattered more than the pause.
+
+</Callout>
+
+## Practice
+
+The **diagnostics pipeline** design exercise asks you to design the logs, signposts, crash reports and breadcrumbs that make this lesson's loop possible for an app with 2 million daily users, including how a support engineer turns on verbose logging for one installation.
+
+```cards
+- id: loop-order
+  front: "What are the steps of a production investigation, and which one comes before diagnosis?"
+  back: "Detect, triage, mitigate, diagnose, fix and verify, learn. Mitigation comes before diagnosis: stop the damage spreading first."
+- id: over-representation
+  front: "How do you tell whether a slice (a device, OS or locale) is a real lead?"
+  back: "Compare its share of the affected reports with its share of all sessions. A group that's 4% of sessions and 58% of crashes is a lead; a big group with a big share is just big."
+- id: no-rollback
+  front: "Why must mobile mitigation levers exist before the incident?"
+  back: "An App Store release can't be rolled back, so stopping damage relies on phased-release pauses, remote flags and kill switches, server-side fixes and minimum-version checks, all of which have to ship first."
+- id: posix-parsing
+  front: "Which locale should you use to parse numbers and dates from a server?"
+  back: "A fixed one, `en_US_POSIX`. The user's locale is for text people read and type; parsing machine data with it breaks in decimal-comma locales."
+```
+
+```quiz
+- id: q1
+  type: order
+  prompt: "Put the steps of handling a crash spike after a release in order."
+  lines:
+    - "An alert: 5.2.0's crash-free sessions are far below 5.1.3's at the same rollout stage"
+    - "Triage: one new crash signature, in checkout, 3% of 5.2.0 sessions"
+    - "Pause the phased release and turn off the feature's remote flag"
+    - "Diagnose from slices, breadcrumbs and the release diff"
+    - "Ship a minimal hotfix with a regression test, with expedited review"
+    - "Confirm with 5.2.1's per-version crash rate, then write the review"
+  explain: "Detect, triage, mitigate, diagnose, fix, verify and learn. Mitigating before diagnosing protects everyone the rollout hasn't reached yet."
+- id: q2
+  type: mcq
+  prompt: "72% of a crash's reports come from iPhone 15 devices. 70% of your sessions are on iPhone 15. What does that tell you?"
+  options:
+    - "It's an iPhone 15 bug"
+    - "Almost nothing: the iPhone 15's share of crashes matches its share of sessions"
+    - "It's an iOS bug"
+    - "Older devices are unaffected"
+  answer: 1
+  explain: "A slice is only a lead when it's over-represented compared with the population. 72% against 70% is a lift of about 1."
+- id: q3
+  type: multi
+  prompt: "Which levers can stop a broken behaviour for users who already installed the bad build? Choose all that apply."
+  options:
+    - "Turning off the feature with a remote flag the build already checks"
+    - "Pausing the phased release"
+    - "Fixing the trigger on the server"
+    - "Rolling the App Store back to the previous version"
+    - "A minimum-version check that asks them to update to the hotfix"
+  answer: [0, 2, 4]
+  explain: "Flags, server-side fixes and a minimum-version prompt reach people already on the build. Pausing protects only those not yet updated, and the App Store has no rollback."
+- id: q4
+  type: truefalse
+  prompt: "While a phased release is paused, nobody can install the new version."
+  answer: false
+  explain: "Pausing stops automatic updates only. Anyone can still update manually, and new downloads get the latest version."
+- id: q5
+  type: mcq
+  prompt: "A bug affects a handful of users, you can't reproduce it, and the crash report alone isn't enough. What's the best next step?"
+  options:
+    - "Ship a speculative fix for the most likely cause"
+    - "Turn on verbose structured logging for those installations with their agreement, or add breadcrumbs and a non-fatal at the suspected point in the next release"
+    - "Ask every user to send a sysdiagnose"
+    - "Close it as unreproducible"
+  answer: 1
+  explain: "When conditions can't be recreated, make the affected devices produce the evidence: targeted verbose logging now, or a diagnostic release. A speculative fix may change nothing and add risk."
+```

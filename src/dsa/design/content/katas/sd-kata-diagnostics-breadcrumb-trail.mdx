@@ -1,0 +1,111 @@
+A crash report says where the app died; breadcrumbs say how it got there. A crash handler can't encode or write anything safely, so the trail must already be in storage when the crash happens. Build the trail: a small ring of recent events kept within a count and a byte budget, persisted through an injected store as it fills, and read back once on the next launch.
+
+`DiagBreadcrumbTrail.Trail`, an actor with `add(_:)`, `flush()`, `crumbs` and `takePreviousLaunch()`
+
+**The budget.** A crumb's `cost` is the UTF-8 byte count of its category plus its message. After every `add`:
+
+- If the new crumb alone costs more than `maxBytes`, first remove characters from the end of its message until it fits.
+- Then drop the oldest crumbs until there are at most `maxCrumbs` and their costs add up to at most `maxBytes`.
+
+**Persistence.** Every write saves the whole current trail with `store.write(_:)`, in any format your `takePreviousLaunch()` can read back.
+
+- A `.warning` or `.error` crumb is written at once, together with everything before it: a crash may be about to follow.
+- `.info` crumbs are written in batches: when `persistEvery` crumbs have been added since the last write, write.
+- `flush()` writes immediately. The app calls it when it goes to the background.
+- Any write, for whatever reason, starts the batch count again.
+
+**The next launch.** `takePreviousLaunch()` reads what the store holds, clears the store, and returns the crumbs, oldest first. Nothing stored, or data it can't read, gives `[]` (and still clears the store). It's called once at launch, before any crumbs are added.
+
+## Examples
+
+| Limits | Calls | Result |
+| --- | --- | --- |
+| `maxCrumbs: 3` | add `a`, `b`, `c`, `d`, `e` | `crumbs` is `c`, `d`, `e` |
+| `maxBytes: 20` | add three `net` crumbs of 5-byte paths (8 bytes each) | the last two remain: 16 bytes |
+| `maxBytes: 10` | add `net` / `abcdefghijkl` (15 bytes) | the message becomes `abcdefg` (10 bytes) |
+| `maxBytes: 7` | add `ui` / `ééééé` (each `é` is 2 bytes) | the message becomes `éé` (6 bytes) |
+| `persistEvery: 3` | add 2 info crumbs, then a third | 0 writes, then 1 |
+| `persistEvery: 10` | add an info crumb, then an error crumb | 1 write, holding both |
+| `persistEvery: 2` | add info, warning, info, info | writes after the warning and after the last info: 2 |
+| any | a trail adds 2 crumbs with a warning; a new `Trail` on the same store calls `takePreviousLaunch()` twice | the 2 crumbs, then `[]` |
+
+## Constraints
+
+- `Trail` is an actor, and the `Store` is injected, so tests use an in-memory store that counts writes. In the app it would be a file in Application Support, or a memory-mapped region that the kernel writes out even if the process dies.
+- Trim messages by whole characters (`removeLast()` on a `String`), never in the middle of one.
+- Categories are short; you can assume the category alone always fits in `maxBytes`.
+- No clocks or timers: batching is by count, so the tests are deterministic.
+
+<Hints>
+<Hint>
+Keep a running total of the buffer's cost alongside the array, so trimming is a `while` loop that removes from the front and subtracts each removed crumb's cost.
+</Hint>
+<Hint>
+Keep a counter of crumbs added since the last write. `add` increments it and writes when the crumb isn't `.info` or the counter reaches `persistEvery`; `flush()` resets it to zero and writes.
+</Hint>
+<Hint>
+`JSONEncoder().encode(buffer)` and `try? JSONDecoder().decode([Crumb].self, from: data)` are enough for the format. The `try?` is what turns unreadable data into an empty trail.
+</Hint>
+</Hints>
+
+## Solutions
+
+<Approach title="A budgeted array with write-through for what matters" time="O(maxCrumbs) per crumb" space="O(maxCrumbs)">
+
+```swift
+public actor Trail {
+    private let store: any Store
+    private let limits: Limits
+    private var buffer: [Crumb] = []
+    private var bytes = 0
+    private var unsaved = 0
+
+    public init(store: any Store, limits: Limits = Limits()) {
+        self.store = store
+        self.limits = limits
+    }
+
+    public var crumbs: [Crumb] { buffer }
+
+    public func add(_ crumb: Crumb) async {
+        let crumb = fitted(crumb)
+        buffer.append(crumb)
+        bytes += crumb.cost
+        while buffer.count > limits.maxCrumbs || bytes > limits.maxBytes {
+            bytes -= buffer.removeFirst().cost
+        }
+        unsaved += 1
+        if crumb.level != .info || unsaved >= limits.persistEvery {
+            await flush()
+        }
+    }
+
+    public func flush() async {
+        unsaved = 0
+        guard let data = try? JSONEncoder().encode(buffer) else { return }
+        await store.write(data)
+    }
+
+    public func takePreviousLaunch() async -> [Crumb] {
+        let data = await store.read()
+        await store.clear()
+        guard let data, let crumbs = try? JSONDecoder().decode([Crumb].self, from: data) else { return [] }
+        return crumbs
+    }
+
+    private func fitted(_ crumb: Crumb) -> Crumb {
+        guard crumb.cost > limits.maxBytes else { return crumb }
+        var message = crumb.message
+        while !message.isEmpty && crumb.category.utf8.count + message.utf8.count > limits.maxBytes {
+            message.removeLast()
+        }
+        return Crumb(category: crumb.category, message: message, level: crumb.level)
+    }
+}
+```
+
+The interesting decision is **when to write**. Writing on every crumb is the safest and the most I/O: on a busy screen, dozens of small writes a second. Batching info crumbs trades a little loss (up to `persistEvery − 1` of the newest crumbs if the app dies between writes) for far fewer writes, and writing through on warnings and errors makes sure the crumbs most likely to explain a crash are never the ones lost. `flush()` on entering the background covers the other big risk: a suspended app that's terminated for memory never runs another line.
+
+The encoding happens before the `await` on the store, so if another `add` runs while a write is suspended (actors are reentrant), each write still saves a consistent snapshot. `removeFirst()` on an array is O(n); with a trail of 50 crumbs that doesn't matter, but a larger buffer would use a ring of fixed capacity with a head index, as a crash SDK does in its pre-allocated memory.
+
+</Approach>

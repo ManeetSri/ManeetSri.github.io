@@ -1,0 +1,212 @@
+<Brief>
+
+You're one of six iOS engineers at a grocery delivery app. Checkout today is one 2,400-line view controller, and the product team wants to change it every sprint. Your job is to design its replacement in **MVVM with coordinators**.
+
+The flow:
+
+1. **Basket review:** items, substitutions allowed or not, the running total.
+2. **Delivery address:** pick a saved address or add one.
+3. **Delivery slot:** two-hour slots over the next seven days. Choosing one **reserves it for 15 minutes**.
+4. **Payment:** a saved card, Apple Pay, or a new card through the payment provider's SDK. Some cards need a **3-D Secure** challenge, a bank screen shown on top of the app.
+5. **Review and place order**, then a confirmation screen.
+
+What the product team cares about:
+
+- **Never charge twice,** and never place an order the customer didn't confirm at the price they saw.
+- **The order of steps changes.** An experiment wants returning customers to pick a slot before the address. Apple Pay express checkout will skip steps entirely.
+- **Checkout starts from three places:** the Basket tab, "Order again" on a past order, and a push notification ("Your slot expires in 5 minutes") that should open straight onto the review step.
+- **It survives real life:** a train tunnel mid-payment, the app sent to the background during 3-D Secure, the slot expiring while the customer looks for their card.
+
+Scale: 1.5 million weekly active customers place about 300,000 orders a week. When next week's slots are released on Sunday at 7 pm, around 60,000 customers open the slot picker within 15 minutes. The backend team will build whatever endpoints you need. The app is UIKit at the root with new screens written in SwiftUI, and supports iOS 18.
+
+Design the feature: the client architecture first, but cover the API and failure handling too. Spend about 40 minutes.
+
+</Brief>
+
+```workspace
+template: feature
+minutes: 40
+```
+
+<ModelAnswer section="requirements">
+
+Questions that change the design:
+
+- **Which steps can be skipped or reordered, and who decides?** If the server or an experiment picks the order, the order must be data, not code in each screen.
+- **How long is a slot held, and can it be extended?** That decides whether review needs a countdown and what happens when it runs out.
+- **Can prices change mid-checkout** (substitutions, a promo expiring)? Then placing the order must carry the total the customer saw.
+- **Must checkout resume after the app is killed?** At minimum, an order whose payment was in flight must never be placed twice.
+- **Guest checkout?** Assume no: customers are signed in.
+
+Functional: the five steps, edit any earlier choice from review, three entry points, Apple Pay, saved and new cards, 3-D Secure.
+
+Non-functional: no double charges; each step appears in under 300 ms with data that's already loaded; works on flaky networks with clear retry; card details never touch our code or storage; step order changeable without editing screens; every step testable without UI.
+
+Out of scope: the payment provider itself, substitution preferences, the confirmation screen's upsells.
+
+</ModelAnswer>
+
+<ModelAnswer section="estimates">
+
+- **Orders:** 300k a week is about 43k a day. Even if a fifth of a day's orders land in the busiest hour, that's ~8,600 an hour, or 2–3 place-order calls a second. The order endpoint isn't a scale problem; it's a correctness problem.
+- **Slot picker at release:** 60k customers in 15 minutes is ~67 slot-list requests a second on average, with a sharp spike at 7 pm. If every open picker polled every 10 seconds, 60k pickers would make 6,000 requests a second for nothing. So: fetch once, refresh on appear and pull, use `ETag`s, and let the **reservation call** be the source of truth (it fails with a conflict if the slot just went).
+- **Payload:** 7 days × 12 slots ≈ 84 slots of ~100 bytes: under 10 KB, cached in memory for a minute.
+- **3-D Secure** takes 5–60 seconds of the customer's time, often in another app (their bank), which is why the app may be suspended mid-payment.
+
+</ModelAnswer>
+
+<ModelAnswer section="architecture">
+
+On the device, a **CheckoutCoordinator** owns the flow. It's started by whichever coordinator launched checkout (Basket, Orders, or the app coordinator for the notification), creates a **CheckoutSession** for the flow's state, builds one **view model per step**, and decides what comes next when a step reports its outcome. A child **PaymentCoordinator** owns adding a card and the 3-D Secure challenge.
+
+Step view models talk to repositories and services: `AddressBook`, `SlotService`, `PaymentMethods` (wrapping the provider's SDK and Apple Pay), and `CheckoutAPI`.
+
+On the server, a **checkout session** resource holds the address, the slot reservation and the latest quote; `POST /orders` places the order **idempotently**; the payment provider handles card data and 3-D Secure.
+
+Data flow: a step's view model reads and writes the session through a narrow protocol, then calls its `onFinish` closure with an outcome (`.chose(address)`, `.reserved(slot)`, `.editAddress`). The coordinator updates its path. Views never see the coordinator, and view models never see each other.
+
+</ModelAnswer>
+
+<ModelAnswer section="client">
+
+- **Module:** a `CheckoutFeature` Swift package. Its public surface is `CheckoutCoordinator`, a `CheckoutEntry` enum (`.basket`, `.reorder(orderID)`, `.review(sessionID)`) and a `CheckoutDependencies` struct of protocols. Everything else is internal.
+- **Navigation:** checkout is presented modally from the launching coordinator, in its own stack. SwiftUI screens in a `NavigationStack` bound to the coordinator's `path: [CheckoutStep]`, hosted in one `UIHostingController` so the UIKit root can present it. `navigationDestination(for: CheckoutStep.self)` asks the coordinator to build each step's view and view model.
+- **Step order is data:** a `CheckoutPlan` (an array of steps) chosen from the customer and the experiment. "Next" means the next step in the plan that isn't already satisfied, so the slot-first experiment and Apple Pay express change the plan, not the screens.
+- **Flow-scoped state:** `CheckoutSession` is `@MainActor @Observable`, created by the coordinator and freed with it. Each view model gets only the slice it needs through a protocol: the slot step sees `SlotSelecting` (the address's postcode, `reserve(slot)`), not payment.
+- **View models:** `@MainActor @Observable`, one per step, each with a view-state enum (`loading`, `loaded`, `failed`), intents as methods and an `onFinish: (Outcome) -> Void`. No UIKit or SwiftUI imports. The review view model owns the place-order state machine.
+- **Dependencies** are injected by the coordinator from `CheckoutDependencies`, so tests and previews pass fakes.
+
+</ModelAnswer>
+
+<ModelAnswer section="api">
+
+```http
+POST /checkout/sessions                      { basketID }            → 201 { sessionID, quote }
+PUT  /checkout/sessions/{id}/address          { addressID }           → 200 { quote }
+GET  /slots?postcode=SW1A&from=2026-11-29     (If-None-Match)         → 200 { slots: [...] } | 304
+POST /checkout/sessions/{id}/reservation      { slotID }              → 201 { slotID, expiresAt } | 409 slot_taken
+PUT  /checkout/sessions/{id}/payment-method   { methodToken }         → 200 { quote }
+POST /orders   Idempotency-Key: <uuid>        { sessionID, expectedTotal } → 201 { orderID }
+                                                                      | 409 price_changed { quote }
+                                                                      | 402 requires_action { challenge }
+POST /orders/{id}/payment-confirmation       { challengeResult }      → 200 { orderID, status }
+GET  /orders?idempotencyKey=<uuid>                                     → 200 { orderID, status } | 404
+```
+
+- **`expectedTotal`** makes the server refuse to charge a total the customer didn't see; a `409` returns the new quote.
+- **The idempotency key** is created when review first appears and kept with the session. Retrying with the same key returns the same order, never a second one.
+- **`requires_action`** hands the client the provider's challenge to present; the result goes back to the server, which completes the charge.
+- Errors carry a machine-readable `code` (`slot_taken`, `price_changed`, `card_declined`) that view models map to messages. Responses are versioned with the app's API version header.
+
+</ModelAnswer>
+
+<ModelAnswer section="data">
+
+- **In memory, flow-scoped:** `CheckoutSession` holds the server session id, a basket snapshot (with its version), the chosen address, the slot reservation (`slotID`, `expiresAt`), the chosen payment method as the **provider's token**, the latest quote and the idempotency key.
+- **On disk, minimal:** a small Codable record in Application Support (session id, idempotency key, the step reached, a timestamp). That's enough to resume, or to ask the server what happened to an order that was in flight when the app died. It's deleted when the flow finishes.
+- **Never stored:** card numbers or security codes. New cards are entered in the provider's UI and come back as a token; Apple Pay hands back a payment token too.
+- **Caches:** slots for the current postcode in memory for 60 seconds, keyed by postcode and `ETag`; saved addresses come from the account's existing `AddressBook` cache.
+
+</ModelAnswer>
+
+<ModelAnswer section="deepdive">
+
+**1. The view model and coordinator contract.** Each step view model reports *what happened*, never *where to go*:
+
+```swift
+@MainActor @Observable
+final class SlotPickerViewModel {
+    enum Outcome { case reserved, cancelled }
+    private(set) var state: SlotPickerState = .loading
+    private let session: any SlotSelecting
+    private let onFinish: (Outcome) -> Void
+    // load(), choose(slot) → session.reserve(slot) → onFinish(.reserved)
+}
+```
+
+The coordinator maps outcomes to the next step in the plan: `.reserved` moves to the next unsatisfied step, which is payment in one plan and address in the other. Editing from review pushes that step with `returnTo: .review`, so finishing it pops back instead of going forward. Reordering steps, skipping them for Apple Pay express, or entering at review from a notification are all coordinator and plan changes; no view model changes.
+
+**2. Placing the order exactly once.** The review view model's state is `ready`, `placing`, `needsChallenge`, `priceChanged(Quote)`, `failed(message)` or `placed(orderID)`. The Place Order button is disabled outside `ready`, and the intent returns early while `placing`. Every attempt sends the **same idempotency key**, so a retry after a timeout returns the original order instead of charging again. `409 price_changed` moves to `priceChanged`, which shows the new total and needs a fresh tap. `402 requires_action` emits an outcome; the coordinator starts `PaymentCoordinator`, which presents the challenge and reports `.completed` or `.abandoned` back. If the app is killed in between, the next launch finds the persisted record and asks `GET /orders?idempotencyKey=…` before offering anything else.
+
+**3. The slot expiring.** The session exposes `reservation.expiresAt`. Review shows "Slot held for 4:12" from an injected clock (so tests can move time) and, at zero, emits `.slotExpired`. The coordinator pops to the slot step with a message and keeps the address and payment choices. The server also rejects an order with an expired reservation, so the client's countdown is a courtesy, not the guard.
+
+</ModelAnswer>
+
+<ModelAnswer section="failure">
+
+- **Offline at any step:** the step keeps what's on screen and shows a retry banner; choices already made stay in the session. Nothing is lost by a tunnel.
+- **Slot taken** (`409 slot_taken` on reserve): refresh the list, say "That slot has just gone", keep the picker open.
+- **Price changed:** show old and new totals, require a new confirmation.
+- **Card declined:** stay on review with the bank's reason mapped to plain words, with a shortcut to change payment.
+- **3-D Secure abandoned or failed:** back to review in `ready`, nothing charged.
+- **Backgrounded during 3-D Secure:** the provider's SDK resumes the challenge; if the process was killed, the persisted record and the idempotency key recover the outcome.
+- **Basket changed on another device:** the session's basket version no longer matches, the server returns a new quote, and review shows what changed.
+- **Double taps and fast back-swipes:** view models ignore intents outside the right state; the coordinator learns about system pops from the navigation stack and updates its path, so it never pushes onto a screen that's gone.
+- **Privacy:** card data stays in the provider's UI; logs and analytics never include addresses or tokens.
+
+</ModelAnswer>
+
+<ModelAnswer section="tradeoffs">
+
+- **A view model per step, plus a coordinator** over one big `CheckoutViewModel`: more types, but each step is small, testable and reusable (the address step also appears in Account), and the flow rules live in one place. One view model for the whole flow would be simpler for two screens and turns massive at five.
+- **A shared session with narrow protocols** over passing values from step to step: every step sees the latest choices (review needs all of them), and the protocols keep a step from reaching into another's data. The cost is one more object whose lifetime must match the flow.
+- **SwiftUI `NavigationStack` driven by the coordinator** over a UIKit navigation controller: native SwiftUI screens and a path the coordinator can rebuild for entry points. The UIKit root presents it in a hosting controller. If the team were UIKit-only, the same coordinator would drive a `UINavigationController`.
+- **Not TCA:** its exhaustive tests and state-driven navigation would suit this flow, but the team doesn't know it and the rest of the app is MVVM. Revisit if more flows need the same rigour.
+- **Evolution:** Apple Pay express becomes a two-step plan; a web checkout can share the server session and idempotency rules; a Live Activity for the slot countdown could read the same reservation.
+
+</ModelAnswer>
+
+```rubric
+- id: flow-ownership
+  label: The coordinator owns the flow; view models report outcomes
+  skill: client
+  look_for:
+    - View models expose outcomes or routes through closures or a delegate, and never reference other screens, view controllers or navigation types
+    - The step order lives in one place (a plan or path in the coordinator), so the experiment and Apple Pay express don't touch screens
+    - A child coordinator (or equivalent) for payment and 3-D Secure
+    - The three entry points, including starting at review, handled by building a path
+- id: flow-state
+  label: Flow-scoped state with a clear owner and narrow access
+  skill: architecture
+  look_for:
+    - One session object for the checkout's choices, created by the coordinator and freed when the flow ends
+    - Each step sees only the part it needs, for example through a protocol
+    - Editing from review returns to review with other choices kept
+- id: exactly-once
+  label: Orders are placed once, at the price the customer saw
+  skill: api
+  look_for:
+    - An idempotency key created once and reused on retries, kept across an app restart
+    - The confirmed total sent with the order, and a price change that needs a new confirmation
+    - Place Order disabled, and the intent ignored, while an attempt is in flight
+- id: failures
+  label: Handled expiry, conflicts and interruptions
+  skill: offline
+  look_for:
+    - Slot reservation expiry with a route back to the slot step, enforced by the server too
+    - Slot taken, card declined and 3-D Secure abandoned each have a defined outcome
+    - Offline at a step keeps the customer's choices and offers retry
+- id: security
+  label: Card data never touches the app's code or storage
+  skill: security
+  look_for:
+    - New cards through the provider's UI and tokens, Apple Pay tokens
+    - Nothing sensitive persisted or logged
+- id: testing
+  label: The design is testable without UI
+  skill: testing
+  look_for:
+    - Step view models tested with fake services and a recorded outcome
+    - The coordinator's step order tested from the plan and outcomes
+    - An injected clock for the slot countdown
+```
+
+<Pitfalls>
+
+- One `CheckoutViewModel` for every step: it becomes the 2,400-line view controller again, with `@Published` instead of `IBOutlet`.
+- View models that hold the coordinator (or a `NavigationPath`) and call "go to payment": the order is welded into every screen, and the experiment touches five files.
+- Generating a new idempotency key on each tap, which makes the key useless exactly when it matters: the retry after a timeout.
+- Treating the client-side slot countdown as the guard. The server must reject expired reservations.
+- Storing card details, or a payment token in `UserDefaults`, "to make resuming easier".
+
+</Pitfalls>

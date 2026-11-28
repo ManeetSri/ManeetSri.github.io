@@ -1,0 +1,140 @@
+<Brief>
+
+A budgeting app's spending screen lists this month's transactions, searches them as you type, and lets you swipe to delete. Testers report rows that come back after deleting, search results that don't match the search, and the odd crash while typing quickly. The view model was written to "get Swift 6 to stop complaining". Review it.
+
+```swift check ios title="SpendingView.swift"
+import SwiftUI
+
+struct Transaction: Identifiable, Sendable {
+    let id: UUID
+    let merchant: String
+    let amount: Decimal
+}
+
+protocol TransactionsService: Sendable {
+    func transactions() async throws -> [Transaction]
+    func search(_ query: String) async throws -> [Transaction]
+}
+
+@Observable
+final class SpendingViewModel: @unchecked Sendable {
+    var transactions: [Transaction] = []
+    var visible: [Transaction] = []
+    var total: Decimal = 0
+    var query = ""
+    nonisolated(unsafe) static var searchCache: [String: [Transaction]] = [:]
+    private let service: any TransactionsService
+
+    init(service: any TransactionsService) {
+        self.service = service
+        Task { await load() }
+    }
+
+    func load() async {
+        let loaded = (try? await service.transactions()) ?? []
+        transactions = loaded
+        visible = loaded
+        total = loaded.reduce(0) { $0 + $1.amount }
+    }
+
+    func search() {
+        Task.detached {
+            if let cached = Self.searchCache[self.query] {
+                self.visible = cached
+                return
+            }
+            let results = try await self.service.search(self.query)
+            Self.searchCache[self.query] = results
+            self.visible = results
+        }
+    }
+
+    func delete(_ transaction: Transaction) { transactions.removeAll { $0.id == transaction.id } }
+}
+
+struct SpendingView: View {
+    @State private var model: SpendingViewModel
+    @State private var searchText = ""
+
+    init(service: any TransactionsService) {
+        _model = State(initialValue: SpendingViewModel(service: service))
+    }
+
+    var body: some View {
+        List(model.visible) { transaction in
+            Text(transaction.merchant)
+                .swipeActions { Button("Delete", role: .destructive) { model.delete(transaction) } }
+        }
+        .searchable(text: $searchText)
+        .onChange(of: searchText) {
+            model.query = searchText
+            model.search()
+        }
+        .navigationTitle("Spent \(model.total.formatted(.currency(code: "GBP")))")
+    }
+}
+```
+
+</Brief>
+
+```workspace
+template: critique
+minutes: 25
+```
+
+```findings
+- id: off-main
+  title: The view model isn't on the main actor, and @unchecked Sendable hides it
+  severity: high
+  lines: "14-15, 36-43"
+  detail: "SwiftUI reads `visible` on the main thread while the detached task writes it from the cooperative pool: a data race on the property the list is drawing. Without `@unchecked Sendable` the compiler would have rejected sending `self` into `Task.detached`; the annotation turns that error off without making anything safe. Make the class `@MainActor @Observable` and drop the annotation."
+- id: unsafe-cache
+  title: A static cache that every search task writes at once
+  severity: high
+  lines: "20, 37, 42"
+  detail: "`nonisolated(unsafe)` switches off checking for a `Dictionary` that several detached tasks read and write concurrently. Concurrent writes to a Swift dictionary can corrupt it and crash, which matches \"crashes while typing quickly\". Being `static`, it also outlives the screen and survives sign-out, so one account's results can show for the next."
+- id: stale-search
+  title: Old searches can win, and results are cached under the wrong query
+  severity: medium
+  lines: "36-43, 64-66"
+  detail: "Each keystroke starts a task that's never cancelled, so results for \"co\" can arrive after \"coffee\" and replace them. The task also reads `self.query` after the `await`, so results for \"co\" are stored under whatever the user has typed by then, and every later search for that text shows the wrong rows. Capture the query when the search starts, cancel the previous search (`.task(id:)` does both), and drop results for a query that's no longer current."
+- id: stored-derived
+  title: The visible rows and the total are copies that delete never updates
+  severity: medium
+  lines: "16-18, 30-32, 47"
+  detail: "`visible` and `total` are computed once from `transactions` and stored. Deleting removes the transaction from `transactions` only, so the row stays on screen and the total still includes it; cached search results keep it too. Store the source of truth (transactions and the query) and compute `visible` and `total` from it."
+- id: init-side-effect
+  title: Each time the view is re-created, another view model starts another load
+  severity: medium
+  lines: "23-26, 54-56"
+  detail: "`State(initialValue:)` evaluates its argument every time `SpendingView.init` runs, which is every time the parent's body runs. SwiftUI keeps the first view model and discards the rest, but each discarded one has already started a load in its `init`. Those tasks aren't tied to the screen either, so they run on after it closes. Keep `init` free of work and start loading in `.task`."
+- id: duplicated-query
+  title: The search text is kept twice, synchronised one way
+  severity: low
+  lines: "19, 52, 63-67"
+  detail: "The view's `searchText` mirrors the model's `query` through `onChange`. Anything that sets `query` in the model (a deep link to a search, clearing it after a delete) never reaches the field, and the two disagree. Bind the field to the model (`@Bindable` and `$model.query`) or route each change through one intent method."
+- id: failure-as-empty
+  title: A failed load looks like a month with no spending
+  severity: low
+  lines: "29"
+  detail: "`try?` turns every failure into an empty array, so offline and \"you spent nothing\" look the same, with no retry. Model a failed state."
+```
+
+<ReferenceReview>
+
+**Most important first.** Two problems can crash the app or corrupt what it shows. The view model isn't isolated to the main actor, and its detached search task writes `visible` while SwiftUI reads it: `@unchecked Sendable` silenced exactly the error Swift 6 raised about that. And the `nonisolated(unsafe)` static cache is a dictionary written by several tasks at once. Neither is a style point: these are data races that the annotations promised the compiler weren't there.
+
+**The design problem underneath** is that state is copied instead of derived, and work isn't tied to anything. `visible`, `total`, the cache and the view's `searchText` are all copies of something else, each updated by some paths and not others, which is why deleted rows reappear. Searches and loads are fire-and-forget tasks, so nothing cancels them when a newer one starts or when the screen goes away.
+
+**How I'd fix it, in small steps:**
+
+1. Mark the class `@MainActor @Observable` and delete `@unchecked Sendable`. The service is `Sendable`, so the view model can still `await service.search(query)`: the slow part (the network, or an actor-backed store) happens off the main actor while the view model is suspended, and only the writes happen on it.
+2. Replace `search()` with `func search(_ query: String) async`, called from `.task(id: model.query)`, which cancels the previous search when the query changes. After the `await`, check `Task.isCancelled` before writing results.
+3. Make the cache an instance property on the main actor, keyed by the query the search was started with, and clear it on delete. (Or drop it: a local search of one month's transactions rarely needs one.)
+4. Keep `transactions` and `query` as the only stored state, and compute `visible` and `total` from them, so delete updates everything at once.
+5. Move loading out of `init` into `.task { await model.load() }`, and give the screen a `failed` state instead of `try?`.
+6. Bind the search field to the model with `@Bindable var model` and `$model.query`, and delete `searchText`.
+
+**Tests to add:** deleting a transaction removes it from the visible rows and the total; a slow search for "co" that finishes after "coffee" doesn't replace its results (a gated stub controls the order); a failing load shows the failed state; creating the view model starts no work until `load()` is called.
+
+</ReferenceReview>

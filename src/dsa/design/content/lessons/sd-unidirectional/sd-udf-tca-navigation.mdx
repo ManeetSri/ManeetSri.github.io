@@ -1,0 +1,348 @@
+## Why it matters
+
+[State-driven navigation: paths, sheets and alerts](/design/learn/sd-nav-state-driven) made the case that what's on screen should be a function of state. TCA takes that literally: presenting a sheet is setting optional state, pushing a screen is appending to an array, and dismissing is setting it back. Navigation then gets everything the rest of the architecture has: deep links are values you construct, a dismissed feature's effects are cancelled automatically, and tests can assert on what's presented. TCA offers two styles, **tree-based** and **stack-based**, and choosing between them (or mixing them) is a real design decision with costs on each side. Interviewers who know TCA ask exactly that: "tree or stack, and why?"
+
+## Tree-based navigation: optional state and destination enums
+
+In tree-based navigation, each feature holds the state of whatever it presents, as an optional. When the optional has a value the destination is shown; when it's `nil` it isn't. The nesting of those optionals is a tree, and the tree *is* the navigation.
+
+A book's detail screen can present an "add note" sheet or push a progress editor. One optional per destination would allow both at once, so the destinations go in an enum:
+
+```swift
+@Reducer
+struct BookDetail {
+    @Reducer
+    enum Destination {
+        case addNote(AddNote)
+        case editProgress(BookProgress)
+    }
+
+    @ObservableState
+    struct State: Equatable {
+        var book: Book
+        var notes: [Note] = []
+        @Presents var destination: Destination.State?
+    }
+
+    enum Action {
+        case addNoteButtonTapped
+        case editProgressButtonTapped
+        case destination(PresentationAction<Destination.Action>)
+    }
+
+    var body: some ReducerOf<Self> {
+        Reduce { state, action in
+            switch action {
+            case .addNoteButtonTapped:
+                state.destination = .addNote(AddNote.State(bookID: state.book.id))
+                return .none
+            case .editProgressButtonTapped:
+                state.destination = .editProgress(BookProgress.State(book: state.book))
+                return .none
+            case let .destination(.presented(.addNote(.delegate(.saved(note))))):
+                state.notes.append(note)
+                return .none
+            case .destination:
+                return .none
+            }
+        }
+        .ifLet(\.$destination, action: \.destination)
+    }
+}
+
+extension BookDetail.Destination.State: Equatable {}
+```
+
+The pieces:
+
+- **`@Reducer enum Destination`** lists every place this feature can go. The macro generates `Destination.State` and `Destination.Action` enums, one case per feature, and the reducer that runs whichever is active.
+- **`@Presents var destination`** marks the optional as presentation state, and **`PresentationAction`** wraps the child's actions with two cases: `.presented(childAction)` and `.dismiss`.
+- **`.ifLet(\.$destination, action: \.destination)`** runs the active destination's reducer, and does the presentation bookkeeping: when `destination` becomes `nil` it **cancels every effect the child started**, and it turns a `.dismiss` action into `destination = nil`.
+
+The view derives a binding per case and hands it to SwiftUI's own modifiers:
+
+```swift
+struct BookDetailView: View {
+    @Bindable var store: StoreOf<BookDetail>
+
+    var body: some View {
+        List {
+            ForEach(store.notes) { note in Text(note.text) }
+            Button("Add note") { store.send(.addNoteButtonTapped) }
+            Button("Update progress") { store.send(.editProgressButtonTapped) }
+        }
+        .navigationTitle(store.book.title)
+        .sheet(item: $store.scope(state: \.$destination, action: \.destination).addNote) { addNoteStore in
+            NavigationStack { AddNoteView(store: addNoteStore) }
+        }
+        .navigationDestination(item: $store.scope(state: \.$destination, action: \.destination).editProgress) { progressStore in
+            BookProgressView(store: progressStore)
+        }
+    }
+}
+```
+
+This is the form TCA 1.25 introduced, scoping to the whole destination enum and then picking a case. Most existing code scopes straight to the case, `$store.scope(state: \.destination?.addNote, action: \.destination.addNote)`, which still works; 1.25 deprecates it behind an opt-in package trait.
+
+### Dismissing
+
+There are three ways a destination goes away, and they all end the same way, with `destination` set to `nil`:
+
+- **The user swipes the sheet down.** SwiftUI writes `nil` through the binding, which sends `.destination(.dismiss)`, and `ifLet` clears the state.
+- **The parent decides,** by setting `state.destination = nil` in its own reducer.
+- **The child decides,** using the `dismiss` dependency, so it doesn't need to know who presented it:
+
+```swift
+@Reducer
+struct AddNote {
+    @ObservableState
+    struct State: Equatable {
+        let bookID: Book.ID
+        var text = ""
+    }
+
+    enum Action: BindableAction {
+        case binding(BindingAction<State>)
+        case saveButtonTapped
+        case cancelButtonTapped
+        case delegate(Delegate)
+
+        enum Delegate {
+            case saved(Note)
+        }
+    }
+
+    @Dependency(\.dismiss) var dismiss
+    @Dependency(\.uuid) var uuid
+    @Dependency(\.date.now) var now
+
+    var body: some ReducerOf<Self> {
+        BindingReducer()
+        Reduce { state, action in
+            switch action {
+            case .saveButtonTapped:
+                let note = Note(id: uuid(), bookID: state.bookID, text: state.text, createdAt: now)
+                return .run { send in
+                    await send(.delegate(.saved(note)))
+                    await dismiss()
+                }
+            case .cancelButtonTapped:
+                return .run { _ in await dismiss() }
+            case .binding, .delegate:
+                return .none
+            }
+        }
+    }
+}
+```
+
+The note's id and timestamp come from dependencies, so a test can predict them exactly.
+
+### Deep links are values
+
+Because navigation is state, opening the app on Dune's add-note sheet is constructing a value: `BookDetail.State(book: .dune, destination: .addNote(AddNote.State(bookID: Book.dune.id)))`. There's no sequence of pushes and presentations to replay with delays between them, and a test can start in exactly that state. The type also rules things out: the enum can't hold the note sheet and the progress editor at once, and you can't present a note sheet from a screen whose `Destination` doesn't list one.
+
+## Stack-based navigation: `StackState` and a `Path` enum
+
+Trees describe *nesting*: this screen presents that one. They're awkward for drill-down stacks that can grow in any order, such as book, then author, then another of that author's books, then that book's author again. Encoding that as nested optionals means recursive types and a lot of plumbing. Stack-based navigation holds the pushed screens in a flat collection instead, mirroring `NavigationStack(path:)`:
+
+```swift
+@Reducer
+struct AppFeature {
+    @Reducer
+    enum Path {
+        case detail(BookDetail)
+        case author(AuthorProfile)
+    }
+
+    @ObservableState
+    struct State: Equatable {
+        var shelf = ShelfFeature.State()
+        var path = StackState<Path.State>()
+    }
+
+    enum Action {
+        case shelf(ShelfFeature.Action)
+        case path(StackActionOf<Path>)
+    }
+
+    var body: some ReducerOf<Self> {
+        Scope(state: \.shelf, action: \.shelf) {
+            ShelfFeature()
+        }
+        Reduce { state, action in
+            switch action {
+            case let .shelf(.delegate(.bookSelected(book))):
+                state.path.append(.detail(BookDetail.State(book: book)))
+                return .none
+            case let .path(.element(id: _, action: .detail(.delegate(.authorTapped(author))))):
+                state.path.append(.author(AuthorProfile.State(author: author)))
+                return .none
+            case let .path(.element(id: id, action: .detail(.delegate(.bookRemoved)))):
+                state.path.pop(from: id)
+                return .none
+            case .shelf, .path:
+                return .none
+            }
+        }
+        .forEach(\.path, action: \.path)
+    }
+}
+
+extension AppFeature.Path.State: Equatable {}
+
+struct AppView: View {
+    @Bindable var store: StoreOf<AppFeature>
+
+    var body: some View {
+        NavigationStack(path: $store.scope(state: \.path, action: \.path)) {
+            ShelfView(store: store.scope(state: \.shelf, action: \.shelf))
+        } destination: { store in
+            switch store.case {
+            case let .detail(store): BookDetailView(store: store)
+            case let .author(store): AuthorProfileView(store: store)
+            }
+        }
+    }
+}
+```
+
+- **`StackState<Path.State>`** is an ordered collection of screen states, each with a `StackElementID` that TCA assigns.
+- **`StackActionOf<Path>`** carries `.element(id:action:)` for actions from a screen in the stack, plus `.push` and `.popFrom(id:)` for changes SwiftUI makes, such as the back button.
+- **`.forEach(\.path, action: \.path)`** runs each screen's reducer, and cancels a screen's effects when it's popped.
+- **The parent wires the stack.** `BookDetail` only says "the author was tapped"; it doesn't know there's a stack, or what an author screen is. The root decides what to push. (A view can also push directly with `NavigationLink(state: AppFeature.Path.State.detail(…))`, at the cost of coupling that view to the app's `Path`.)
+
+Step through a session that mixes both styles:
+
+```visual flow
+title: One state value drives the whole navigation
+nodes:
+  - { id: root, label: AppFeature.State, kind: store, at: [2, 0] }
+  - { id: shelf, label: Shelf, kind: view, at: [0, 2] }
+  - { id: detail, label: "detail: Dune", kind: view, at: [2, 2] }
+  - { id: author, label: "author: Herbert", kind: view, at: [4, 2] }
+  - { id: sheet, label: Add note sheet, kind: view, at: [2, 4] }
+groups:
+  - { id: stack, label: "path: StackState", nodes: [detail, author] }
+edges:
+  - [root, shelf, shelf]
+  - [root, detail, "path[0]"]
+  - [root, author, "path[1]"]
+  - [detail, sheet, destination]
+steps:
+  - say: "At launch `path` is empty, so only the shelf is on screen. The root store's state describes every screen there is."
+    show: [root, shelf]
+  - say: "Tapping Dune sends a delegate action; the root **appends** `.detail(…)` to `path`, and `NavigationStack` pushes it. TCA gives it a stack id, 0."
+    show: [detail]
+    send: root->detail
+    label: { detail: "id 0" }
+  - say: "In the detail, *Add note* sets `destination = .addNote(…)`. That's **tree-based**: the sheet's state lives inside the detail's state, inside the stack."
+    show: [sheet]
+    send: detail->sheet
+    state: { sheet: active }
+  - say: "Saving sends `delegate(.saved(note))`, then the child calls `dismiss()`. `ifLet` sets `destination` to `nil` and cancels anything the sheet was still doing."
+    hide: [sheet]
+    state: { detail: ok }
+  - say: "Tapping the author appends `.author(…)`. A stack can grow in any order (author, book, author again) without recursive types."
+    show: [author]
+    send: root->author
+    label: { author: "id 1" }
+  - say: "Swipe back: SwiftUI writes the shorter path, TCA receives `.popFrom(id: 1)`, removes the author screen and cancels its effects. Every step was a change to one value."
+    hide: [author]
+    state: { detail: null }
+```
+
+## Tree or stack?
+
+| | Tree-based (`@Presents`, `ifLet`) | Stack-based (`StackState`, `forEach`) |
+| --- | --- | --- |
+| Good for | Sheets, popovers, alerts, covers, and fixed drill-downs | Drill-downs that can go any depth in any order |
+| Invalid states | Ruled out by types: an enum holds one destination | Possible: nothing stops `[author, author, author]` |
+| Deep links | Build a nested value | Build an array |
+| Who decides what's next | The presenting feature | Usually the root, from children's delegate actions |
+| Coupling | Each feature knows what it presents | A screen doesn't know what's above or below it |
+| Testing | A feature and its destinations test together, naturally | Screens test alone; their wiring is tested at the root |
+| Recursion | Needs recursive state types | Free |
+
+Most apps use both, which is also what Point-Free recommends: a stack at the root for drill-down, and tree-based presentation inside each feature for its sheets, alerts and confirmation dialogs, as in the walkthrough above. UIKit apps can follow the same patterns through TCA's UIKit navigation tools, which come from Point-Free's swift-navigation library.
+
+<Callout kind="interview">
+
+**Say** "Navigation is state. Sheets and alerts are optional destination state with `@Presents` and `ifLet`, so presenting is setting a value and dismissing cancels the child's effects. Drill-down is a `StackState` path driven by `NavigationStack`, with the root deciding what to push from children's delegate actions. A deep link is constructing the state." **Ask** whether screens can recurse (book, author, book…), because that pushes towards a stack, and whether invalid combinations must be impossible, which favours a tree. **Red flags:** booleans like `isShowingSheet` plus a separate optional payload, navigation triggered from views with no state behind it, and child screens that know which screen pushed them.
+
+</Callout>
+
+<Callout kind="gotcha" title="iOS gotcha: dismiss() only works for presented features">
+
+The `dismiss` dependency asks whoever presented the feature, through `ifLet` or a stack's `forEach`, to remove it. Called from a feature that wasn't presented that way, such as the app's root or a feature shown with plain SwiftUI state, it can't do anything, and TCA reports a runtime warning. If a feature is sometimes presented and sometimes embedded, let the parent decide with a delegate action instead.
+
+</Callout>
+
+<Callout kind="gotcha" title="iOS gotcha: a binding to a presented feature must come from its store">
+
+Mixing TCA destination state with an extra `@State var isPresented` in the view gives two sources of truth for one sheet, and they drift: the sheet closes, but the reducer still thinks it's open, and the next tap does nothing. Derive every presentation binding from the store with `$store.scope(…)`, so SwiftUI's dismissals become actions the reducer sees.
+
+</Callout>
+
+## Practice
+
+- **[Scope child features into a parent](/design/practice/sd-kata-unidirectional-scoped-features)**: its `ifLet` is tree-based presentation without SwiftUI. Write it and see why the sheet's reducer must run before the parent that closes it.
+- **[A unidirectional onboarding with async validation](/design/practice/sd-design-unidirectional-onboarding)**: choose between a stack and a tree for a five-step flow with back navigation, resume-after-kill and a step order that can change remotely.
+
+```cards
+- id: tree-nav
+  front: "What is tree-based navigation in TCA?"
+  back: "Each feature holds what it presents as optional state (`@Presents var destination`, often an enum of destinations). Non-nil means shown. `ifLet` runs the child and cancels its effects when the state becomes nil."
+- id: stack-nav
+  front: "What is stack-based navigation in TCA?"
+  back: "The pushed screens live in `StackState<Path.State>`, driven by `NavigationStack(path:)`. `forEach(\\.path, action: \\.path)` runs each screen; the root decides what to push from children's delegate actions."
+- id: dismiss-paths
+  front: "What are the three ways a presented TCA feature is dismissed?"
+  back: "The user dismisses it (the binding sends `.dismiss`), the parent sets the state to nil, or the child calls the `dismiss` dependency. All end with the state nil and the child's effects cancelled."
+- id: tree-or-stack
+  front: "When does a stack beat a tree?"
+  back: "When screens can be pushed to any depth in any order (book, author, book), and screens shouldn't know their neighbours. Trees win for modals and fixed flows, where types can rule out invalid combinations."
+```
+
+```quiz
+- id: q1
+  type: sort
+  prompt: "Tree-based or stack-based? Choose the better fit for each."
+  buckets: [Tree-based, Stack-based]
+  items:
+    - [An alert confirming deletion, 0]
+    - [A sheet for adding a note, 0]
+    - ["Book, then author, then another book, then that book's author", 1]
+    - [A settings screen with exactly one possible detail, 0]
+    - [Search results whose rows push details that link to more results, 1]
+  explain: "Modals and fixed, shallow drill-downs suit trees, where the types allow only valid combinations. Open-ended, recursive drill-down suits a stack, where any screen can follow any other."
+- id: q2
+  type: truefalse
+  prompt: "When the user swipes away a sheet presented with `@Presents` and `ifLet`, effects the sheet started are cancelled."
+  answer: true
+  explain: "The swipe writes nil through the binding, which sends `.dismiss`. `ifLet` clears the state and cancels the child's effects, so a sheet's timer or request can't outlive it."
+- id: q3
+  type: mcq
+  prompt: "A push notification should open the app on Dune's detail screen with its add-note sheet showing. With TCA navigation, what does the handler do?"
+  options:
+    - "Push the detail, wait for the animation, then send `addNoteButtonTapped`"
+    - "Build the state, a path holding `.detail` whose `destination` is `.addNote`, and set it on the root"
+    - "Post a notification that the detail screen observes"
+    - "Present the sheet first, then push the detail underneath"
+  answer: 1
+  explain: "Navigation is state, so a deep link is a value. Setting it once renders the whole hierarchy, with no timing between steps and nothing to test but the state."
+- id: q4
+  type: multi
+  prompt: "`BookDetail` is pushed from the shelf, from search results and from an author's page. Which designs keep it reusable? Choose all that apply."
+  options:
+    - "It sends `delegate(.authorTapped(author))` and lets whoever owns the stack push the author"
+    - "It uses `NavigationLink(state: AppFeature.Path.State.author(…))` directly"
+    - "It calls `dismiss()` after a book is removed, whoever presented it"
+    - "It reads `AppFeature.State` to find out what's below it in the stack"
+  answer: [0, 2]
+  explain: "Delegate actions and the `dismiss` dependency let the detail say what happened without knowing its context. Linking to `AppFeature.Path` or reading the root's state ties it to one app structure."
+- id: q5
+  type: recall
+  prompt: "Why does TCA's tree-based navigation use an enum of destinations instead of one optional per destination?"
+  model: "With separate optionals, both could be non-nil at once, an impossible screen that the types allow. An enum holds exactly one destination, so presenting one replaces the other, and the compiler makes every reducer and view handle each case."
+```

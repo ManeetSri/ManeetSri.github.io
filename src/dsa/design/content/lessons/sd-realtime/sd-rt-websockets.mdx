@@ -1,0 +1,399 @@
+## Why it matters
+
+When both sides talk often (chat with typing indicators and read receipts, a multiplayer game, a shared document, a trading screen), you want one long-lived channel that either end can write to at any moment. That's a **WebSocket**, and on iOS it's `URLSessionWebSocketTask`. It's also where many apps get real-time wrong: one receive call instead of a loop, no heartbeats, a socket per screen, tokens in the URL. Interviewers expect you to choose WebSockets for the right reasons and then describe the client you'd build around the task, not only name it.
+
+## From HTTP to WebSocket
+
+A WebSocket starts life as an HTTP/1.1 request asking to switch protocols:
+
+```http
+GET /live HTTP/1.1
+Host: live.example.com
+Upgrade: websocket
+Connection: Upgrade
+Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==
+Sec-WebSocket-Version: 13
+Sec-WebSocket-Protocol: scores.v2
+Authorization: Bearer eyJhbGciOi…
+
+HTTP/1.1 101 Switching Protocols
+Upgrade: websocket
+Connection: Upgrade
+Sec-WebSocket-Accept: s3pPLMBiTxaQ9kYGzzhZRbK+xOo=
+Sec-WebSocket-Protocol: scores.v2
+```
+
+After the `101`, HTTP is over. The same TCP (and TLS) connection now carries **frames** in both directions, defined by RFC 6455:
+
+- **Text** and **binary** frames carry your messages. A large message may be split across several frames; URLSession reassembles them and hands you whole messages.
+- **Ping** and **pong** are control frames for checking the other side is alive.
+- **Close** carries a numeric code and an optional reason, so each side can say *why* it's leaving.
+
+The key exchange (`Sec-WebSocket-Key` and `Accept`) only proves the server really speaks WebSocket; it isn't security. Security comes from TLS: always use `wss://`, which runs on port 443 and passes through most networks that would block anything unusual. `Sec-WebSocket-Protocol` lets client and server agree on an application protocol and its version, which is a tidy place to version your messages.
+
+```visual sequence
+title: The life of one WebSocket
+participants:
+  - { id: app, label: App }
+  - { id: gateway, label: Socket gateway }
+  - { id: bus, label: Match feed }
+messages:
+  - [app, gateway, "GET /live · Upgrade: websocket", { say: "The app sends an HTTP request asking to upgrade, with its access token in the `Authorization` header." }]
+  - [gateway, app, 101 Switching Protocols, { reply: true, say: "The gateway checks the token and agrees. From here on, both sides can send frames at any time." }]
+  - [app, gateway, "subscribe: match 841", { say: "The app tells the gateway what it cares about. The gateway, not the app, knows which feed to listen to." }]
+  - [bus, gateway, "score 2–0", { async: true, say: "A goal is published on the backend's pub/sub feed." }]
+  - [gateway, app, "score 2–0 · seq 42", { say: "The gateway writes a frame to every socket subscribed to match 841, within milliseconds." }]
+  - [app, gateway, ping]
+  - [gateway, app, pong, { reply: true }]
+  - [gateway, app, "close 1001 going away", { say: "A deploy is draining this gateway. It closes the socket with **1001**, so the app knows to reconnect, elsewhere, after a short random wait." }]
+  - [app, gateway, close 1001, { reply: true, say: "The app answers the close, and the TCP connection ends cleanly." }]
+fragments:
+  - { kind: loop, label: every 25 s, from: 5, to: 6 }
+```
+
+### Close codes
+
+The close code is your protocol's last word, and the app should act on it:
+
+| Code | Meaning | What the app does |
+| --- | --- | --- |
+| 1000 | Normal closure | Nothing: someone meant to close it |
+| 1001 | Going away (server shutting down, or the app leaving) | Reconnect after a short random delay |
+| 1006 | Abnormal: the connection died without a close frame | Reconnect with backoff. This code is never sent; it's what your side reports. |
+| 1008 | Policy violation | Don't retry the same thing; log it |
+| 1009 | Message too big | Fix the message, don't resend it |
+| 1011 | Internal server error | Reconnect with backoff |
+| 1012, 1013 | Service restart; try again later | Reconnect, later than usual |
+| 4000–4999 | Yours to define, such as 4001 "token expired" | Whatever your protocol says: refresh the token, then reconnect |
+
+`URLSessionWebSocketTask.CloseCode` covers the standard codes up to 1015; read others from the raw value. Codes 1012 and 1013 are registered with IANA but not in Apple's enum.
+
+## URLSessionWebSocketTask
+
+The whole API fits on a page:
+
+- **Create** with `session.webSocketTask(with: request)`. Passing a `URLRequest`, not a bare URL, lets you set headers such as `Authorization`. `webSocketTask(with:protocols:)` advertises subprotocols.
+- **Open** with `resume()`. Sends you make before the handshake completes are queued and go out once it does.
+- **Send** with `try await task.send(.string(json))` or `.data(bytes)`. Completion means the bytes were written to the kernel, not that the server received them.
+- **Receive** with `try await task.receive()`, which returns *one* message. Call it again for the next one, in a loop, for as long as the socket lives.
+- **Ping** with `sendPing(pongReceiveHandler:)`. There's no async version, and the handler gets an error if the connection fails before the pong. Pings from the server are answered for you.
+- **Close** with `cancel(with: .normalClosure, reason: nil)`. Afterwards `closeCode` and `closeReason` say how it ended. The session delegate's `urlSession(_:webSocketTask:didOpenWithProtocol:)` and `urlSession(_:webSocketTask:didCloseWith:reason:)` report both ends of the life.
+- **Limit**: `maximumMessageSize` is 1 MiB (1,048,576 bytes) by default. A bigger incoming message fails the receive and ends the task.
+
+## Wrapping it: one connection, typed messages
+
+The rest of the app shouldn't see `URLSessionWebSocketTask` at all. Wrap it in a type that turns frames into typed messages and exposes them as an `AsyncSequence`. Reconnection and resubscription sit one layer above this, in a client you'll build in the reconnection lesson, so this type does one job: a single connection, start to finish.
+
+```swift check group=socket title="LiveSocket.swift"
+import Foundation
+
+/// What the server sends. Unknown types decode as .unknown, so a newer server can't break this build.
+enum ServerMessage: Decodable, Sendable {
+    case score(matchID: String, home: Int, away: Int, seq: Int)
+    case error(code: String, message: String)
+    case unknown(type: String)
+
+    private enum CodingKeys: String, CodingKey {
+        case type, matchID, home, away, seq, code, message
+    }
+
+    init(from decoder: any Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        let type = try container.decode(String.self, forKey: .type)
+        switch type {
+        case "score":
+            self = .score(
+                matchID: try container.decode(String.self, forKey: .matchID),
+                home: try container.decode(Int.self, forKey: .home),
+                away: try container.decode(Int.self, forKey: .away),
+                seq: try container.decode(Int.self, forKey: .seq)
+            )
+        case "error":
+            self = .error(code: try container.decode(String.self, forKey: .code), message: try container.decode(String.self, forKey: .message))
+        default:
+            self = .unknown(type: type)
+        }
+    }
+}
+
+/// What the app sends
+enum ClientMessage: Encodable, Sendable {
+    case subscribe(matchID: String)
+    case unsubscribe(matchID: String)
+
+    private enum CodingKeys: String, CodingKey {
+        case type, matchID
+    }
+
+    func encode(to encoder: any Encoder) throws {
+        var container = encoder.container(keyedBy: CodingKeys.self)
+        switch self {
+        case .subscribe(let matchID):
+            try container.encode("subscribe", forKey: .type)
+            try container.encode(matchID, forKey: .matchID)
+        case .unsubscribe(let matchID):
+            try container.encode("unsubscribe", forKey: .type)
+            try container.encode(matchID, forKey: .matchID)
+        }
+    }
+}
+
+/// One WebSocket connection: typed messages in, decoded messages out. Reconnecting is the caller's job.
+actor LiveSocket {
+    private let task: URLSessionWebSocketTask
+    private let encoder = JSONEncoder()
+
+    init(request: URLRequest, session: URLSession = .shared) {
+        task = session.webSocketTask(with: request)
+    }
+
+    /// Opens the connection. The stream ends, with an error, when the socket closes.
+    func open() -> AsyncThrowingStream<ServerMessage, any Error> {
+        let (messages, continuation) = AsyncThrowingStream.makeStream(of: ServerMessage.self)
+        let socket = task
+        let reader = Task {
+            let decoder = JSONDecoder()
+            do {
+                while true {
+                    // receive() hands over one message; keep asking for as long as the socket lives
+                    let frame = try await socket.receive()
+                    let data = switch frame {
+                    case .string(let text): Data(text.utf8)
+                    case .data(let bytes): bytes
+                    @unknown default: Data()
+                    }
+                    // A message we can't read is a bug to log, not a reason to drop the connection
+                    if let message = try? decoder.decode(ServerMessage.self, from: data) {
+                        continuation.yield(message)
+                    }
+                }
+            } catch {
+                continuation.finish(throwing: error)
+            }
+        }
+        continuation.onTermination = { _ in
+            reader.cancel()
+            // Cancelling the reader isn't enough: a pending receive() only ends when the socket does
+            socket.cancel(with: .goingAway, reason: nil)
+        }
+        socket.resume()
+        return messages
+    }
+
+    func send(_ message: ClientMessage) async throws {
+        let json = String(decoding: try encoder.encode(message), as: UTF8.self)
+        try await task.send(.string(json))
+    }
+
+    /// Returns when the pong arrives; throws if the connection fails first
+    func ping() async throws {
+        let socket = task
+        try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, any Error>) in
+            socket.sendPing { error in
+                if let error {
+                    continuation.resume(throwing: error)
+                } else {
+                    continuation.resume()
+                }
+            }
+        }
+    }
+
+    func close() {
+        task.cancel(with: .normalClosure, reason: nil)
+    }
+}
+```
+
+The decisions worth copying:
+
+- **Decode off the main actor.** The reader task runs on the socket's actor, so a burst of 200 messages after a goal is decoded without touching the UI thread.
+- **Unknown is a case, not an error.** Next year's server will send message types this build has never heard of. Decoding them as `.unknown` and ignoring them keeps old apps working; throwing would tear down the connection on every new feature.
+- **Closing is explicit.** The async `receive()` wrapper doesn't respond to task cancellation, so `onTermination` closes the socket itself. Otherwise a cancelled screen would leave a socket open until the next message arrived.
+
+A screen uses it through its view model, inside `.task`, so the subscription ends with the view:
+
+```swift check ios group=socket title="MatchCentreModel.swift"
+import SwiftUI
+
+@MainActor @Observable
+final class MatchCentreModel {
+    private(set) var score = "–"
+    private(set) var isLive = false
+    let matchID: String
+
+    init(matchID: String) {
+        self.matchID = matchID
+    }
+
+    func follow(on socket: LiveSocket) async {
+        let messages = await socket.open()
+        do {
+            try await socket.send(.subscribe(matchID: matchID))
+            isLive = true
+            for try await message in messages {
+                if case let .score(id, home, away, _) = message, id == matchID {
+                    score = "\(home)–\(away)"
+                }
+            }
+        } catch {
+            // The connection ended; the reconnecting client one layer up decides what happens next
+        }
+        isLive = false
+    }
+}
+
+struct MatchCentreView: View {
+    let model: MatchCentreModel
+    let socket: LiveSocket
+
+    var body: some View {
+        VStack {
+            Text(model.score).font(.largeTitle.monospacedDigit())
+            Text(model.isLive ? "Live" : "Reconnecting…").foregroundStyle(.secondary)
+        }
+        .task { await model.follow(on: socket) }
+    }
+}
+```
+
+In a real app the socket is shared: one connection for the whole app, owned by a service, with screens subscribing to topics on it. Opening a socket per screen multiplies handshakes, heartbeats and server connections for no benefit.
+
+## Designing the messages
+
+A WebSocket gives you a pipe, not a protocol. You design everything above it:
+
+```json
+{ "type": "score", "v": 2, "matchID": "841", "seq": 42, "home": 2, "away": 0 }
+```
+
+- **An envelope** with a `type` (and often a version) on every message, so either side can route and skip what it doesn't understand.
+- **Sequence numbers** per channel, so the app can tell when it missed something. That's the ordering lesson later in this module.
+- **Correlation ids** for anything request-shaped: the app sends `{"type": "send", "clientID": "c-81f2", …}` and the server's acknowledgement carries the same `clientID`. Without them, you can't match answers to questions on a channel where messages interleave.
+- **A format.** JSON is easy to debug and fine for most apps. Binary formats such as protobuf shrink payloads and decoding time on chatty sockets, as you saw in [serialisation formats and gRPC](/design/learn/sd-api-serialisation); send them as `.data` frames.
+- **Compatibility rules**: add fields, never rename them; unknown types are ignored; the server can refuse a version that's too old with a close code the app turns into "please update".
+
+## Authentication
+
+A native app can set headers on the upgrade request, so put the access token in `Authorization`, exactly as for any other request. Browsers' WebSocket API can't set headers, which is why web clients often put tokens in the URL's query string. Don't copy that: URLs end up in server logs, proxy logs and analytics. If a backend insists on a URL parameter, use a **ticket**: fetch a single-use token over an authenticated HTTP call, valid for seconds, and connect with that.
+
+Tokens expire while a socket is open. The server should say so explicitly, with a close code such as 4001 or an `auth_expired` message, rather than silently stop sending. The app refreshes the token through the same single-flight refresh as its HTTP requests (D33) and reconnects with the new one.
+
+## The server side, briefly
+
+A WebSocket server is **stateful** in a way HTTP servers usually aren't: each gateway holds thousands of open connections, and each connection belongs to one machine for its whole life.
+
+- **Load balancers** must support the upgrade (an AWS Application Load Balancer does; a Network Load Balancer passes TCP straight through) and must not cut idle connections before the heartbeat interval.
+- **Fan-out** needs a backplane: when a score changes, every gateway with subscribers for that match must hear about it. A pub/sub system (Redis, NATS, Kafka) sits behind the gateways, and each gateway subscribes once per topic its clients care about.
+- **Deploys** can't just restart a gateway: thousands of clients would reconnect in the same second. Drain gradually, closing connections with 1001 a few at a time, and let clients add jitter.
+
+You'll size and design such a tier in the live-scores exercise for this module, and the backend building blocks in D43.
+
+## Other WebSocket clients on iOS
+
+- **Network.framework** (`NWProtocolWebSocket`): lower-level control over TLS, connection options and framing, and it can act as a server (for a companion device on the local network).
+- **Starscream**: a popular open-source client from before iOS 13 added `URLSessionWebSocketTask`. Fine, but rarely needed now.
+- **Socket.IO**: not plain WebSockets but its own protocol on top, with rooms, acknowledgements and a long-polling fallback. It requires a Socket.IO server, and the convenience comes with that coupling.
+
+## Trade-offs
+
+| | `URLSessionWebSocketTask` | Network.framework | Starscream | Socket.IO client |
+| --- | --- | --- | --- | --- |
+| Dependency | None | None | Third-party | Third-party, plus a Socket.IO server |
+| Shares URLSession settings, cookies, auth challenges, proxies | Yes | No | No | Depends on its transport |
+| Control over TLS and framing | Limited | Full | Medium | Low |
+| Built-in reconnection, acks, rooms | No | No | No | Yes |
+| Best for | Most apps | Local-network peers, custom protocols | Older codebases | Teams already running Socket.IO |
+
+`URLSessionWebSocketTask` is the default: no dependency, and it uses your session's configuration. Write the envelope, heartbeats and reconnection yourself; they're your protocol's rules, and no library knows them. Reach for Network.framework when you need control URLSession doesn't give, and for Socket.IO only when the server is already Socket.IO.
+
+<Callout kind="interview">
+
+**Say** what the socket is for and what it isn't: "One WebSocket per app while it's in the foreground, authenticated with the same bearer token on the upgrade request. Messages have a type, a version and a per-channel sequence number; unknown types are ignored. The socket accelerates updates, and the HTTP API remains the source of truth, so after any reconnect the app catches up from its last sequence number." **Ask** what the server does on deploys and token expiry, and whether old app versions must keep working. **Red flags:** a socket per screen, decoding on the main thread, treating `send` completion as delivery, tokens in the URL, and no plan for the socket dying in the background.
+
+</Callout>
+
+<Callout kind="gotcha" title="iOS gotcha: receive() gives you one message">
+
+`receive()` completes once, with one message. Code that calls it once in `connect()` gets the first message and then silence, while the server keeps writing into a buffer nobody reads. Receiving is a loop that runs for the socket's whole life, re-arming after every message.
+
+</Callout>
+
+<Callout kind="gotcha" title="Swift gotcha: cancelling the task doesn't cancel the receive">
+
+`URLSessionWebSocketTask.receive()`'s async version is a plain continuation with no cancellation handler. Cancelling the Swift `Task` that's awaiting it does nothing until a message arrives or the socket closes. To stop listening, close the socket with `cancel(with:reason:)`; the pending receive then throws.
+
+</Callout>
+
+## Practice
+
+The review **"a live-scores socket client"** shows a `URLSessionWebSocketTask` wrapper that ships with no heartbeat, reconnects in a tight loop, decodes on the main thread and buffers without limit. Find what breaks first on a cup final's evening, and plan the fix. The kata **"A reconnecting socket client"** then has you build the layer above the socket wrapper in this lesson: one owning task, heartbeats, backoff and resubscription.
+
+```cards
+- id: ws-upgrade
+  front: "How does a WebSocket connection start?"
+  back: "As an HTTP/1.1 GET with Upgrade: websocket. The server answers 101 Switching Protocols, and the same TCP/TLS connection then carries frames both ways."
+- id: ws-receive-loop
+  front: "What does URLSessionWebSocketTask.receive() return, and what follows from that?"
+  back: "One message. Receiving must be a loop that calls receive() again after every message for the socket's whole life."
+- id: ws-cancel
+  front: "How do you stop a pending receive() on a URLSessionWebSocketTask?"
+  back: "Close the socket with cancel(with:reason:). Cancelling the Swift task awaiting it does nothing, because the async wrapper has no cancellation handler."
+- id: ws-unknown
+  front: "Why should a socket client decode unknown message types as a case instead of throwing?"
+  back: "Servers add message types long before every user updates. Ignoring unknown types keeps old builds working; throwing would drop the connection whenever the server adds a feature."
+```
+
+```quiz
+- id: q1
+  type: bug
+  prompt: "The chat screen shows the first message after connecting, then nothing more, although the server keeps sending. Which line is the problem?"
+  code: |
+    func connect() {
+        task = session.webSocketTask(with: request)
+        task?.resume()
+        Task {
+            let message = try await task?.receive()
+            handle(message)
+        }
+    }
+  answer: 5
+  explain: "`receive()` delivers one message. It must be called again after each one, in a loop that runs until the socket closes."
+- id: q2
+  type: sort
+  prompt: "The server closes the socket with each of these codes. What should the app do?"
+  buckets: [Reconnect with backoff, "Don't reconnect", Fix something first]
+  items:
+    - [1001 going away during a deploy, 0]
+    - [1006 abnormal closure in a tunnel, 0]
+    - [1011 internal server error, 0]
+    - [1000 normal closure after the user signed out on the web, 1]
+    - [4001 token expired, 2]
+    - [1009 message too big, 2]
+  explain: "Going away, abnormal closures and server errors are worth retrying with jittered backoff. A normal closure was intended. An expired token needs a refresh before reconnecting, and an oversized message will be rejected again until it's fixed."
+- id: q3
+  type: truefalse
+  prompt: "When `task.send(.string(json))` returns without throwing, the server has received the message."
+  answer: false
+  explain: "Completion only means the bytes were written to the kernel's socket buffer. The connection can still die before they arrive. Anything that must arrive needs an acknowledgement from the server, matched by a client-generated id."
+- id: q4
+  type: mcq
+  prompt: "A web team tells you to authenticate the socket with `wss://live.example.com/socket?token=…`, as their browser client does. What do you propose for the iOS app?"
+  options:
+    - "Do the same: one implementation is simpler"
+    - "Send the token in the Authorization header of the upgrade request, or a single-use ticket in the URL if the server can't read headers"
+    - "Send the token in the first message after connecting, and nothing on the upgrade"
+    - "Skip authentication on the socket; it only carries public scores"
+  answer: 1
+  explain: "Browsers can't set headers on a WebSocket, so web clients often use the URL, where tokens leak into logs. A native app can use the header. A short-lived ticket is the safe compromise if the URL is the only option."
+- id: q5
+  type: mcq
+  prompt: "Five screens each need live data. Where should the WebSocket live?"
+  options:
+    - "Each screen opens its own, so features stay independent"
+    - "One connection owned by an app-wide service; screens subscribe to topics and unsubscribe when they disappear"
+    - "One per tab"
+    - "A new socket for every subscription, closed when it ends"
+  answer: 1
+  explain: "One connection means one handshake, one set of heartbeats and one server connection per user. Screens express interest through subscriptions on it, which also makes resubscribing after a reconnect one job in one place."
+```

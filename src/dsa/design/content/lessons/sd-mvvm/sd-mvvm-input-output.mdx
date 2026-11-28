@@ -1,0 +1,323 @@
+## Why it matters
+
+A view model with fifteen public properties and twelve methods is hard to review: which methods does the view call, which properties does it read, which ones are leftovers? **Input/output view models** answer that with types. Everything the view can say goes in one `Input`; everything it shows comes out as one `Output`. Large teams adopted the shape to make every screen look the same and every test a table, and it's the bridge between MVVM and the unidirectional architectures of D28. In interviews it shows you've thought about a view model's *contract*, not only its contents.
+
+## Two types are the whole contract
+
+The idea is a discipline more than a pattern:
+
+- **Inputs** are what happens to the screen: the user typed, tapped, pulled; the screen appeared. They're named after events, not after what the view model should do with them.
+- **Outputs** are what the screen shows: the text of the strength meter, whether Save is enabled, the error message. The view renders them and nothing else.
+- **Routes** (or effects) are one-off things the view model wants to happen outside the screen, such as "saved, close the screen".
+
+Read the three types and you know everything the screen can do. That's what makes the shape valuable on a team: a reviewer checks a new screen's contract in a minute, and a tester can enumerate its behaviour.
+
+## Where it came from
+
+The shape became popular in the reactive era, and you'll meet both of its early forms in older codebases.
+
+**Inputs and outputs protocols.** Kickstarter's open-source iOS app (written with ReactiveSwift) gave every view model two protocols, so call sites read `viewModel.inputs.emailChanged(text)` and `viewModel.outputs.isSubmitEnabled`. The protocols make the direction of every member explicit, and the outputs are signals the view binds to.
+
+**`transform(input:) -> Output`.** Many RxSwift codebases go further: the view hands the view model all its event streams at once, and gets all its output streams back.
+
+```swift
+// RxSwift style: the view model is a function from input streams to output streams
+struct ChangePasswordViewModel {
+    struct Input {
+        let newPassword: Driver<String>
+        let confirmation: Driver<String>
+        let saveTapped: Signal<Void>
+    }
+
+    struct Output {
+        let strength: Driver<String>
+        let isSaveEnabled: Driver<Bool>
+        let saved: Signal<Void>
+    }
+
+    func transform(_ input: Input) -> Output {
+        let passwords = Driver.combineLatest(input.newPassword, input.confirmation)
+        let isValid = passwords.map { new, confirm in new.count >= 12 && new == confirm }
+        let saved = input.saveTapped
+            .withLatestFrom(passwords)
+            .flatMapLatest { new, _ in service.change(to: new).asSignal(onErrorSignalWith: .empty()) }
+        return Output(strength: input.newPassword.map(Strength.describe), isSaveEnabled: isValid, saved: saved)
+    }
+}
+```
+
+It's elegant: no mutable state at all, and the whole screen's behaviour is one function. It's also easy to get subtly wrong. Each output subscribed twice runs its pipeline twice (two network calls for one tap) unless it's shared, and errors must be caught inside every request or the stream ends. `Driver` (replays its latest value, delivers on the main thread, can't fail) and `Signal` (doesn't replay) exist to encode exactly the state-versus-event distinction the next section is about.
+
+## The modern shape: an Input enum and an Output value
+
+With Observation and `async`/`await`, the same contract needs no streams. Inputs become cases of an enum handled by one method; the output becomes one `Equatable` value, computed from a few stored facts; routes go out through a closure.
+
+```swift check group=password title="ChangePasswordViewModel.swift"
+import Foundation
+import Observation
+
+protocol PasswordService: Sendable {
+    func changePassword(to newPassword: String) async throws
+}
+
+@MainActor
+@Observable
+final class ChangePasswordViewModel {
+    enum Input: Equatable, Sendable {
+        case newPasswordChanged(String)
+        case confirmationChanged(String)
+        case saveTapped
+    }
+
+    enum Strength: Equatable, Sendable { case empty, weak, fair, strong }
+
+    struct Output: Equatable, Sendable {
+        var strength: Strength = .empty
+        var showsMismatch = false
+        var isSaveEnabled = false
+        var isSaving = false
+        var failure: String?
+    }
+
+    enum Route: Equatable, Sendable { case saved }
+
+    /// Everything the view renders, rebuilt from the facts below on every read
+    var output: Output {
+        Output(
+            strength: Self.strength(of: newPassword),
+            showsMismatch: !confirmation.isEmpty && confirmation != newPassword,
+            isSaveEnabled: canSave,
+            isSaving: isSaving,
+            failure: failure
+        )
+    }
+
+    private var newPassword = ""
+    private var confirmation = ""
+    private var isSaving = false
+    private var failure: String?
+
+    private let service: any PasswordService
+    private let onRoute: @MainActor (Route) -> Void
+
+    init(service: any PasswordService, onRoute: @escaping @MainActor (Route) -> Void) {
+        self.service = service
+        self.onRoute = onRoute
+    }
+
+    func send(_ input: Input) async {
+        switch input {
+        case .newPasswordChanged(let text):
+            newPassword = text
+            failure = nil
+        case .confirmationChanged(let text):
+            confirmation = text
+            failure = nil
+        case .saveTapped:
+            guard canSave else { return }
+            isSaving = true
+            defer { isSaving = false }
+            do {
+                try await service.changePassword(to: newPassword)
+                onRoute(.saved)
+            } catch is CancellationError {
+                // Not a failure
+            } catch {
+                failure = "Couldn't change your password. Try again."
+            }
+        }
+    }
+
+    private var canSave: Bool {
+        Self.strength(of: newPassword) != .weak && Self.strength(of: newPassword) != .empty
+            && confirmation == newPassword && !isSaving
+    }
+
+    static func strength(of password: String) -> Strength {
+        guard !password.isEmpty else { return .empty }
+        let kinds = [password.contains(where: \.isLowercase), password.contains(where: \.isUppercase),
+                     password.contains(where: \.isNumber), password.contains { !$0.isLetter && !$0.isNumber }]
+            .filter { $0 }.count
+        switch (password.count, kinds) {
+        case (16..., _), (12..., 3...): return .strong
+        case (12..., _): return .fair
+        default: return .weak
+        }
+    }
+}
+```
+
+Three choices carry the design:
+
+- **`output` is computed, not stored.** The inputs change a handful of stored facts, and the output is derived from them on every read. There's no way to update `isSaveEnabled` and forget `showsMismatch`, so the output can never contradict itself. Observation tracks a computed property through what it reads, so views re-render correctly.
+- **`send` is the only way in.** A `switch` over the input makes every event visible in one place. It's `async` so that a test can await a save to completion; the view calls it from a `Task` in the button's action.
+- **The route is a closure, not part of the output.** That's the subject of the next section.
+
+## State goes in the output, events go out
+
+Some things the view model produces are **state**: they're true until something changes them, and a view that appears or re-renders must see them. Others are **events**: they happen once. "Save is enabled" is state. "Saved, close the screen" is an event.
+
+Put an event in the output and it becomes state by accident. A `var route: Route?` that's set to `.saved` stays `.saved`: every re-render sees it, a coordinator that observes it must remember whether it has already acted, and someone has to set it back to `nil`. Android's history has a cautionary tale here: the "single live event" wrapper teams wrote to stop navigation re-firing after rotation was so error-prone that the guidance became "model it as state the consumer resets, or use a one-shot channel". In Swift the clean options are:
+
+- **A closure** injected at `init`, as above. One listener (the coordinator), called exactly once per event.
+- **An `AsyncStream<Route>`**, when the listener should be able to subscribe later or several things listen.
+
+Alerts sit between the two. An alert must survive re-renders and stay until dismissed, so it's **state**: an `alert: AlertContent?` in the output, plus an `.alertDismissed` input. SwiftUI's `.alert(_:isPresented:presenting:)`, given a binding derived from that optional, fits the shape exactly.
+
+```visual states
+title: The save button's life, in inputs
+states:
+  - { id: editing, label: Editing, at: [0, 0] }
+  - { id: saving, label: Saving, at: [2, 0] }
+  - { id: failed, label: Failed, at: [2, 1] }
+  - { id: saved, label: Saved, at: [4, 0] }
+initial: editing
+final: [saved]
+transitions:
+  - [editing, editing, edit]
+  - [editing, editing, save, invalid]
+  - [editing, saving, save, valid]
+  - [saving, saving, save]
+  - [saving, failed, fail]
+  - [saving, saved, succeed]
+  - [failed, editing, edit]
+  - [failed, saving, save]
+events:
+  - { event: edit, say: "Each keystroke is an input. The output's strength and mismatch flags are recomputed; nothing else happens." }
+  - { event: save, guard: invalid, say: "Save with a weak password or a mismatch: `canSave` is false, so `send` returns at once. The button was disabled anyway; this guards the keyboard's Return key." }
+  - edit
+  - { event: save, guard: valid, say: "A valid save sets `isSaving`, so the output disables the button and shows a spinner." }
+  - { event: save, say: "A second tap while saving is ignored: `canSave` includes `!isSaving`. No double requests." }
+  - { event: fail, say: "The request fails. `failure` is set and appears in the output; the button comes back for a retry." }
+  - { event: edit, say: "Editing clears the failure, because the message described an attempt that's no longer relevant. (Tapping Save again straight from Failed would retry too.)" }
+  - { event: save, guard: valid }
+  - { event: succeed, say: "Success is an **event**: `onRoute(.saved)` fires once and the coordinator closes the screen. Nothing in the output says \"saved\"." }
+```
+
+## Testing as a table
+
+Because the contract is two value types, the natural test is a table: a sequence of inputs, and the output you expect afterwards.
+
+```swift check group=password title="ChangePasswordViewModelTests.swift"
+import Testing
+
+struct NeverCalledService: PasswordService {
+    func changePassword(to newPassword: String) async throws {}
+}
+
+typealias Input = ChangePasswordViewModel.Input
+typealias Output = ChangePasswordViewModel.Output
+
+@MainActor
+@Test(arguments: [
+    ([Input.newPasswordChanged("short")], Output(strength: .weak)),
+    ([.newPasswordChanged("correct horse battery")], Output(strength: .strong)),
+    ([.newPasswordChanged("correcthorsebat"), .confirmationChanged("correcthorse")],
+     Output(strength: .fair, showsMismatch: true)),
+    ([.newPasswordChanged("Correct-Horse-9"), .confirmationChanged("Correct-Horse-9")],
+     Output(strength: .strong, isSaveEnabled: true)),
+])
+func outputFollowsInputs(inputs: [Input], expected: Output) async {
+    let model = ChangePasswordViewModel(service: NeverCalledService()) { _ in }
+    for input in inputs {
+        await model.send(input)
+    }
+    #expect(model.output == expected)
+}
+```
+
+Each row reads like a sentence from the spec, and adding a case is one line. Saving needs a service the test can hold open (so it can check `isSaving` mid-flight) and a recorder for routes, which [Testing view models](/design/learn/sd-mvvm-testing) builds.
+
+## Towards reducers
+
+Look at `send` again: an input arrives, some stored facts change, and an effect (the save) may run. Separate the "facts change" part into a pure function, `(state, input) -> (state, effect)`, and you have a **reducer**, the heart of Redux, the Elm architecture and TCA. Input/output view models are often the first step a team takes towards them, and they're a good place to stop if the screen doesn't need more. You'll meet reducers in D28.
+
+## Trade-offs
+
+| | Properties and methods | Inputs/outputs protocols | `transform(input:)` | Input enum + Output value |
+| --- | --- | --- | --- | --- |
+| Contract visible at a glance | no | yes | yes | yes |
+| Needs a reactive framework | no | usually | yes | no |
+| Output always consistent | only by care | by care | yes, if built from shared streams | yes: computed from facts |
+| Testing | method calls and properties | per output stream | stream recording | tables of inputs and outputs |
+| Main risks | sprawl | boilerplate | double subscriptions, unshared side effects | one large `switch` |
+| Wins for | small screens | Rx codebases wanting explicit direction | Rx codebases, pure pipelines | most screens on iOS 17+ that want a strict contract |
+
+<Callout kind="interview">
+
+**What to say:** "I give each screen an `Input` enum and an `Output` value, with one-off events like navigation going out through a closure. The output is computed from a few stored facts, so it's always consistent, and tests are tables of inputs and expected outputs. In an RxSwift codebase I'd follow its `transform(input:)` convention and make sure every output is shared."
+
+**What to ask:** "Do the team's screens already follow one convention?" Consistency across fifty screens is most of the value.
+
+**Red flags:** navigation or "show toast" stored in the output; outputs stored separately and updated by hand; a `transform` whose outputs trigger a request per subscriber; a 40-case `Input` that should be two child view models.
+
+</Callout>
+
+<Callout kind="gotcha" title="Swift gotcha: an `async` send from a button">
+
+`Button("Save") { await model.send(.saveTapped) }` doesn't compile: a button's action is synchronous. Write `Button("Save") { Task { await model.send(.saveTapped) } }`, and let the view model's own guard (`!isSaving`) handle fast double taps, since two taps make two tasks. Keyboard submission (`.onSubmit`) needs the same guard.
+
+</Callout>
+
+## Practice
+
+**An input/output sign-in view model** builds this lesson's shape with harder rules: an email error that waits until the field loses focus, error messages for each failure, and a sign-in that routes exactly once, even with a double tap.
+
+```cards
+- id: io-contract
+  front: "What are the three parts of an input/output view model's contract?"
+  back: "Inputs (events from the view), outputs (everything the view renders, as state), and routes or effects (one-off things that happen outside the screen)."
+- id: io-computed-output
+  front: "Why compute the output from stored facts instead of storing it?"
+  back: "So it can never contradict itself: every field is derived from the same facts on every read, and no input can forget to update one of them."
+- id: io-events
+  front: "Why shouldn't navigation be part of the output?"
+  back: "It's an event, not state. Stored in the output it stays set, re-fires on re-render, and someone must reset it. A closure or an AsyncStream delivers it once."
+- id: io-transform-risk
+  front: "What's the classic bug in transform(input:) view models?"
+  back: "Outputs that aren't shared: each subscriber runs the pipeline again, so one tap makes two network calls."
+```
+
+```quiz
+- id: q1
+  type: sort
+  prompt: "Is each of these an input, part of the output, or a route?"
+  buckets: [Input, Output, Route]
+  items:
+    - ["The user changed the confirmation field", 0]
+    - ["Whether Save is enabled", 1]
+    - ["Password changed: close the screen", 2]
+    - ["The text of the strength meter", 1]
+    - ["The user tapped Save", 0]
+    - ["Open the Forgot Password flow", 2]
+  explain: "Inputs are things that happened to the screen. Outputs are what it shows, true until something changes. Routes are one-off actions outside the screen, delivered once."
+- id: q2
+  type: mcq
+  prompt: "A view model stores `var route: Route?` in its output, and the coordinator pushes when it becomes `.details`. Users report the details screen sometimes opens twice. Why?"
+  options:
+    - "Observation delivers changes twice"
+    - "The route stays set, so a later re-render or re-subscription sees it again and the coordinator acts on it again"
+    - "The coordinator should use `DispatchQueue.main.async`"
+    - "Routes must be `Equatable`"
+  answer: 1
+  explain: "An event stored as state doesn't go away. Unless every consumer resets it at exactly the right moment, it fires again. Deliver routes through a closure or a stream, once."
+- id: q3
+  type: truefalse
+  prompt: "In an RxSwift `transform(input:)` view model, subscribing two views to the same output runs its network request once, because the outputs come from one call to `transform`."
+  answer: false
+  explain: "Rx pipelines are cold by default: every subscription runs the chain again, so two subscribers make two requests. `share(replay:)`, or `Driver`, which shares, avoids it."
+- id: q4
+  type: multi
+  prompt: "Which belong in the output of an edit-profile screen? Choose all that apply."
+  options:
+    - "The name field's validation message"
+    - "\"Saved\" as a one-off confirmation that closes the screen"
+    - "An alert describing why the save failed, until the user dismisses it"
+    - "Whether the Save button shows a spinner"
+  answer: [0, 2, 3]
+  explain: "The validation message, the alert and the spinner are all states the screen must keep showing across re-renders; the alert is cleared by an `.alertDismissed` input. Closing the screen happens once, so it's a route."
+- id: q5
+  type: recall
+  prompt: "Explain how an input/output view model relates to a reducer."
+  model: "In both, an input (action) arrives and the state changes, possibly starting an effect. A reducer makes the state change a pure function, (state, action) -> (state, effect), with effects run elsewhere. An input/output view model does the same inside one method with the effect inline, so it's a reducer with the purity relaxed."
+```

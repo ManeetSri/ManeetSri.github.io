@@ -1,0 +1,351 @@
+## Why it matters
+
+The "C" in TCA is the point. A real screen is built from smaller features (a search box, a list of rows, a summary), and each should be writable, previewable and testable on its own, then plugged into a parent without either knowing more than it must about the other. Composition is also where homemade stores fall down: [The Elm architecture](/design/learn/sd-udf-elm) showed how much wrapping every level of nesting needs by hand. This lesson covers how TCA routes state and actions between parents and children, how children talk back, how siblings share state, and the ordering rules that decide whether it works. Interviewers ask about it as "how would you split this screen into features, and how do they communicate?"
+
+## A parent made of children
+
+The reading app's shelf screen has two parts: the book search from [TCA: effects and dependencies](/design/learn/sd-udf-tca-effects), now with a delegate action for "add to shelf", and a list of books, each a `BookRow` feature with its own progress and a remove button. The parent holds the children's state and routes their actions:
+
+```swift
+@Reducer
+struct ShelfFeature {
+    @ObservableState
+    struct State: Equatable {
+        var search = BookSearch.State()
+        var rows: IdentifiedArrayOf<BookRow.State> = []
+
+        var finishedCount: Int { rows.filter(\.isFinished).count }
+    }
+
+    enum Action {
+        case search(BookSearch.Action)
+        case rows(IdentifiedActionOf<BookRow>)
+    }
+
+    var body: some ReducerOf<Self> {
+        Scope(state: \.search, action: \.search) {
+            BookSearch()
+        }
+        Reduce { state, action in
+            switch action {
+            case let .search(.delegate(.addToShelf(book))):
+                state.rows.append(BookRow.State(book: book))
+                return .none
+            case let .rows(.element(id: id, action: .delegate(.removeRequested))):
+                state.rows.remove(id: id)
+                return .none
+            case .search, .rows:
+                return .none
+            }
+        }
+        .forEach(\.rows, action: \.rows) {
+            BookRow()
+        }
+    }
+}
+
+struct ShelfView: View {
+    let store: StoreOf<ShelfFeature>
+
+    var body: some View {
+        List {
+            BookSearchView(store: store.scope(state: \.search, action: \.search))
+            Section("Your shelf · \(store.finishedCount) finished") {
+                ForEach(store.scope(state: \.rows, action: \.rows)) { rowStore in
+                    BookRowView(store: rowStore)
+                }
+            }
+        }
+    }
+}
+```
+
+Three operators do the routing:
+
+- **`Scope(state:action:)`** embeds a child that's always there. For every action, it checks whether it's a `.search(…)` action; if so, it runs `BookSearch` on `state.search` and wraps any actions the child's effects send back in `.search(…)`.
+- **`.forEach(\.rows, action: \.rows)`** embeds one child per element of an `IdentifiedArray`. Row actions arrive as `.rows(.element(id:action:))`, and it runs `BookRow` on the element with that id.
+- **`store.scope(state:action:)`** in the view gives each child view a store that sees only its slice and sends only its own actions. It's a lens onto the parent's store, not a copy: there's still one state, owned at the root.
+
+Since 1.26 you can drop the `state:` label (`Scope(\.search, action: \.search)`, `store.scope(\.search, action: \.search)`), matching `ifLet` and `forEach`; the labelled form still works, and it's what most existing code uses.
+
+## Key paths for state, case paths for actions
+
+Compare `Scope` with Elm's hand-written nesting. Elm's parent unwraps the child's message, runs the child's `update` on its slice, stores the result and re-wraps the child's commands. `Scope` does exactly that, generically, from two paths:
+
+- **`\.search` on `State`** is an ordinary writable key path: it reads and writes the child's slice.
+- **`\.search` on `Action`** is a **case key path**, which `@CasePathable` generates for every case: it can *extract* a child action from a parent action, returning `nil` if it's a different case, and *embed* a child action back into the parent's.
+
+Those two operations, and running the child before the parent, are all composition needs. You'll build them yourself in the kata for this lesson.
+
+## Address children by id, never by index
+
+Why an `IdentifiedArray` rather than an array? Because effects are asynchronous, and positions move. Suppose each row can download its book, and the user deletes a row while a download is running:
+
+```swift run title="Routing a late action by index, and by id"
+struct Row: Identifiable {
+    let id: Int
+    let title: String
+    var isDownloaded = false
+}
+
+func shelf() -> [Row] {
+    [Row(id: 10, title: "Dune"), Row(id: 20, title: "Emma"), Row(id: 30, title: "Ulysses")]
+}
+
+func downloaded(_ rows: [Row]) -> [String] {
+    rows.filter(\.isDownloaded).map(\.title)
+}
+
+// The download for Emma started when Emma was at index 1. Then the user deleted Dune.
+var byIndex = shelf()
+let emmaIndex = 1
+byIndex.removeAll { $0.id == 10 }
+byIndex[emmaIndex].isDownloaded = true   // the late answer, routed by position
+print("by index, after deleting Dune:", downloaded(byIndex))
+
+var byID = shelf()
+let emmaID = 20
+byID.removeAll { $0.id == 10 }
+if let index = byID.firstIndex(where: { $0.id == emmaID }) { byID[index].isDownloaded = true }
+print("by id, after deleting Dune:", downloaded(byID))
+
+// Now the user deletes Emma herself before her download finishes
+var gone = shelf()
+gone.removeAll { $0.id == emmaID }
+if let index = gone.firstIndex(where: { $0.id == emmaID }) { gone[index].isDownloaded = true }
+print("by id, after deleting Emma:", downloaded(gone))
+```
+
+```output
+by index, after deleting Dune: ["Ulysses"]
+by id, after deleting Dune: ["Emma"]
+by id, after deleting Emma: []
+```
+
+By index, Emma's download marks Ulysses, the book that slid into her place. By id, it marks Emma, and if Emma has gone it does nothing at all (by index it would have marked whatever was at position 1, or crashed if nothing was). `IdentifiedArray` keeps the elements in order like an array, and a dictionary from id to position alongside them, so `rows[id: 20]` and `rows.remove(id: 20)` are fast and every child action carries an identity that survives insertions, deletions and reordering.
+
+## How children talk to parents: delegate actions
+
+A child often needs to tell its parent something: "add this book to the shelf", "remove me", "I'm finished". It does so with a **delegate action**: a nested enum of messages meant for the parent, sent as an effect.
+
+```swift
+@Reducer
+struct BookRow {
+    @ObservableState
+    struct State: Equatable, Identifiable {
+        var book: Book
+        var currentPage = 0
+        @Presents var confirmation: ConfirmationDialogState<Action.Confirmation>?
+
+        var id: Book.ID { book.id }
+        var isFinished: Bool { currentPage == book.pageCount }
+    }
+
+    enum Action {
+        case removeButtonTapped
+        case confirmation(PresentationAction<Confirmation>)
+        case delegate(Delegate)
+
+        enum Confirmation { case confirmRemove }
+        enum Delegate { case removeRequested }
+    }
+
+    var body: some ReducerOf<Self> {
+        Reduce { state, action in
+            switch action {
+            case .removeButtonTapped:
+                let title = state.book.title
+                state.confirmation = ConfirmationDialogState {
+                    TextState("Remove \(title)?")
+                } actions: {
+                    ButtonState(role: .destructive, action: .confirmRemove) { TextState("Remove") }
+                }
+                return .none
+            case .confirmation(.presented(.confirmRemove)):
+                return .send(.delegate(.removeRequested))
+            case .confirmation, .delegate:
+                return .none
+            }
+        }
+        .ifLet(\.$confirmation, action: \.confirmation)
+    }
+}
+```
+
+The parent listens only to `.delegate(.removeRequested)`. It never matches `.removeButtonTapped`, and that matters: when the row gained a confirmation dialog, nothing in the parent changed. A parent that had matched the button tap would now remove rows before the user confirmed. Delegate actions are the child's *public* interface; everything else is its business.
+
+Step through one removal:
+
+```visual flow
+title: A row asks to be removed
+nodes:
+  - { id: rowView, label: Row view, kind: view, at: [0, 0] }
+  - { id: scoped, label: Scoped store, at: [2, 0] }
+  - { id: root, label: Shelf store, kind: store, at: [4, 0] }
+  - { id: parent, label: Shelf reducer, at: [2, 2] }
+  - { id: row, label: BookRow reducer, at: [4, 2] }
+edges:
+  - [rowView, scoped, send]
+  - [scoped, root, wrapped]
+  - [root, row, "forEach: id 20"]
+  - [row, root, delegate]
+  - [root, parent, then parent]
+  - [parent, rowView, row removed, { style: data }]
+steps:
+  - say: "The user confirms the removal. The row's view sends `confirmation(.presented(.confirmRemove))` to its **scoped store**. It knows nothing about shelves."
+    show: [rowView, scoped]
+    send: rowView->scoped
+  - say: "A scoped store owns no state. It wraps the action, `.rows(.element(id: 20, action: …))`, and sends it to the one **root store**."
+    show: [root]
+    send: scoped->root
+  - say: "The root runs its `body`. `forEach` finds element 20 **by id** and runs the `BookRow` reducer on that row's state."
+    show: [row]
+    send: root->row
+    active: [row]
+  - say: "The row returns `.send(.delegate(.removeRequested))`. It comes back wrapped the same way, as a new action for the parent."
+    send: row->root
+  - say: "This time the **parent's** `Reduce` matches it, `.rows(.element(id: 20, action: .delegate(.removeRequested)))`, and removes row 20."
+    show: [parent]
+    send: root->parent
+    state: { parent: ok }
+  - say: "The list re-renders without that row. Other rows' views don't, because each observes only its own fields."
+    send: parent->rowView
+```
+
+## Order inside `body`
+
+Reducers in a `body` run top to bottom, and the composition operators run the child *before* the reducer they're attached to. Both rules are deliberate.
+
+- **`Scope` above `Reduce`** means the child has already handled its action when the parent's logic runs, so the parent sees the child's new state.
+- **`.forEach` and `.ifLet` run the child first** because the parent often removes the child in response to the child's own action. If the parent ran first and removed a row, the row's reducer would receive its action with no state to apply it to. TCA reports that case as a runtime warning ("received an action for a missing element"), because it usually means an ordering mistake or an effect that outlived its row.
+
+## Sharing state between features
+
+Sometimes two features need the same value: the shelf's yearly reading goal is edited in Settings and shown on the shelf. There are three honest options.
+
+1. **The parent owns it and passes copies down,** updating each child when it changes. Simple and explicit, and easy to forget when a third child appears.
+2. **The parent derives it,** as `finishedCount` above: no child holds the value, so nothing can drift.
+3. **`@Shared`,** from Point-Free's swift-sharing library (built into TCA since 1.10). Each feature declares the value, optionally with a persistence strategy, and every holder sees one value:
+
+```swift
+@ObservableState
+struct State: Equatable {
+    @Shared(.appStorage("yearlyGoal")) var yearlyGoal = 24
+}
+
+// In the reducer
+case let .goalStepperChanged(goal):
+    state.$yearlyGoal.withLock { $0 = goal }
+    return .none
+```
+
+`@Shared` puts a reference inside value-typed state, which is the trade: no syncing code, at the cost of one more way for state to change from outside a feature's own actions. TCA's `TestStore` still tracks shared values in its assertions, so tests stay exhaustive. Use it for genuinely shared, often persisted, values (settings, the signed-in user, a goal), not to avoid thinking about which feature owns what. Strategies include `.appStorage` (UserDefaults), `.fileStorage(url)` and `.inMemory`.
+
+## Features as modules
+
+Scoping makes features natural module boundaries. Put `BookRowFeature`, `BookSearchFeature` and `ShelfFeature` in separate targets of a Swift package; the shelf imports its children, the children import nothing above them. A row's preview then builds only the row's module, and two teams can work on two features without touching each other's code. Point-Free's open-source game isowords is split into dozens of modules this way. You'll meet modular architecture properly later in the course; for now, notice that "a child never knows its parent" is what makes it possible.
+
+## Trade-offs
+
+| | One big reducer | Composed with `Scope`, `forEach`, `ifLet` | Separate stores talking through services | `@Shared` values |
+| --- | --- | --- | --- | --- |
+| Child testable alone | No | Yes | Yes | Yes |
+| How children talk up | They don't: it's one feature | Delegate actions | Callbacks, notifications or a shared service | They don't need to: one value |
+| Consistency | Strong | Strong: one state tree | Each store can drift | Strong for the shared value |
+| Boilerplate | Least at first | Paths, delegate enums, child cases | Wiring between stores | A property wrapper |
+| Where it breaks down | A few hundred lines | Deep trees make parent `switch`es long | Cross-feature rules have no single home | Overuse: everything becomes globally writable |
+| Wins when | A small screen | Most screens with distinct parts | Truly independent features | Settings and session-like values many features read |
+
+<Callout kind="interview">
+
+**Say** "Each part of the screen is a child feature with its own state, actions and reducer. The parent holds their state, embeds them with `Scope` or `forEach` over an `IdentifiedArray`, and views get scoped stores that see only their slice. Children talk upwards only through delegate actions, so the parent never depends on a child's internals." **Ask** which state is genuinely shared between siblings, because that decides between deriving it, passing it down and `@Shared`. **Red flags:** rows in a plain array addressed by index, a parent matching a child's button taps, and a child that reaches into its parent's state.
+
+</Callout>
+
+<Callout kind="gotcha" title="Swift gotcha: a row's effects can outlive the row">
+
+A row that starts a download keeps it running after the user deletes the row, unless something cancels it, and its answer then arrives for a missing element. Give a row's long-running effects ids that include its id, such as `CancelID.download(book.id)`, and cancel them when the row is removed.
+
+</Callout>
+
+<Callout kind="gotcha" title="iOS gotcha: onDelete hands you positions">
+
+SwiftUI's `.onDelete` gives you an `IndexSet` for the list as it's currently displayed. Send it to the reducer and turn it into ids straight away (`indexSet.map { state.rows[$0].id }`) in the same action, then remove by id. Keeping indices around for later, in an effect or a confirmation, reintroduces the bug above.
+
+</Callout>
+
+## Practice
+
+- **[Scope child features into a parent](/design/practice/sd-kata-unidirectional-scoped-features)**: write `scope`, `ifLet` and `forEach` yourself, with delegate actions, and see why children run before parents.
+- **[A unidirectional onboarding with async validation](/design/practice/sd-design-unidirectional-onboarding)**: decide the feature tree for a five-step sign-up, what each step owns, and how steps report to the flow.
+
+```cards
+- id: scope-routing
+  front: "What does `Scope(state: \\.child, action: \\.child)` do?"
+  back: "For each action, it extracts a child action with the case key path; if there is one, it runs the child reducer on the child's slice (via the key path) and embeds the child's effects' actions back into the parent's."
+- id: identified-array
+  front: "Why use `IdentifiedArray` for child features in a list?"
+  back: "Child actions are routed by id, which survives insertions, deletions and reordering. A late effect for a moved or deleted row can't update the wrong one, and lookup by id is fast."
+- id: delegate-actions
+  front: "What's a delegate action, and why should a parent only listen to those?"
+  back: "A child's message to its parent (`delegate(.removeRequested)`), sent as an effect. Matching only delegates keeps the parent independent of the child's UI, so the child can add a confirmation without breaking the parent."
+- id: child-first
+  front: "Why do `forEach` and `ifLet` run the child before the parent?"
+  back: "The parent often removes the child in response to the child's own action. Running the child first means it never receives an action after its state is gone."
+```
+
+```quiz
+- id: q1
+  type: mcq
+  prompt: "A row gains a confirmation dialog before removal. After the change, rows disappear the moment the button is tapped, before anyone confirms. What's the likely cause?"
+  options:
+    - "`ConfirmationDialogState` doesn't work inside lists"
+    - "The parent matches the row's `removeButtonTapped` instead of a delegate action"
+    - "`forEach` runs the parent before the child"
+    - "The row's state isn't `Identifiable`"
+  answer: 1
+  explain: "A parent that listens to a child's UI actions depends on its internals. Once the tap only opens a dialog, the parent's rule is wrong. The parent should react to `delegate(.removeRequested)`, which the row sends after confirmation."
+- id: q2
+  type: bug
+  prompt: "Each row's download reports back with this action. Which line will mark the wrong book after a deletion?"
+  code: |
+    enum Action {
+        case downloadFinished(rowIndex: Int)
+    }
+
+    func reduce(_ state: inout ShelfState, _ action: Action) {
+        switch action {
+        case let .downloadFinished(rowIndex):
+            state.rows[rowIndex].isDownloaded = true
+        }
+    }
+  answer: 8
+  explain: "The index was captured when the download started. After a row above it is deleted, the same index points at a different book (or past the end). Carry the row's id instead and look it up when the answer arrives."
+- id: q3
+  type: truefalse
+  prompt: "`store.scope(state: \\.search, action: \\.search)` gives the search view its own copy of the search state, which the parent syncs when it changes."
+  answer: false
+  explain: "A scoped store owns no state. It reads its slice from the root store and wraps its actions in the parent's case, so there's still exactly one state tree."
+- id: q4
+  type: sort
+  prompt: "How should the shelf screen get each value?"
+  buckets: [Derive it in the parent, "@Shared", Child's own state]
+  items:
+    - [The number of finished books, 0]
+    - [The yearly reading goal edited in Settings, 1]
+    - [A row's current page, 2]
+    - [Whether every book on the shelf is downloaded, 0]
+    - [The signed-in reader's display name, 1]
+    - [Whether a row's remove confirmation is showing, 2]
+  explain: "Values computed from children's state are derived, so they can't drift. Values many features read and that outlive any one of them suit `@Shared`. Everything else belongs to the child that uses it."
+- id: q5
+  type: order
+  prompt: "Put the handling of a row's confirmed removal in order."
+  lines:
+    - "The row view sends its action to its scoped store"
+    - "The scoped store wraps it as `.rows(.element(id:action:))` and sends it to the root store"
+    - "`forEach` runs the `BookRow` reducer on the row with that id"
+    - "The row returns `.send(.delegate(.removeRequested))`"
+    - "The parent's `Reduce` matches the delegate action and removes the row by id"
+  explain: "Actions always enter at the root, children run before parents, and the child's message to its parent is a separate, wrapped action that the parent handles."
+```

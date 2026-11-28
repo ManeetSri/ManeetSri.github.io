@@ -1,0 +1,299 @@
+## Why it matters
+
+A reducer is pure, and an app is not. Searches hit the network, drafts save to disk, timers tick, analytics fire. Every unidirectional architecture has to answer one question: where does that work live, and how do its results get back in? The answer decides whether your reducers stay testable, whether a stale search result can overwrite a fresh one, and whether anyone can find the code that runs when a button is tapped. This lesson compares the three answers the Redux world tried (middleware with thunks, long-running listeners, and effects returned as values) and the one most Swift libraries settled on. It's a favourite interview follow-up: "your reducer is pure, so where does the networking go?"
+
+## Middleware: a chain around dispatch
+
+Redux's first extension point is **middleware**: functions that sit between `dispatch` and the reducer and see every action on the way through. Each one can log it, change it, swallow it, dispatch others, or pass it on to the next. It's the chain of responsibility pattern from [Chain of responsibility: interceptors and middleware](/design/learn/sd-behavioural-chain-of-responsibility), wrapped around the store.
+
+Redux writes a middleware as three nested functions, `store => next => action => …`, so that each one can be built once and wrapped around the next. Here's the same shape in Swift, with three middleware on a basket:
+
+```swift run title="Middleware: order matters"
+enum Action: Equatable {
+    case addTapped(String)
+    case signOutTapped
+}
+
+struct State {
+    var items: [String] = []
+    var isSignedIn = true
+}
+
+typealias Dispatch = (Action) -> Void
+/// Redux's shape: given a way to read the state, and the next link, return this link
+typealias Middleware = (_ getState: @escaping () -> State) -> (_ next: @escaping Dispatch) -> Dispatch
+
+let logger: Middleware = { getState in { next in { action in
+    print("→ \(action)")
+    next(action)
+    print("  items: \(getState().items)")
+} } }
+
+let analytics: Middleware = { _ in { next in { action in
+    if case .addTapped = action { print("  analytics: item added") }
+    next(action)
+} } }
+
+let signedInOnly: Middleware = { getState in { next in { action in
+    if case .addTapped = action, !getState().isSignedIn {
+        print("  blocked: signed out")
+        return
+    }
+    next(action)
+} } }
+
+final class Store {
+    private(set) var state = State()
+    private var chain: Dispatch = { _ in }
+
+    init(reducer: @escaping (inout State, Action) -> Void, middleware: [Middleware]) {
+        let reduce: Dispatch = { [unowned self] action in reducer(&self.state, action) }
+        // The last middleware wraps the reducer; the first one wraps everything
+        chain = middleware.reversed().reduce(reduce) { next, link in link({ [unowned self] in self.state })(next) }
+    }
+
+    func dispatch(_ action: Action) { chain(action) }
+}
+
+let store = Store(reducer: { state, action in
+    switch action {
+    case .addTapped(let item): state.items.append(item)
+    case .signOutTapped: state.isSignedIn = false
+    }
+}, middleware: [logger, analytics, signedInOnly])
+
+store.dispatch(.addTapped("Milk"))
+store.dispatch(.signOutTapped)
+store.dispatch(.addTapped("Eggs"))
+```
+
+```output
+→ addTapped("Milk")
+  analytics: item added
+  items: ["Milk"]
+→ signOutTapped
+  items: ["Milk"]
+→ addTapped("Eggs")
+  analytics: item added
+  blocked: signed out
+  items: ["Milk"]
+```
+
+The last action shows the classic middleware bug. Analytics runs before the guard, so it reports an item that was never added. Middleware is powerful precisely because each link is independent, and that's also why ordering bugs hide in it: nothing in any single middleware is wrong. Put guards first, and have anything that reports *outcomes* look at the state after `next` returns rather than at the action.
+
+Middleware is the right home for **cross-cutting** concerns that apply to every action: logging, crash-report breadcrumbs, analytics derived from actions, performance signposts around each dispatch. It's a poor home for feature logic, because nothing in the feature's code says the middleware exists.
+
+## Three places to put async work
+
+### Thunks: dispatch a function
+
+The simplest Redux answer to async work is **redux-thunk**: a middleware that lets you dispatch a *function* instead of an action. The middleware calls it with `dispatch` and `getState`, and the function does whatever it likes: fetch, then dispatch `searchLoaded`. In Swift the equivalent is an action case carrying an async closure, or a method on the store that does the work and dispatches the result.
+
+It's easy to learn, and it scatters logic. The decision "search when the query changes" now lives in the thunk, outside the reducer, so testing it needs a fake store and a fake network, and the action log shows a closure where an action should be. Two thunks started by fast typing can finish in any order, and nothing cancels the first.
+
+### Long-running listeners: sagas, epics and streams
+
+**redux-saga** and **redux-observable** turn it around: instead of the view dispatching work, a long-running process *listens* to the stream of actions and reacts. "Every time `queryChanged` arrives, debounce 300 ms, cancel the previous search, call the API, then dispatch `searchLoaded`" is a few lines with saga's `takeLatest` or an RxJS pipeline. Sagas yield *descriptions* of effects (`call(api.search, query)`) that the middleware performs, which makes them testable step by step.
+
+They handle orchestration beautifully: cancellation, races, retries, multi-step flows. The cost is indirection: reading the reducer for `queryChanged` tells you nothing about the search it triggers, because the code that reacts is somewhere else, subscribed to an action stream. On iOS the same shape appears as a Combine pipeline or an `AsyncStream` of actions, and as ReactorKit's `mutate()` (you'll meet it in [MVI and ReSwift](/design/learn/sd-udf-mvi-reswift)).
+
+### Effects as return values
+
+The third answer comes from Elm and is the one TCA and most modern Swift stores use: **the reducer returns its effects**. Handling `queryChanged` sets the query *and* returns "search for this query, and cancel any search already running". The store's runtime performs the effect and sends its result back as an action, which the same reducer handles.
+
+Everything about a feature's behaviour, including what it asks the world to do, is in one function. The decision is visible in the reducer's return value, cancellation is centralised in one runtime, and the reducer's test can check what it asked for. Step through a search:
+
+```visual sequence
+title: A search, with effects returned by the reducer
+participants:
+  - { id: view, label: Search view }
+  - { id: store, label: Store }
+  - { id: mw, label: Middleware }
+  - { id: reducer, label: Reducer }
+  - { id: api, label: Books API }
+messages:
+  - [view, store, "queryChanged(\"du\")", { say: "The view sends an action describing what the user did. It knows nothing about searching." }]
+  - [store, mw, "queryChanged(\"du\")", { say: "Middleware sees every action first: here a logger records it and passes it on." }]
+  - [mw, reducer, next(action), { say: "The reducer sets the query and returns an effect, as a value: *search for \"du\", id `search`, cancel any search in flight*." }]
+  - [reducer, store, "state + search effect", { reply: true }]
+  - [store, api, "GET /search?q=du", { async: true, say: "The store's runtime performs the effect. The reducer has already returned; nothing waits on it." }]
+  - [view, store, "queryChanged(\"dun\")", { say: "The user types another letter before the answer arrives." }]
+  - [store, api, "cancel, GET ?q=dun", { async: true, say: "The new search has the same id, so the runtime **cancels** the first one before starting it. The answer for \"du\" can never arrive." }]
+  - [api, store, "results for dun", { reply: true }]
+  - [store, mw, "searchLoaded(…)", { say: "The result comes back as an **action**, through the middleware like a tap, and the reducer puts the results in the state." }]
+  - [store, view, new state, { async: true, say: "The view renders. A tap and a network answer took the same path, and only the latest search could land." }]
+```
+
+## Effects as data, or as closures
+
+There are two ways to write "the reducer returns an effect", and they trade purity against flexibility.
+
+**Effects as data.** The effect is an enum of requests: `case search(query: String)`, `case saveDraft(Draft)`. The reducer is completely pure, and a test compares values: `#expect(effects == [.search(query: "du")])`. A separate interpreter turns each case into real work. You saw this style in [Reducers: state changes as pure functions](/design/learn/sd-functional-reducers). It shines for small, fixed sets of effects. It gets awkward for work with steps (wait, then fetch, then fetch again), and every new kind of effect needs a case *and* an interpreter branch.
+
+**Effects as closures.** The effect carries the async work itself, with an id for cancellation. The reducer stays pure in the sense that matters (it *returns* the work rather than doing it), but a test can't compare two closures, so it has to run them, and that only works if every dependency they touch is injected and replaceable:
+
+```swift check title="An effect type with ids, and a debounced search"
+import Foundation
+
+struct EffectID: Hashable, Sendable {
+    let name: String
+}
+
+enum Effect<Action: Sendable>: Sendable {
+    case none
+    case send(Action)
+    case run(id: EffectID? = nil, cancelInFlight: Bool = false, operation: @Sendable (_ send: @MainActor @Sendable (Action) -> Void) async throws -> Void)
+    case cancel(id: EffectID)
+}
+
+struct BookSearch {
+    struct State: Equatable {
+        var query = ""
+        var results: [String] = []
+        var isSearching = false
+    }
+
+    enum Action: Sendable {
+        case queryChanged(String)
+        case resultsLoaded([String])
+        case clearTapped
+    }
+
+    // Dependencies are injected, so a test can swap in a stub API and a test clock
+    let search: @Sendable (String) async throws -> [String]
+    let clock: any Clock<Duration>
+
+    static let searchID = EffectID(name: "search")
+
+    func reduce(_ state: inout State, _ action: Action) -> Effect<Action> {
+        switch action {
+        case .queryChanged(let query):
+            state.query = query
+            state.isSearching = true
+            return .run(id: Self.searchID, cancelInFlight: true) { [search, clock] send in
+                // Debounce: a newer keystroke cancels this effect while it sleeps
+                try await clock.sleep(for: .milliseconds(300))
+                let results = try await search(query)
+                await send(.resultsLoaded(results))
+            }
+        case .resultsLoaded(let results):
+            state.results = results
+            state.isSearching = false
+            return .none
+        case .clearTapped:
+            state = State()
+            return .cancel(id: Self.searchID)
+        }
+    }
+}
+```
+
+Three details carry most of the weight. The query is captured as a **value** when the reducer decides, so the effect does exactly what was decided even if the state moves on. The debounce is a `sleep` *inside* a cancellable effect, so there's no separate debounce operator: a new keystroke cancels the sleeping search. And `clearTapped` cancels by id, so a slow answer for an abandoned query can't fill a screen the user just cleared.
+
+TCA's `Effect` is this second style, and it's why TCA comes with a dependency system and a `TestStore`: closures are only testable if you control what they call.
+
+## Lifetimes: who owns the work?
+
+An effect lives as long as its owner lets it. Decide that deliberately, per kind of work:
+
+| Work | Owner | What ends it |
+| --- | --- | --- |
+| A search for the current query | The search feature's store, with an id | A newer query (`cancelInFlight`), clearing, or the feature closing |
+| A timer while a workout screen is open | The screen's store | The screen disappearing |
+| Live updates while a view is visible | The view, through `.task` | SwiftUI cancels the task when the view goes away |
+| An upload the user expects to finish | A service outside the feature, or a background `URLSession` | The upload completing, even if the screen closes or the app is suspended |
+
+The last row is the one that bites: an effect is the wrong place for work that must outlive the screen that started it. The feature's effect should hand the job to a service and listen for progress, not own the upload itself.
+
+## Trade-offs
+
+| | Thunks | Listeners: sagas, epics, streams | Effects as data | Effects as closures (TCA style) |
+| --- | --- | --- | --- | --- |
+| Where the decision lives | In the thunk, outside the reducer | In a listener, outside the reducer | In the reducer | In the reducer |
+| Testing | Fake store and fake network | Step through effect descriptions, or test streams | Compare effect values | Run effects with controlled dependencies |
+| Cancellation and races | Manual, per thunk | Built in (`takeLatest`, `switchMap`) | Convention in the interpreter | Ids in one runtime |
+| Finding what a tap does | Follow the thunk | Search for who listens to the action | Read the reducer | Read the reducer |
+| Multi-step work | Easy | Easy | Awkward: one case per step | Easy: it's async code |
+| Wins when | Small apps, a few simple fetches | Heavy orchestration across many actions | A few fixed effects and maximal purity | Most features, with a dependency system and test tools |
+
+<Callout kind="interview">
+
+**Say** "The reducer stays pure by returning effects instead of performing them. The store runs each effect, and its result comes back as an action through the same path as a tap. Effects have ids, so a new search cancels the old one and leaving the screen cancels its work." **Ask** which work must outlive the screen, because that belongs in a service, not in a feature's effect. **Red flags:** `Task { }` inside a reducer, middleware that holds feature logic, and a search with no cancellation, so answers land in whatever order the network chose.
+
+</Callout>
+
+<Callout kind="gotcha" title="iOS gotcha: an effect owned by a screen dies with it">
+
+Start a photo upload as a screen's effect, and dismissing the screen cancels it, or leaves it running with nowhere to send its result. If the app is suspended, it stops either way. Work the user expects to finish belongs to a service that outlives screens, ideally on a background `URLSession`; the feature's effect starts it and listens for progress.
+
+</Callout>
+
+<Callout kind="gotcha" title="Swift gotcha: effects cross actors">
+
+The store and its reducer run on the main actor; an effect's async work does not. In Swift 6, everything an effect captures must be `Sendable` and every action it sends must be too, which is why the effect above captures `query` and the injected closures rather than `state` or `self`. Sending is an `await`, a hop back to the main actor, where the action is reduced like any other. If the compiler complains about a capture, it has usually found a real race.
+
+</Callout>
+
+## Practice
+
+- **[A Redux-style store with middleware](/design/practice/sd-kata-unidirectional-redux-store)**: build the middleware chain, including middleware that swallows, rewrites and dispatches actions, thunk-style.
+- **[Effects the store runs, cancellable by id](/design/practice/sd-kata-unidirectional-cancellable-effects)**: build the runtime from the sequence above, including the subtle case where a cancelled search finishes after its replacement has started.
+
+```cards
+- id: middleware-for
+  front: "What belongs in middleware, and what doesn't?"
+  back: "Cross-cutting work that applies to every action: logging, breadcrumbs, analytics, signposts. Not feature logic, because nothing in the feature says the middleware exists."
+- id: three-homes
+  front: "What are the three places Redux-style apps put async work?"
+  back: "Thunks (dispatch a function that does the work), long-running listeners (sagas, epics, streams that react to actions), and effects returned by the reducer for a runtime to perform."
+- id: effect-styles
+  front: "Effects as data or effects as closures: what's the trade?"
+  back: "Data effects are enum values you can compare in tests, but each needs an interpreter and multi-step work is awkward. Closure effects can do anything async, but can only be tested by running them with controlled dependencies."
+- id: debounce-in-effect
+  front: "How do you debounce a search with cancellable effects?"
+  back: "Sleep at the start of the search effect and give it an id with cancel-in-flight. Each keystroke cancels the previous effect while it's still sleeping, so only the last one reaches the network."
+```
+
+```quiz
+- id: q1
+  type: mcq
+  prompt: "An analytics middleware reports `itemAdded` for every `addTapped`, but a later middleware sometimes blocks adds. Dashboards show more adds than baskets contain. What's the best fix?"
+  options:
+    - "Move the analytics call into the reducer"
+    - "Run the guard before analytics, or have analytics check the state after `next` returns"
+    - "Dispatch a second action from the view after adding"
+    - "Remove the guard middleware"
+  answer: 1
+  explain: "Middleware order is behaviour. Analytics that reports outcomes should look at what actually happened, after the rest of the chain has run, or run after anything that can swallow the action. Putting it in the reducer would make the reducer impure."
+- id: q2
+  type: sort
+  prompt: "Where does each concern belong in a store-based feature?"
+  buckets: [Middleware, The reducer, An effect, A service outside the feature]
+  items:
+    - [Logging every action in debug builds, 0]
+    - [Deciding that a new query should start a search, 1]
+    - [Calling the search API after a 300 ms debounce, 2]
+    - [A 200 MB video upload that must finish if the screen closes, 3]
+    - [Breadcrumbs for crash reports, 0]
+    - [Clearing results when the query is emptied, 1]
+  explain: "Middleware handles what applies to every action, the reducer decides, effects do the feature's async work, and work that must outlive the feature belongs to something that lives longer than it."
+- id: q3
+  type: multi
+  prompt: "A search reducer returns `.run(id: searchID, cancelInFlight: true)` with a 300 ms sleep before the request. The user types `d`, `du`, `dun` 100 ms apart. Which statements are true? Choose all that apply."
+  options:
+    - "Only one request reaches the network"
+    - "The results for `du` could arrive after the results for `dun`"
+    - "Clearing the field with `.cancel(id: searchID)` stops a request in flight"
+    - "Three requests are sent, but only the last result is shown"
+  answer: [0, 2]
+  explain: "Each keystroke cancels the previous effect while it's still sleeping, so only `dun` reaches the network, and nothing for an earlier query can arrive. Cancelling by id also stops the last one if the user clears the field."
+- id: q4
+  type: truefalse
+  prompt: "A reducer that returns closure-based effects can be tested by comparing the effects it returns with `==`."
+  answer: false
+  explain: "Closures can't be compared. You test them by running them with controlled dependencies and checking the actions they send back, which is what TCA's `TestStore` does. Effects as enum values are the style you can compare directly."
+- id: q5
+  type: recall
+  prompt: "An interviewer asks: \"Your reducer is pure, so where does the networking go, and how does the result get back?\" Answer in two or three sentences."
+  model: "The reducer returns an effect describing the work, with an id, instead of performing it. The store runs the effect with injected dependencies and sends its result back as an action, which the reducer handles like any other, so a tap and a response change state through the same path. Ids let a new request cancel a stale one, and leaving the feature cancels its work."
+```

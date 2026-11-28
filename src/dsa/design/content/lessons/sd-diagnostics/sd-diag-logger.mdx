@@ -1,0 +1,280 @@
+## Why it matters
+
+When a user reports "checkout spun forever", the only witness is what your app wrote down while it happened. Apple's unified logging system, which you write to with `Logger`, is that witness on iOS: cheap enough to leave on in production, private by default, and collected by the system whether or not your app is running. Using it well means choosing subsystems and categories you can filter, levels that decide what survives, and privacy annotations that keep user data out of a support engineer's screen. Interviewers ask about logging to hear whether you've debugged something you couldn't reproduce.
+
+## Why not print
+
+`print` writes to standard output. In Xcode you see it in the console; on a user's iPhone nothing reads standard output, so every `print` in a release build is wasted work. `NSLog` does reach the system log, but it formats every message eagerly into a string, at the same level, and treats every value as public.
+
+`Logger`, in the `os` framework since iOS 14, writes to **unified logging**, the system-wide log that every Apple process shares. What makes it different:
+
+- **It's cheap.** A log call doesn't build a string. It records a reference to the format string, which lives in your binary, plus the raw arguments in a compact binary form. Formatting happens only when someone reads the log.
+- **It has levels,** and the level decides whether a message is kept, for how long, and whether it costs anything at all.
+- **It's private by default.** Dynamic values are redacted unless you say they're safe.
+- **It's filterable.** Every message carries its subsystem, category, process, thread and time, so a reader can cut millions of lines down to your feature's.
+
+[The logging decorator](/design/learn/sd-structural-decorator) used `Logger` to record each request. This lesson is about using it as a deliberate design across the app.
+
+## Subsystems and categories
+
+Every `Logger` has a **subsystem**, conventionally reverse-DNS and usually the bundle identifier, and a **category** naming the part of the app. Define them once, as static members, so call sites stay short and names stay consistent:
+
+```swift check
+import Foundation
+import os
+
+extension Logger {
+    private static let subsystem = Bundle.main.bundleIdentifier ?? "com.example.shop"
+
+    static let checkout = Logger(subsystem: subsystem, category: "checkout")
+    static let network = Logger(subsystem: subsystem, category: "network")
+    static let sync = Logger(subsystem: subsystem, category: "sync")
+}
+
+struct OrderID: CustomStringConvertible, Sendable {
+    let raw: String
+    var description: String { raw }
+}
+
+func placeOrder(id: OrderID, email: String, totalPence: Int, attempt: Int) {
+    Logger.checkout.info("Placing order \(id, privacy: .public) for \(email, privacy: .private(mask: .hash))")
+    Logger.checkout.notice("Order \(id, privacy: .public) placed: \(totalPence) pence, attempt \(attempt)")
+}
+```
+
+A few conventions that pay off once the app is large:
+
+- **Categories follow ownership.** One per feature or layer (`checkout`, `network`, `sync`, `push`), so a team can filter to what it owns. A modular app can give each package its own subsystem, such as `com.example.shop.checkout`, and use categories inside it.
+- **Extensions get their own subsystem or a clear category.** A widget or notification service extension is a separate process; filtering by subsystem across processes lets you follow one push from the extension into the app.
+- **`Logger` is a cheap value,** and `Sendable`, so a `static let` is safe in Swift 6 and creating one per type is fine too. Avoid building categories from dynamic strings: they become impossible to filter predictably.
+
+## Levels decide what survives
+
+There are five levels. Choose by **who will read this, and when**:
+
+| Level | Meaning | Kept? | Use it for |
+| --- | --- | --- | --- |
+| `debug` | Detail only useful while developing | Not stored unless debug logging is enabled | Cache keys, decoded values, every step of a parser |
+| `info` | Helpful context, not essential | In memory only, overwritten as buffers fill | "Served cached orders after timeout", "Prefetched 20 images" |
+| `notice` (also `log`) | Something worth knowing happened | Written to the on-device store, up to a size limit | "Signed in", "Order placed", "Sync finished: 12 changes" |
+| `error` | Something failed that the app handled | Written to the store | "Order failed: unavailable ← timeout", with the chain |
+| `fault` | A bug: something that should never happen | Written to the store | "Ledger out of balance", `reportBug` from the previous lessons |
+
+`trace` is another name for `debug`, `warning` for `error`, and `critical` for `fault`. The mapping to [the taxonomy](/design/learn/sd-diag-error-taxonomy) is direct: recoveries at `info`, user-facing outcomes at `notice`, handled failures that ran out of recovery at `error`, programmer errors at `fault`.
+
+Because `debug` and `info` mostly aren't stored, they're nearly free on a user's device. That's the design: log generously at `debug`, and be deliberate about everything at `notice` and above, because those lines compete for the same limited store with every other process on the phone. An app that logs every scroll position at `notice` pushes out the lines from five minutes ago that would have explained the bug.
+
+### What happens to a log line
+
+Follow two calls through the system: one at `debug`, one at `error`:
+
+```visual flow
+title: Where a Logger call goes
+nodes:
+  - { id: app, label: Logger call, kind: client, at: [0, 0] }
+  - { id: logd, label: Logging system, kind: service, at: [2, 0] }
+  - { id: memory, label: Memory buffers, kind: store, at: [4, 0] }
+  - { id: live, label: Xcode or Console, kind: external, at: [0, 2] }
+  - { id: disk, label: On-device store, kind: store, at: [4, 2] }
+  - { id: own, label: OSLogStore (your app), kind: service, at: [2, 4] }
+  - { id: sysdiag, label: sysdiagnose, kind: external, at: [4, 4] }
+edges:
+  - [app, logd, record]
+  - [logd, memory, buffer]
+  - [logd, live, stream]
+  - [memory, disk, persist]
+  - [disk, own, this launch]
+  - [disk, sysdiag, collect]
+steps:
+  - say: "`logger.debug(\"Cache key \\(key)\")` records the format string's address and the raw `key`. No `String` is built at the call site."
+    show: [app, logd]
+    send: app->logd
+  - say: "While Xcode's debugger or Console is **streaming** the device, records are formatted for display, debug included, and private values are visible to the debugger."
+    send: logd->live
+    state: { live: active }
+  - say: "Nobody is streaming on a user's phone. `debug` isn't kept at all, and `info` goes to **memory buffers** that are overwritten as they fill."
+    send: logd->memory
+    state: { live: null, memory: wait }
+  - say: "An `error` line is **persisted** to the on-device store, shared with every other process, which keeps a few days of logs up to a size limit."
+    send: memory->disk
+    state: { memory: null, disk: ok }
+  - say: "A **sysdiagnose** collects that store, with private values shown as `<private>`. It's how a support team gets your logs from a user's phone."
+    send: disk->sysdiag
+  - say: "Your own app can read entries back with `OSLogStore`, but on iOS only from the **current process**: this launch, not the one that crashed."
+    send: disk->own
+    state: { own: wait }
+```
+
+## Privacy: redacted unless you say otherwise
+
+Every interpolated value has a privacy level. The defaults are designed so that forgetting is safe:
+
+- **Strings and objects** (anything dynamic) are **private**. Outside a debugging session, they appear as `<private>`.
+- **Numbers and booleans** are public, because they're rarely personal on their own.
+
+You change the default per value:
+
+- `privacy: .public` for values you've decided are safe: an order id, an endpoint path, an error kind, a screen name.
+- `privacy: .private(mask: .hash)` for values you need to **correlate** but not read. Two lines with the same hash refer to the same email address, and nobody learns the address.
+- `privacy: .private` to be explicit about the default, which documents that someone thought about it.
+
+```swift check
+import os
+
+let checkout = Logger(subsystem: "com.example.shop", category: "checkout")
+
+func logPaymentAttempt(orderID: String, email: String, cardLast4: String, amountPence: Int, error: (any Error)?) {
+    // Safe to read: our own identifiers and amounts
+    checkout.notice("Paying order \(orderID, privacy: .public): \(amountPence) pence")
+    // Needed to correlate, never to read
+    checkout.info("Customer \(email, privacy: .private(mask: .hash)), card ending \(cardLast4, privacy: .private)")
+    if let error {
+        // The error's description can contain anything, including server text: leave it private
+        checkout.error("Payment for \(orderID, privacy: .public) failed: \(error)")
+    }
+}
+```
+
+Three things to decide deliberately:
+
+- **An error's description isn't automatically safe.** It can contain server-supplied text or a URL with a query string. Prefer logging your own error kinds publicly (`OrdersError.unavailable`) and leaving raw descriptions private.
+- **Numbers aren't always harmless.** A phone number stored as an `Int`, a precise latitude or an account balance is public by default. Mark them private.
+- **`.public` is a promise.** Once a value is public it appears in every sysdiagnose a user sends anyone. Treat a review of new `.public` annotations like a review of a new analytics field.
+
+## Formatting and cost
+
+Interpolation in a log message isn't `String` interpolation: the message type is `OSLogMessage`, built at compile time. That has consequences:
+
+- **You can't pass a `String` variable as the message.** `logger.info(message)` doesn't compile ("cannot convert value of type 'String' to expected argument type 'OSLogMessage'"). Interpolate it: `logger.info("\(message)")`. Building messages in a helper that returns `String` throws away the laziness and the per-value privacy, so prefer logging at the call site.
+- **Arguments are captured lazily.** For a level that isn't enabled, such as `debug` on a user's device, the interpolated expressions aren't evaluated, so `\(expensiveSummary())` costs nothing there.
+- **Formatting options** live in the interpolation: `\(ratio, format: .fixed(precision: 2))`, `\(name, align: .left(columns: 12))`.
+
+## Reading logs
+
+During development, Xcode's console (Xcode 15 and later) shows each line's level, subsystem and category, filters by them (type `subsystem:` or `category:` in the filter field), and jumps from a line to the code that wrote it. Console on the Mac streams a connected device; turn on **Include Info Messages** and **Include Debug Messages** in its Action menu to see the lower levels.
+
+From the command line, the same predicate language filters a simulator or a log archive:
+
+```bash
+# Stream one subsystem from the booted simulator, including debug messages
+xcrun simctl spawn booted log stream --level debug --predicate 'subsystem == "com.example.shop"'
+
+# Read a sysdiagnose's logs, errors and faults from checkout only
+log show system_logs.logarchive --predicate 'subsystem == "com.example.shop" AND category == "checkout" AND (messageType == error OR messageType == fault)'
+```
+
+From a user's device, the system's tool is a **sysdiagnose**: the user triggers it (or support walks them through it), and it collects the on-device store along with much else. That's thorough but slow and awkward, so many apps add their own "Send diagnostics" button. On iOS, the app can read its own entries with `OSLogStore`, with one big limitation:
+
+```swift check ios title="DiagnosticsExport.swift"
+import Foundation
+import OSLog
+
+/// The last hour of this app's own log entries, as text a user can attach to a support request
+func recentLogLines(subsystem: String) throws -> [String] {
+    // On iOS, .currentProcessIdentifier is the only scope: entries from this launch only
+    let store = try OSLogStore(scope: .currentProcessIdentifier)
+    let start = store.position(date: Date().addingTimeInterval(-3600))
+    let predicate = NSPredicate(format: "subsystem == %@", subsystem)
+    return try store.getEntries(at: start, matching: predicate)
+        .compactMap { $0 as? OSLogEntryLog }
+        .map { "\($0.date.formatted(.iso8601)) [\($0.category)] \($0.composedMessage)" }
+}
+```
+
+The system scopes (`.system`, `OSLogStore.local()`) are unavailable on iOS. So when a user taps "Send diagnostics" after the app crashed, the launch that crashed is gone from what the app can read. If your support process depends on shipping logs from previous sessions, you need your own durable log sink as well, which the structured-logging lesson builds.
+
+## Trade-offs
+
+| Option | Cost per call | Privacy | Survives on device | Can be shipped by the app | When it wins |
+| --- | --- | --- | --- | --- | --- |
+| `print` | Builds a string | None | No | No | Throwaway debugging, removed before merging |
+| `NSLog` | Builds a string, every time | Everything public | Yes | No | Legacy Objective-C code |
+| `Logger` | Tiny; lazy formatting | Private by default, per value | `notice` and above, for days | Only this launch, via `OSLogStore` | Everyday logging in every app |
+| A facade (such as `swift-log`) over several back ends | Builds a `String` per message | Whatever you implement | Depends on the back end | Yes, if a back end writes files | Shared code across platforms, or when logs must be shipped |
+
+Many apps end up with `Logger` everywhere for local diagnostics, plus a separate, much smaller stream of structured events written to their own store for shipping. The cost of a facade in front of `Logger` is real: messages become `String`s built at the call site, and per-value privacy has to be reinvented.
+
+<Callout kind="interview">
+
+**Say:** "Logger with a subsystem per app or package and a category per feature. Debug and info are free on device, so we log generously there; notice and above compete for the store, so they're deliberate. Values are private by default; we mark ours public, hash what we need to correlate, and keep raw error text private."
+
+**Ask:** how does support get logs from a user today? Do we need logs from the session *before* a crash?
+
+**Red flags:** `print` in production code; every message at `error`; `privacy: .public` on user data to make the logs "readable"; and assuming the app can read yesterday's logs back with `OSLogStore`.
+
+</Callout>
+
+<Callout kind="gotcha" title="iOS gotcha: your logs from the field say private">
+
+A log that's perfectly readable in Xcode shows `GET <private> failed: <private>` in a sysdiagnose, because private values are only revealed while a debugger is attached. Don't fix it by making everything public. Decide value by value: endpoint paths and your own error kinds are usually safe; user input, names, emails and server-supplied text aren't.
+
+</Callout>
+
+## Practice
+
+The **structured log formatter** kata builds the redaction rules you'd apply to logs you ship yourself, where `Logger`'s privacy annotations no longer protect you. In the **account screen review**, look for the `print` that writes an email address and a token.
+
+```cards
+- id: logger-levels
+  front: "Which Logger levels are stored on a user's device, and which are nearly free?"
+  back: "`debug` isn't kept unless enabled and `info` lives only in memory buffers, so both are almost free. `notice`, `error` and `fault` are written to the on-device store, so use them deliberately."
+- id: logger-privacy-default
+  front: "What are Logger's privacy defaults?"
+  back: "Dynamic strings and objects are private (shown as `<private>` outside a debugging session); numbers and booleans are public. Mark safe values `.public`, and use `.private(mask: .hash)` to correlate without revealing."
+- id: oslogstore-scope
+  front: "What can an iOS app read back with OSLogStore?"
+  back: "Only its own entries from the current process, so not the launch that crashed. Shipping earlier sessions' logs needs your own durable sink."
+- id: oslogmessage
+  front: "Why doesn't `logger.info(message)` compile when `message` is a String?"
+  back: "Logger takes an `OSLogMessage`, built at compile time so formatting is lazy and privacy is per value. Interpolate instead: `logger.info(\"\\(message)\")`."
+```
+
+```quiz
+- id: q1
+  type: sort
+  prompt: "Which level should each line use?"
+  buckets: [debug, info, notice, error, fault]
+  items:
+    - [Decoded 48 products from page 3, 0]
+    - [Served cached orders because the request timed out, 1]
+    - [User signed in, 2]
+    - [Checkout failed after retries; showing the failure state, 3]
+    - [The basket total is negative after applying a discount, 4]
+  explain: "Developer detail is `debug`; a successful recovery is `info`; a notable event is `notice`; a handled failure the user saw is `error`; a broken invariant is a bug, so `fault`."
+- id: q2
+  type: mcq
+  prompt: "`logger.error(\"Upload failed for \\(user.email)\")`. What does a support engineer see in the user's sysdiagnose?"
+  options:
+    - "The email address"
+    - "`<private>` in place of the email"
+    - "Nothing: error messages aren't stored"
+    - "A hash of the email"
+  answer: 1
+  explain: "Interpolated strings are private by default and shown as `<private>` outside a debugging session. To correlate users without revealing them, use `privacy: .private(mask: .hash)`."
+- id: q3
+  type: truefalse
+  prompt: "After a crash, the app can use `OSLogStore` on its next launch to read the log lines the crashed launch wrote."
+  answer: false
+  explain: "On iOS, `OSLogStore` only offers the `.currentProcessIdentifier` scope: entries from the current launch. The previous process's entries are in the system store, reachable through a sysdiagnose but not from your app."
+- id: q4
+  type: multi
+  prompt: "Which of these should normally be logged with `privacy: .public`? Choose all that apply."
+  options:
+    - "The endpoint path `/orders`"
+    - "Your own error kind, such as `OrdersError.unavailable`"
+    - "The search text the user typed"
+    - "`error.localizedDescription` from a server response"
+    - "The screen name `CheckoutView`"
+  answer: [0, 1, 4]
+  explain: "Paths without query strings, your own error kinds and screen names are your vocabulary, not the user's data. Search text is personal, and server-supplied descriptions can contain anything."
+- id: q5
+  type: mcq
+  prompt: "A teammate logs every scroll offset at `notice` \"so we can debug scrolling in the field\". What's the main problem?"
+  options:
+    - "Notice messages aren't stored, so it's useless"
+    - "It floods the shared on-device store, pushing out the older lines that would explain real bugs"
+    - "Scroll offsets are private data"
+    - "It doesn't compile"
+  answer: 1
+  explain: "`notice` lines are persisted to a store with a size limit shared by every process. High-frequency detail belongs at `debug`, where it's free unless someone is watching."
+```

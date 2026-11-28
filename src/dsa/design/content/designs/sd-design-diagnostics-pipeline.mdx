@@ -1,0 +1,214 @@
+<Brief>
+
+You've joined **Dishpatch**, a food delivery app, as the engineer who owns the app's platform code. The app has about **2 million daily users**, who open it around 4 times a day, with a dinner peak between 18:00 and 20:00 at roughly three times the average load. It's SwiftUI on iOS 18, in Swift 6 language mode, built by six feature teams, each in its own Swift package.
+
+Today, diagnostics are an afterthought, and it shows:
+
+- Code logs with `print`, so nothing from the field is readable. Support asks users for screenshots.
+- A crash SDK is installed, but dSYMs are uploaded by hand, and a third of the last release's crashes are unsymbolicated.
+- The last two incidents were found through App Store reviews, about nine hours after each release started.
+- When checkout feels slow, nobody can say which step got slower, or for whom.
+
+Design the app's **diagnostics pipeline**: the API feature teams use, logs and structured events, signposts for the key journeys, crash reports and breadcrumbs, non-fatal errors, shipping data off the device, and turning on detailed logging for one user that support is helping.
+
+Constraints:
+
+- **Privacy.** Users are mostly in the UK and EU. Crash reports and aggregate performance data are covered by the privacy policy. Anything that ships a session's trail of events needs the user's opt-in in Settings, which about 40% of users give. Nothing that identifies a person may leave the device in diagnostics.
+- **Budgets.** At most 50 KB of diagnostics uploads per user per day on cellular; no work on the caller's thread beyond enqueuing an event; a bounded amount of memory and disk.
+- **Backend.** A platform team can host an authenticated ingestion endpoint and a log search service keyed by any field you choose. Product analytics is a separate pipeline and out of scope.
+
+Spend about 35 minutes. Write as if presenting the design to the six feature teams and the support lead.
+
+</Brief>
+
+```workspace
+template: component
+minutes: 35
+```
+
+<ModelAnswer section="requirements">
+
+**Who uses it:** six feature teams write events and signposts; support looks up a user's sessions and turns on verbose logging for one installation; release engineers watch each release's health during rollout.
+
+**Functional:**
+
+- A logging API with levels, typed fields and privacy declared per field, backed by `Logger` locally.
+- Structured events shipped from the device: errors and faults always (for consenting users, with recent context); a sample of sessions at `notice`; `info` for one installation when support turns it on.
+- Signposts around five journeys: launch to restaurant list, search to results, add to basket, checkout to confirmation, and order-tracking updates.
+- Crash reports with breadcrumbs and metadata, symbolicated for every build; non-fatal reports for bugs the app survives.
+- Per-release health: crash-free users and sessions, error rates by event name, journey durations, comparable at each stage of a phased release.
+
+**Non-functional, with numbers:**
+
+- 2M × 4 = **8M sessions a day**. At 99.9% crash-free sessions that's still about 8,000 crash reports a day, so grouping and symbolication must be automatic.
+- Shipped trails: 40% consent × 10% sampling = 320k sessions a day × 40 events × ~400 B ≈ **5 GB of raw JSON a day**, about 1 GB compressed, ≈ 150 events a second on average and ~450 at the dinner peak. Per sampled session that's ~3 KB compressed, well inside 50 KB.
+- Recording an event costs the caller an enqueue, nothing more: no I/O, no locks held across work, never throws, never crashes.
+- Bounded: ~1,000 events in memory, 5 MB of files on disk, 100 breadcrumbs or 16 KB.
+
+**Out of scope:** product analytics (it needs delivery guarantees this pipeline deliberately doesn't give), and backend tracing beyond passing request ids through.
+
+</ModelAnswer>
+
+<ModelAnswer section="api">
+
+One small facade, injected through the environment from the composition root, so features never import a vendor SDK:
+
+```swift
+// Event names are declared per package, so they're reviewable and stable
+enum CheckoutEvent: String, DiagnosticEventName {
+    case started = "checkout.started"
+    case failed = "checkout.failed"
+}
+
+// Feature code: synchronous, never throws
+diagnostics.record(CheckoutEvent.failed, .error, [
+    "kind": .public("unavailable"),          // our own vocabulary
+    "attempts": .public(3),
+    "restaurant": .hashed(restaurant.id),    // correlate, never read
+    "basket_note": .redacted,                // existed, value stays home
+])
+
+// A bug the app survives: StaticString message, fault locally, non-fatal report
+diagnostics.reportBug("basket total negative after promo")
+
+// A journey: signpost interval locally, plus a duration event for rollout signals
+let journey = diagnostics.begin(.checkout)
+// …
+journey.end(.succeeded)
+```
+
+- **Privacy is part of the field's type** (`.public`, `.hashed`, `.redacted`), so a call site can't add a field without deciding. Free text has no `.public` initialiser.
+- **Names come from enums**, never string interpolation, so dashboards and alerts can rely on them, and a review sees every new name.
+- **Breadcrumbs aren't a separate API.** Navigation, lifecycle and `notice`-and-above events feed the trail automatically, so teams can't forget them and there's one redaction path.
+- `DiagnosticsRecording` is a protocol; tests and previews get a recording fake.
+
+</ModelAnswer>
+
+<ModelAnswer section="internals">
+
+**On the device**, behind `record`:
+
+1. **Facade** stamps the envelope (session id, sequence number, build, OS, device class, config version) and yields to a bounded stream.
+2. **Redactor** (one consumer task): applies field privacy, the denied-key list, the scan of public strings for emails and long digit runs, value truncation and the field limit. Everything after this point is safe.
+3. **Fan-out to sinks:**
+   - **Unified logging:** every event, through `Logger` with a subsystem per package and a category per feature. Free for developers, and present in sysdiagnoses.
+   - **Breadcrumb trail:** a ring of 100 crumbs or 16 KB, written through on warnings and errors and in batches otherwise, flushed on entering the background. Read and cleared on the next launch, and attached to the crash report.
+   - **Shipping files:** JSON lines in Application Support, excluded from backup, rotating 256 KB files with a 5 MB cap, oldest first. Errors and faults are written for every consenting user, together with the preceding 50 events; `notice` only when the session was sampled at launch; `info` only for an installation support has flagged.
+   - **Crash SDK bridge:** faults and `reportBug` become non-fatals with stable domains and codes.
+4. **Uploader:** on foreground and from a `BGProcessingTask` for backlogs, it takes closed files, compresses them, and uploads with a background `URLSession` task. It deletes a file only after a 2xx, respects Low Data Mode, and keeps a per-day cellular budget, after which it waits for Wi-Fi.
+
+**Crashes and the system's view:** one crash SDK, started first at launch. dSYMs for every App Store and TestFlight build are uploaded by CI, and the build fails if the upload does. A MetricKit subscriber uploads diagnostic payloads (hangs, crash diagnostics, including terminations no in-process handler sees) and the daily metric payload, symbolicated server-side against the same dSYM store.
+
+**Signposts:** an `OSSignposter` per package with stable interval names for the five journeys, the same names measured by `XCTOSSignpostMetric` tests in CI and collected in the field with `mxSignpost`. Each journey also emits a `journey.completed` event with its duration, because MetricKit's daily histograms are too slow for a rollout alarm.
+
+**Remote config:** the sampling rate, the list of verbose installation ids (support reads the user's **support code** from Settings → About), and a kill switch for shipping.
+
+**Backend:** the ingestion endpoint authenticates the app, validates the schema version and size, rate-limits per installation, and indexes by session id, request id, build and event name. Retention is 30 days, with deletion by installation id. Dashboards show crash-free users and sessions, error events per thousand sessions and journey p50 and p90, all **per build**, with alerts comparing a new build with the previous one at the same rollout stage.
+
+</ModelAnswer>
+
+<ModelAnswer section="concurrency">
+
+- `record` is `nonisolated` and synchronous: it builds a `Sendable` event and yields it into an `AsyncStream` with `.bufferingNewest(1_000)`. Callers on the main thread pay for one enqueue. Under a flood, the oldest events are dropped and counted.
+- **One consumer task** owns ordering: it redacts, then awaits each sink in turn, so every sink sees events in the order they were recorded. Redaction happens there rather than at the call site, which keeps `record` cheap.
+- **Sinks are actors** where they own state (the trail, the shipping file sink, the uploader) and `Sendable` structs where they don't (the `Logger` sink). Each encodes its data before any `await`, so actor reentrancy can't write a torn snapshot.
+- **The uploader is single-flight:** one upload at a time, triggered by foreground, background tasks or the cellular budget resetting.
+- **The crash path has no Swift concurrency at all:** the SDK's handlers are installed at launch and use pre-allocated state. The trail is already on disk when a crash happens.
+- MetricKit calls its subscriber on a background queue; the subscriber is `nonisolated` and only hands the payload's data to the uploader.
+
+</ModelAnswer>
+
+<ModelAnswer section="failure">
+
+- **Logging never fails the app.** No sink throws to callers. Drops, from the buffer or a failed write, are counted and shipped as a `diagnostics.dropped` event, so a broken pipeline is visible.
+- **A full disk:** the shipping sink stops writing at its cap or when a write fails; `Logger` carries on. Diagnostics can never fill a user's phone.
+- **Upload failures:** files stay until acknowledged, retries use exponential backoff with jitter, and the server's `503` with `Retry-After` is obeyed, so a struggling ingestion service isn't hammered by 2M phones at once. The kill switch stops shipping entirely.
+- **Crashes before the reporter starts:** the SDK is the first thing configured; MetricKit and Organizer catch the rest. A crash loop (two crashes within seconds of launch) sends the pending report synchronously for at most a couple of seconds on the next launch, and starts a safe mode that skips non-essential features.
+- **Invisible terminations:** watchdog and jetsam kills come from MetricKit's exit metrics and diagnostics, alongside the SDK's own "didn't end cleanly" estimate.
+- **Privacy:** consent off means no trail leaves the device and queued files are deleted; turning verbose logging on requires the user's agreement in the support conversation and expires after 24 hours. Diagnostics are declared in the App Store privacy details and the privacy manifests.
+- **Old app versions:** events carry a schema version; the server accepts at least the last few, so last year's build doesn't break ingestion.
+- **Clock skew:** events are ordered by sequence number within a session; the server records its own receive time.
+
+</ModelAnswer>
+
+<ModelAnswer section="testing">
+
+- **Redactor:** table-driven tests for each rule (deny list, scan, truncation, hashing, field limit), plus a catalogue test that records every declared event name with fixture values full of emails, tokens and card numbers and asserts none of them survive into a record.
+- **Facade and sinks:** inject fake sinks; assert ordering, and that a flood of 10,000 events keeps memory bounded and the newest events.
+- **Trail:** the budget, batching, write-through and read-once behaviour against an in-memory store, as in the breadcrumb kata.
+- **Uploader:** `StubHTTPClient` and `TestClock` for backoff; files are deleted only after a 2xx, and the cellular budget holds.
+- **Journeys:** `XCTOSSignpostMetric` performance tests on a fixed device in CI, with baselines per journey.
+- **The real crash path,** in a release-like build on a device before each release: a QA-only menu item calls `fatalError`, and the checklist confirms the report arrives symbolicated, with breadcrumbs.
+- **Pipeline checks in CI:** the event schema against the server's, and the dSYM upload, which fails the build when it fails.
+
+</ModelAnswer>
+
+<ModelAnswer section="tradeoffs">
+
+- **A vendor crash SDK over building one:** signal-safe crash capture, grouping and symbolication infrastructure are months of specialist work. Our own pieces stay vendor-independent (the facade, the redaction and the trail), and the trail is also attached to MetricKit diagnostics and support uploads, which the vendor never sees. Swapping vendors touches one sink.
+- **Sampling over shipping every session:** 10% sampling of consenting users gives a statistically solid picture at a tenth of the cost and exposure; errors are always shipped, and verbose logging covers the "it only happens to me" cases.
+- **Our own shipping files over reading `OSLogStore`:** on iOS it only returns the current launch, so the session that crashed is unreachable from the app.
+- **A small facade over `swift-log`:** we need typed per-field privacy and stable names, which a string-message API would make optional.
+- **Best-effort delivery:** dropping old diagnostics is acceptable; analytics with business consequences uses its own durable pipeline.
+- **As it grows:** at 10× the users, lower the sample rate first; later, propagate W3C `traceparent` headers so app events join backend traces, and move journey durations into the tracing system.
+
+</ModelAnswer>
+
+```rubric
+- id: budgets
+  label: Turned the constraints into numbers that shape the design
+  skill: requirements
+  look_for:
+    - Sessions a day and crash reports a day from 2M daily users
+    - Upload volume per user and at ingestion, checked against the 50 KB budget and the dinner peak
+    - The consent share and a sampling rate in the arithmetic
+    - A non-blocking, never-throwing requirement for the logging call
+- id: facade
+  label: One facade, redaction once, several sinks
+  skill: architecture
+  look_for:
+    - A synchronous record call that only enqueues into a bounded buffer
+    - Redaction before any sink, with privacy declared per field in the API
+    - Fan-out to Logger, the breadcrumb trail, capped shipping files and the crash SDK
+    - Stable event and signpost names declared in code, not interpolated
+- id: privacy
+  label: Kept personal data off the wire
+  skill: security
+  look_for:
+    - Denied keys, a scan of public strings, truncation and hashing for correlation
+    - Consent gating for session trails, and deletion of queued files when it's withdrawn
+    - Retention, deletion by installation, and the privacy label or manifest
+- id: crashes
+  label: Crash reports that can be read and explained
+  skill: offline
+  look_for:
+    - The crash SDK started first, and dSYMs uploaded by CI for every build
+    - Breadcrumbs persisted before a crash (write-through or flush on background), read once on the next launch
+    - MetricKit for hangs and the terminations an in-process handler can't see
+    - Upload that deletes only after acknowledgement, with backoff and caps
+- id: journeys
+  label: Journeys measured in the lab and the field
+  skill: performance
+  look_for:
+    - Signposts around named user journeys
+    - XCTOSSignpostMetric in CI and MetricKit signpost metrics from users
+    - A fast per-release signal (duration events), since MetricKit is daily
+- id: release-health
+  label: Made incidents visible within minutes of a release
+  skill: tradeoffs
+  look_for:
+    - Crash-free users and sessions, error rates and journey durations per build
+    - Alerts comparing a new build with the previous one at the same rollout stage
+    - A support code and on-demand verbose logging for one installation
+```
+
+<Pitfalls>
+
+- Shipping every log line from every user: the arithmetic alone rules it out, before privacy does.
+- Relying on `Logger`'s privacy annotations for data the app uploads itself.
+- A logging call that writes to disk, or awaits, on the caller's thread.
+- Treating dSYM upload as a manual step, so the builds that crash most are the ones nobody can read.
+- Building a second breadcrumb API that teams must remember to call, instead of deriving crumbs from events.
+- Alerting on absolute crash counts, which rise with every step of a phased rollout whether or not anything is wrong.
+
+</Pitfalls>

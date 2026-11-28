@@ -1,0 +1,252 @@
+## Why it matters
+
+A view model's most important output is one type: the view state. If it's shaped well, the view is a `switch`, the tests compare whole values, and impossible screens can't be built. If it's shaped badly, every bug report is "the screen showed X and Y at the same time". D19 introduced view-state enums; this lesson is about shaping them for a real MVVM screen: what's stored and what's derived, how independent parts sit together, how pagination fits, and what never belongs in the state at all.
+
+## Where D19 left off
+
+[View-state enums: loading, loaded, empty, error](/design/learn/sd-state-view-state) established two ideas. A screen's content is an enum (idle, loading, loaded, empty, failed) so impossible combinations can't be written down. And what's on screen varies independently of what's happening (a refresh, a banner), so those live beside the content, not inside it. Everything below builds on those two.
+
+## Three kinds of state on one screen
+
+Look at any screen's state and it splits into three kinds:
+
+- **Domain state:** the data. The products, the orders, the user's account. It comes from repositories or shared stores, and other screens may hold the same data.
+- **UI state:** the screen's own choices. The selected category, which sections are expanded, the search text, a half-typed draft. Nobody else cares about it, and it's often lost when the screen closes.
+- **Display state:** what the view actually draws, computed from the other two. The rows, their formatted prices, the section headers, whether the "Clear filters" button shows.
+
+The rule that prevents most view-state bugs: **store the first two, compute the third.** The moment display state is stored, it can disagree with the facts it came from, and every code path that changes a fact must remember to update it. [Review: an @Observable spending screen that races itself](/design/practice/sd-review-mvvm-spending-observable) has a list and a total that drift for exactly this reason.
+
+Computing display state as a **pure function** of the facts also makes it the easiest part of the screen to test:
+
+```swift check group=catalogue title="CatalogueViewState.swift"
+import Foundation
+
+struct Product: Identifiable, Equatable, Sendable {
+    let id: Int
+    let name: String
+    let category: String
+    let pricePence: Int
+    let isInStock: Bool
+}
+
+/// One row, ready to draw: strings and facts, no domain types
+struct ProductRow: Identifiable, Equatable {
+    let id: Int
+    let title: String
+    let price: String
+    let isDimmed: Bool
+}
+
+/// The screen's own choices
+struct CatalogueUIState: Equatable {
+    var category: String?            // nil means all
+    var hidesOutOfStock = false
+}
+
+enum CatalogueDisplay {
+    /// Pure: the same products and choices always give the same rows
+    static func rows(products: [Product], ui: CatalogueUIState, format: (Int) -> String) -> [ProductRow] {
+        products
+            .filter { ui.category == nil || $0.category == ui.category }
+            .filter { !ui.hidesOutOfStock || $0.isInStock }
+            .map { ProductRow(id: $0.id, title: $0.name, price: format($0.pricePence), isDimmed: !$0.isInStock) }
+    }
+
+    static func showsClearFilters(_ ui: CatalogueUIState) -> Bool {
+        ui.category != nil || ui.hidesOutOfStock
+    }
+}
+```
+
+The view model stores `products` and `ui`, and exposes `rows` as a computed property that calls this function with its injected price formatter. Deleting a product, changing the category and refreshing all update the rows, because there's nothing else to update.
+
+## A struct of parts, each with its own life
+
+A real screen has several parts that change independently. A paginated catalogue has its content (loading, loaded, empty, failed), and once loaded, a footer for the next page, a refresh in progress and possibly a banner about a failed refresh. Each part gets its own field, and **nesting** keeps out the combinations that can't exist:
+
+```swift check group=catalogue title="CatalogueScreenState.swift"
+enum Footer: Equatable {
+    case more                        // another page exists
+    case loadingMore
+    case failed(message: String)     // the next page failed; the rows above stay
+    case end
+}
+
+struct LoadedCatalogue: Equatable {
+    var products: [Product]
+    var footer: Footer
+    var isRefreshing = false
+    var banner: String?              // the last refresh failed; the rows stay
+}
+
+enum CatalogueContent: Equatable {
+    case idle
+    case loading
+    case empty
+    case failed(message: String)
+    case loaded(LoadedCatalogue)     // footer, refreshing and banner only exist here
+}
+```
+
+A footer can't appear under the failed screen, and a refresh can't run while nothing has loaded, because those fields only exist inside `.loaded`. The struct inside the case keeps the `switch` in the view short: one case for loaded, then plain property reads.
+
+## Pagination: the footer is its own machine
+
+Once the first page is on screen, the bottom of the list has a lifecycle of its own. Modelling it as a separate enum keeps a failure at the bottom from touching anything above it.
+
+```visual states
+title: The footer of a paginated list
+intro: "The first page has loaded and there's a cursor for the next one, so the footer starts at **More**."
+states:
+  - { id: more, label: More, at: [0, 0] }
+  - { id: loading, label: Loading more, at: [2, 0] }
+  - { id: failed, label: Failed, at: [2, 1] }
+  - { id: end, label: End, at: [4, 0] }
+initial: more
+final: [end]
+transitions:
+  - [more, loading, reachedBottom]
+  - [loading, more, pageLoaded, has next]
+  - [loading, end, pageLoaded, last page]
+  - [loading, failed, pageFailed]
+  - [failed, loading, retryTapped]
+  - [loading, more, refreshStarted]
+events:
+  - { event: reachedBottom, say: "The last row appears, and the view tells the view model. The footer shows a spinner; the rows above don't change." }
+  - { event: pageLoaded, guard: has next, say: "The page arrives with another cursor. Its products are appended and the footer goes back to **More**." }
+  - reachedBottom
+  - { event: pageFailed, say: "The next page fails. Only the footer changes: it shows the error and a Retry button, and every row stays." }
+  - retryTapped
+  - { event: refreshStarted, say: "The user pulls to refresh while the page is loading. That page belongs to the list being replaced, so the footer goes back to **More** and the page is ignored when it arrives." }
+  - reachedBottom
+  - { event: pageLoaded, guard: last page, say: "A page with no cursor is the last. The footer says so, and reaching the bottom again does nothing." }
+```
+
+Two rules make pagination robust, and both live in the view model, not the view:
+
+- **Guard the trigger.** The last row's `onAppear` fires again after a refresh, a rotation or a quick scroll up and down. The view model ignores `reachedBottom` unless the footer is `.more` (or `.failed`, for a retry). The view stays dumb.
+- **Drop pages for an old list.** A refresh that starts while a page is loading begins a new list; that page must not be appended to it. A generation number, bumped on each refresh and checked when a page arrives, is the simplest guard.
+
+### The cursor: state or bookkeeping?
+
+D19's reading-list kata kept the request number in the state, and its quiz put the next-page cursor there too. That's right for a **reducer**: a pure function has nowhere else to keep anything, so everything it needs goes in the state. A **view model** has private storage. The view never draws a cursor or a generation number, so a view model can keep them as private bookkeeping, and the published view state then contains only what users see, which makes test expectations read like the screen. Either is defensible; what matters is choosing deliberately.
+
+## Rows that diff well
+
+Lists diff their rows: SwiftUI's `ForEach` and UIKit's diffable data sources compare old and new to animate the change. Two properties make that work:
+
+- **Stable identity.** Each row's `id` is the domain id (the product's server id), never an index or a fresh `UUID()`. With a stable id, a price change is an update, not a delete and an insert.
+- **Cheap equality.** Display rows are small `Equatable` structs. Comparing two arrays of `ProductRow` is fast; comparing arrays of view models (classes) compares identities and misses changes.
+
+For UIKit, put ids in the snapshot and `reconfigureItems` the ones whose row changed, as [Diffable data sources and snapshots](/design/learn/sd-uikit-diffable) showed.
+
+## What never belongs in the view state
+
+- **Errors as `any Error`.** Not `Equatable`, so the state can't be compared in tests, and the view would have to turn errors into words. Store the message, or a small enum of presentable cases.
+- **Closures.** Not `Equatable` either, and they hide behaviour inside data. Intents are methods.
+- **Tasks, cancellables, cursors, generation numbers.** Bookkeeping, as above.
+- **One-off events.** Navigation, haptics and "copied" toasts happen once. Stored in the state they replay on every render; send them out as routes or effects, as [Input/output view models](/design/learn/sd-mvvm-input-output) showed.
+- **Copies of domain data you don't own.** If the basket lives in a shared store, the view model reads it; a private copy goes stale when another screen changes the basket.
+
+Alerts, sheets and confirmation dialogs are the exception that proves the rule: they must persist until the user dismisses them, so they **are** state. Model them as an optional value (`var presented: Presentation?`) and clear it on dismissal; SwiftUI's `.sheet(item:)`, and `.alert(_:isPresented:presenting:)` with a binding derived from the optional, fit that shape.
+
+## Trade-offs
+
+| | Flags and optionals | One flat enum | Struct of parts | Nested: parts inside the loaded case |
+| --- | --- | --- | --- | --- |
+| Impossible screens | many | none | a few, guarded by the view model | none for the nested parts |
+| Refresh and paging without flicker | by care | no | yes | yes |
+| Size of updates | small | small | small | medium: read, change, write back the case |
+| Test expectations | many fields | one value | one value | one value |
+| Wins for | nothing past a prototype | screens that load once | screens whose parts really are independent | paginated, refreshable lists |
+
+<Callout kind="interview">
+
+**What to say:** "I separate domain state, the screen's UI state, and display state, and only store the first two: rows and flags are computed by a pure function, so they can't drift. Parts with their own lifecycle get their own fields, and parts that only exist once content has loaded are nested in the loaded case. For pagination, the footer is a small state machine, and the view model guards the trigger and drops pages from a list that's been refreshed."
+
+**What to ask:** "Is the list paginated, and can it refresh while paging?" and "What does the user see when the next page fails?" The answers decide the shape.
+
+**Red flags:** a stored `filteredItems` next to `items`; pagination triggered straight from `onAppear` with no guard; `any Error` or closures in the state; a navigation event stored as a property.
+
+</Callout>
+
+<Callout kind="gotcha" title="Swift gotcha: one non-Equatable field costs you the whole comparison">
+
+Add `var error: (any Error)?` or `var onRetry: () -> Void` to a view-state struct and `Equatable` no longer synthesises. Then tests can't compare states, `removeDuplicates()` can't skip repeats, and someone writes a hand-rolled `==` that forgets a field. Keep view state made of values: strings, numbers, enums and other `Equatable` structs.
+
+</Callout>
+
+<Callout kind="gotcha" title="iOS gotcha: the last row appears more often than you think">
+
+`.onAppear` on the last row (or `willDisplay` for the last cell) fires on first display, after a refresh replaces the rows, after rotation, and every time the user scrolls back down. Treat it as "the bottom is visible", not "load the next page", and let the view model decide whether a page should load.
+
+</Callout>
+
+## Practice
+
+**A paginated catalogue view model** builds this lesson's state and the footer machine: first load, empty and failed screens, appending pages without duplicates, a refresh that keeps the rows, and pages from a refreshed list that must be ignored. **Review: an @Observable spending screen that races itself** shows what stored copies of display state do to a screen.
+
+```cards
+- id: vs-three-kinds
+  front: "What are the three kinds of state on a screen, and which do you store?"
+  back: "Domain state (the data), UI state (the screen's own choices) and display state (what's drawn). Store the first two; compute the third with a pure function."
+- id: vs-nesting
+  front: "Why nest the footer, refresh flag and banner inside the loaded case?"
+  back: "They only exist once content has loaded, so nesting makes a footer under an error screen impossible to write, and keeps the view's switch short."
+- id: vs-footer
+  front: "What are the footer states of a paginated list?"
+  back: "More, loading more, failed (with retry, rows kept) and end. The view model ignores the bottom-reached trigger unless the footer is more or failed."
+- id: vs-not-state
+  front: "Name things that don't belong in view state."
+  back: "any Error, closures, tasks and cursors (bookkeeping), one-off events such as navigation, and private copies of shared data."
+```
+
+```quiz
+- id: q1
+  type: sort
+  prompt: "For a product catalogue screen, which kind of state is each?"
+  buckets: [Domain, UI, Display]
+  items:
+    - ["The products returned by the server", 0]
+    - ["The category the user picked", 1]
+    - ["\"£2.50\" for a product's price", 2]
+    - ["Whether the \"Clear filters\" button shows", 2]
+    - ["Whether out-of-stock products are hidden", 1]
+    - ["The basket's item count, shared with the Basket tab", 0]
+  explain: "Domain state is data other screens could hold. UI state is this screen's own choices. Display state is computed from both, so it should never be stored."
+- id: q2
+  type: mcq
+  prompt: "Page 3 of a list fails to load. What should the screen show?"
+  options:
+    - "The failed screen with a Retry button, replacing the list"
+    - "Pages 1 and 2, with a footer that says the next page failed and offers Retry"
+    - "An alert, and an empty list behind it"
+    - "Pages 1 and 2, and nothing else: the user can scroll up and down to try again"
+  answer: 1
+  explain: "The rows already loaded are still good. The failure belongs to the footer, which is why it's its own state, and an explicit Retry beats making the user guess."
+- id: q3
+  type: multi
+  prompt: "A paginated view model's `loadMore()` is called from the last row's `onAppear`. Which should it guard against? Choose all that apply."
+  options:
+    - "Being called while a page is already loading"
+    - "Being called after the last page"
+    - "Being called while a pull to refresh is running"
+    - "Being called when the user scrolls quickly"
+  answer: [0, 1, 2]
+  explain: "Loading, end and refreshing are states in which a new page request is wrong. Fast scrolling isn't a problem in itself: the first three guards already make repeated triggers harmless."
+- id: q4
+  type: truefalse
+  prompt: "Storing `visibleRows` alongside `products` is fine as long as every method that changes `products` also recomputes `visibleRows`."
+  answer: false
+  explain: "It works until someone adds a method and forgets, which is the bug that stored derived state always produces eventually. A computed property can't be forgotten, and Observation tracks it through what it reads."
+- id: q5
+  type: mcq
+  prompt: "Where should a \"Delete this list?\" confirmation dialog live?"
+  options:
+    - "Nowhere: the view shows it directly from the button's action"
+    - "In the view state, as an optional presentation value that's cleared when the dialog is dismissed"
+    - "As a one-off route sent to the coordinator"
+    - "As a `Bool` in the view and the list's id in the view model"
+  answer: 1
+  explain: "A dialog stays until it's dismissed, so it's state. Keeping it in the view model makes the confirmation flow testable; an optional value maps directly onto SwiftUI's presentation modifiers."
+```

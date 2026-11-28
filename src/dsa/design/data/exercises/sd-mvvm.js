@@ -1,2 +1,38 @@
 // Design exercises and architecture reviews for D27 · MVP & MVVM
-export default [];
+export default [
+    {
+        id: 'sd-design-mvvm-checkout-flow',
+        kind: 'design',
+        title: 'MVVM and coordinators for a grocery checkout',
+        difficulty: 'hard',
+        patterns: ['architecture', 'navigation', 'state', 'payments'],
+        lessons: ['sd-mvvm-coordinators', 'sd-mvvm-view-model'],
+        minutes: 40,
+        template: 'feature',
+        mock: true,
+        lists: [],
+        summary: 'Split a five-step checkout into step view models and a coordinator, so steps can be reordered, entered from a notification and paid for exactly once.',
+    },
+    {
+        id: 'sd-review-mvvm-event-detail',
+        kind: 'critique',
+        title: 'Review: the event view model that does everything',
+        difficulty: 'medium',
+        patterns: ['ui', 'architecture'],
+        lessons: ['sd-mvvm-massive', 'sd-mvvm-view-model', 'sd-mvvm-bindings'],
+        minutes: 25,
+        lists: [],
+        summary: 'A view model that imports UIKit, holds its view controller, pushes screens, calls the network and formats by hand: find what leaks, what fails silently and how to split it.',
+    },
+    {
+        id: 'sd-review-mvvm-spending-observable',
+        kind: 'critique',
+        title: 'Review: an @Observable spending screen that races itself',
+        difficulty: 'hard',
+        patterns: ['ui', 'concurrency', 'state'],
+        lessons: ['sd-mvvm-observable', 'sd-mvvm-view-state'],
+        minutes: 25,
+        lists: [],
+        summary: 'An @Observable view model silenced with @unchecked Sendable, a static cache written by concurrent tasks and three copies of the same facts: find the races and the drift.',
+    },
+];

@@ -1,0 +1,147 @@
+<Brief>
+
+A ticketing app moved its event screen from MVC to MVVM last year. The view controller is now short, but every change to the event screen still touches this file, nobody has written a test for it, and the screen leaks: open and close ten events and ten view models are still in memory. Review the view model as you would a pull request: what's wrong, what matters most, and how you'd split it.
+
+```swift check ios title="EventDetailViewModel.swift"
+import UIKit
+
+struct Event: Decodable {
+    let id: String
+    let title: String
+    let startsAt: Date
+    let priceInPence: Int
+    let seatsLeft: Int
+    let venueAddress: String
+}
+
+@MainActor
+final class EventDetailViewModel {
+    var viewController: UIViewController?
+    var onChange: (() -> Void)?
+    private(set) var event: Event?
+    private(set) var isLoading = false
+    private(set) var titleText = ""
+    private(set) var dateText = ""
+    private(set) var priceText = ""
+    private(set) var seatsColor = UIColor.label
+    private let eventID: String
+
+    init(eventID: String) {
+        self.eventID = eventID
+    }
+
+    func load() {
+        isLoading = true
+        onChange?()
+        Task {
+            let url = URL(string: "https://api.tickets.example/events/\(eventID)")!
+            let (data, _) = try await URLSession.shared.data(from: url)
+            let event = try JSONDecoder().decode(Event.self, from: data)
+            self.event = event
+            isLoading = false
+            titleText = event.title.uppercased()
+            let formatter = DateFormatter()
+            formatter.dateFormat = "EEEE d MMMM, HH:mm"
+            dateText = formatter.string(from: event.startsAt)
+            priceText = "£" + String(format: "%.2f", Double(event.priceInPence) / 100)
+            seatsColor = event.seatsLeft < 20 ? .systemRed : .label
+            onChange?()
+        }
+    }
+
+    func buyTapped(quantity: Int) {
+        guard let event else { return }
+        let limit = UserDefaults.standard.bool(forKey: "isMember") ? 8 : 4
+        guard quantity <= limit, quantity <= event.seatsLeft else {
+            let alert = UIAlertController(title: "Too many tickets", message: "You can buy up to \(limit).", preferredStyle: .alert)
+            alert.addAction(UIAlertAction(title: "OK", style: .default))
+            viewController?.present(alert, animated: true)
+            return
+        }
+        let checkout = CheckoutViewController(eventID: event.id, quantity: quantity)
+        viewController?.navigationController?.pushViewController(checkout, animated: true)
+    }
+
+    func directionsTapped() {
+        guard let event else { return }
+        let query = event.venueAddress.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed) ?? ""
+        UIApplication.shared.open(URL(string: "maps://?q=\(query)")!)
+    }
+}
+
+final class CheckoutViewController: UIViewController {
+    init(eventID: String, quantity: Int) { super.init(nibName: nil, bundle: nil) }
+    required init?(coder: NSCoder) { nil }
+}
+```
+
+</Brief>
+
+```workspace
+template: critique
+minutes: 25
+```
+
+```findings
+- id: navigates
+  title: The view model presents alerts and pushes the next screen itself
+  severity: high
+  lines: "51-57"
+  detail: "It builds a `UIAlertController` and a `CheckoutViewController` and drives the navigation controller. The flow can't change without editing this class, the checkout screen can't be reached from a deep link without it, and a test can't check \"too many tickets\" without a window. Expose the outcome instead: an alert value in the state, and a route such as `.checkout(eventID:quantity:)` that a coordinator handles."
+- id: retain-cycle
+  title: A strong reference to the view controller makes a cycle
+  severity: high
+  lines: "14-15"
+  detail: "The view controller owns its view model, and the view model owns the view controller, so neither is ever freed: that's the leak support reported. The `onChange` closure usually captures the view controller too. A view model shouldn't reference its view at all; if a callback is needed, the view captures itself weakly."
+- id: swallowed-errors
+  title: Every failure is silent, and the spinner never stops
+  severity: high
+  lines: "29-36"
+  detail: "The throwing `Task` discards its error. Offline, a 500, or a date the default `JSONDecoder` can't read (it expects a number, and APIs usually send ISO 8601) all end the task before `isLoading = false`, so the screen spins forever with no way to retry. The status code is never checked either. Catch inside the task and move to a failed state with a retry."
+- id: networking-inline
+  title: Networking and decoding live in the view model
+  severity: medium
+  lines: "32-34"
+  detail: "It builds the URL, calls `URLSession.shared` and decodes. None of that can be replaced in a test, and the next screen that shows an event will copy it. Inject an `EventRepository` (protocol, async) and let the view model ask it for an `Event`."
+- id: business-rule
+  title: The ticket limit is a business rule read from UserDefaults
+  severity: medium
+  lines: "49-51"
+  detail: "How many tickets a member may buy is a rule of the business, not of this screen, and it reads membership from a global key anyone can change. The checkout and the server need the same rule, so it will drift. The message is also wrong when seats are the limit: with 3 seats left it says \"up to 8\". Move the rule to a domain type (a `TicketPolicy`) fed by the real account."
+- id: uikit-types
+  title: UIKit types and singletons tie the view model to one UI
+  severity: medium
+  lines: "1, 21, 42, 63"
+  detail: "It imports UIKit to return a `UIColor` and to call `UIApplication.shared.open`. The colour is a visual decision; the fact is \"few seats left\". With a `Bool` or a small enum instead, the same view model could drive a SwiftUI screen or a widget, and opening Maps through an injected closure could be tested."
+- id: formatting
+  title: Formatting ignores the user's locale and rebuilds a formatter each time
+  severity: low
+  lines: "37-41"
+  detail: "A fixed `dateFormat` shows 24-hour times to people who use 12-hour clocks, and English day names everywhere; the hard-coded \"£\" and `%.2f` ignore currency and locale. Uppercasing the title is a styling choice the view should make. Use `formatted(date:time:)` and `.currency(code:)` with an injected locale and time zone, which also makes the output testable."
+- id: loose-state
+  title: The screen state is six loose properties and one change callback
+  severity: low
+  lines: "15-21, 30, 43"
+  detail: "Loading, loaded and failed aren't modelled, so failure can't even be represented, and the view reads `event` as well as the formatted text, so there are two sources for the title. One `ViewState` enum (loading, loaded with display values, failed) published through a single callback or observation keeps the view honest."
+```
+
+<ReferenceReview>
+
+**Most important first.** Two bugs reach users today. The screen **leaks**, because the view model holds its view controller strongly while the view controller owns the view model. And every failure is **silent**: the throwing task drops its error before `isLoading` is reset, so a flaky network leaves a spinner that never ends.
+
+**The design problem underneath** is that this "view model" is still a view controller. It presents alerts, pushes screens, opens Maps, makes the networking call, applies a business rule, chooses colours and formats text. MVVM only helps when the view model holds presentation logic and nothing else: it decides *what* the screen shows and *that* something should happen, and other objects decide *how*.
+
+**How I'd fix it, in small steps:**
+
+1. Pin today's behaviour with characterisation tests on the formatted text, using a stub that feeds the view model a fixed `Event` (this needs step 2's seam first, so do the two together).
+2. Inject an `EventRepository` protocol and move the URL, the request, the status check and the decoding (with `.iso8601` dates) into its implementation.
+3. Replace the loose properties with one `ViewState` (`loading`, `loaded(EventDisplay)`, `failed(message)`), and catch errors in the task so failure is a state with a retry.
+4. Delete `viewController`. Give the view model an `onRoute` closure (`.checkout(eventID:quantity:)`, `.directions(address:)`), injected by a coordinator, and put the "too many tickets" alert in the state as a value the view presents.
+5. Move the ticket limit into a `TicketPolicy` in the domain layer, given the account's membership rather than a `UserDefaults` key.
+6. Replace `UIColor` with `isLowOnSeats: Bool` and drop `import UIKit`; format with `FormatStyle`s and an injected `Locale` and `TimeZone`.
+
+After step 6 the view model imports Foundation only, and the view controller maps state to labels and routes to its coordinator.
+
+**Tests to add:** loading moves to loaded with the expected display text for a fixed locale; a failing repository produces the failed state and retry recovers; buying within and beyond the limit emits a route or an alert; a `weak` reference to the view model is `nil` after the screen is dismissed.
+
+</ReferenceReview>

@@ -1,0 +1,309 @@
+## Why it matters
+
+"Online", "last seen 5 minutes ago" and "Ana is typing…" look like the smallest features in a chat app. They're among the most expensive. Presence changes constantly and has to reach everyone who can see it, so it can generate more traffic than the messages themselves, and typing indicators are a stream of tiny events that must be throttled on one side and expired on the other. Interviewers use them to check whether you know which data deserves guarantees and which should be cheap, lossy and short-lived.
+
+## Presence is derived, not stored
+
+Nobody tells the server "I'm online". The server **infers** it from connections: a user is online while at least one of their devices holds a live connection whose heartbeats are arriving. That makes presence a by-product of the reconnection machinery you built in the last lessons, with three states most apps show:
+
+- **Online**: a device is connected and in the foreground.
+- **Away** (or idle): connected but backgrounded, or no interaction for some minutes. Apps that close their socket in the background, as they should on iOS, usually skip this state and go straight to offline.
+- **Offline**, with **last seen**: the time the last connection went away.
+
+```visual flow
+title: Where presence comes from
+layers:
+  - { label: Devices, rows: [0, 0] }
+  - { label: Backend, rows: [2, 4] }
+nodes:
+  - { id: phone, label: "Ana's iPhone", kind: client, at: [0, 0] }
+  - { id: ipad, label: "Ana's iPad", kind: client, at: [1.5, 0] }
+  - { id: ben, label: "Ben's app", kind: client, at: [4, 0] }
+  - { id: gateway, label: Gateways, kind: service, at: [0.75, 2] }
+  - { id: presence, label: Presence store, kind: cache, at: [0.75, 4] }
+  - { id: fanout, label: Presence fan-out, kind: service, at: [3.5, 3] }
+edges:
+  - [phone, gateway, heartbeats]
+  - [ipad, gateway, heartbeats]
+  - [gateway, presence, "refresh TTL", { style: data }]
+  - [presence, fanout, changes, { style: async }]
+  - [fanout, ben, "Ana: online", { style: async }]
+steps:
+  - say: "Ana's iPhone connects. Its gateway writes a presence entry for this **connection** with a short time-to-live, say 60 seconds, and refreshes it on every heartbeat."
+    show: [phone, gateway, presence]
+    send: [phone->gateway, gateway->presence]
+    state: { phone: ok }
+  - say: "Ana is now online, because at least one of her connections is alive. That change is published to whoever is watching her."
+    show: [fanout, ben]
+    send: [presence->fanout, fanout->ben]
+  - say: "Her iPad connects too. She was already online, so nothing is published: presence is per **user**, aggregated across devices."
+    show: [ipad]
+    send: ipad->gateway
+    state: { ipad: ok }
+  - say: "The iPhone enters a lift and its heartbeats stop. Its entry expires, but the iPad's is fresh, so Ana stays online."
+    state: { phone: error }
+  - say: "Later the iPad closes too. When the last entry has expired **and a grace period has passed** without a reconnect, the store records last seen and publishes `offline`."
+    state: { ipad: error }
+    label: { presence: "last seen 18:42" }
+    send: [presence->fanout, fanout->ben]
+```
+
+A store with **expiring keys** (Redis is the usual choice) suits this exactly: each connection writes a key with a TTL, heartbeats refresh it, and a crashed gateway's entries simply expire. Nothing needs to remember to clean up.
+
+### Flapping and the grace period
+
+A phone in a lift drops for ten seconds and comes back. Publishing "offline" and then "online" ten seconds later is noise for everyone watching and costs a fan-out each way. A **grace period** of 30–60 seconds before announcing offline absorbs nearly all of these blips; online can be announced at once. The same idea applies on the device: show "online" from the last state you received, and don't animate every flicker.
+
+### Why presence is expensive: fan-out
+
+Every presence change goes to everyone who can see it. Suppose 10 million users are online at peak, each can see about 200 contacts, and each changes state about 10 times a day (opening and leaving the app). That's 10M × 10 × 200 = 20 billion presence deliveries a day, more than 200,000 a second on average, almost all to people who aren't looking. Delivered naively, presence outweighs chat.
+
+The fixes all come down to **sending presence only where it's seen**:
+
+- **Subscribe to what's on screen.** The app subscribes to the presence of the people in the visible conversation list or the open chat, and unsubscribes when they scroll away. Slack moved its clients to this kind of presence subscription as workspaces grew; before that, every change went to every connected member.
+- **Fetch lazily.** "Last seen" is fetched when someone opens a profile, not pushed to everyone on every change.
+- **Batch and coarsen.** Send presence changes in batches every few seconds, and prefer coarse states ("active today") where precision doesn't matter.
+- **Give up for large groups.** In a 5,000-member channel, show "312 online" from a periodic count instead of per-person dots.
+
+### Presence is personal data
+
+Online status and last-seen times reveal when someone sleeps, works and talks to whom. Treat them like any other personal data:
+
+- Let users hide them. WhatsApp, for example, lets people choose who sees their last seen and online status, and not show theirs to anyone.
+- Never send presence to people the user has blocked, and enforce visibility on the server, not by hiding it in the app.
+- Don't keep presence history you don't need. A current state with a TTL is enough for the feature.
+
+## Typing indicators
+
+A typing indicator is the purest **at-most-once** data there is: it's useful for a few seconds, worthless afterwards, and harmless if lost. So it should cost almost nothing:
+
+- never stored on the server, never queued for offline users, never sent through APNs;
+- sent only to members of the conversation who are connected right now;
+- throttled on the sender, and expired on the receiver.
+
+### The sender: throttle and stop
+
+Sending an event per keystroke would be five or more messages a second per typist. Instead:
+
+1. On the **first keystroke**, send `typing` at once (the leading edge), so the indicator appears immediately.
+2. While typing continues, send `typing` again at most every **3 seconds**. That's a throttle, as you met in [debounce, throttle and coalesce](/design/learn/sd-resilience-debounce-throttle), and its job here is to refresh the receiver before its indicator expires.
+3. Send `stopped` when the field is **cleared**, or after **5 seconds** with no keystrokes.
+4. When the message is **sent**, send nothing: the message itself tells everyone to clear the indicator.
+
+### The receiver: expire and ignore yourself
+
+The receiver must survive a `stopped` that never comes (the sender's app was suspended, the signal was dropped). Each `typing` signal is therefore valid only for a limited time, the **expiry**, and a new one extends it. Choose the expiry longer than two refresh intervals plus some latency (8 seconds against a 3-second refresh), so one lost refresh doesn't make the indicator flicker off mid-sentence. Clear a person at once on `stopped` or when their message arrives, and ignore your own signals, which the server may echo back.
+
+```visual timeline
+title: Ana types, pauses, and sends
+unit: s
+lanes:
+  - { id: keys, label: "Ana's keys" }
+  - { id: signals, label: Signals sent }
+  - { id: ben, label: "Ben sees" }
+spans:
+  - { lane: keys, from: 0, to: 7, label: typing, tone: active }
+  - { lane: signals, from: 0, to: 0.3, label: typing }
+  - { lane: signals, from: 3, to: 3.3, label: typing }
+  - { lane: signals, from: 6, to: 6.3, label: typing }
+  - { lane: ben, from: 0.2, to: 12, label: "Ana is typing…", tone: wait }
+  - { lane: signals, from: 12, to: 12.3, label: stopped, tone: error }
+  - { lane: keys, from: 15, to: 17, label: typing, tone: active }
+  - { lane: signals, from: 15, to: 15.3, label: typing }
+  - { lane: ben, from: 15.2, to: 17.2, label: "Ana is typing…", tone: wait }
+  - { lane: keys, from: 17, to: 17.5, label: send, tone: ok }
+  - { lane: ben, from: 17.2, to: 20, label: message, tone: ok }
+markers:
+  - { at: 12, label: 5 s quiet }
+steps:
+  - { at: 0.3, say: "Ana's first keystroke sends `typing` at once, and Ben's indicator appears." }
+  - { at: 6.3, say: "She keeps typing. Twenty keystrokes produce only three signals: one every 3 seconds refreshes Ben's 8-second expiry before it runs out." }
+  - { at: 12, say: "She stops to think. After 5 quiet seconds her app sends `stopped`, and Ben's indicator goes. Had that signal been lost, Ben's expiry would have cleared it at 14 s anyway." }
+  - { at: 15.3, say: "She starts again: a fresh `typing` goes out at once." }
+  - { at: 17.5, say: "She sends the message. No `stopped` is needed: the message's arrival clears the indicator on Ben's side." }
+```
+
+In a group, the receiver keeps one expiry per person and summarises: "Ana is typing…", "Ana and Ben are typing…", then "Several people are typing…". For very large groups, the server can stop relaying typing altogether; a dozen strangers typing tells nobody anything.
+
+### Wiring it into SwiftUI
+
+The sending rules live in a small object the composer calls on every change; the receiving side needs no timer per person, because `TimelineView` re-evaluates the expiries every second:
+
+```swift check ios title="Typing.swift"
+import SwiftUI
+
+/// Turns keystrokes into a few typing signals: one at once, a refresh at most every 3 s while typing goes
+/// on, and "stopped" when the field is cleared or after 5 quiet seconds
+@MainActor
+final class TypingSignals {
+    private let send: @MainActor (_ isTyping: Bool) -> Void
+    private let clock = ContinuousClock()
+    private var lastSent: ContinuousClock.Instant?
+    private var quietTimer: Task<Void, Never>?
+
+    init(send: @escaping @MainActor (_ isTyping: Bool) -> Void) {
+        self.send = send
+    }
+
+    func textChanged(_ text: String) {
+        quietTimer?.cancel()
+        guard !text.isEmpty else {
+            stop()
+            return
+        }
+        let now = clock.now
+        if lastSent.map({ now - $0 >= .seconds(3) }) ?? true {
+            lastSent = now
+            send(true)
+        }
+        quietTimer = Task { [weak self] in
+            try? await Task.sleep(for: .seconds(5))
+            if !Task.isCancelled { self?.stop() }
+        }
+    }
+
+    /// The message itself clears the indicator for everyone else, so no signal is sent
+    func messageSent() {
+        quietTimer?.cancel()
+        lastSent = nil
+    }
+
+    private func stop() {
+        guard lastSent != nil else { return }
+        lastSent = nil
+        send(false)
+    }
+}
+
+struct ComposerView: View {
+    @State private var draft = ""
+    let typing: TypingSignals
+    let sendMessage: (String) -> Void
+
+    var body: some View {
+        HStack {
+            TextField("Message", text: $draft, axis: .vertical)
+                .onChange(of: draft) { _, text in typing.textChanged(text) }
+            Button("Send") {
+                sendMessage(draft)
+                typing.messageSent()
+                draft = ""
+            }
+            .disabled(draft.isEmpty)
+        }
+    }
+}
+
+/// Shows who's typing. Each name stays until its last signal expires; TimelineView re-checks every second,
+/// so expiry needs no timer per person
+struct TypingBanner: View {
+    let typingUntil: [String: Date]
+
+    var body: some View {
+        TimelineView(.periodic(from: .now, by: 1)) { context in
+            let names = typingUntil.filter { $0.value > context.date }.keys.sorted()
+            if let summary = Self.summary(of: names) {
+                Text(summary).font(.footnote).foregroundStyle(.secondary)
+            }
+        }
+    }
+
+    static func summary(of names: [String]) -> String? {
+        switch names.count {
+        case 0: nil
+        case 1: "\(names[0]) is typing…"
+        case 2: "\(names[0]) and \(names[1]) are typing…"
+        default: "Several people are typing…"
+        }
+    }
+}
+```
+
+`messageSent()` runs before the draft is cleared, so the empty draft that follows finds nothing announced and sends nothing. In production, pass a clock in instead of creating `ContinuousClock` inside, so the rules can be tested without waiting, which is what the kata for this lesson does.
+
+## Trade-offs
+
+| Decision | Cheap option | Rich option | Choose rich when |
+| --- | --- | --- | --- |
+| Who receives presence | Only subscribers to what's on screen | Every contact, all the time | Contact lists are small (a family app) |
+| Offline detection | Heartbeat TTL plus a 30–60 s grace period | Immediate, on every disconnect | Almost never: flapping costs more than it tells |
+| Presence precision | "Active today", or a count in big groups | A live dot and exact last seen | One-to-one and small-group chat |
+| Typing frequency | A refresh every 3–5 s, expiry about 8 s | An event per keystroke | Never: it's the same indicator for many times the traffic |
+| Typing in large groups | Off, or "several people" | Every name | Groups up to a dozen or so |
+
+<Callout kind="interview">
+
+**Say** that both are ephemeral and say what that buys: "Presence is derived from live connections with a TTL in Redis, aggregated per user across devices, with a grace period before offline. It's only pushed to clients that subscribe to the people on screen, and last seen is fetched on demand. Typing signals are at most once: throttled to one every 3 seconds on the sender, expiring after 8 on the receiver, never stored or pushed." **Ask** about group sizes and privacy settings. **Red flags:** storing typing events, pushing presence through APNs, broadcasting every presence change to every contact, and an indicator that relies on `stopped` always arriving.
+
+</Callout>
+
+<Callout kind="gotcha" title="iOS gotcha: 'online' while suspended">
+
+A suspended app can't send heartbeats, but the server may still list the user as online until its TTL and grace period run out, sometimes a minute or more. If "online" matters to your product (a support agent's availability, a dating app), have the app send an explicit `away` or close its socket cleanly when the scene enters the background, which takes a moment and gives the server an immediate, accurate signal.
+
+</Callout>
+
+## Practice
+
+The kata **"A typing indicator"** builds both sides as plain value types driven by timestamps: a sender that throttles and stops, and a roster that expires stale signals, ignores your own echoes and writes the summary line.
+
+```cards
+- id: presence-derived
+  front: "How does a server know a user is online?"
+  back: "It infers it from live connections: each connection's presence entry has a TTL refreshed by heartbeats, and the user is online while any device's entry is alive."
+- id: presence-grace
+  front: "Why wait 30–60 seconds before announcing that someone went offline?"
+  back: "Phones drop for seconds at a time in lifts and handovers. A grace period absorbs the flaps, which would otherwise cost an offline and an online fan-out each."
+- id: presence-fanout
+  front: "How do you keep presence fan-out affordable?"
+  back: "Send it only where it's seen: clients subscribe to the presence of people on screen, last seen is fetched on demand, changes are batched, and large groups get a count."
+- id: typing-rules
+  front: "What are the sender and receiver rules for a typing indicator?"
+  back: "Sender: send at once, refresh at most every 3 s, stop on clear or 5 s idle, and let the sent message clear it. Receiver: expire each signal after about 8 s and ignore your own."
+```
+
+```quiz
+- id: q1
+  type: estimate
+  prompt: "5 million users are online at peak. Each can see 300 contacts and changes presence about 8 times a day. If every change went to every contact, roughly how many presence deliveries a second would that average?"
+  answer: 140000
+  unit: deliveries a second
+  explain: "5M × 8 × 300 = 12 billion a day; ÷ 86,400 s ≈ 139,000 a second, almost all to people who aren't looking. Subscribing to on-screen users cuts it by orders of magnitude."
+- id: q2
+  type: mcq
+  prompt: "Ben's indicator says 'Ana is typing…' for ten minutes after Ana locked her phone mid-sentence. What's the fix?"
+  options:
+    - "Send typing events with QoS 1 so the stop always arrives"
+    - "Have each typing signal expire on the receiver after a few seconds unless refreshed"
+    - "Store typing state on the server"
+    - "Send a silent push to Ben when Ana's app is suspended"
+  answer: 1
+  explain: "The `stopped` signal can always be lost, here because Ana's app was suspended before it could send it. Receiver-side expiry makes the indicator correct without relying on any one message."
+- id: q3
+  type: sort
+  prompt: "Ephemeral, or does it need delivery guarantees?"
+  buckets: [Ephemeral, Needs guarantees]
+  items:
+    - ["Ana is typing…", 0]
+    - [Ana is online, 0]
+    - [Ana sent a photo, 1]
+    - [Ana read your message, 1]
+    - [Ana is recording a voice note, 0]
+  explain: "Typing, recording and live presence are useful for seconds and replaced constantly. A message and a read receipt are facts the user expects to persist, so they're stored, numbered and synced."
+- id: q4
+  type: trace
+  prompt: "A sender throttles typing signals to one every 3 s and sends the first at once. Keystrokes arrive at 0, 1, 2, 3.5, 4, 6.5 and 7 seconds. At which times does it send `typing`? List them separated by commas."
+  answer: "0, 3.5, 6.5"
+  explain: "0 goes at once. 1 and 2 are within 3 s of it. 3.5 is the first keystroke 3 s or more after 0. 4 is too soon after 3.5; 6.5 is exactly 3 s after it, so it goes; 7 is too soon."
+- id: q5
+  type: multi
+  prompt: "Which belong in a presence design for a large workplace chat app? Choose all that apply."
+  options:
+    - "A TTL on each connection's presence entry, refreshed by heartbeats"
+    - "Subscribing to presence only for people visible on screen"
+    - "A push notification to every contact when someone comes online"
+    - "A setting that hides your status, enforced on the server"
+    - "A count of members online for very large channels"
+  answer: [0, 1, 3, 4]
+  explain: "Expiring entries, on-screen subscriptions, server-enforced privacy and counts keep presence accurate and cheap. Pushing presence through APNs would be enormous, unwanted and against the point of notifications."
+```

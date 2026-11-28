@@ -1,0 +1,251 @@
+## Why it matters
+
+Video calls, voice chat, screen sharing, a doorbell camera's live view and some multiplayer games all need media or data between devices in a fraction of a second. **WebRTC** is the open standard for that: Google Meet and Discord's voice and video are built on it, and so are many vendor calling SDKs. You'll rarely implement its internals, but "design a video-calling app" is a classic interview, and a strong answer explains why calls need a signalling server *and* relay servers even though they're "peer to peer", what happens when the callee's app is suspended, and why a ten-person call can't be a mesh.
+
+## What WebRTC is
+
+WebRTC is a bundle of protocols plus an API (originally the browser's, now also Google's open-source **libwebrtc** for native apps) that lets two endpoints:
+
+- **send audio and video** with low latency, adapting quality to the network second by second;
+- **open data channels** for arbitrary messages, reliable or unreliable;
+- **find a network path to each other** through NATs and firewalls;
+- and **encrypt everything**, always: there's no unencrypted mode.
+
+Conversation needs low delay: the ITU's guidance (G.114) is to keep one-way delay under about 150 ms for natural talk. That's why media goes over **UDP**. A lost packet is concealed or skipped instead of retransmitted, because a frame that arrives late is as useless as one that never arrives. TCP's in-order delivery would stall the whole call behind one lost packet.
+
+## Signalling: you bring your own
+
+Before two phones can exchange media, they must agree on *what* to send (codecs, resolutions, which streams) and *how to reach each other*. WebRTC deliberately leaves the channel for that conversation to you. This is **signalling**, and in an app it's usually your WebSocket, or your API plus pushes.
+
+What travels over it is a **session description** (SDP): a text blob listing media, codecs, encryption fingerprints and connection credentials. One side makes an **offer**, the other replies with an **answer**, and both trade **ICE candidates**, the addresses where each might be reachable.
+
+```visual sequence
+title: Setting up a call
+participants:
+  - { id: ana, label: "Ana's app" }
+  - { id: signal, label: Signalling }
+  - { id: ben, label: "Ben's app" }
+  - { id: stun, label: STUN/TURN }
+messages:
+  - [ana, ana, create offer]
+  - [ana, signal, offer (SDP)]
+  - [signal, ben, VoIP push + offer, { async: true }]
+  - [ben, ben, CallKit rings]
+  - [ben, signal, answer (SDP)]
+  - [signal, ana, answer, { reply: true }]
+  - [ana, stun, my public address?]
+  - [stun, ana, "203.0.113.7:51820", { reply: true }]
+  - [ana, signal, ICE candidates]
+  - [signal, ben, ICE candidates]
+  - [ana, ben, connectivity checks]
+  - [ben, ana, check succeeds, { reply: true }]
+  - [ana, ben, audio + video (SRTP), { async: true }]
+  - [ben, ana, audio + video (SRTP), { async: true }]
+fragments:
+  - { kind: par, label: media both ways, from: 12, to: 13 }
+steps:
+  - { upTo: -1, say: "Ana taps Call. Nothing can flow yet: the two phones don't know each other's codecs, keys or addresses." }
+  - { upTo: 2, say: "Ana's app creates an **offer** describing what it can send and receive, and sends it through *your* signalling server. Ben's app is suspended, so the server wakes it with a **VoIP push**." }
+  - { upTo: 5, say: "Ben's app reports the call to **CallKit** at once, which rings like a phone call. When Ben answers, his app sends back an **answer** choosing codecs both sides support." }
+  - { upTo: 9, say: "Each side asks a **STUN** server what its address looks like from the internet, and trickles **ICE candidates** (local, public, relayed) to the other through signalling." }
+  - { upTo: 11, say: "The phones test candidate pairs with **connectivity checks** and pick the best pair that works: direct if the NATs allow it, through a TURN relay if not." }
+  - { upTo: 13, say: "Media flows over **SRTP**, encrypted with keys agreed by DTLS on the chosen path. The signalling server is out of the media path." }
+```
+
+## ICE, STUN and TURN: getting through NATs
+
+Almost no phone has a public IP address. It sits behind a home router or a carrier-grade NAT that rewrites addresses and drops unsolicited packets. **ICE** (Interactive Connectivity Establishment) is the procedure that finds a path anyway, from three kinds of candidate:
+
+- **Host** candidates: the device's own addresses. They work when both peers are on the same network.
+- **Server-reflexive** candidates: the public address and port a **STUN** server saw the request come from. If both NATs keep that mapping open for the peer, the call goes direct.
+- **Relay** candidates: an address on a **TURN** server, which forwards all media for this call. It works through almost any NAT or firewall, at the cost of latency and of bandwidth you pay for.
+
+Symmetric NATs, some corporate firewalls and some carrier networks defeat direct paths, so a share of calls (usually a minority; figures around 10–20% are often quoted) can only connect through TURN. Running TURN servers near your users isn't optional for a calling product, and their bandwidth is often the largest line in its infrastructure bill. **Trickle ICE** sends candidates as they're discovered instead of waiting for all of them, which takes seconds off call setup.
+
+## The media: encrypted, adaptive, real-time
+
+- **Encryption** is mandatory: DTLS agrees keys on the media path, and SRTP encrypts audio and video with them. Signalling must be protected separately (`wss://` and authentication).
+- **Codecs:** every implementation supports Opus for audio and VP8 and H.264 for video; VP9 and AV1 are common additions. Hardware H.264 and HEVC encoders matter for battery on iPhones.
+- **Congestion control** estimates the available bandwidth continuously from packet timing and loss, and the encoder follows it, dropping resolution or frame rate before the call breaks up.
+- **Jitter buffers** smooth out packets arriving at uneven intervals, trading a few tens of milliseconds of delay for continuous playback; **packet-loss concealment** papers over the gaps.
+- **Data channels** run over SCTP inside the same encrypted connection. Each can be reliable and ordered (chat during a call) or unreliable and unordered (game state, where the newest update wins).
+
+## Topologies: beyond two people
+
+"Peer to peer" stops scaling quickly, because every participant would have to encode and upload a stream for every other.
+
+| | Mesh | SFU (selective forwarding unit) | MCU (multipoint control unit) |
+| --- | --- | --- | --- |
+| How it works | Every participant sends to every other | Everyone sends once to a server, which forwards streams to each receiver | A server decodes everything, mixes one composite stream, re-encodes it for each receiver |
+| Upload per phone | One stream per other participant | One stream (or a few simulcast layers) | One stream |
+| Server cost | Signalling and TURN only | Forwarding: bandwidth, little CPU | Decoding and encoding: heavy CPU |
+| Latency | Lowest | Low | Higher (decode, mix, encode) |
+| Practical size | 2–4 people | Dozens; hundreds with care | Large, but rigid layouts |
+| End-to-end encryption | Natural | Possible with insertable streams | Impossible: the server must decode |
+
+Almost every modern group-calling service uses an **SFU**. With **simulcast**, each sender uploads the same video at two or three qualities, and the SFU forwards each receiver the layer that fits its network and screen: the active speaker in high quality, the thumbnails in low.
+
+## WebRTC on iOS
+
+Apple doesn't ship a WebRTC framework for native apps. Your options:
+
+- **Google's libwebrtc**, compiled into an `.xcframework` (community builds are distributed through Swift Package Manager). It's a large C++ codebase with an Objective-C API, and you own updating it.
+- **A vendor SDK** built on it, such as LiveKit (open source, with an SFU you can host) or Daily, which bundle the media stack, an SFU and signalling.
+- **`WKWebView`**, which has supported WebRTC (including camera and microphone through `getUserMedia`) since iOS 14.3. It's fine for an embedded web experience, but it can't integrate with CallKit or run in the background.
+
+Whichever stack you choose, the iOS integration is the same, and it's what interviews probe:
+
+- **Incoming calls arrive as VoIP pushes** through PushKit, which can wake or launch a suspended app. Since iOS 13 the app **must report every VoIP push to CallKit** as an incoming call straight away; an app that doesn't is terminated, and one that keeps failing stops receiving VoIP pushes. VoIP pushes are for calls only, never for chat messages.
+- **CallKit** shows the system call UI (on the lock screen too), handles answering, holding and ending, and coordinates with the Phone app and other calls.
+- **The audio session** is activated by CallKit, not by you: configure it as `.playAndRecord` with the `.voiceChat` mode, and start WebRTC's audio only in `provider(_:didActivate:)`.
+- **During a call** the app keeps running in the background, so the media connection survives the user switching apps or locking the phone.
+
+```swift check ios title="CallCoordinator.swift"
+import AVFAudio
+import CallKit
+import PushKit
+
+/// Rings the phone for a call that arrives as a VoIP push, then lets WebRTC start audio when CallKit says so
+final class CallCoordinator: NSObject, PKPushRegistryDelegate, CXProviderDelegate {
+    private let provider: CXProvider
+    private let registry = PKPushRegistry(queue: .main)
+    private let sendTokenToServer: (Data) -> Void
+
+    init(sendTokenToServer: @escaping (Data) -> Void) {
+        let configuration = CXProviderConfiguration()
+        configuration.supportsVideo = true
+        configuration.maximumCallsPerCallGroup = 1
+        configuration.supportedHandleTypes = [.generic]
+        provider = CXProvider(configuration: configuration)
+        self.sendTokenToServer = sendTokenToServer
+        super.init()
+        provider.setDelegate(self, queue: .main)
+        registry.delegate = self
+        registry.desiredPushTypes = [.voIP]
+    }
+
+    func pushRegistry(_ registry: PKPushRegistry, didUpdate pushCredentials: PKPushCredentials, for type: PKPushType) {
+        // VoIP pushes use their own token, separate from the app's alert-push token
+        sendTokenToServer(pushCredentials.token)
+    }
+
+    func pushRegistry(_ registry: PKPushRegistry, didReceiveIncomingPushWith payload: PKPushPayload, for type: PKPushType, completion: @escaping () -> Void) {
+        let caller = payload.dictionaryPayload["caller"] as? String ?? "Unknown caller"
+        let update = CXCallUpdate()
+        update.remoteHandle = CXHandle(type: .generic, value: caller)
+        update.hasVideo = true
+        // Report before doing anything else: since iOS 13, a VoIP push that doesn't ring CallKit gets the app
+        // terminated, and repeated misses stop VoIP pushes altogether
+        // PushKit's completion isn't marked Sendable; CallKit calls back on the provider's queue, here main
+        nonisolated(unsafe) let finished = completion
+        provider.reportNewIncomingCall(with: UUID(), update: update) { _ in
+            finished()
+        }
+        // Then start signalling: fetch the offer, create the peer connection, gather candidates
+    }
+
+    func providerDidReset(_ provider: CXProvider) {
+        // End every call and tear down peer connections
+    }
+
+    func provider(_ provider: CXProvider, perform action: CXAnswerCallAction) {
+        // Send the SDP answer through the signalling channel, then:
+        action.fulfill()
+    }
+
+    func provider(_ provider: CXProvider, didActivate audioSession: AVAudioSession) {
+        // CallKit has activated the audio session: start WebRTC's audio here, never earlier
+    }
+}
+```
+
+Two design consequences follow. The push must carry enough to ring (who's calling, a call id) without a network round trip, because the call must be reported first; the offer is fetched or arrives over the socket afterwards. And the signalling server must handle the race where Ben answers on his iPad while his iPhone is still ringing: it tells the other devices to end their CallKit calls.
+
+## When not to use WebRTC
+
+- **One-to-many broadcast** (a live sports stream to a million viewers): WebRTC's per-viewer connections and SFU costs don't make sense at that fan-out. HLS, or Low-Latency HLS at a few seconds of delay, goes through CDNs. You'll meet it in D40.
+- **Chat and app events:** a WebSocket is far simpler. Data channels shine only when you already have a peer connection, or need unreliable, low-latency delivery between peers.
+- **Calls that must be recorded or moderated:** possible with an SFU that records, but plan the server path from the start.
+
+## Trade-offs
+
+| Choice | Wins when | Costs |
+| --- | --- | --- |
+| Direct peer-to-peer (mesh) | One-to-one calls, privacy-sensitive calls | Still needs signalling and TURN; doesn't scale past a few people |
+| Your own SFU (for example LiveKit or mediasoup) | Group calls, control over data and costs | Running media servers in several regions |
+| A vendor platform | Small teams, fast launch | Per-minute pricing, less control |
+| libwebrtc directly | Full control, custom features | A large native dependency to build, update and debug |
+| `WKWebView` | A web experience inside the app | No CallKit, no background, weaker device integration |
+
+<Callout kind="interview">
+
+**Say** the three servers a "peer-to-peer" call still needs: "Signalling over our WebSocket to exchange offers, answers and candidates; STUN for public addresses; and TURN relays in every region for the calls that can't go direct. Group calls go through an SFU with simulcast. On iOS, incoming calls arrive as VoIP pushes, reported to CallKit straight away, and CallKit activates the audio session." **Ask** about call sizes, whether calls are recorded, and the target regions. **Red flags:** "it's peer to peer, so no servers", a mesh for group calls, ringing with ordinary alert pushes, and VoIP pushes used for chat.
+
+</Callout>
+
+<Callout kind="gotcha" title="iOS gotcha: starting audio before CallKit activates the session">
+
+With CallKit, the system activates the audio session on your behalf, at a moment it chooses (for example after the user answers on the lock screen). If WebRTC starts its audio unit before `provider(_:didActivate:)`, the call connects with no sound, or with sound only after the user toggles mute. Configure the session early, but start audio only when CallKit hands it to you, and stop it in `provider(_:didDeactivate:)`.
+
+</Callout>
+
+```cards
+- id: webrtc-signalling
+  front: "What does WebRTC's 'signalling' carry, and who provides it?"
+  back: "Session descriptions (the offer and answer: codecs, keys, credentials) and ICE candidates. WebRTC doesn't define the channel; your app provides it, usually a WebSocket plus pushes."
+- id: stun-turn
+  front: "What's the difference between STUN and TURN?"
+  back: "STUN tells a device its public address so peers can try a direct path. TURN relays all the media when no direct path works, at the cost of latency and paid bandwidth."
+- id: sfu
+  front: "Why do group calls use an SFU rather than a mesh?"
+  back: "In a mesh each phone uploads a stream per participant. With an SFU each uploads once (or a few simulcast layers) and the server forwards streams, so calls scale to dozens."
+- id: voip-push-callkit
+  front: "What must an iOS app do when it receives a VoIP push?"
+  back: "Report an incoming call to CallKit straight away. Since iOS 13, apps that don't are terminated, and repeated failures stop VoIP push delivery."
+```
+
+```quiz
+- id: q1
+  type: estimate
+  prompt: "In a mesh call of 6 people, each sending video at 1 Mbps, roughly how much does each phone upload?"
+  answer: 5
+  unit: Mbps
+  within: { percent: 20 }
+  explain: "Each phone sends its stream separately to the 5 others: 5 × 1 Mbps = 5 Mbps of upload, more than many cellular connections sustain. Through an SFU it would upload about 1 Mbps (a little more with simulcast)."
+- id: q2
+  type: order
+  prompt: "Put the setup of a one-to-one call in order."
+  lines:
+    - "The caller creates an offer and sends it through the signalling server"
+    - "The callee's device receives a VoIP push and reports the call to CallKit"
+    - "The callee answers, and its answer goes back through signalling"
+    - "Both sides trickle ICE candidates and run connectivity checks"
+    - "Media flows over the best working candidate pair, encrypted with SRTP"
+  explain: "Offer, wake and ring, answer, find a path, then media. Candidates often start trickling during the offer and answer, but media can't flow until a pair passes its checks."
+- id: q3
+  type: mcq
+  prompt: "Calls between two users on the same corporate Wi-Fi work, but calls from that office to people on cellular often fail to connect. What's most likely missing?"
+  options:
+    - "A faster codec"
+    - "A TURN server: the office firewall or the carrier's NAT blocks direct paths, so these calls need a relay"
+    - "An MCU"
+    - "A longer ICE timeout on the signalling server"
+  answer: 1
+  explain: "On one network, host candidates connect directly. Across restrictive NATs and firewalls, only a relay candidate works, and without TURN there's none."
+- id: q4
+  type: truefalse
+  prompt: "An app can use VoIP pushes to deliver chat messages instantly to a suspended app, as long as it doesn't show a call screen."
+  answer: false
+  explain: "Every VoIP push must be reported to CallKit as an incoming call. Using them for anything else gets the app terminated and, repeatedly, cut off from VoIP pushes (and breaks App Review rules)."
+- id: q5
+  type: sort
+  prompt: "Mesh, SFU or not WebRTC at all?"
+  buckets: [Mesh, SFU, Not WebRTC]
+  items:
+    - [A one-to-one video call, 0]
+    - [A 12-person team stand-up, 1]
+    - ["A live concert stream to 200,000 viewers", 2]
+    - [A webinar with 4 speakers and 300 interactive attendees, 1]
+    - [A support chat with file sharing, 2]
+  explain: "Two people can go direct. Group calls need forwarding servers. Huge one-way audiences belong on HLS through a CDN, and chat belongs on a WebSocket."
+```

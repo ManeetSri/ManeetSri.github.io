@@ -1,0 +1,337 @@
+## Why it matters
+
+MVVM says nothing about navigation, and that silence is where most MVVM codebases go wrong: view models end up holding view controllers, calling `pushViewController`, or owning a `NavigationPath`. Then a screen can't be reused in another flow, a deep link has to fake a sequence of taps, and an A/B test that reorders two steps touches five files. **Coordinators** fix this with one rule. D20 built the coordinator tree and its lifetimes in [Coordinators in UIKit](/design/learn/sd-nav-coordinators-uikit); this lesson is about the seam between a coordinator and its view models, which is what interviewers dig into when you say "MVVM-C".
+
+## The rule: say what happened, not where to go
+
+A view model knows **that** something happened: the user picked order 42, sign-in succeeded, the form was cancelled. It doesn't know **what comes next**, because that depends on things it shouldn't know about:
+
+- **The flow:** in checkout, choosing an address leads to slots; in Account, it leads back.
+- **The device:** on iPhone an order opens in a pushed screen, on iPad in the split view's detail column.
+- **The entry point:** a notification may open the order screen with no list underneath it.
+- **The experiment:** returning customers might see the slot step before the address step.
+
+So a view model **reports outcomes**, and a coordinator, which owns the flow, **decides**. The coordinator creates each step's view model with its dependencies, listens to its outcomes, and drives the navigation.
+
+```visual flow
+title: A returns flow in MVVM-C
+nodes:
+  - { id: coordinator, label: Returns coordinator, kind: service, at: [2, 0] }
+  - { id: draft, label: Return draft, kind: store, at: [4, 0] }
+  - { id: items, label: Items view model, kind: service, at: [0, 2] }
+  - { id: reason, label: Reason view model, kind: service, at: [2, 2] }
+  - { id: confirm, label: Confirm view model, kind: service, at: [4, 2] }
+edges:
+  - [coordinator, items, creates]
+  - [items, coordinator, chose items, { style: async }]
+  - [coordinator, draft, records, { style: data }]
+  - [coordinator, reason, creates]
+  - [reason, coordinator, chose reason, { style: async }]
+  - [coordinator, confirm, creates]
+  - [confirm, draft, reads, { style: data }]
+steps:
+  - say: "The coordinator starts the flow with the first step's view model. Its `path` is empty: the items screen is the root."
+    show: [coordinator, items]
+    send: coordinator->items
+    label: { coordinator: "path: []" }
+  - say: "The user picks two items. The view model reports `.continued(itemIDs)`. It has no idea a reason screen exists."
+    send: items->coordinator
+  - say: "The coordinator records the choice in the flow's **draft** and appends `.reason` to its path. SwiftUI pushes the screen, which gets a new view model."
+    show: [draft, reason]
+    send: [coordinator->draft, coordinator->reason]
+    label: { coordinator: "path: [.reason]" }
+  - say: "A reason is chosen. If the product team adds a photo step for damaged items, this is the only place that changes: the reason view model stays the same."
+    send: reason->coordinator
+  - say: "Confirm reads the whole draft to show a summary. No step passed data to the next one by hand."
+    show: [confirm]
+    send: [coordinator->confirm, confirm->draft]
+    label: { coordinator: "path: [.reason, .confirm]" }
+  - say: "The user swipes back. In SwiftUI the stack writes through its binding to `path`, so the coordinator's state is already right. (UIKit needs the navigation controller's delegate for this, as D20 showed.)"
+    label: { coordinator: "path: [.reason]" }
+    active: [reason]
+```
+
+## Three ways to report an outcome
+
+**Closures passed to `init`** are the most common choice, and the default worth starting with:
+
+```swift
+final class ChooseItemsViewModel {
+    init(order: Order, onContinue: @escaping ([Item.ID]) -> Void, onCancel: @escaping () -> Void)
+}
+```
+
+They're explicit (the view model can't be built without saying what happens), non-optional (no silent `nil` delegate), and trivial to test: pass a closure that records. The coordinator captures itself weakly in them.
+
+**A delegate protocol** (`weak var delegate: ChooseItemsDelegate?`) is familiar from UIKit and groups related outcomes. Its weakness is that it's optional: forget to set it and taps do nothing, with no error.
+
+**An outcome stream**, an `AsyncStream<Outcome>` the coordinator reads with `for await`, suits view models whose outcomes arrive over time and coordinators written as linear `async` code ("await the address, then await the slot"). Someone must own the task that reads it and cancel it when the flow ends.
+
+What a view model should **not** hold: the coordinator itself (it can then call anything, and knows which object runs its flow), a `NavigationPath` or `UINavigationController` (it now knows the navigation structure), or a router protocol named after screens (`showSlotPicker()`). A narrow protocol named after **outcomes** (`addressChosen(_:)`) is a delegate by another name and is fine; one named after **destinations** puts the flow back in the view model.
+
+## Passing results back, and flow-scoped state
+
+Data moves between steps in two ways:
+
+- **A result returned to an earlier screen.** The address picker finishes with an address; the checkout review must show it. The coordinator receives the outcome and hands it on: `onFinish: { [weak self] address in self?.review.addressChanged(address); self?.path.removeLast() }`.
+- **A draft many steps share.** A returns flow collects items, a reason, a refund method and a drop-off point, and the confirm step needs all of it. Passing each value forward through every view model's `init` gets brittle fast. Instead, the coordinator owns a small `@Observable` draft for the flow's lifetime, and each step's view model sees only the part it needs, through a protocol (`ReasonSelecting`), so the reason step can't touch the refund method.
+
+The draft lives exactly as long as the coordinator, which lives exactly as long as the flow, so abandoning the flow throws the draft away with it.
+
+## A SwiftUI coordinator
+
+In SwiftUI the coordinator owns the path and builds each step's screen; the views stay ignorant of each other.
+
+```swift check ios group=returns title="ReturnsFlow.swift"
+import SwiftUI
+
+enum ReturnReason: String, CaseIterable, Sendable { case damaged, wrongItem, changedMind }
+
+enum ReturnsStep: Hashable {
+    case reason
+    case confirm
+}
+
+/// What the whole flow is collecting. Owned by the coordinator, so it lives exactly as long as the flow.
+@MainActor
+@Observable
+final class ReturnDraft {
+    var itemIDs: [Int] = []
+    var reason: ReturnReason?
+}
+
+@MainActor
+@Observable
+final class ChooseItemsViewModel {
+    private(set) var selected: Set<Int> = []
+    private let onContinue: ([Int]) -> Void
+
+    init(onContinue: @escaping ([Int]) -> Void) {
+        self.onContinue = onContinue
+    }
+
+    func toggle(_ id: Int) {
+        if selected.contains(id) { selected.remove(id) } else { selected.insert(id) }
+    }
+
+    func continueTapped() {
+        guard !selected.isEmpty else { return }
+        onContinue(selected.sorted())                 // what happened; not where to go
+    }
+}
+
+@MainActor
+@Observable
+final class ReturnsCoordinator {
+    var path: [ReturnsStep] = []
+    let draft = ReturnDraft()
+    @ObservationIgnored private(set) lazy var root = ChooseItemsViewModel { [weak self] itemIDs in
+        self?.itemsChosen(itemIDs)
+    }
+    private let onFinish: (Bool) -> Void
+
+    init(onFinish: @escaping (Bool) -> Void) {
+        self.onFinish = onFinish
+    }
+
+    func itemsChosen(_ itemIDs: [Int]) {
+        draft.itemIDs = itemIDs
+        path.append(.reason)
+    }
+
+    func reasonChosen(_ reason: ReturnReason) {
+        draft.reason = reason
+        path.append(.confirm)                         // a photo step for .damaged would go here
+    }
+
+    func submitted() {
+        onFinish(true)
+    }
+
+    @ViewBuilder
+    func screen(for step: ReturnsStep) -> some View {
+        switch step {
+        case .reason:
+            List(ReturnReason.allCases, id: \.self) { reason in
+                Button(reason.rawValue) { self.reasonChosen(reason) }
+            }
+        case .confirm:
+            Button("Return \(draft.itemIDs.count) items") { self.submitted() }
+        }
+    }
+}
+
+struct ReturnsFlowView: View {
+    @State var coordinator: ReturnsCoordinator
+
+    var body: some View {
+        NavigationStack(path: $coordinator.path) {
+            ChooseItemsScreen(model: coordinator.root)
+                .navigationDestination(for: ReturnsStep.self) { step in
+                    coordinator.screen(for: step)
+                }
+        }
+    }
+}
+
+struct ChooseItemsScreen: View {
+    let model: ChooseItemsViewModel
+
+    var body: some View {
+        List([101, 102, 103], id: \.self) { id in
+            Button("Item \(id)\(model.selected.contains(id) ? " ✓" : "")") { model.toggle(id) }
+        }
+        .toolbar { Button("Continue") { model.continueTapped() } }
+    }
+}
+```
+
+The reason and confirm screens are inlined to keep the example short; in an app each is its own view with its own view model, built by `screen(for:)` with the dependencies it needs. A few decisions are worth calling out:
+
+- **The path is an array of plain `Hashable` steps.** It's data, so a deep link or a notification can set it in one assignment (`path = [.reason, .confirm]`), and a test can read it.
+- **The root view model is created once** and kept by the coordinator (`lazy`, marked `@ObservationIgnored` because it never changes). Pushed screens' view models can be created inside their destination views with `@State`, as in the previous lessons, since nothing outside needs them; when the coordinator must reach one, it keeps it.
+- **Back navigation needs no code.** The stack writes pops through the `$coordinator.path` binding.
+- **Closures capture the coordinator weakly.** The coordinator owns the root view model, which owns its `onContinue` closure; a strong capture would be a cycle that keeps the whole flow alive.
+
+In UIKit the coordinator does the same job with a `UINavigationController`: it builds each view controller with its view model, wires the outcome closures, and pushes. The view model code doesn't change at all, which is the point.
+
+## Entry points
+
+Because only the coordinator knows the flow, entry points are coordinator methods:
+
+- **A deep link to the confirm step** of a saved return sets the draft from the server's copy and the path to `[.reason, .confirm]`, so back still makes sense.
+- **The same flow on iPad** in a sheet with a different first step is a different root, not different view models.
+- **An experiment** that skips the reason step for some users is a branch in `itemsChosen`.
+
+## Testing the seam
+
+Both sides of the seam test without any UI:
+
+```swift check ios group=returns title="ReturnsFlowTests.swift"
+import Testing
+
+@Test @MainActor func continuingReportsTheSortedSelection() {
+    var reported: [[Int]] = []
+    let model = ChooseItemsViewModel { reported.append($0) }
+
+    model.toggle(103)
+    model.toggle(101)
+    model.continueTapped()
+
+    #expect(reported == [[101, 103]])
+}
+
+@Test @MainActor func choosingItemsThenAReasonReachesConfirm() {
+    let coordinator = ReturnsCoordinator { _ in }
+
+    coordinator.itemsChosen([101])
+    coordinator.reasonChosen(.damaged)
+
+    #expect(coordinator.path == [.reason, .confirm])
+    #expect(coordinator.draft.itemIDs == [101])
+    #expect(coordinator.draft.reason == .damaged)
+}
+```
+
+The view model test checks that the right outcome is reported, and nothing about navigation. The coordinator test checks the flow's rules (what follows what, what's recorded) as plain data. Add one more test per flow in practice: after `onFinish`, a `weak` reference to the coordinator is `nil` once its parent lets go.
+
+## Trade-offs
+
+| | Closures in `init` | Delegate protocol | Outcome stream | View model holds a router | View model holds the coordinator |
+| --- | --- | --- | --- | --- | --- |
+| View model knows the flow | no | no | no | partly, if named after screens | yes |
+| Can be forgotten | no: required in `init` | yes: optional | yes: nobody iterates | no | no |
+| Testing | record calls | a spy delegate | collect from the stream | a spy router | needs the real coordinator |
+| Lifetime risks | strong captures | low (weak) | an iterating task to cancel | low | a cycle, usually |
+| Wins for | most screens | UIKit code with many related outcomes | linear `async` flow logic | outcome-named protocols in large teams | nothing |
+
+<Callout kind="interview">
+
+**What to say:** "View models report outcomes through closures they get in `init`, like `onContinue(itemIDs)`, and never see the navigation. The coordinator for each flow creates the step view models, owns a draft for flow-scoped state, and owns the path. Deep links and experiments are coordinator changes; view models don't move. I test view models by recording outcomes and coordinators by asserting on the path."
+
+**What to ask:** "Which flows are entered from outside: links, notifications, widgets? Do steps change by experiment or device?" The more yes answers, the more a coordinator pays for itself.
+
+**Red flags:** `weak var coordinator` in a view model; a view model with a `NavigationPath`; data passed from step to step through five initialisers; a global router singleton any view model can call.
+
+</Callout>
+
+<Callout kind="gotcha" title="Swift gotcha: the closure that keeps the flow alive">
+
+A coordinator owns its view models; each view model owns its outcome closures. If a closure captures the coordinator strongly (`onContinue: { ids in self.itemsChosen(ids) }`), the coordinator, its view models and its draft are never freed, and an abandoned flow's draft can resurface next time. Capture `[weak self]`, and test that the coordinator is freed after the flow finishes.
+
+</Callout>
+
+<Callout kind="gotcha" title="iOS gotcha: destination views may be built more than once">
+
+SwiftUI calls a `navigationDestination` closure whenever it needs the view, not exactly once per push. A view model created inline there (`ReasonScreen(model: ReasonViewModel(…))`) can be rebuilt and lose its state. Let the destination view own it in `@State` with a cheap `init`, or keep it in the coordinator when the coordinator needs to reach it.
+
+</Callout>
+
+## Practice
+
+**MVVM and coordinators for a grocery checkout** asks you to design exactly this seam at full size: five steps, a draft shared through narrow protocols, a child coordinator for 3-D Secure, three entry points and an experiment that reorders steps.
+
+```cards
+- id: mvvmc-rule
+  front: "What's the rule between a view model and its coordinator?"
+  back: "The view model reports what happened (an outcome); the coordinator decides what comes next, because that depends on the flow, the device, the entry point and experiments."
+- id: mvvmc-closures
+  front: "Why are closures in init a good default for reporting outcomes?"
+  back: "They're required, so they can't be forgotten; explicit about what the screen can report; and easy to test by recording. Capture the coordinator weakly."
+- id: mvvmc-draft
+  front: "How do steps in a flow share the data they collect?"
+  back: "The coordinator owns a flow-scoped draft for exactly the flow's lifetime, and each step's view model sees only its part through a narrow protocol."
+- id: mvvmc-test
+  front: "How do you test the view model and coordinator seam?"
+  back: "Test the view model by recording the outcomes it reports, and the coordinator by feeding it outcomes and asserting on its path and draft, all without UI."
+```
+
+```quiz
+- id: q1
+  type: mcq
+  prompt: "An order list view model must open an order. Which design keeps it reusable in both the Orders tab and a returns flow?"
+  options:
+    - "`func select(_ order: Order) { coordinator?.showOrderDetail(order) }` with a weak coordinator"
+    - "`func select(_ order: Order) { path.append(.detail(order.id)) }` with the path in the view model"
+    - "`func select(_ order: Order) { onSelect(order.id) }` with the closure passed in by whoever creates it"
+    - "Post a `Notification` named `.orderSelected`"
+  answer: 2
+  explain: "The closure reports the outcome and leaves the decision to the creator: the Orders coordinator pushes a detail screen, the returns coordinator starts a return. The other options tie the view model to one flow or to the navigation structure, or hide the outcome in a global channel."
+- id: q2
+  type: bug
+  prompt: "After finishing the returns flow several times, memory shows several `ReturnsCoordinator` instances still alive. Which line is the cause?"
+  code: |
+    final class ReturnsCoordinator {
+        lazy var root = ChooseItemsViewModel { itemIDs in
+            self.itemsChosen(itemIDs)
+        }
+        func itemsChosen(_ itemIDs: [Int]) { }
+    }
+  answer: 3
+  explain: "The coordinator owns `root`, `root` owns its closure, and the closure captures `self` strongly: a cycle. Capture `[weak self]` and call `self?.itemsChosen(itemIDs)`."
+- id: q3
+  type: multi
+  prompt: "Which changes should touch only the coordinator, not any step's view model? Choose all that apply."
+  options:
+    - "Show the slot step before the address step for returning customers"
+    - "Open checkout at the review step from a notification"
+    - "Validate that a postcode is well formed"
+    - "On iPad, present payment as a sheet instead of pushing it"
+  answer: [0, 1, 3]
+  explain: "Order, entry point and presentation are flow decisions. Postcode validation is a rule of the address step's screen (or the domain), so it lives in that view model or below it."
+- id: q4
+  type: truefalse
+  prompt: "In SwiftUI, a coordinator that owns `path` and passes `$coordinator.path` to `NavigationStack` must observe back swipes separately to keep its path in sync."
+  answer: false
+  explain: "The stack writes pops through the binding, so the back swipe itself updates the coordinator's `path`. UIKit is where a navigation controller's delegate is needed to learn about system pops."
+- id: q5
+  type: mcq
+  prompt: "Five checkout steps all need the chosen address, and the review step needs everything. What's the cleanest way to share it?"
+  options:
+    - "Pass the address into each later view model's `init`, step by step"
+    - "A singleton `CheckoutState.shared`"
+    - "A draft owned by the checkout coordinator, given to each view model through a narrow protocol"
+    - "Store it in `UserDefaults` so any screen can read it"
+  answer: 2
+  explain: "The draft lives exactly as long as the flow, and narrow protocols limit what each step can touch. Passing values along every initialiser is brittle, and a singleton or UserDefaults outlives the flow and is shared with everything."
+```

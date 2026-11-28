@@ -1,0 +1,170 @@
+## Why it matters
+
+Every lesson in this module has argued for unidirectional flow: one owner, one door in, effects as values, exhaustive tests. This one is about the bill. Routing every change through a reducer costs main-thread time, and at 120 changes a second that can cost frames. Actions, delegates and dependency clients cost typing, reading and onboarding. A large third-party architecture costs migrations when it changes. None of that means "don't", but a senior answer to "should we adopt TCA?" or "why is this screen janky?" names the costs, measures them, and says where the pattern stops paying. That's what interviewers listen for.
+
+## What one action costs
+
+In a TCA-style tree, every action enters at the root store and runs the root's `body`. Each `Scope` checks whether the action is its child's, which is a cheap enum match, and the matching path runs down to the leaf feature, plus any parent logic along the way. Then observation notifies the views that read fields that changed, and SwiftUI re-evaluates their bodies. Effects add a `Task` and an actor hop or two.
+
+For a tap, all of that takes microseconds and never matters. It matters when actions arrive **many times a second**: a scroll offset, a drag gesture, download progress, a playback position, a 60 Hz timer, motion sensor readings. On a ProMotion display a frame lasts 8.3 ms, and everything the main actor does in that frame competes with rendering. Try the numbers: the defaults are a drag gesture sent to the store on every frame.
+
+```visual estimator
+title: Main-thread cost of a high-frequency action
+inputs:
+  - { id: rate, label: Actions per second, min: 1, max: 240, value: 120, unit: /s }
+  - { id: depth, label: Reducers on the action's path, min: 1, max: 20, value: 6 }
+  - { id: reducerMicros, label: Time per reducer, min: 1, max: 200, value: 15, unit: µs }
+  - { id: views, label: Views re-evaluated per action, min: 0, max: 200, value: 40 }
+  - { id: bodyMicros, label: Time per view body, min: 5, max: 500, value: 60, unit: µs }
+  - { id: fps, label: Display refresh rate, min: 60, max: 120, step: 60, value: 120, unit: Hz }
+outputs:
+  - { id: perAction, label: Main-thread work per action, formula: (depth * reducerMicros + views * bodyMicros) / 1000000, format: duration }
+  - { id: perSecond, label: Main-thread work per second, formula: rate * perAction, format: duration, unit: /s }
+  - { id: budget, label: One frame's budget, formula: 1 / fps, format: duration }
+  - { id: perFrame, label: Work in an average frame, formula: perAction * rate / fps, format: duration }
+  - { id: used, label: Share of every frame spent on this action, formula: perFrame / budget * 100, unit: "%" }
+```
+
+With the defaults, each action costs about 2.5 ms and nearly a third of every frame goes on one gesture, most of it re-evaluating 40 views. Drop the views to 2, as narrow observation does, and it falls to about 2.5%. Push the rate to 240 or the body time up and the screen can't keep up at all. The reducers themselves are rarely the problem; what each action makes SwiftUI redo usually is.
+
+## Keeping the hot path fast
+
+### Keep high-frequency state out of the store
+
+Not every change needs to be an action. A drag's live offset belongs in the view's `@GestureState` or `@State`; the store hears about it once, when the drag ends and something meaningful happened (`cardDropped(on: column)`). A scroll position that no logic reads stays in the view. The test from [TCA: state, actions and reducers](/design/learn/sd-udf-tca-reducers) applies: if no test of the feature would assert on every intermediate value, the store doesn't need every intermediate value.
+
+### Throttle at the source
+
+When the store does need a stream of values, such as download progress for a progress bar, send fewer of them. The effect that observes the download can send an update only when the percentage changes by a whole point, or at most ten times a second using the injected clock. A progress bar that moves ten times a second looks smooth; the other fifty updates were pure cost.
+
+### Narrow what each view observes
+
+`@ObservableState` tracks fields, so a view re-renders only when a field it read changes. That only helps if views read narrowly:
+
+- **Give rows their own scoped stores** (`ForEach(store.scope(state: \.rows, action: \.rows))`) rather than passing arrays down, so changing one row re-renders one row.
+- **Watch computed properties on big state.** `finishedCount` reads every row; a view that shows it re-evaluates whenever any row changes, and recomputes an O(n) count each time. For large collections, keep the derived value somewhere it's computed once per change, or show it in fewer places.
+- **Legacy TCA code** (before 1.7) used `WithViewStore` and `ViewStore`, which compared whole observed states with `==` after every action. Moving those screens to `@ObservableState` is a performance fix as much as an API update.
+
+### Keep heavy work out of reducers
+
+Reducers run on the main actor, inside `send`. Sorting ten thousand books, parsing a large file, diffing two big collections or resizing an image in a reducer blocks the UI for as long as it takes. Do it in an effect, off the main actor, and send the result back as an action.
+
+### Measure before you change anything
+
+Guessing about performance is usually wrong. Instruments' SwiftUI template shows how often each view's body runs and how long it takes; the Time Profiler shows which reducer or computed property is hot. In debug builds, TCA's `._printChanges()` shows every action with its state diff, which quickly reveals an action firing far more often than you thought. For production numbers, wrap `send` in signposts ([Signposts: measuring intervals with OSSignposter](/design/learn/sd-diag-signposts)) and look at the intervals in a field trace.
+
+## Compile times and the build
+
+Performance isn't only runtime. A feature with a 60-case action enum, a `body` with a dozen composed reducers and a long `switch` gives the type checker a lot to solve, and TCA's macros bring in swift-syntax, which adds to clean builds. TCA's documentation has advice for when the compiler struggles: break a long `Reduce` closure out into a method, split a large `body` into smaller reducers, and add explicit types where inference has to search. Modularising features into separate targets, as in [TCA: composing and scoping features](/design/learn/sd-udf-tca-scoping), helps the most: a change to one feature rebuilds one module, and previews build only what they need.
+
+## Ergonomic costs
+
+The costs people feel day to day aren't milliseconds:
+
+- **Indirection.** "Jump to definition" on `store.send(.saveButtonTapped)` lands on the enum case, not the code that runs. Finding what a tap does means finding the case in the reducer, then following delegate actions up through parents. Clear naming and small features keep that short; deep trees with delegates three levels up make it long.
+- **Ceremony.** An action for every change, a delegate enum per child, a client struct per dependency, a test for every effect. Some of that is the point (it's where the testability comes from), and some is tax. `BindableAction`, helper methods and good templates reduce it; they don't remove it.
+- **Learning curve.** Case paths, scoping, `@Presents`, effect lifetimes and exhaustive testing take a newcomer weeks to be fluent in, not days. Point-Free's documentation and tutorials are free; much of the deeper explanation lives in their paid video series. Factor that into hiring and onboarding.
+- **A big dependency, and its versions.** TCA's 0.x releases, the reducer protocol, the move to Observation in 1.7 and now the 2.0 beta have each asked large codebases for real migration work. Point-Free makes these gradual (1.25's opt-in deprecation traits exist so teams can prepare for 2.0 at their own pace), but an app built entirely on one library inherits its roadmap.
+- **Interop.** TCA works with UIKit and with features written in other styles, and you can adopt it one feature at a time inside an MVVM app. The seams between the two styles still need care: who owns shared state, how a TCA feature reports to a coordinator, how dependencies reach both.
+
+The other side of the ledger is real, too: one way to build every feature, state changes you can read in a log, dependencies that are explicit and swappable, navigation that's testable state, and tests that catch the change you didn't mean to make.
+
+## Trade-offs
+
+| Situation | Lean towards | Why |
+| --- | --- | --- |
+| A small app, one to three developers | `@Observable` view models, with a reducer inside the one or two complex ones | The ceremony would cost more than the bugs it prevents |
+| A mostly MVVM app with one intricate feature (an editor, a checkout, a live session) | A homemade reducer store, or TCA, for that feature only | Contain the complexity where it lives |
+| A large SwiftUI app with several teams that want one consistent style | TCA, with features in modules | Consistency, composition and exhaustive tests across teams |
+| An app built alongside an Android team that uses MVI | MVI-style view models with one view state | Shared shapes and vocabulary in design reviews |
+| An existing ReSwift or ReactorKit app | Keep it consistent, migrate feature by feature if at all | A rewrite costs more than the pattern's flaws |
+| Real-time UI: drawing, games, audio scrubbing, live video effects | Plain mutable state on the hot path, unidirectional flow around it | 120 Hz updates shouldn't go through a reducer tree |
+
+<Callout kind="interview">
+
+**Say** "Unidirectional flow costs a little per action and a lot per high-frequency action: every action runs from the root and can invalidate many views. I keep gesture and scroll state local, throttle streams at the source, scope stores so views observe narrowly, and move heavy work into effects, then measure with Instruments. The bigger costs are ergonomic: indirection, boilerplate, onboarding and depending on one library's roadmap." Then give a recommendation tied to the team and app, as in the table above. **Ask** how many developers will work in it and how often features interact, since those decide whether the ceremony pays. **Red flags:** "TCA is slow" with no measurement, scroll offsets in a global store, and adopting an architecture because it's fashionable rather than because of a problem it solves.
+
+</Callout>
+
+<Callout kind="gotcha" title="iOS gotcha: a scroll offset in the store">
+
+`onScrollGeometryChange` or a `GeometryReader` that sends the offset to the store on every frame turns scrolling into 120 actions a second, each re-evaluating whatever reads that field. Keep the offset in the view, and send an action only when a threshold is crossed: "header collapsed", "near the end of the list".
+
+</Callout>
+
+<Callout kind="gotcha" title="Swift gotcha: derived values that walk the whole state">
+
+A computed property such as `rows.filter(\.isFinished).count`, read by a header and by every row's badge, recomputes over all rows for each view that reads it, every time any row changes. With 20 rows, nobody notices; with 2,000 rows and a progress action every second, it shows up in the Time Profiler. Read it in one place, or maintain the count in the reducer when profiling says you must.
+
+</Callout>
+
+## Practice
+
+- **[Review: one reducer for the whole app](/design/practice/sd-review-unidirectional-app-reducer)**: among its problems is a scroll position sent through an app-wide store. Weigh the performance findings against the correctness ones.
+- **[A unidirectional onboarding with async validation](/design/practice/sd-design-unidirectional-onboarding)**: the trade-offs section asks you to defend TCA against a homemade store for one flow, with the costs from this lesson on the table.
+
+```cards
+- id: action-cost
+  front: "What does one action cost in a TCA-style tree?"
+  back: "Running from the root down the matching path of reducers, then re-evaluating every view that read a field that changed. Usually microseconds; significant at high frequency, mostly because of view re-evaluation."
+- id: hot-path
+  front: "How do you keep high-frequency updates fast in a unidirectional app?"
+  back: "Keep gesture and scroll state local, throttle streams at the source, scope stores so views observe narrowly, and move heavy work from reducers into effects. Then measure."
+- id: ergonomic-costs
+  front: "What are the ergonomic costs of a library like TCA?"
+  back: "Indirection (finding what an action does), ceremony (actions, delegates, clients), a learning curve measured in weeks, and depending on one library's major versions and roadmap."
+- id: frame-budget
+  front: "What's the frame budget at 60 Hz and at 120 Hz?"
+  back: "About 16.7 ms and 8.3 ms. Main-actor work from actions competes with rendering inside that budget."
+```
+
+```quiz
+- id: q1
+  type: estimate
+  prompt: "A drag gesture sends 120 actions a second. Each action costs 0.1 ms in reducers and re-evaluates 40 views at 0.06 ms each. Roughly what percentage of the main thread's time does the gesture take?"
+  answer: 30
+  unit: percent
+  within: { factor: 1.5 }
+  explain: "Per action: 0.1 + 40 × 0.06 = 2.5 ms. 120 × 2.5 ms = 300 ms of every second, about 30%, and almost all of it is view re-evaluation. Narrowing observation helps far more than faster reducers."
+- id: q2
+  type: sort
+  prompt: "Where should each value live in a TCA screen for a kanban board?"
+  buckets: [The view's own state, A throttled action, An ordinary action]
+  items:
+    - [A card's offset while it's being dragged, 0]
+    - [The column a card is dropped on, 2]
+    - [Upload progress of a card's attachment, 1]
+    - [The board's scroll position, 0]
+    - [Whether a card was archived, 2]
+  explain: "Live gesture and scroll values stay local. Meaningful outcomes are ordinary actions. Streams the store must show, like progress, are sent at a rate the eye needs, not the rate they're produced."
+- id: q3
+  type: mcq
+  prompt: "A team reports their TCA list screen stutters when one row's download progress updates. What should they look at first?"
+  options:
+    - "Rewriting the screen in UIKit"
+    - "Whether the progress action re-evaluates every row, for example because rows read the whole array or a computed property over it, and how often progress is sent"
+    - "Removing `@ObservableState`"
+    - "Switching from Swift Testing to XCTest"
+  answer: 1
+  explain: "The usual culprits are wide observation and update frequency. Scoped row stores make one row's change re-render one row, and throttling progress at the source cuts the rate. Measure with Instruments to confirm."
+- id: q4
+  type: multi
+  prompt: "Which are real costs of adopting TCA across a large app? Choose all that apply."
+  options:
+    - "Finding what an action does means reading the reducer and following delegate actions"
+    - "Major versions have required significant migrations"
+    - "Reducers can't be unit tested"
+    - "New developers need time to learn case paths, scoping and effect lifetimes"
+    - "Large action enums and composed bodies can slow the type checker"
+  answer: [0, 1, 3, 4]
+  explain: "Indirection, migrations, onboarding and compile time are all real. Testability is the opposite: it's TCA's strongest point."
+- id: q5
+  type: truefalse
+  prompt: "Migrating a pre-1.7 TCA screen from `WithViewStore` to `@ObservableState` can improve its runtime performance."
+  answer: true
+  explain: "`ViewStore` compared whole observed states with `==` after every action and re-rendered when they differed. `@ObservableState` tracks the fields each view reads, so fewer views re-evaluate, and no big comparisons run."
+- id: q6
+  type: recall
+  prompt: "A startup with four iOS developers asks whether to build their whole app in TCA. What do you recommend, and why?"
+  model: "Probably not everywhere. With four developers, the consistency benefit is small and the ceremony, onboarding and dependency costs are real. I'd use `@Observable` view models by default, put a reducer (homemade or TCA) inside the few features with tricky async interactions, and revisit if the team grows or features start interacting heavily. If the team already knows TCA well, adopting it broadly is more reasonable."
+```

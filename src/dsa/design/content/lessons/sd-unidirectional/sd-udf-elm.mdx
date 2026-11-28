@@ -1,0 +1,385 @@
+## Why it matters
+
+Redux borrowed from it, TCA descends from it, and SwiftUI's "a view is a function of state" echoes it: the **Elm architecture** is unidirectional flow in its purest form, in a language that enforces every rule. Studying it shows you which parts of the pattern are essential and which are Swift workarounds. It also brings one idea the Redux world never had, **subscriptions as a function of state**, which removes a whole family of "forgot to stop the timer" bugs and maps neatly onto SwiftUI's `.task(id:)`. In interviews it comes up as "MVU" (model, view, update), usually in "how does MVU differ from MVVM?"
+
+## Model, view, update
+
+Elm is a small, purely functional language for web apps, created by Evan Czaplicki in 2012. Its programs settled into one shape, which the community named **The Elm Architecture** and which Elm 0.17 (2016) made the only shape. A program is four values:
+
+- **`init`**: the first `Model`, and any work to start with.
+- **`update : Msg -> Model -> (Model, Cmd Msg)`**: given a message and the model, return the next model *and* a command.
+- **`view : Model -> Html Msg`**: turn the model into a description of the UI, whose event handlers produce messages.
+- **`subscriptions : Model -> Sub Msg`**: what the program wants to listen to (time, keyboard, sockets) given the current model.
+
+Here's a search box:
+
+```elm
+type alias Model =
+    { query : String, results : List String, loading : Bool }
+
+type Msg
+    = QueryChanged String
+    | GotResults (Result Http.Error (List String))
+
+update : Msg -> Model -> ( Model, Cmd Msg )
+update msg model =
+    case msg of
+        QueryChanged query ->
+            ( { model | query = query, loading = True }
+            , Http.get
+                { url = "/search?q=" ++ query
+                , expect = Http.expectJson GotResults resultsDecoder
+                }
+            )
+
+        GotResults (Ok results) ->
+            ( { model | results = results, loading = False }, Cmd.none )
+
+        GotResults (Err _) ->
+            ( { model | loading = False }, Cmd.none )
+
+view : Model -> Html Msg
+view model =
+    div []
+        [ input [ value model.query, onInput QueryChanged ] []
+        , ul [] (List.map (\result -> li [] [ text result ]) model.results)
+        ]
+```
+
+Read it as a Swift developer and three things stand out.
+
+- **`update` can't perform anything.** Elm has no function that makes an HTTP request *now*. `Http.get` returns a `Cmd`, a description of a request, and the only thing you can do with it is hand it back to the runtime. Purity isn't a convention; the language gives you no way around it.
+- **`view` can't change anything.** `onInput QueryChanged` doesn't run code when the user types: it says "when this input changes, send a `QueryChanged` message with the text". The view is data that produces messages.
+- **The runtime owns the loop.** It holds the model, calls `update` for each message, performs commands, calls `view` and patches the screen. Your code is three pure functions and some types.
+
+Because every piece of state is immutable, every function is pure and every `case` must be handled, Elm famously produces no runtime exceptions in practice. That isn't magic: it's the same set of rules you've been adopting by convention in Swift, enforced by the compiler.
+
+```visual flow
+title: The Elm loop
+nodes:
+  - { id: view, label: view, kind: view, at: [0, 0] }
+  - { id: update, label: update, at: [2, 0] }
+  - { id: model, label: Model, kind: store, at: [4, 0] }
+  - { id: runtime, label: Runtime, kind: external, at: [2, 2] }
+  - { id: world, label: "HTTP, time, ports", kind: external, at: [4, 2] }
+edges:
+  - [view, update, Msg]
+  - [update, model, new model]
+  - [model, view, render, { style: data }]
+  - [update, runtime, Cmd]
+  - [runtime, world, perform, { style: async }]
+  - [world, runtime, result]
+  - [runtime, update, Msg]
+steps:
+  - say: "The user types. The **view** doesn't run any code of yours: it turns the event into a value, `QueryChanged \"du\"`."
+    show: [view, update]
+    send: view->update
+  - say: "`update` returns the next **model** with `loading = True`..."
+    show: [model]
+    send: update->model
+  - say: "...and a **command**: a value that *describes* an HTTP request. `update` can't make the request itself; Elm gives it no way to."
+    show: [runtime]
+    send: update->runtime
+  - say: "The **runtime** performs the command. This is the only place in an Elm program where anything touches the outside world."
+    show: [world]
+    send: runtime->world
+    state: { runtime: wait }
+  - say: "The answer comes back, and the runtime wraps it in the message the command named: `GotResults (Ok [...])`."
+    send: [world->runtime, runtime->update]
+    state: { runtime: null }
+  - say: "`update` stores the results; the runtime calls `view` with the new model and patches the screen. One loop, one direction, and every step is a pure function or the runtime."
+    send: [update->model, model->view]
+    state: { model: ok }
+```
+
+## Subscriptions: effects as a function of state
+
+Commands are one-shot: do this once, tell me the result. Some effects are ongoing: a timer while a stopwatch runs, location updates while a run is being recorded, a socket while a chat is open. Most architectures start and stop those imperatively, and the bug is always the same: something started them and nothing stopped them.
+
+Elm handles them declaratively. After every update, the runtime calls `subscriptions model`, which says what the program *wants* to be listening to right now:
+
+```elm
+subscriptions : Model -> Sub Msg
+subscriptions model =
+    if model.isRunning then
+        Time.every 1000 Tick
+    else
+        Sub.none
+```
+
+The runtime compares the answer with what's already running, starts what's new and stops what's gone. You never write "start the timer" or "stop the timer"; you write the rule, and the runtime keeps reality in step with it. Here's the whole architecture in Swift, with a runtime that does that diffing:
+
+```swift run title="Model, update, view and subscriptions, run by a tiny runtime"
+struct Model: Equatable {
+    var isRunning = false
+    var elapsed = 0
+    var laps: [Int] = []
+}
+
+enum Msg {
+    case startTapped, pauseTapped, lapTapped, tick
+}
+
+/// A description of one-shot work. The runtime performs it.
+enum Cmd: Equatable {
+    case none
+    case haptic(String)
+}
+
+/// What the program wants to listen to. The runtime starts and stops it.
+enum Sub: Hashable {
+    case everySecond
+}
+
+func update(_ msg: Msg, _ model: Model) -> (Model, Cmd) {
+    var model = model
+    switch msg {
+    case .startTapped:
+        model.isRunning = true
+        return (model, .haptic("start"))
+    case .pauseTapped:
+        model.isRunning = false
+        return (model, .none)
+    case .lapTapped:
+        guard model.isRunning else { return (model, .none) }
+        model.laps.append(model.elapsed)
+        return (model, .haptic("lap"))
+    case .tick:
+        model.elapsed += 1
+        return (model, .none)
+    }
+}
+
+func view(_ model: Model) -> String {
+    "\(model.isRunning ? "running" : "paused"), \(model.elapsed)s, laps \(model.laps)"
+}
+
+func subscriptions(_ model: Model) -> Set<Sub> {
+    model.isRunning ? [.everySecond] : []
+}
+
+/// Owns the model, performs commands, and keeps subscriptions in step with the model
+final class Runtime {
+    private(set) var model = Model()
+    private var active: Set<Sub> = []
+
+    func send(_ msg: Msg) {
+        print(msg)
+        let (next, cmd) = update(msg, model)
+        model = next
+        if case .haptic(let style) = cmd { print("  perform haptic: \(style)") }
+        let wanted = subscriptions(model)
+        for sub in wanted.subtracting(active) { print("  start \(sub)") }
+        for sub in active.subtracting(wanted) { print("  stop \(sub)") }
+        active = wanted
+        print("  view: \(view(model))")
+    }
+
+    /// Stands in for real time: an active timer fires once a second
+    func advance(seconds: Int) {
+        for _ in 0..<seconds where active.contains(.everySecond) {
+            send(.tick)
+        }
+    }
+}
+
+let runtime = Runtime()
+runtime.send(.startTapped)
+runtime.advance(seconds: 2)
+runtime.send(.lapTapped)
+runtime.send(.pauseTapped)
+runtime.advance(seconds: 3)
+runtime.send(.lapTapped)
+```
+
+```output
+startTapped
+  perform haptic: start
+  start everySecond
+  view: running, 0s, laps []
+tick
+  view: running, 1s, laps []
+tick
+  view: running, 2s, laps []
+lapTapped
+  perform haptic: lap
+  view: running, 2s, laps [2]
+pauseTapped
+  stop everySecond
+  view: paused, 2s, laps [2]
+lapTapped
+  view: paused, 2s, laps [2]
+```
+
+Nothing in `update` starts or stops the timer. Pausing changes `isRunning`, `subscriptions` stops asking for `everySecond`, and the runtime stops it; three seconds pass with no ticks. Add a "reset" message or a second way to pause, and the timer still can't leak, because there's no stop call to forget.
+
+## SwiftUI's version: `.task(id:)`
+
+SwiftUI has a small, practical form of the same idea. `.task(id:)` runs an async closure while the view is on screen, **cancels and restarts it whenever `id` changes**, and cancels it when the view goes away. Give it the piece of state the work depends on, and the work follows the state:
+
+```swift check ios title="A subscription keyed by state, with .task(id:)"
+import SwiftUI
+
+@MainActor
+@Observable
+final class StopwatchModel {
+    enum Msg {
+        case startTapped, pauseTapped, tick
+    }
+
+    private(set) var isRunning = false
+    private(set) var elapsed = 0
+
+    func send(_ msg: Msg) {
+        switch msg {
+        case .startTapped: isRunning = true
+        case .pauseTapped: isRunning = false
+        case .tick: elapsed += 1
+        }
+    }
+}
+
+struct StopwatchView: View {
+    let model: StopwatchModel
+
+    var body: some View {
+        VStack(spacing: 16) {
+            Text(Duration.seconds(model.elapsed), format: .time(pattern: .minuteSecond))
+                .font(.largeTitle.monospacedDigit())
+            Button(model.isRunning ? "Pause" : "Start") {
+                model.send(model.isRunning ? .pauseTapped : .startTapped)
+            }
+        }
+        // Like Elm's subscriptions: the timer exists exactly while `isRunning` is true
+        .task(id: model.isRunning) {
+            guard model.isRunning else { return }
+            while !Task.isCancelled {
+                try? await Task.sleep(for: .seconds(1))
+                guard !Task.isCancelled else { return }
+                model.send(.tick)
+            }
+        }
+    }
+}
+```
+
+The view never calls "start timer". When `isRunning` flips, SwiftUI cancels the old task and starts a new one, which returns at once if the stopwatch is paused. The same shape works for location: run `for try await update in CLLocationUpdate.liveUpdates()` inside a `.task(id: isRecording)`, and recording can't keep the GPS on after it stops.
+
+It's narrower than Elm's subscriptions. The work is tied to one view's lifetime, not the feature's, and the "diff" is a single id. For work that must continue while the view is off screen, the feature's store has to own it as a long-running effect with an id, as you saw in [Middleware and effects](/design/learn/sd-udf-effects).
+
+## Composing programs: where Elm gets verbose
+
+A real app has many screens, each with its own model, messages and update. Elm composes them by hand. The parent's `Msg` wraps each child's (`SearchMsg Search.Msg`), the parent's `update` unwraps it, calls the child's `update`, stores the child's new model, and wraps the child's command so its results come back wrapped too:
+
+```elm
+update msg model =
+    case msg of
+        SearchMsg childMsg ->
+            let
+                ( search, cmd ) =
+                    Search.update childMsg model.search
+            in
+            ( { model | search = search }, Cmd.map SearchMsg cmd )
+```
+
+`view` does the same with `Html.map SearchMsg`. Every level of nesting repeats this wrapping for models, messages, commands and views. Elm's own guidance is to resist splitting into "components" until a module really needs it, partly because of this cost. Remember the shape: unwrap the child's message, run the child on its slice, re-wrap the child's effects. It's exactly what TCA's `Scope` automates with key paths and case paths, as you'll see in [TCA: composing and scoping features](/design/learn/sd-udf-tca-scoping).
+
+## What carries over to Swift, and what doesn't
+
+| Elm idea | In Swift | The gap |
+| --- | --- | --- |
+| `update` is pure | A reducer taking `inout` state | Nothing stops a Swift reducer calling `URLSession` or `Date()`; it's discipline or a library |
+| `Cmd`: effects as values | An `Effect` enum or closure returned by the reducer | You must write the runtime that performs them, or adopt one |
+| `Sub`: subscriptions from state | `.task(id:)`, or a long-running effect with an id | No built-in diffing beyond a single id |
+| `view : Model -> Html Msg` | A SwiftUI `body` over observable state | SwiftUI views keep local `@State` too, so state isn't all in one model |
+| Immutable values everywhere | Structs and enums | Classes exist, and a class in the state breaks replay |
+| Exhaustive `case` | Exhaustive `switch` | The same |
+
+Swift won't enforce the rules, so the job of an architecture library on iOS is to make the right thing easy: a runtime for effects, a way to control dependencies, and tooling that tells you when a reducer has done something it shouldn't.
+
+## Trade-offs
+
+| | Elm itself | The Elm architecture in Swift, by convention | MVVM with `@Observable` |
+| --- | --- | --- | --- |
+| Purity | Enforced by the language | Reviewed, not enforced | Not a goal |
+| Effects | Commands performed by the runtime | Returned by reducers, run by your store | Called directly from methods |
+| Ongoing work | `subscriptions`, diffed by the runtime | `.task(id:)` or effects with ids | Tasks started and cancelled by hand |
+| Composition | Manual wrapping at every level | Manual, or a library such as TCA | Child view models owned by parents |
+| Testing | Pure functions; commands as values | Reducer tests; effects need injected dependencies | View model tests with mocks |
+| Learning curve | A new language | A new discipline | Familiar to most iOS developers |
+| Wins when | You can choose the language | Features whose events interact in tricky ways | Most screens, most teams |
+
+<Callout kind="interview">
+
+**Say** "MVU, the Elm architecture, is a model, a pure `update` that returns the next model plus commands as data, and a `view` that's a function of the model. The runtime performs commands and feeds results back as messages, and subscriptions are declared from the model, so ongoing work starts and stops with the state." Contrast with MVVM: "a view model changes its own properties and calls services directly; MVU routes every change through one function." **Ask** whether the team wants that rigour everywhere or only in complex features. **Red flags:** "SwiftUI is already MVU, so we need no architecture" (its local `@State` and direct mutation say otherwise), and timers or observers started in `onAppear` with no matching stop.
+
+</Callout>
+
+<Callout kind="gotcha" title="iOS gotcha: .task(id:) restarts on every change of its id">
+
+Pass `id: model` or another large value that changes often, and SwiftUI cancels and restarts the task on every change: a location stream restarts on every keystroke elsewhere in the model. Key the task on exactly the state the work depends on, such as `isRecording` or the selected item's id.
+
+</Callout>
+
+## Practice
+
+**[Effects the store runs, cancellable by id](/design/practice/sd-kata-unidirectional-cancellable-effects)** builds the runtime half of this lesson: something that takes the effect values a reducer returns, performs them, feeds their actions back, and stops long-running ones (a timer, here) when asked. It's Elm's runtime, in Swift, with ids where Elm has subscription diffing.
+
+```cards
+- id: tea-four
+  front: "What are the four parts of an Elm program?"
+  back: "`init` (the first model and commands), `update` (message and model in, new model and command out), `view` (model to UI that produces messages) and `subscriptions` (what to listen to, given the model)."
+- id: cmd-is-data
+  front: "Why can't an Elm `update` make an HTTP request?"
+  back: "The language has no function that performs effects. `Http.get` returns a `Cmd`, a description of the request, which `update` returns for the runtime to perform."
+- id: subs-from-state
+  front: "What does declaring subscriptions as a function of the model buy you?"
+  back: "Ongoing work (timers, location, sockets) starts and stops with the state. The runtime diffs what's wanted against what's running, so there's no stop call to forget."
+- id: task-id
+  front: "What's SwiftUI's nearest equivalent to an Elm subscription?"
+  back: "`.task(id:)`: it runs while the view is visible, restarts when `id` changes and is cancelled when the view goes away. Key it on the state the work depends on."
+```
+
+```quiz
+- id: q1
+  type: mcq
+  prompt: "In the Elm search box, the user types quickly and two `GotResults` messages arrive out of order. What does the code shown do?"
+  options:
+    - "Elm's runtime drops the older response automatically"
+    - "The older results can overwrite the newer ones, because `GotResults` doesn't say which query it answers"
+    - "It can't happen, because Elm is single-threaded"
+    - "The compiler rejects the program"
+  answer: 1
+  explain: "Purity doesn't fix logic. Each keystroke starts a request, and whichever answer arrives last wins. Carry the query in the message (`GotResults query result`) and ignore stale ones, or cancel the old request, as effects with ids do."
+- id: q2
+  type: sort
+  prompt: "In the Elm architecture, who does each job?"
+  buckets: [update, view, subscriptions, The runtime]
+  items:
+    - [Decide the next model when a message arrives, 0]
+    - [Describe a request to make, 0]
+    - [Turn a tap into a message, 1]
+    - [Say that a timer is wanted while recording, 2]
+    - [Actually send the HTTP request, 3]
+    - [Stop the timer when recording ends, 3]
+  explain: "Your code only describes: update decides and describes commands, view describes UI and messages, subscriptions describe ongoing interest. The runtime does everything that touches the world, including starting and stopping."
+- id: q3
+  type: multi
+  prompt: "A SwiftUI run-tracking screen streams location in `.task(id: isRecording)`. Which statements are true? Choose all that apply."
+  options:
+    - "Setting `isRecording` to false cancels the stream's task"
+    - "The stream keeps running after the user navigates away from the screen"
+    - "Changing the run's title restarts the stream"
+    - "The task needs to check `isRecording` and return early when it's false"
+  answer: [0, 3]
+  explain: "`.task(id:)` restarts when its id changes and is cancelled when the view disappears, so the stream follows `isRecording` and the view's lifetime. Other state changes don't restart it. The restarted task runs for `false` too, so it returns early."
+- id: q4
+  type: truefalse
+  prompt: "Because SwiftUI views are functions of state, a SwiftUI app follows the Elm architecture without any extra design."
+  answer: false
+  explain: "SwiftUI renders from state, but state is spread across `@State`, bindings and observable models, which any code can mutate directly, and effects run wherever you call them. MVU is a discipline you add: one owner, changes through one update function, effects as values."
+- id: q5
+  type: recall
+  prompt: "Why does nesting Elm programs need so much code, and what would a library have to provide to remove it?"
+  model: "Each level must wrap the child's messages in its own, unwrap them in update, run the child's update on its slice of the model, store the result, and map the child's commands and view back into the parent's message type. A library removes it by doing that routing generically: a way to focus on a child's state (key paths) and to extract and embed its actions (case paths), plus a runtime that maps child effects automatically."
+```

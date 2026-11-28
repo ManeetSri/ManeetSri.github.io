@@ -1,0 +1,278 @@
+## Why it matters
+
+A crash is the one failure you can't handle in code: by definition the process is gone. All you can do is make sure that, when it happens, you find out, and that the report tells you enough to fix it. That takes three things working together: something that records the crash despite the process dying, **symbolication** to turn raw addresses back into your function names and line numbers, and **breadcrumbs** that say what the app was doing beforehand. "Design a crash reporter" is a classic mobile system design question, and every senior iOS engineer is expected to read a crash report.
+
+## What a crash looks like on iOS
+
+When a process does something it can't recover from, the kernel raises a **Mach exception**, which becomes a Unix **signal**, and the process is terminated. The report's exception type is the first clue:
+
+| Exception type (signal) | Usually means |
+| --- | --- |
+| `EXC_BREAKPOINT` (`SIGTRAP`) | A Swift runtime trap: force-unwrapping `nil`, an index out of range, integer overflow, a failed `as!` or `try!`, `precondition` or `fatalError`. The [programmer errors lesson](/design/learn/sd-diag-programmer-errors) put these there on purpose. |
+| `EXC_BAD_ACCESS` (`SIGSEGV`, `SIGBUS`) | Touching memory the process doesn't own: a dangling unsafe pointer, a use-after-free in C or Objective-C, memory corrupted by a data race |
+| `EXC_CRASH` (`SIGABRT`) | The process called `abort()`, most often for an uncaught Objective-C exception such as "unrecognized selector" or a table view's "invalid number of rows" |
+| `EXC_CRASH` (`SIGKILL`), code `0x8badf00d` | The **watchdog**: the main thread didn't respond in time during launch, resume or a background task |
+| `EXC_CRASH` (`SIGKILL`), code `0xdead10cc` | Suspended while holding a file lock or a SQLite database lock in a shared container |
+| `EXC_RESOURCE` | Exceeded a CPU, memory or wake-up limit; sometimes only reported, not fatal |
+| No crash report at all | **Jetsam**: terminated for memory. iOS writes a separate jetsam event report, and MetricKit counts these exits |
+
+The last three rows matter for design. `SIGKILL` can't be caught by any code in the process, so an in-process reporter never sees watchdog kills or jetsam. You learn about those only from Apple's reports and MetricKit, or by inference, as you'll see below.
+
+## Three ways reports reach you
+
+**Apple's crash logs.** When users agree to share analytics with developers, iOS sends crash reports to Apple. Xcode's Organizer downloads them, groups them, and symbolicates them using the archives on your Mac. TestFlight builds report the same way. They're free and need no code, but they arrive with a delay, cover only users who opted in, and carry no context of your own.
+
+**MetricKit diagnostics.** On the launch after a crash, MetricKit delivers an `MXDiagnosticPayload` to your app (immediately since iOS 15). It holds `MXCrashDiagnostic`s with the exception type, signal, termination reason and, since iOS 17, the Objective-C exception's name and message, plus a call stack tree of binary UUIDs and offsets. Hang, CPU, disk-write and launch diagnostics arrive the same way. The stacks aren't symbolicated: you upload the payload and symbolicate it on your side.
+
+```swift check ios title="DiagnosticsSubscriber.swift"
+import MetricKit
+
+final class DiagnosticsSubscriber: NSObject, MXMetricManagerSubscriber {
+    private let upload: @Sendable (Data) -> Void
+
+    init(upload: @escaping @Sendable (Data) -> Void) {
+        self.upload = upload
+        super.init()
+        MXMetricManager.shared.add(self)
+    }
+
+    // Called on a background queue, on the launch after a crash or hang
+    nonisolated func didReceive(_ payloads: [MXDiagnosticPayload]) {
+        for payload in payloads {
+            for crash in payload.crashDiagnostics ?? [] {
+                // Enough to group before symbolication: build, exception, signal, reason
+                let build = crash.metaData.applicationBuildVersion
+                let signal = crash.signal?.intValue ?? 0
+                let reason = crash.exceptionReason?.composedMessage ?? crash.terminationReason ?? ""
+                _ = (build, signal, reason)
+            }
+            // The whole payload, call stacks included, goes to the backend to be symbolicated
+            upload(payload.jsonRepresentation())
+        }
+    }
+}
+```
+
+**An in-process crash reporter.** Crashlytics, Sentry and others built on libraries like PLCrashReporter or KSCrash install exception and signal handlers at launch. When the app crashes, the handler writes a report to disk; on the next launch, the SDK uploads it with breadcrumbs and metadata, and the service symbolicates it with dSYMs you uploaded. They give the richest reports, but writing one is harder than it looks.
+
+### Writing a report from a dying process
+
+Step through what an in-process reporter does:
+
+```visual sequence
+title: A crash, reported on the next launch
+participants:
+  - { id: app, label: App }
+  - { id: handler, label: Crash handler }
+  - { id: disk, label: Disk }
+  - { id: next, label: Next launch }
+  - { id: server, label: Crash service }
+messages:
+  - [app, handler, install handlers, { say: "At launch, the SDK installs Mach exception and signal handlers, and **pre-allocates** the memory and file it will need." }]
+  - [app, app, "nil!  → brk", { say: "Much later, a force unwrap of `nil` executes a trap instruction: `EXC_BREAKPOINT`." }]
+  - [app, handler, SIGTRAP, { say: "The handler runs on the crashing process's own terms: the heap may be corrupt, other threads may hold locks." }]
+  - { note: "no malloc, no locks, no Swift or Objective-C runtime", over: handler }
+  - [handler, disk, raw report, { say: "So it only does **async-signal-safe** work: walk each thread's stack and write raw addresses and register values to the pre-opened file." }]
+  - [handler, app, re-raise, { reply: true, say: "It hands the signal back, so the system's own crash report is still written, and the process dies." }]
+  - [next, disk, read report + crumbs, { say: "On the next launch, before anything else can crash, the SDK reads the report and the breadcrumbs saved before the crash." }]
+  - [next, server, upload, { async: true, say: "It uploads them in the background, with the build's **UUID**." }]
+  - [server, server, symbolicate + group, { say: "The service finds the dSYM with that UUID, turns addresses into functions and lines, and groups the crash with others that have the same top frames." }]
+```
+
+The constraints at crash time drive the whole design:
+
+- **Only async-signal-safe operations.** No `malloc`, no locks, no Objective-C messaging, no Swift runtime, no `JSONEncoder`. Everything the handler needs must exist before the crash.
+- **One owner of the handlers.** Two crash SDKs installing signal handlers fight over them, and one usually loses its reports. Pick one.
+- **Some deaths are invisible.** `SIGKILL` runs no handler. SDKs infer the rest: if the last session didn't end cleanly, wrote no crash report, wasn't upgraded or killed by the user, and was in the foreground, it was probably a jetsam or watchdog termination. Treat those numbers as estimates.
+- **Upload early, but carefully.** If the app crashes at launch, it can crash again before the upload finishes. Reporters upload first thing, and some send a launch crash synchronously for a moment before continuing.
+
+## Symbolication: from addresses to lines
+
+A raw frame says almost nothing to a person:
+
+```text
+3   Shop     0x0000000104c3d2a4 0x104c34000 + 37540
+```
+
+That's the binary's name, the address of the instruction, and the address where the binary was **loaded** in that launch. Because of address-space layout randomisation (ASLR), the load address differs every launch, so only the **offset** into the binary is meaningful. To name the function, you need the **dSYM**: the debug symbols the build produced, matched to the binary by its **build UUID**.
+
+```swift run
+import Foundation
+
+// One frame from a crash report: "Shop  0x0000000104c3d2a4 0x104c34000 + 37540"
+let loadAddress: UInt64 = 0x1_04c3_4000      // where ASLR put the app's binary in this launch
+let frameAddress: UInt64 = 0x1_04c3_d2a4     // the instruction that was running
+
+// In the binary as linked, an arm64 iOS app's code starts at 0x100000000. ASLR slides the whole image
+// by a random amount per launch, so only the offset from the load address is meaningful.
+let linkedTextStart: UInt64 = 0x1_0000_0000
+
+// A dSYM is matched to the build by UUID, then maps linked addresses to functions, files and lines.
+// Here, a tiny symbol table sorted by start address stands in for it.
+struct Symbol {
+    let start: UInt64
+    let name: String
+    let file: String
+}
+
+let symbols = [
+    Symbol(start: 0x1_0000_4000, name: "AppDelegate.application(_:didFinishLaunchingWithOptions:)", file: "AppDelegate.swift"),
+    Symbol(start: 0x1_0000_8a10, name: "CheckoutModel.applyDiscount(_:)", file: "CheckoutModel.swift"),
+    Symbol(start: 0x1_0000_9c40, name: "CheckoutModel.total.getter", file: "CheckoutModel.swift"),
+    Symbol(start: 0x1_0000_b200, name: "OrdersRepository.orders()", file: "OrdersRepository.swift"),
+]
+
+let offset = frameAddress - loadAddress
+let linkedAddress = linkedTextStart + offset
+print("offset: \(offset) bytes into the binary")
+print("linked address: 0x\(String(linkedAddress, radix: 16))")
+
+// The function containing an address is the last one that starts at or before it
+if let symbol = symbols.last(where: { $0.start <= linkedAddress }) {
+    print("\(symbol.name) + \(linkedAddress - symbol.start) (\(symbol.file))")
+}
+```
+
+```output
+offset: 37540 bytes into the binary
+linked address: 0x1000092a4
+CheckoutModel.applyDiscount(_:) + 2196 (CheckoutModel.swift)
+```
+
+Real tools do the same with the full DWARF data, which also has line numbers and the functions the optimiser **inlined** into others, so one address can expand into several frames. On a Mac, `atos` does it for a single address:
+
+```bash
+# Which build is this dSYM for? It must match the crash report's binary UUID
+dwarfdump --uuid Shop.app.dSYM
+
+# Symbolicate one address, given the load address from the report
+atos -arch arm64 -o Shop.app.dSYM/Contents/Resources/DWARF/Shop -l 0x104c34000 0x104c3d2a4
+```
+
+What this means for your build pipeline:
+
+- **Every build has a new UUID,** so you need the dSYM of *exactly* the build that crashed. Archive every build you distribute, including TestFlight builds.
+- **Upload dSYMs from CI,** to your crash service, as part of the release job. A missing dSYM is the most common reason a team stares at unreadable crashes during an incident. Since Xcode 14 dropped bitcode, the App Store no longer recompiles your app, so the dSYM from your own archive is the right one.
+- **Release builds need `DEBUG_INFORMATION_FORMAT = dwarf-with-dsym`,** for your frameworks and packages too. Binary SDKs from vendors should ship their own dSYMs.
+- **System frames** (UIKit, Foundation) are symbolicated with symbols for that exact iOS build. Xcode and crash services keep them; you rarely think about them until one is missing.
+
+## Breadcrumbs: how the app got there
+
+A symbolicated stack tells you **where** the app crashed. It rarely tells you **why**: `applyDiscount` crashed, but after what? **Breadcrumbs** are a short, structured trail of recent events attached to the report:
+
+- screens shown and the key actions taken on them ("checkout.apply_code tapped");
+- network calls with endpoint path, status and duration, but not bodies;
+- lifecycle changes: background, foreground, memory warnings, scene changes;
+- state machine transitions and feature-flag or remote-config versions;
+- handled errors, by kind.
+
+Their design is a small systems problem of its own:
+
+- **A ring buffer with a budget.** Keep the last N crumbs and at most a fixed number of bytes; the oldest go first. Services cap them too: Sentry keeps 100 breadcrumbs by default, and Crashlytics keeps the last 64 KB of custom logs per session.
+- **Persisted before the crash, not at it.** The crash handler can't encode anything, so the trail must already be on disk. Options: write the buffer through on every crumb (simple, more I/O), batch writes and flush important crumbs at once, or keep it in a memory-mapped file, whose pages the kernel writes out even if the process dies.
+- **Read back on the next launch** and attached to the uploaded report, then cleared, so one session's crumbs never decorate another's crash.
+- **Redacted like logs.** Crumbs leave the device, so the field rules of [structured logging](/design/learn/sd-diag-structured-logging) apply: no names, emails, tokens or free text.
+- **Metadata alongside:** app version and build, OS, device model, free disk and memory, locale, and a hashed user or installation id if support needs to find a user's crashes.
+
+## Non-fatals and the numbers that matter
+
+The same pipeline can report **handled** errors: the bug-kind failures from the taxonomy and the `reportBug` helper. They're grouped by error domain and code, which is why the propagation lesson insisted on stable codes. Rate-limit them per session; services do too, and one loop reporting the same error can drown everything else.
+
+Two headline numbers summarise stability, and both matter:
+
+- **Crash-free sessions:** the share of sessions that didn't crash. It's how often the app fails people.
+- **Crash-free users:** the share of users who didn't crash at all in the period. It's how many people are affected. A crash that many users hit once, such as a data migration that fails on the first launch after an update, barely moves the first number and badly hurts the second.
+
+Track both per release, so a new build can be compared with the last one as it rolls out, which the next lesson relies on.
+
+## Trade-offs
+
+| Source | Setup | Context | Catches watchdog and jetsam | Delay | When it wins |
+| --- | --- | --- | --- | --- | --- |
+| Xcode Organizer (Apple's crash logs) | None | None of your own | Yes, as terminations | Hours to days | Every app, as the baseline |
+| MetricKit diagnostics | A subscriber and an upload endpoint | Little: what's in the payload | Hangs and exits, yes | Next launch | Apps that want Apple's data in their own pipeline |
+| In-process SDK (Crashlytics, Sentry…) | An SDK, dSYM uploads | Breadcrumbs, metadata, non-fatals | Only by inference | Next launch, minutes | Most production apps |
+| A crash reporter you build | Months of hard, signal-safe code | Whatever you design | By inference | Your choice | Almost never: only with a team that owns it |
+
+Most apps run one in-process SDK, watch Organizer as a cross-check, and subscribe to MetricKit for hangs and the exits an in-process reporter can't see.
+
+<Callout kind="interview">
+
+**Say:** "One in-process reporter, installed first at launch, writing signal-safe reports and uploading them on the next launch with breadcrumbs: a capped ring buffer persisted as it fills, redacted like our logs. dSYMs uploaded from CI for every build. MetricKit for hangs and the watchdog and jetsam exits no in-process handler can see. We track crash-free users and sessions per release."
+
+**Ask:** do we keep every build's dSYM? What's in our breadcrumbs, and has anyone checked them for personal data? How do we learn about memory terminations?
+
+**Red flags:** two crash SDKs at once; formatting JSON in a signal handler; "we'll symbolicate when we need to" with no dSYMs archived; breadcrumbs containing request bodies; and no plan for crashes that happen before the reporter is set up.
+
+</Callout>
+
+<Callout kind="gotcha" title="iOS gotcha: the crash before the reporter starts">
+
+A crash in a static initialiser, in `application(_:didFinishLaunchingWithOptions:)` before the SDK is configured, or in a framework that loads first is never seen by an in-process reporter. Configure the crash SDK as the very first thing at launch, keep launch code before it trivial, and rely on Organizer and MetricKit to catch the rest.
+
+</Callout>
+
+## Practice
+
+The **breadcrumb trail** kata builds the ring buffer: a count and byte budget, oversized messages trimmed, important crumbs persisted at once and the rest in batches through an injected store, and the previous session's trail read back once after a crash. The **diagnostics pipeline** design exercise puts it into a whole system.
+
+```cards
+- id: exception-types
+  front: "What does EXC_BREAKPOINT (SIGTRAP) in an iOS crash report usually mean?"
+  back: "A Swift runtime trap: force-unwrapping nil, an index out of range, overflow, a failed `as!` or `try!`, or a `precondition` or `fatalError`."
+- id: sigkill-invisible
+  front: "Why can't an in-process crash reporter record watchdog or jetsam terminations?"
+  back: "They're SIGKILL, which runs no handler in the process. Apple's reports and MetricKit see them; SDKs can only infer them from a session that didn't end cleanly."
+- id: dsym-uuid
+  front: "How is a crash matched to the right debug symbols?"
+  back: "By the binary's build UUID: each build has a new one, and the dSYM with the same UUID maps offsets (address minus load address) to functions and lines. Archive and upload every distributed build's dSYM."
+- id: breadcrumbs-persist
+  front: "Why must breadcrumbs be persisted before the crash rather than at it?"
+  back: "A crash handler may only do async-signal-safe work, so it can't encode or write a buffer. The trail must already be on disk (written through, batched, or memory-mapped) to be read on the next launch."
+```
+
+```quiz
+- id: q1
+  type: sort
+  prompt: "Which exception type would you expect in each report?"
+  buckets: ["EXC_BREAKPOINT (SIGTRAP)", "EXC_BAD_ACCESS (SIGSEGV)", "EXC_CRASH (SIGABRT)", "SIGKILL, 0x8badf00d"]
+  items:
+    - [A `try!` around decoding a changed server response, 0]
+    - [An unsafe pointer used after its buffer was freed, 1]
+    - [A table view batch update whose row counts don't add up, 2]
+    - [A synchronous network call on the main thread during launch on a bad connection, 3]
+    - [An array index one past the end, 0]
+  explain: "Swift traps (try!, out-of-range index) are breakpoints; memory misuse is a bad access; UIKit's consistency checks raise Objective-C exceptions that abort; a blocked main thread at launch is killed by the watchdog."
+- id: q2
+  type: mcq
+  prompt: "Crashes from build 5.2.0 (812) show only addresses, while 5.1.0's are readable. What's the most likely cause?"
+  options:
+    - "Swift changed its name mangling"
+    - "The dSYM for build 812 wasn't uploaded, so no symbols match its UUID"
+    - "The crash happened in a system framework"
+    - "Users of 812 turned off analytics sharing"
+  answer: 1
+  explain: "Symbolication needs the dSYM with the crashed binary's exact UUID. A new build means a new UUID; if its dSYM wasn't archived and uploaded, frames stay as addresses."
+- id: q3
+  type: estimate
+  prompt: "An app has 2 million daily users with 4 sessions each, and a crash-free session rate of 99.95%. Roughly how many crashing sessions a day is that?"
+  answer: 4000
+  unit: sessions a day
+  explain: "2M × 4 = 8M sessions; 0.05% of 8M is 4,000 crashing sessions every day. A rate that sounds excellent is still thousands of interrupted people."
+- id: q4
+  type: multi
+  prompt: "Which of these may a crash handler safely do while the process is dying? Choose all that apply."
+  options:
+    - "Write raw addresses to a file it opened at launch"
+    - "Encode the breadcrumbs with `JSONEncoder`"
+    - "Read registers and walk thread stacks"
+    - "Take a lock to read shared state"
+    - "Upload the report with `URLSession`"
+  answer: [0, 2]
+  explain: "Only async-signal-safe work is safe: no allocation, no locks, no runtime calls, no networking. Pre-opened files and raw stack walking are how reporters survive; encoding and uploading wait for the next launch."
+- id: q5
+  type: truefalse
+  prompt: "If crash-free sessions stays at 99.9%, you can be sure the release didn't make things worse for any group of users."
+  answer: false
+  explain: "A crash that many users hit once, such as a migration failing on the first launch after an update, is a tiny share of a week's sessions but a large share of users. Crash-free users shows it; crash-free sessions barely moves. Watch both, per release."
+```

@@ -1,0 +1,147 @@
+<Brief>
+
+A social shopping app moved to "Redux style" last year: one `AppStore`, one `AppState`, one `send(_:)`. The team likes that every screen reads from one place, but the feed's spinner sometimes never stops, search shows results for the wrong query, likes vanish, scrolling stutters, and nobody has managed to write a test for `send`. Review it as you would a pull request: what's wrong, what matters most, and how you'd move it towards a store that keeps its promises.
+
+```swift check ios title="AppStore.swift"
+import SwiftUI
+
+struct Post: Codable, Equatable, Identifiable { let id: String; var text: String; var likes: Int }
+
+struct AppState: Equatable {
+    var feed: [Post] = []
+    var isRefreshing = false
+    var searchQuery = ""
+    var searchResults: [Post] = []
+    var basket: [String: Int] = [:]
+    var feedScrollOffset: CGFloat = 0
+}
+
+enum AppAction {
+    case refreshPulled
+    case searchChanged(String)
+    case likeTapped(Post.ID)
+    case addToBasketTapped(String)
+    case feedScrolled(CGFloat)
+}
+
+@MainActor
+final class AppStore: ObservableObject {
+    static let shared = AppStore()
+    @Published private(set) var state = AppState()
+
+    func send(_ action: AppAction) {
+        switch action {
+        case .refreshPulled:
+            state.isRefreshing = true
+            Task {
+                let (data, _) = try await URLSession.shared.data(from: URL(string: "https://api.example.com/feed")!)
+                self.state.feed = try JSONDecoder().decode([Post].self, from: data)
+                self.state.isRefreshing = false
+            }
+        case .searchChanged(let query):
+            state.searchQuery = query
+            Task {
+                let (data, _) = try await URLSession.shared.data(from: URL(string: "https://api.example.com/search?q=\(query)")!)
+                self.state.searchResults = try JSONDecoder().decode([Post].self, from: data)
+            }
+        case .likeTapped(let id):
+            guard let index = state.feed.firstIndex(where: { $0.id == id }) else { return }
+            state.feed[index].likes += 1
+            Analytics.shared.track("like \(id)", at: Date())
+        case .addToBasketTapped(let productID):
+            state.basket[productID, default: 0] += 1
+            UserDefaults.standard.set(state.basket, forKey: "basket")
+            Analytics.shared.track("basket \(UUID().uuidString)", at: Date())
+        case .feedScrolled(let offset):
+            state.feedScrollOffset = offset
+        }
+    }
+}
+
+@MainActor final class Analytics { static let shared = Analytics(); func track(_ event: String, at date: Date) {} }
+
+struct FeedView: View {
+    @ObservedObject var store = AppStore.shared
+
+    var body: some View {
+        List(store.state.feed) { post in
+            Button("\(post.text) · \(post.likes) likes") { store.send(.likeTapped(post.id)) }
+        }
+        .onScrollGeometryChange(for: CGFloat.self, of: { $0.contentOffset.y }) { _, offset in
+            store.send(.feedScrolled(offset))
+        }
+        .refreshable { store.send(.refreshPulled) }
+    }
+}
+```
+
+</Brief>
+
+```workspace
+template: critique
+minutes: 25
+```
+
+```findings
+- id: effects-in-reducer
+  title: The reducer runs side effects, and the effects write state behind its back
+  severity: high
+  lines: "31-35, 38-41"
+  detail: "`send` starts tasks that call the network, and those tasks assign `self.state` directly when they finish. The feed and search results arrive without any action, so an action log can't show or replay them, and `send` can't be tested without a real network. Return the work as an effect, and send its result back as an action the reducer handles."
+- id: errors-swallowed
+  title: Any failure leaves the spinner on forever, with no error shown
+  severity: high
+  lines: "30-34"
+  detail: "If the request or the decoding throws (offline, a timeout, an HTML error page), the task simply ends: `isRefreshing` is never set back to `false` and the user sees nothing. Status codes aren't checked either, so a 500 with a JSON body is decoded as if it were the feed. Recent Swift compilers warn about exactly these unused throwing tasks."
+- id: stale-search
+  title: Search results arrive in any order, so old queries overwrite new ones
+  severity: high
+  lines: "36-41"
+  detail: "Every keystroke starts a request that's never cancelled, and whichever finishes last wins: results for \"du\" can replace those for \"dune\". Nothing debounces it, so typing a word costs a request per letter. The query is also pasted into the URL unencoded, so `&` or `#` in a search changes the request. Use one cancellable effect id with cancel-in-flight and a short sleep, encode with `URLQueryItem`, and carry the query in the result action."
+- id: uncontrolled-dependencies
+  title: The reducer reaches for the network, the clock, UUIDs, UserDefaults and a singleton
+  severity: medium
+  lines: "32, 39, 45, 48-49"
+  detail: "`URLSession.shared`, `Date()`, `UUID()`, `UserDefaults.standard` and `Analytics.shared` are called directly, so tests and previews can't replace them and results differ on every run. Replaying a log of actions would resend analytics and rewrite UserDefaults. The UUID in the event name also makes every basket event unique, so the analytics can't be aggregated."
+- id: one-global-store
+  title: One state and one ObservableObject singleton for every feature
+  severity: medium
+  lines: "5-12, 22-25, 59"
+  detail: "Feed, search, basket and scroll position share one `@Published` state. Any change, a basket tap or a keystroke, fires `objectWillChange` and re-evaluates every view observing the store. Features can't be built, tested or previewed apart, and `AppStore.shared` means tests share state. Give each feature its own state and store (or scope one tree), and inject them rather than reaching for a singleton."
+- id: scroll-in-store
+  title: The scroll offset goes through the app-wide store on every frame
+  severity: medium
+  lines: "11, 50-51, 65-67"
+  detail: "`onScrollGeometryChange` sends up to 120 actions a second while scrolling, and each one republishes the whole app state to every observer, which is why scrolling stutters. No logic reads the offset; it's view state. Keep it in the view, and send an action only when something meaningful happens."
+- id: like-local-only
+  title: A like never reaches the server, and the next refresh erases it
+  severity: medium
+  lines: "42-45"
+  detail: "The like only increments the local count. Nothing tells the server, nothing records that this user has liked the post (so repeated taps keep counting), and the next refresh replaces `feed` and silently undoes it. Model `isLiked`, send the like as an effect, and roll back if the server refuses."
+- id: refresh-returns-early
+  title: Pull to refresh ends before the refresh does
+  severity: low
+  lines: "68"
+  detail: "`.refreshable` hides the system spinner when its closure returns, and `send` returns at once, so the spinner vanishes before the feed arrives. Nothing checks `isRefreshing`, so pulling again starts an overlapping request. Await the refresh (for example by having `send` return the effect's task, as TCA's `StoreTask` does) and ignore a pull while one is running."
+```
+
+<ReferenceReview>
+
+**Most important first.** This store has the shape of Redux and none of its guarantees. The reducer does work instead of describing it, and that work changes state without going through an action. That one design flaw produces three user-visible bugs: a spinner that never stops when anything fails (the error vanishes inside an unobserved task), search results for the wrong query (nothing cancels or orders the requests), and a reducer nobody can test.
+
+**Second tier.** The reducer calls the outside world directly (network, clock, UUIDs, UserDefaults, analytics), so even a fixed reducer would be untestable. And everything lives in one `ObservableObject` singleton, which couples every feature to every other and makes each change, including 120 scroll actions a second, re-evaluate every observing view.
+
+**How I'd fix it, in small steps that each ship:**
+
+1. **Write characterisation tests around what can be tested today:** the like and basket counts. They protect the refactor of the reducer's shape.
+2. **Make effects values.** Change `send` to call a pure `reduce(_:_:) -> Effect<AppAction>` and run the effect in the store. Add result actions (`feedLoaded`, `feedFailed`, `searchLoaded(query:results:)`) so every state change goes through the reducer. The spinner bug is fixed here: `feedFailed` resets `isRefreshing` and shows a message.
+3. **Give search an effect id** with cancel-in-flight and a 300 ms sleep on an injected clock, build the URL with `URLQueryItem`, and ignore results whose query no longer matches.
+4. **Inject dependencies** as a struct of closures: the feed and search API, the clock, the date, UUIDs, persistence and analytics. Tests get stubs; previews get fixtures. Replace the UUID in the analytics event with a proper property.
+5. **Move the scroll offset into the view.** Send an action only on a meaningful threshold.
+6. **Fix the like:** an `isLiked` flag, an optimistic update, an idempotent `PUT /posts/{id}/like` effect and a rollback on failure.
+7. **Split the state by feature.** Feed, search and basket each get their own state, actions and reducer, composed at the root or held in separate stores. Drop `AppStore.shared` and inject the stores, moving to `@Observable` (or TCA's `@ObservableState`) so views observe only what they read.
+8. **Make refresh awaitable**, so `.refreshable` keeps its spinner until the feed arrives and a second pull is ignored.
+
+**Tests to add:** the reducer on values for every action (spinner reset on failure, like and rollback, basket counts); search with a test clock, proving that only the last query's request is made and a stale result is ignored; and a store-level test that every effect's result arrives as an action. If the team adopts TCA during step 7, these become `TestStore` tests.
+
+</ReferenceReview>

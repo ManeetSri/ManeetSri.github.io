@@ -1,0 +1,343 @@
+## Why it matters
+
+The Composable Architecture (TCA) is the most widely used unidirectional library on iOS, and the one interviewers mean when they say "Redux for Swift". It packages everything the last three lessons built by hand (state as a value, actions as events, pure reducers, effects as return values) and adds what Swift doesn't enforce: composition, dependency control and exhaustive tests. Knowing it well lets you join a TCA codebase productively, and knowing what it costs lets you argue honestly about whether to adopt it. This lesson covers the core: state, actions, reducers and the store. The next four add effects, composition, navigation and testing.
+
+## What TCA is
+
+TCA comes from Point-Free, Brandon Williams and Stephen Celis's video series on functional Swift. They open-sourced it in May 2020, released 1.0 in 2023, rebuilt its SwiftUI integration on Swift's Observation in 1.7 (early 2024), and have kept shipping 1.x releases since: 1.26 in 2026. In April 2026 they opened a beta of **TCA 2.0**, which reshapes the API around a new `@Feature` macro and lets features start work from the store instead of returning effects. 1.x is what production apps run today, so these lessons teach it; the ideas carry straight over.
+
+A TCA feature is built from a handful of pieces:
+
+| Piece | What it is | You've met it as |
+| --- | --- | --- |
+| **State** | A struct with everything the feature needs to do its job | The Redux state, Elm's model |
+| **Action** | An enum of everything that can happen: user events, effect results, child events | Actions, Elm's messages |
+| **Reducer** | Applies an action to the state and returns an `Effect` | A reducer returning effects |
+| **Effect** | Work for the store to run, whose results come back as actions | Elm's commands |
+| **Store** | Owns the state at runtime, receives actions, runs the reducer and effects | The store |
+| **Dependencies** | The clock, the network, UUIDs, persistence, as swappable values | The environment style |
+
+It's built on smaller Point-Free libraries you'll see imported in TCA codebases: swift-case-paths (key paths for enum cases), swift-dependencies, swift-identified-collections, swift-sharing and swift-navigation.
+
+## A first feature
+
+A reading app tracks how far you are through a book. Here's that screen as a TCA feature:
+
+```swift
+import ComposableArchitecture
+import SwiftUI
+
+struct Book: Equatable, Identifiable {
+    let id: UUID
+    var title: String
+    var pageCount: Int
+}
+
+@Reducer
+struct BookProgress {
+    @ObservableState
+    struct State: Equatable {
+        var book: Book
+        var currentPage = 0
+        var note = ""
+
+        var fractionRead: Double {
+            book.pageCount == 0 ? 0 : Double(currentPage) / Double(book.pageCount)
+        }
+        var isFinished: Bool { currentPage == book.pageCount }
+    }
+
+    enum Action: BindableAction {
+        case binding(BindingAction<State>)
+        case pageStepperChanged(Int)
+        case finishButtonTapped
+    }
+
+    var body: some ReducerOf<Self> {
+        BindingReducer()
+        Reduce { state, action in
+            switch action {
+            case .binding(\.note):
+                state.note = String(state.note.prefix(280))
+                return .none
+            case .binding:
+                return .none
+            case let .pageStepperChanged(page):
+                state.currentPage = min(max(page, 0), state.book.pageCount)
+                return .none
+            case .finishButtonTapped:
+                state.currentPage = state.book.pageCount
+                return .none
+            }
+        }
+    }
+}
+
+struct BookProgressView: View {
+    @Bindable var store: StoreOf<BookProgress>
+
+    var body: some View {
+        Form {
+            Section(store.book.title) {
+                Stepper(
+                    "Page \(store.currentPage) of \(store.book.pageCount)",
+                    value: $store.currentPage.sending(\.pageStepperChanged)
+                )
+                ProgressView(value: store.fractionRead)
+            }
+            Section("Note") {
+                TextField("What stood out?", text: $store.note, axis: .vertical)
+            }
+            Button("Mark as finished") { store.send(.finishButtonTapped) }
+                .disabled(store.isFinished)
+        }
+    }
+}
+```
+
+Walk through it piece by piece.
+
+- **`@ObservableState struct State`.** The state is a value type, `Equatable` so tests can compare it, with derived values (`fractionRead`, `isFinished`) computed rather than stored. `@ObservableState` makes the struct observable field by field, like `@Observable` does for a class, so a view that reads `store.currentPage` re-renders when the page changes and not when the note does.
+- **`enum Action`.** Every way the state can change is a case, named after what happened in the UI: `finishButtonTapped`, not `finishBook`. TCA's own guidance is the same as Redux's: name actions after events, and let the reducer decide what they mean.
+- **`var body: some ReducerOf<Self>`.** A reducer is a value, and `body` composes reducers with a result builder, top to bottom. Here `BindingReducer()` runs first and applies simple field changes, then `Reduce` runs the feature's logic on the same action.
+- **`Reduce { state, action in … }`.** The core: `state` is `inout`, and each case returns an `Effect`. This feature does no async work, so every case returns `.none`.
+- **The view** holds a `StoreOf<BookProgress>`, reads state straight from the store (`store.currentPage`), and changes it only by sending actions. `$store.note` derives a binding whose setter sends a binding action; `$store.currentPage.sending(\.pageStepperChanged)` derives one whose setter sends a specific action.
+
+The store is created once, at the root, and handed down:
+
+```swift
+@main
+struct ShelfApp: App {
+    static let store = Store(initialState: BookProgress.State(book: .dune)) {
+        BookProgress()
+            ._printChanges()
+    }
+
+    var body: some Scene {
+        WindowGroup {
+            BookProgressView(store: Self.store)
+        }
+    }
+}
+```
+
+`._printChanges()` wraps the reducer and prints every action with a diff of the state it produced: the Redux DevTools idea, in the Xcode console.
+
+## What the macros and types do
+
+TCA leans on macros. They're worth demystifying, because when something goes wrong the error is in the expanded code.
+
+- **`@Reducer`** makes the type conform to `Reducer`, and applies `@CasePathable` to `Action`. That's what lets you write `\.pageStepperChanged` or `\.binding`: **case key paths**, the enum equivalent of key paths, which TCA uses everywhere to extract and embed actions. It also generates conveniences for `@Reducer enum`s, which you'll meet in navigation.
+- **`@ObservableState`** adds observation to the state struct. It also gives each value an identity, so SwiftUI can tell "this row's state changed" from "this is a different row". On iOS 17 and later it uses Swift's Observation; for iOS 16 TCA back-deploys it through its Perception library, where views must be wrapped in `WithPerceptionTracking`.
+- **`ReducerOf<Self>`** is `Reducer<State, Action>`, and **`StoreOf<Feature>`** is `Store<Feature.State, Feature.Action>`.
+- **`body`** is how you implement a reducer. The protocol also has a `reduce(into:action:)` requirement, which `Reduce` and the built-in reducers implement for you; since 1.25, calling it yourself is deprecated, and actions should go through a store.
+
+Underneath, a `body` is a list of reducers run in order on the same action. Here's that idea with the library stripped away, including what `BindingReducer` does and why `Reduce` sees the note *after* it's been written:
+
+```swift run title="What body, BindingReducer and Reduce boil down to"
+/// A reducer is anything that applies an action to state
+protocol Reducer<State, Action> {
+    associatedtype State
+    associatedtype Action
+    func reduce(into state: inout State, action: Action)
+}
+
+struct Reduce<State, Action>: Reducer {
+    let run: (inout State, Action) -> Void
+    func reduce(into state: inout State, action: Action) { run(&state, action) }
+}
+
+/// What a `body` is: reducers run in order, each seeing the state the one before it left
+struct CombineReducers<State, Action>: Reducer {
+    let reducers: [any Reducer<State, Action>]
+    func reduce(into state: inout State, action: Action) {
+        for reducer in reducers { reducer.reduce(into: &state, action: action) }
+    }
+}
+
+/// A binding action carries which field changed and how to write the new value
+struct BindingAction<Root> {
+    let keyPath: PartialKeyPath<Root>
+    let write: (inout Root) -> Void
+
+    static func set<Value>(_ keyPath: WritableKeyPath<Root, Value>, _ value: Value) -> Self {
+        Self(keyPath: keyPath) { $0[keyPath: keyPath] = value }
+    }
+}
+
+/// Applies binding actions, and ignores every other action
+struct BindingReducer<State, Action>: Reducer {
+    let extract: (Action) -> BindingAction<State>?
+    func reduce(into state: inout State, action: Action) {
+        extract(action)?.write(&state)
+    }
+}
+
+struct Progress: Equatable {
+    var currentPage = 0
+    var pageCount = 412
+    var note = ""
+}
+
+enum ProgressAction {
+    case binding(BindingAction<Progress>)
+    case pageStepperChanged(Int)
+    case finishButtonTapped
+}
+
+let feature = CombineReducers<Progress, ProgressAction>(reducers: [
+    BindingReducer<Progress, ProgressAction> { action in
+        if case .binding(let binding) = action { binding } else { nil }
+    },
+    Reduce<Progress, ProgressAction> { state, action in
+        switch action {
+        case .binding(let binding) where binding.keyPath == \Progress.note:
+            state.note = String(state.note.prefix(12))   // runs after BindingReducer wrote the note
+        case .binding:
+            break
+        case .pageStepperChanged(let page):
+            state.currentPage = min(max(page, 0), state.pageCount)
+        case .finishButtonTapped:
+            state.currentPage = state.pageCount
+        }
+    },
+])
+
+var state = Progress()
+let actions: [(String, ProgressAction)] = [
+    ("stepper to 30", .pageStepperChanged(30)),
+    ("stepper to 999", .pageStepperChanged(999)),
+    ("type a long note", .binding(.set(\.note, "The spice must flow"))),
+    ("finish", .finishButtonTapped),
+]
+for (label, action) in actions {
+    feature.reduce(into: &state, action: action)
+    print("\(label): page \(state.currentPage)/\(state.pageCount), note \"\(state.note)\"")
+}
+```
+
+```output
+stepper to 30: page 30/412, note ""
+stepper to 999: page 412/412, note ""
+type a long note: page 412/412, note "The spice mu"
+finish: page 412/412, note "The spice mu"
+```
+
+The real library adds effects, observation and a lot of type-level care, but the shape is this. A `body` is ordered: put `BindingReducer()` first and your `Reduce` can react to the new value, as the 280-character limit does in the TCA version.
+
+## Designing actions
+
+Actions are the feature's public vocabulary, and they're worth naming carefully.
+
+- **User events by what the user did:** `finishButtonTapped`, `noteFieldSubmitted`, `rowSwiped(id:)`. A reader of the action log sees the user's story.
+- **Effect results by what came back:** `searchResponse(Result<[Book], any Error>)`. Actions don't need to be `Equatable`: since TCA 1.4, tests match received actions by case key path, so a `Result` holding `any Error` is fine.
+- **Bindings for plain fields.** `BindableAction` with `BindingReducer` is right when a field just needs to be stored, like a note. When a change needs logic, such as clamping a page or starting a search, derive the binding with `.sending(\.someAction)` and handle the action explicitly.
+- **Group when the enum grows.** Some teams nest actions as `view(View)`, `delegate(Delegate)` and `internal(Internal)`, so it's obvious which ones the view may send and which ones a parent may listen to. It costs a level of nesting everywhere; reach for it when a feature has dozens of actions, not three.
+
+## Designing state
+
+TCA's state is everything the feature's *logic* needs: what's loaded, what's selected, whether a request is in flight, what's presented. Two kinds of state usually stay out of it:
+
+- **Derived values.** Compute them, as `fractionRead` does. Storing them invites drift ([Derived state: compute it, don't store it](/design/learn/sd-state-derived)).
+- **Purely visual state.** A scroll position, an animation phase or a hover highlight that no logic reads can stay in the view's `@State`. When logic *does* depend on it, focus being the usual example, keep it in the store's state and sync it with the view's `@FocusState` using TCA's `.bind($store.focusedField, to: $focus)`.
+
+The test is simple: if a test of this feature would want to assert on it, it belongs in `State`.
+
+## Trade-offs
+
+| | `@Observable` view model | A homemade reducer store | TCA |
+| --- | --- | --- | --- |
+| Ceremony per feature | Least: properties and methods | An action enum and a reducer | Actions, reducer, macros, a store per screen |
+| Where rules live | Methods, which can write anything | One reducer | One reducer, plus composed child reducers |
+| Async work | Called from methods | Your own effect runtime | `Effect`, with ids and cancellation built in |
+| Dependency control | Whatever you inject | Whatever you inject | A dependency system with test and preview values |
+| Tests | View model tests with mocks | Reducer tests with values | Exhaustive `TestStore` tests |
+| Composition | Parents own child view models | Hand-written routing | `Scope`, `ifLet`, `forEach`, navigation tools |
+| Cost you take on | Discipline in large features | Maintaining the runtime | A large third-party dependency, its major versions, macro compile time and the learning curve |
+| Wins when | Most screens and most teams | One or two complex features in an MVVM app | A team that wants one consistent architecture and its testing across a large app |
+
+<Callout kind="interview">
+
+**Say** "In TCA a feature is a `@Reducer` with an `@ObservableState` struct and an action enum. The reducer's `body` composes reducers; each action mutates state and returns an effect. The view reads the store and sends actions; bindings are derived from the store, so even text fields go through the reducer." **Ask** whether the team already uses TCA and on which version, because 1.x before and after 1.7 (Observation) look quite different, and 2.0 is coming. **Red flags:** every tiny piece of view state turned into actions, logic shared by sending actions to yourself, and a `Store` created inside a view's `body`.
+
+</Callout>
+
+<Callout kind="gotcha" title="iOS gotcha: create a store once, at its owner">
+
+`Store(initialState:)` written in a view's `body`, or as a default argument of a view's initialiser, runs again whenever the parent re-renders: the feature's state resets and its effects are orphaned. Create the root store once (a `static let` on the `App`, or `@State` in a root view), and give children *scoped* stores from their parent, which you'll see in [TCA: composing and scoping features](/design/learn/sd-udf-tca-scoping). Previews are the exception: each `#Preview` makes its own.
+
+</Callout>
+
+<Callout kind="gotcha" title="Swift gotcha: don't send actions to share logic">
+
+`return .send(.refresh)` from three cases looks tidy, but every extra action goes through the whole reducer, adds noise to logs and tests, and since 1.25 an action sent synchronously while another is being processed earns a runtime warning. TCA's documentation recommends a plain helper method instead: `func refresh(_ state: inout State) -> Effect<Action>`, called from each case.
+
+</Callout>
+
+## Practice
+
+**[Review: one reducer for the whole app](/design/practice/sd-review-unidirectional-app-reducer)** is a store that follows Redux's shape but breaks the rules TCA was built to enforce: side effects inside the reducer, dependencies it reaches for instead of being given, and one state for every screen. Spot each one and say which TCA piece would prevent it.
+
+```cards
+- id: tca-pieces
+  front: "What are the pieces of a TCA feature?"
+  back: "State (an `@ObservableState` struct), Action (an enum of events), a reducer (`@Reducer` with a `body`) that mutates state and returns an Effect, a Store that runs it, and dependencies for the outside world."
+- id: observable-state
+  front: "What does `@ObservableState` do?"
+  back: "Makes the state struct observable field by field, so a view re-renders only when the fields it read change. It uses Observation on iOS 17+, and is back-deployed to iOS 16 through Perception."
+- id: body-order
+  front: "Why does `BindingReducer()` come before `Reduce` in a body?"
+  back: "Reducers in a body run in order on the same action. With BindingReducer first, the new field value is already in the state when your Reduce handles `.binding`, so it can react or correct it."
+- id: binding-or-sending
+  front: "When do you use a binding action, and when `.sending(\\.action)`?"
+  back: "Binding actions for fields that are simply stored. `.sending` when the change needs logic (clamping, validation, starting a search), so it gets an explicit action and reducer case."
+```
+
+```quiz
+- id: q1
+  type: mcq
+  prompt: "A note field uses `$store.note` with `BindingReducer`. You need to cap notes at 280 characters. Where does the rule go?"
+  options:
+    - "In the view, by truncating the text before it reaches the binding"
+    - "In `Reduce`, in a `case .binding(\\.note):` branch, with `BindingReducer()` listed before it"
+    - "In a custom setter on the `State` struct"
+    - "In a middleware that rewrites binding actions"
+  answer: 1
+  explain: "BindingReducer writes the new value first, and Reduce, running after it, can correct it. Rules belong in the reducer, where tests can see them; truncating in the view puts logic where nothing can test it."
+- id: q2
+  type: sort
+  prompt: "For the book progress screen, where does each piece of state belong?"
+  buckets: [The feature's State, A computed property, The view's own @State]
+  items:
+    - [The current page, 0]
+    - [The note being written, 0]
+    - [The fraction of the book read, 1]
+    - [Whether the book is finished, 1]
+    - [The scroll position of the form, 2]
+  explain: "State holds what logic and tests care about. Values derived from it are computed so they can't drift. Purely visual state that no logic reads can stay in the view."
+- id: q3
+  type: truefalse
+  prompt: "TCA requires every `Action` enum to conform to `Equatable`."
+  answer: false
+  explain: "Since 1.4, tests match received actions by case key path (`receive(\\.searchResponse)`), so actions can carry non-equatable values such as `Result<[Book], any Error>`."
+- id: q4
+  type: multi
+  prompt: "Which of these does `@Reducer` do for you? Choose all that apply."
+  options:
+    - "Makes the type conform to the `Reducer` protocol"
+    - "Makes `Action` case-pathable, so you can write `\\.pageStepperChanged`"
+    - "Makes the `State` struct observable"
+    - "Runs the reducer on a background thread"
+  answer: [0, 1]
+  explain: "`@Reducer` provides the conformance and case paths for actions. Observation comes from `@ObservableState` on the state, and reducers run on the main actor, inside the store."
+- id: q5
+  type: mcq
+  prompt: "A list row's view creates its own store: `init(book: Book) { store = Store(initialState: .init(book: book)) { BookProgress() } }`. Users report their page resets when they scroll. Why?"
+  options:
+    - "`@ObservableState` loses changes when a view scrolls off screen"
+    - "Every time the parent re-renders the row, its initialiser runs again and creates a fresh store with fresh state"
+    - "Stores can't be used inside lists"
+    - "The page should be stored in UserDefaults"
+  answer: 1
+  explain: "View initialisers run whenever the parent's body does, so a store created there is thrown away and rebuilt. The row should receive a store scoped from its parent, which owns every row's state in one collection."
+```

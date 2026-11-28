@@ -1,0 +1,221 @@
+## Why it matters
+
+Thermostats, door locks, delivery vans, factory sensors and some of the world's biggest chat apps have one protocol in common: **MQTT**, a publish–subscribe protocol designed in 1999 for oil pipelines on satellite links. It's tiny on the wire, tolerant of terrible networks, and it has delivery guarantees, last-known values and offline detection built in, things you'd otherwise design yourself on top of a WebSocket. Facebook wrote in 2011 that Messenger used MQTT to keep latency low without draining batteries. Smart-home and fleet-tracking interviews expect you to know when it fits, and when the phone shouldn't speak it at all.
+
+## Clients, a broker and topics
+
+In MQTT nobody talks to anybody directly. Every participant is a **client** of a central **broker** (Mosquitto, EMQX, HiveMQ, or a managed one such as AWS IoT Core). Clients **publish** messages to **topics** and **subscribe** to topics they care about; the broker routes each message to every matching subscriber.
+
+```visual flow
+title: A smart thermostat, its app and the broker
+nodes:
+  - { id: thermostat, label: Thermostat, kind: client, at: [0, 0] }
+  - { id: broker, label: MQTT broker, kind: queue, at: [2, 1] }
+  - { id: app, label: iPhone app, kind: client, at: [4, 0] }
+  - { id: rules, label: Rules service, kind: service, at: [2, 3] }
+edges:
+  - [thermostat, broker, temperature]
+  - [broker, app, temperature]
+  - [app, broker, set 21°]
+  - [broker, thermostat, set 21°]
+  - [broker, rules, events, { style: async }]
+steps:
+  - say: "The thermostat publishes `home/42/temperature` every minute, flagged **retained**: the broker keeps the latest value for that topic."
+    show: [thermostat, broker]
+    send: thermostat->broker
+    label: { broker: "retained: 19.5°" }
+  - say: "The app connects and subscribes to `home/42/#`. The broker sends the retained value at once, so the screen shows 19.5° without waiting for the next reading."
+    show: [app]
+    send: broker->app
+  - say: "The user sets 21°. The app publishes to `home/42/setpoint` with **QoS 1**, so the broker keeps resending until it's acknowledged."
+    send: app->broker
+  - say: "The thermostat is subscribed to its setpoint topic, and the broker delivers the command."
+    send: broker->thermostat
+    state: { thermostat: ok }
+  - say: "A backend rules service subscribes to `home/+/temperature` across every home, for alerts and history. Publishers never know who's listening."
+    show: [rules]
+    send: broker->rules
+  - say: "The thermostat loses power without saying goodbye. After 1.5 × its keep-alive, the broker publishes the **last will** it registered when it connected: `home/42/status = offline`."
+    state: { thermostat: error }
+    send: broker->app
+    label: { broker: "will: offline" }
+```
+
+The decoupling is the point: devices, apps and backend services come and go without knowing about each other, and the broker handles fan-out, buffering and liveness.
+
+## Topics and wildcards
+
+Topics are UTF-8 strings split into levels by `/`, such as `home/42/kitchen/temperature`. They aren't declared anywhere; publishing to one creates it. Subscriptions can use two wildcards:
+
+- `+` matches exactly one level: `home/+/temperature`.
+- `#` matches any number of levels, including none, and must come last: `home/42/#` matches `home/42` itself as well as everything below it.
+- Topics starting with `$` (such as `$SYS/…`, the broker's own statistics) aren't matched by a filter that starts with a wildcard.
+
+```swift run title="TopicFilter.swift"
+import Foundation
+
+/// Does an MQTT topic filter match a topic? `+` matches exactly one level; `#` matches the rest, if any.
+func matches(filter: String, topic: String) -> Bool {
+    let filterLevels = filter.split(separator: "/", omittingEmptySubsequences: false)
+    let topicLevels = topic.split(separator: "/", omittingEmptySubsequences: false)
+    // A filter starting with a wildcard never matches broker topics such as $SYS/…
+    if topic.hasPrefix("$"), filterLevels.first == "+" || filterLevels.first == "#" {
+        return false
+    }
+    for (index, level) in filterLevels.enumerated() {
+        if level == "#" { return true }              // only valid as the last level
+        guard index < topicLevels.count else { return false }
+        if level != "+", level != topicLevels[index] { return false }
+    }
+    return filterLevels.count == topicLevels.count
+}
+
+let topics = [
+    "home/kitchen/temperature", "home/kitchen/humidity", "home/garage/door",
+    "home", "garden/sprinkler", "$SYS/broker/clients",
+]
+for filter in ["home/kitchen/temperature", "home/+/temperature", "home/kitchen/+", "home/#", "+/+", "#"] {
+    let hits = topics.filter { matches(filter: filter, topic: $0) }
+    print("\(filter) → \(hits.isEmpty ? "nothing" : hits.joined(separator: ", "))")
+}
+```
+
+```output
+home/kitchen/temperature → home/kitchen/temperature
+home/+/temperature → home/kitchen/temperature
+home/kitchen/+ → home/kitchen/temperature, home/kitchen/humidity
+home/# → home/kitchen/temperature, home/kitchen/humidity, home/garage/door, home
++/+ → garden/sprinkler
+# → home/kitchen/temperature, home/kitchen/humidity, home/garage/door, home, garden/sprinkler
+```
+
+Topic design is API design. Put the most selective, most stable part first and the identity of the thing in the middle (`home/{homeID}/{device}/{measurement}`), so access rules can say "this user may subscribe to `home/42/#` and nothing else". Brokers enforce those rules per client, which is how one broker serves millions of homes without anyone reading their neighbour's door lock.
+
+## Quality of service
+
+Each publish and each subscription carries a **QoS level**, and the broker delivers at the lower of the two:
+
+| QoS | Guarantee | Packets | Cost |
+| --- | --- | --- | --- |
+| 0 | At most once: fire and forget | `PUBLISH` | Cheapest; lost if the connection drops mid-flight |
+| 1 | At least once: resent until acknowledged | `PUBLISH`, `PUBACK` | Duplicates possible after a resend |
+| 2 | Exactly once between two hops | `PUBLISH`, `PUBREC`, `PUBREL`, `PUBCOMP` | Two round trips, and state on both sides |
+
+QoS 0 suits readings that are replaced every few seconds anyway. QoS 1 is the workhorse for commands and events, with receivers that tolerate duplicates. QoS 2 is rarely worth its cost, and it's narrower than it sounds: "exactly once" holds between a client and the broker, not end to end through your backend and database. You'll see why that distinction matters everywhere in the ordering lesson later in this module.
+
+## Sessions, retained messages and last will
+
+Three features do work you'd otherwise build yourself.
+
+**Persistent sessions.** A client can ask the broker to keep its session while it's away: its subscriptions and any QoS 1 and 2 messages that arrive meanwhile. In MQTT 5 that's `Clean Start = false` plus a **session expiry interval**, say an hour. A phone that drops off in a lift reconnects and receives what it missed, with no catch-up API. Set the expiry deliberately: a broker queuing messages for a million devices that never return is a memory leak with a monthly bill.
+
+**Retained messages.** Publishing with the retain flag makes the broker store that message as the topic's current value and send it to every new subscriber at once. It turns a stream into **state**: "the door is locked", "the van is at this position", "the device is online".
+
+**Last will and testament.** When connecting, a client can register a message for the broker to publish if the client disappears without a clean `DISCONNECT`. Combined with a retained "online" message at connect, it gives presence for free: `device/42/status` is `online` while the device is connected and `offline` shortly after it isn't.
+
+All three depend on **keep-alive**. The client promises to send something at least every *k* seconds (a `PINGREQ` if it has nothing else to say), and the broker treats a client that's silent for 1.5 × *k* as gone: it closes the connection and publishes the will. Keep-alive is the heartbeat you'll design by hand for WebSockets in the reconnection lesson, already specified.
+
+### What MQTT 5 added
+
+MQTT 3.1.1 (2014) is still widespread; MQTT 5 (2019) adds what large deployments kept asking for: **reason codes** on every acknowledgement (so a client learns *why* a subscribe failed), session and **message expiry**, **shared subscriptions** (`$share/workers/jobs/#` load-balances messages across a group of backend consumers), **topic aliases** that replace long topic strings with small integers, **user properties** (headers), and request–response with a response topic and correlation data.
+
+## MQTT on iOS
+
+Apple doesn't ship an MQTT client; you'd use an open-source one such as **CocoaMQTT** (MQTT 3.1.1 and 5) or **MQTTNIO** (built on SwiftNIO), or a vendor SDK such as AWS IoT's. Connections go over TCP on port 1883, TLS on 8883, or MQTT over WebSockets on 443, which is what you want from phones on hotel and corporate Wi-Fi that block unusual ports.
+
+Two mobile realities shape the design:
+
+- **Suspension ends the session's connection**, as it does every socket. A persistent session means messages wait at the broker until the app reconnects, which is better than a raw WebSocket, but the user still won't see them until then. Pushes still come through APNs, typically sent by a backend service that's subscribed to the same topics.
+- **The phone may not need MQTT at all.** Many smart-home products keep MQTT between devices and the cloud, and give the app an HTTP API, a WebSocket for live state while it's open, and pushes. That keeps device credentials, topic ACLs and broker load away from millions of phones. Put the app on the broker when it needs low-latency control of devices and the backend would only be a relay.
+
+## Trade-offs
+
+| | MQTT | WebSocket with your own protocol | SSE |
+| --- | --- | --- | --- |
+| Routing and fan-out | Built in: topics, wildcards, a broker | You build it (gateways plus pub/sub) | You build it |
+| Delivery guarantees | QoS 0, 1, 2 per message | You design acks | Replay by `Last-Event-ID` |
+| Last-known value | Retained messages | You build it | You build it |
+| Offline detection | Keep-alive plus last will | Your heartbeats plus server logic | Your heartbeats |
+| Overhead per message | A 2-byte minimum header | A few bytes plus your envelope | Text framing |
+| Infrastructure | A broker cluster | WebSocket gateways | Any HTTP server that streams |
+| iOS client | Third-party library | Built in | Built in, plus a parser |
+| Fits | Devices, fleets, constrained networks | Chat, collaboration, games | One-way feeds |
+
+MQTT wins when many devices publish and subscribe to a shared space of topics, especially over poor networks or constrained hardware, and when its built-in session, retain and will features replace code you'd otherwise write. A WebSocket wins when the app talks to *your* service with a protocol shaped like your product. SSE wins for one-way feeds.
+
+<Callout kind="interview">
+
+**Say**, for a smart-home design: "Devices speak MQTT to the broker: readings as retained QoS 0 messages, commands at QoS 1, and a last will for offline detection. Topics are `home/{homeID}/…`, and the broker's ACLs limit each client to its own home. The app either joins the broker over WebSockets on 443 for live control, or uses our API and a socket while it's open; either way, alerts reach it through APNs from a backend subscriber." **Ask** whether devices or phones are the constrained side, and how many devices per home. **Red flags:** QoS 2 everywhere "to be safe", treating QoS as end-to-end exactly-once, persistent sessions without expiry, and topics with no tenancy level for ACLs.
+
+</Callout>
+
+<Callout kind="gotcha" title="iOS gotcha: one client id per install, not per user">
+
+The broker allows one connection per client id; a second connection with the same id takes over the session and disconnects the first. Derive the id from the user's account and their iPhone and iPad will kick each other off in a reconnect loop. Generate a random id per installation, keep it in the Keychain so it survives relaunches (and app reinstalls only if you want them to resume the session), and map ids to users on the server.
+
+</Callout>
+
+```cards
+- id: mqtt-wildcards
+  front: "What do + and # match in an MQTT topic filter?"
+  back: "+ matches exactly one level; # matches any number of levels, including none, and must be last, so home/42/# also matches home/42."
+- id: mqtt-qos
+  front: "What do MQTT's QoS levels 0, 1 and 2 guarantee?"
+  back: "At most once, at least once (resent until PUBACK, so duplicates are possible), and exactly once between one client and the broker, via a four-packet handshake."
+- id: mqtt-retain-will
+  front: "How do retained messages and a last will give an app device presence?"
+  back: "The device publishes a retained 'online' when it connects and registers a retained 'offline' will. New subscribers get the current status at once, and the broker publishes the will if the device vanishes."
+- id: mqtt-keepalive
+  front: "When does an MQTT broker decide a client has gone?"
+  back: "When it hears nothing from the client for 1.5 times the keep-alive interval the client chose; it then closes the connection and publishes the client's will."
+```
+
+```quiz
+- id: q1
+  type: multi
+  prompt: "Which topics does the filter `fleet/+/position/#` match? Choose all that apply."
+  options:
+    - "fleet/van-7/position"
+    - "fleet/van-7/position/gps"
+    - "fleet/position"
+    - "fleet/van-7/eu/position"
+    - "fleet/van-9/position/gps/raw"
+  answer: [0, 1, 4]
+  explain: "`+` takes exactly one level (`van-7`, `van-9`), and `#` takes any number of levels after `position`, including none. `fleet/position` is missing a level, and `van-7/eu` is two levels where `+` allows one."
+- id: q2
+  type: sort
+  prompt: "Which QoS would you choose for each message?"
+  buckets: [QoS 0, QoS 1]
+  items:
+    - [A temperature reading published every 30 seconds, 0]
+    - ["Unlock the front door", 1]
+    - [A van's GPS position published every 2 seconds, 0]
+    - [A smoke alarm triggering, 1]
+    - [A firmware update is available, 1]
+  explain: "Frequent readings are replaced by the next one, so losing one costs nothing. Commands and alarms must arrive, so QoS 1, with receivers that handle the occasional duplicate (an unlock that's already unlocked is harmless)."
+- id: q3
+  type: mcq
+  prompt: "A new user opens the app, which subscribes to their lock's status topic. How does the screen show 'Locked' at once, rather than after the lock's next change?"
+  options:
+    - "QoS 2 on the subscription"
+    - "The lock publishes its status as a retained message, which the broker sends to every new subscriber"
+    - "A persistent session for the app"
+    - "The app polls the broker"
+  answer: 1
+  explain: "A retained message is the topic's current value, delivered immediately on subscribe. A persistent session only holds messages for a client that was subscribed before it went away."
+- id: q4
+  type: truefalse
+  prompt: "With QoS 2 from the device to the broker, a backend service that writes each message to a database will never write a message twice."
+  answer: false
+  explain: "QoS 2 is exactly-once between two hops: the device and the broker. The broker to the service is another hop with its own QoS, and the service can crash after writing but before acknowledging. End to end, you still need idempotent processing."
+- id: q5
+  type: mcq
+  prompt: "Users with both an iPhone and an iPad report the live device screen flickering 'reconnecting' every few seconds. Both apps connect with client id `user-1234`. What's happening?"
+  options:
+    - "The keep-alive is too short"
+    - "Each connection with the same client id takes over the session and disconnects the other, so they fight"
+    - "The broker can't handle two subscriptions to one topic"
+    - "QoS 1 duplicates are confusing the UI"
+  answer: 1
+  explain: "Client ids must be unique per connection. Use a random id per installation, and map it to the user on the server."
+```
