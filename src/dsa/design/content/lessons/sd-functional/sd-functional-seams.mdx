@@ -1,0 +1,311 @@
+## Why it matters
+
+To test code, or to change what it does without editing it, you need a **seam**: a place where behaviour can be swapped from outside. Michael Feathers coined the term in *Working Effectively with Legacy Code*. Object-oriented code usually builds seams from protocols and subclasses. In Swift, a function parameter is often a smaller, sharper seam, and a function that wraps another function can add logging, retries or caching without touching the original. Interviewers reach for this with "how would you test code that calls `URLSession`?" and "add retries without changing the API client".
+
+## Higher-order functions are already everywhere
+
+A **higher-order function** takes a function as an argument, returns one, or both. You use them all day:
+
+- `sorted(by:)`, `filter`, `map`: the standard library owns the loop, you own the decision.
+- `withAnimation { }`, `Task { }`, `DispatchQueue.main.async { }`: the framework owns *when*, you own *what*.
+- Completion handlers: the API owns the work, you own what happens with the result.
+
+Every closure parameter is a seam the caller controls. `sorted(by:)` never needs editing to sort by date, by price or by distance: the varying part was handed to the caller. That's the whole trick, applied to your own code.
+
+## Passing a function in: the smallest seam
+
+A profile editor needs to upload an avatar. The usual first step towards testability is a protocol. Compare it with a plain function type:
+
+```swift check title="The same seam, as a protocol and as a function"
+import Foundation
+
+// As a protocol: a named type, and a conforming type for every fake
+protocol AvatarUploading: Sendable {
+    func upload(_ jpeg: Data) async throws -> URL
+}
+
+// As a function: the function type is the whole contract
+typealias UploadAvatar = @Sendable (Data) async throws -> URL
+
+@MainActor
+final class ProfileEditor {
+    private let upload: UploadAvatar
+    private(set) var avatarURL: URL?
+
+    init(upload: @escaping UploadAvatar) {
+        self.upload = upload
+    }
+
+    func save(_ jpeg: Data) async throws {
+        avatarURL = try await upload(jpeg)
+    }
+}
+
+// The app passes a closure over its real API client; a test or preview passes one line
+@MainActor func previewEditor() -> ProfileEditor {
+    ProfileEditor(upload: { _ in URL(string: "https://cdn.example/avatar.jpg")! })
+}
+```
+
+**A protocol with one requirement is a function type with a name.** The closure version needs no fake type, no conformance and no file: a test that wants a failure passes `{ _ in throw URLError(.notConnectedToInternet) }`, and one that wants to see what was uploaded captures it.
+
+The protocol still wins in some places:
+
+- **Several related operations** that belong together, such as `load`, `save` and `delete` on a store. (A struct of closures can hold them too; that's the next lesson.)
+- **Fakes with state**, like an in-memory database that later calls must see.
+- **Existing types that already conform**, such as making `URLSession` your `HTTPClient` with an extension.
+- **Navigation in Xcode.** Jump to Definition on a protocol method lists the implementations; on a closure property it lands on the property.
+
+### A value or a function?
+
+[Pure functions and side effects](/design/learn/sd-functional-pure) passed `now` as a `Date`. Here it might be `now: () -> Date`. The difference is *when* you need it:
+
+- Needed once, at the moment of the call: pass a **value**. `statusLabel(for:at:in:)` takes a `Date`.
+- Needed repeatedly, or later, by a long-lived object: pass a **function**. A session that checks "has it been 15 minutes?" on every request takes `now: @Sendable () -> Date` and calls it each time.
+
+## Returning functions: decorators
+
+A function that takes a function and returns a new one of the same type can **add behaviour around it**. This is the decorator pattern without the classes. Each wrapper below has the same input and output type as what it wraps, so they stack in any order:
+
+```swift run title="Logging, retrying and caching, each a function around a function"
+struct Offline: Error {}
+
+typealias Fetch = (String) throws -> String
+
+/// Prints each call and its outcome, then passes everything through unchanged
+func logged(_ name: String, _ fetch: @escaping Fetch) -> Fetch {
+    { path in
+        print("→ \(name) \(path)")
+        do {
+            let body = try fetch(path)
+            print("← \(name) ok")
+            return body
+        } catch {
+            print("← \(name) failed: \(error)")
+            throw error
+        }
+    }
+}
+
+/// Tries up to `attempts` times, rethrowing the last error
+func retrying(_ attempts: Int, _ fetch: @escaping Fetch) -> Fetch {
+    { path in
+        var lastError: any Error = Offline()
+        for _ in 0..<attempts {
+            do { return try fetch(path) } catch { lastError = error }
+        }
+        throw lastError
+    }
+}
+
+/// Remembers each successful answer, so a second request for the same path never reaches `fetch`
+func cached(_ fetch: @escaping Fetch) -> Fetch {
+    var answers: [String: String] = [:]
+    return { path in
+        if let answer = answers[path] { return answer }
+        let answer = try fetch(path)
+        answers[path] = answer
+        return answer
+    }
+}
+
+/// A server that drops the first request, as a phone does when the radio is waking up
+final class FlakyServer {
+    private var requests = 0
+
+    func get(_ path: String) throws -> String {
+        requests += 1
+        if requests == 1 { throw Offline() }
+        return "profile for \(path)"
+    }
+}
+
+let server = FlakyServer()
+let fetch = cached(retrying(3, logged("network", server.get)))
+
+print(try fetch("/me"))
+print(try fetch("/me"))
+```
+
+```output
+→ network /me
+← network failed: Offline()
+→ network /me
+← network ok
+profile for /me
+profile for /me
+```
+
+Step through the two calls to see each layer's job:
+
+```visual sequence
+title: Two calls through cached, retrying and logged
+participants:
+  - { id: caller, label: Caller }
+  - { id: cached, label: cached }
+  - { id: retrying, label: retrying }
+  - { id: logged, label: logged }
+  - { id: server, label: FlakyServer }
+messages:
+  - [caller, cached, 'fetch("/me")']
+  - [cached, retrying, /me]
+  - [retrying, logged, /me]
+  - [logged, server, "get(/me)"]
+  - [server, logged, throws Offline, { reply: true }]
+  - [logged, retrying, rethrows, { reply: true }]
+  - [retrying, logged, /me]
+  - [logged, server, "get(/me)"]
+  - [server, logged, profile, { reply: true }]
+  - [logged, retrying, profile, { reply: true }]
+  - [retrying, cached, profile, { reply: true }]
+  - [cached, caller, profile, { reply: true }]
+  - [caller, cached, 'fetch("/me")']
+  - [cached, caller, profile (cached), { reply: true }]
+fragments:
+  - { kind: loop, label: up to 3 attempts, from: 2, to: 9 }
+steps:
+  - say: "The caller sees one `fetch`. The outermost layer, `cached`, has no answer for `/me`, so it calls the function it wraps."
+    upTo: 1
+  - say: "`retrying` calls `logged`, which prints the request and passes it to the server."
+    upTo: 3
+  - say: "The first request fails. `logged` prints the failure and **rethrows**: it adds behaviour, it never hides errors."
+    upTo: 5
+  - say: "`retrying` catches the error and tries again; this time the server answers."
+    upTo: 9
+  - say: "On the way out, `cached` stores the answer before handing it back."
+    upTo: 11
+  - say: "The second call never leaves `cached`: no log line, no request."
+    upTo: 13
+```
+
+What to notice:
+
+- **The server and the caller didn't change.** Behaviour was added purely by wrapping.
+- **Order is meaning.** With `cached` outside, a cache hit skips logging entirely. Put `logged` outside instead and every call is logged, hits included. Put `retrying` outside `cached` and a failure is retried against the cache, which is pointless. Choosing the order is a design decision; write it down where the stack is assembled.
+- **Each wrapper is testable alone**, with a fake function in place of the server.
+
+In a real app the same wrappers take `@Sendable (URLRequest) async throws -> (Data, HTTPURLResponse)` and wait between retries using an injected clock. You'll build retry policies properly in D14 and interceptor chains in D33; both are this idea at full size.
+
+## SwiftUI's own seams are functions
+
+Apple uses the same design in SwiftUI's environment. `openURL`, `dismiss`, `refresh` and `requestReview` aren't objects with methods: they're small structs you **call** like functions, because they implement `callAsFunction`. And because they live in the environment, a parent can replace one for everything below it:
+
+```swift check ios title="Opening the shop's own links inside the app"
+import SwiftUI
+
+struct HelpLink: View {
+    @Environment(\.openURL) private var openURL
+
+    var body: some View {
+        Button("Delivery help") {
+            openURL(URL(string: "https://shop.example/help/delivery")!)
+        }
+    }
+}
+
+struct CheckoutScreen: View {
+    let showInApp: (URL) -> Void
+
+    var body: some View {
+        HelpLink()
+            .environment(\.openURL, OpenURLAction { url in
+                guard url.host() == "shop.example" else { return .systemAction }
+                showInApp(url)   // the shop's own pages open inside the app
+                return .handled
+            })
+    }
+}
+```
+
+`HelpLink` doesn't know or care what opening a URL means. In the app it might push a screen; in a preview it might do nothing; in another screen it opens Safari. The seam is a function, and the environment decides which one.
+
+## Trade-offs
+
+| Seam | Ceremony | Fakes in tests | Several operations | Navigating the code | When it wins |
+| --- | --- | --- | --- | --- | --- |
+| Function parameter | Least: a type signature | A closure literal | One per parameter | Weaker: lands on the property | One capability: upload, now, a new ID, open a URL |
+| Protocol | A protocol plus a type per implementation | A conforming type | Natural | Strong: lists the implementations | Related operations, stateful fakes, existing types that conform |
+| Subclass and override | Inheritance, often `open` | A subclass | Natural | Strong | Rarely in new Swift; mostly legacy UIKit code |
+| Decorator function | One function per behaviour | Wrap a fake | One behaviour each | Weaker: the stack is assembled in one place | Cross-cutting behaviour: logging, retries, caching, metrics |
+
+<Callout kind="interview">
+
+**Say** "For a single capability I'd inject a function, say `upload: (Data) async throws -> URL`, and wrap cross-cutting behaviour like retries and logging as decorators around it, so the client itself stays simple." **Ask** whether the dependency has state or several related operations, which tips it towards a protocol. **Red flags:** a protocol, a class and a mock for every dependency by reflex; decorators that swallow errors; and not being able to say why the wrappers are stacked in that order.
+
+</Callout>
+
+<Callout kind="gotcha" title="Swift gotcha: a stored closure can keep its owner alive">
+
+`model.onSave = { self.dismiss() }` in a view controller makes the model hold the closure and the closure hold the controller: if the controller also holds the model, neither is ever freed. Capture weakly (`[weak self]`), or capture only what the closure needs (`[dismiss = self.dismiss]`). Function parameters that are used during the call and not stored don't have this problem, which is one more reason to prefer them.
+
+</Callout>
+
+<Callout kind="gotcha" title="Swift gotcha: the memoising wrapper isn't Sendable">
+
+`cached` captures a mutable dictionary, so its closure isn't `@Sendable`, and Swift 6 won't let you call it from several tasks at once. That's the compiler catching a real data race. For concurrent use, keep the answers in an actor (or a `Mutex` from the Synchronization module) and make the wrapper `async`.
+
+</Callout>
+
+## Practice
+
+The kata **queued likes outbox** takes every effect as a closure: `isOnline`, `load`, `send` and `save`. Its tests replace all four with closures that record what they were asked to do. Notice how little code a fake needs when the seam is a function.
+
+```cards
+- id: seam-definition
+  front: "What's a seam?"
+  back: "A place where you can change what code does without editing that code, such as a function parameter, a protocol or the SwiftUI environment."
+- id: protocol-is-function
+  front: "When is a function parameter a better seam than a protocol?"
+  back: "When the dependency is one capability with no state: a protocol with one requirement is a function type with a name, and a closure fake is one line."
+- id: decorator-order
+  front: "Why does the order of `cached(retrying(logged(fetch)))` matter?"
+  back: "Each wrapper only sees what passes through it: with the cache outside, hits skip logging and retries; reorder them and you log hits or retry against the cache."
+```
+
+```quiz
+- id: q1
+  type: mcq
+  prompt: "You want every request logged, including the ones answered from the cache. Which stack does that?"
+  options:
+    - "`cached(retrying(3, logged(\"net\", get)))`"
+    - "`logged(\"net\", cached(retrying(3, get)))`"
+    - "`retrying(3, cached(logged(\"net\", get)))`"
+    - "`cached(logged(\"net\", retrying(3, get)))`"
+  answer: 1
+  explain: "Only the outermost layer sees every call. With `logged` outside `cached`, hits are logged too; anywhere inside, a hit returns before reaching it."
+- id: q2
+  type: sort
+  prompt: "Would you inject each of these as a function parameter or as a protocol?"
+  buckets: [Function parameter, Protocol]
+  items:
+    - ["The current time, for a session that checks expiry on every request", 0]
+    - ["Generating a new `UUID` for each draft", 0]
+    - ["A store with load, save, delete and a query, faked in tests by an in-memory version", 1]
+    - ["Uploading one image and getting its URL back", 0]
+    - ["Making `URLSession` itself the app's HTTP client through an extension", 1]
+  explain: "Single capabilities are naturally functions. A group of related operations with a stateful fake, or a seam that existing types should conform to, reads better as a protocol."
+- id: q3
+  type: blank
+  prompt: "Complete the decorator so it adds a header to every request and passes it on."
+  code: |
+    typealias Send = @Sendable (URLRequest) async throws -> Data
+
+    func authorised(_ token: String, _ send: @escaping Send) -> Send {
+        { request in
+            var request = request
+            request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
+            return try await ___(request)
+        }
+    }
+  answers: ["send"]
+  explain: "A decorator calls the function it wraps, with the same type in and out. That's why decorators stack: `authorised(token, logged(send))` is still a `Send`."
+- id: q4
+  type: truefalse
+  prompt: "SwiftUI's `openURL` environment value is an object with an `open(_:)` method that you must subclass to customise."
+  answer: false
+  explain: "It's an `OpenURLAction` struct you call like a function through `callAsFunction`. You customise it by putting a different action in the environment with `.environment(\\.openURL, OpenURLAction { … })`."
+- id: q5
+  type: recall
+  prompt: "When would you pass `now` as a `Date` value, and when as a `() -> Date` function?"
+  model: "Pass a value when the code needs the time once, at the moment it's called, like a pure formatting or pricing function. Pass a function when a long-lived object needs the current time repeatedly or later, such as a session checking expiry on every request."
+```

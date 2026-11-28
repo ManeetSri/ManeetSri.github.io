@@ -1,0 +1,343 @@
+## Why it matters
+
+A lot of app code is a chain of steps that can each fail: parse a deep link, decode a response and turn it into a domain model, check a sign-up form. Written as small functions joined with `map` and `flatMap`, or with `try`, the happy path reads top to bottom and the failures are handled in one place, with their reasons intact. Interviewers notice two things here: whether errors keep enough detail to show the user something useful, and whether each layer translates errors into its own terms.
+
+## Two moves: map and flatMap
+
+`Optional` and `Result` are both boxes that either hold a value or don't. Each has the same two ways to work on what's inside:
+
+- **`map`** runs a transform that *can't* fail, and keeps the box: `Int("42").map { $0 * 2 }` is `Optional(84)`, and `Int("abc").map { $0 * 2 }` is `nil` without ever calling the closure.
+- **`flatMap`** runs a transform that *can* fail, and returns its box instead of nesting one inside another: `URL(string: text).flatMap { URLComponents(url: $0, resolvingAgainstBaseURL: false) }` is a plain `URLComponents?`.
+
+| Type | `map` takes | `flatMap` takes | Also has |
+| --- | --- | --- | --- |
+| `Optional<Wrapped>` | `(Wrapped) -> U` | `(Wrapped) -> U?` | `??` for a default, optional chaining with `?.` |
+| `Result<Success, Failure>` | `(Success) -> U` | `(Success) -> Result<U, Failure>` | `mapError`, `get()`, `init(catching:)` |
+
+The decision is always the same question: **can this step fail?** If not, `map`. If it can, `flatMap`. Get it wrong and the types tell you: a failing transform passed to `map` gives you `Int??` or a `Result` inside a `Result`.
+
+Optional chaining is the same idea with sugar. `order?.delivery?.postcode` is a chain of `flatMap`s that stops at the first `nil`.
+
+## A pipeline: parsing a deep link
+
+A shopping app opens links like `myshop://product/42` from push notifications and emails. Turning one into a screen takes three steps, and each can fail for its own reason:
+
+```swift run title="Parsing a deep link with Result and flatMap"
+import Foundation
+
+enum Route: Equatable {
+    case product(id: Int)
+    case order(id: String)
+}
+
+enum LinkError: Error, Equatable {
+    case notALink
+    case wrongScheme(String)
+    case unknownScreen(String)
+    case badProductID(String)
+}
+
+func components(of link: String) -> Result<URLComponents, LinkError> {
+    guard let parts = URLComponents(string: link), parts.scheme != nil else { return .failure(.notALink) }
+    return .success(parts)
+}
+
+func checkingScheme(_ parts: URLComponents) -> Result<URLComponents, LinkError> {
+    parts.scheme == "myshop" ? .success(parts) : .failure(.wrongScheme(parts.scheme ?? ""))
+}
+
+func route(from parts: URLComponents) -> Result<Route, LinkError> {
+    let id = String(parts.path.dropFirst())   // "/42" → "42"
+    switch parts.host {
+    case "product":
+        guard let number = Int(id), number > 0 else { return .failure(.badProductID(id)) }
+        return .success(.product(id: number))
+    case "order":
+        return .success(.order(id: id))
+    default:
+        return .failure(.unknownScreen(parts.host ?? ""))
+    }
+}
+
+func parse(_ link: String) -> Result<Route, LinkError> {
+    components(of: link)
+        .flatMap(checkingScheme)
+        .flatMap(route(from:))
+}
+
+for link in ["myshop://product/42", "myshop://order/A-1009", "https://product/42", "myshop://product/abc", "myshop://basket", "not a link"] {
+    switch parse(link) {
+    case .success(let route): print("\(link) → \(route)")
+    case .failure(let error): print("\(link) ✗ \(error)")
+    }
+}
+```
+
+```output
+myshop://product/42 → product(id: 42)
+myshop://order/A-1009 → order(id: "A-1009")
+https://product/42 ✗ wrongScheme("https")
+myshop://product/abc ✗ badProductID("abc")
+myshop://basket ✗ unknownScreen("basket")
+not a link ✗ notALink
+```
+
+`parse` is three lines that read like the steps themselves. No step knows about the others, each is pure and testable alone, and every failure arrives with a reason the app can log or show. Picture it as two tracks:
+
+```visual flow
+title: Two tracks, success and failure
+nodes:
+  - { id: link, label: link, kind: client, at: [0, 0] }
+  - { id: parts, label: components, at: [1, 0] }
+  - { id: scheme, label: checkingScheme, at: [2, 0] }
+  - { id: route, label: route(from:), at: [3, 0] }
+  - { id: ok, label: Route, kind: view, at: [4, 0] }
+  - { id: fail, label: LinkError, kind: external, at: [2, 2] }
+edges:
+  - [link, parts]
+  - [parts, scheme]
+  - [scheme, route]
+  - [route, ok]
+  - [parts, fail, notALink]
+  - [scheme, fail, wrongScheme]
+  - [route, fail, badProductID]
+steps:
+  - say: "`myshop://product/42` goes in. `components(of:)` parses it, so the result is a `.success`."
+    send: link->parts
+  - say: "`flatMap` unwraps the success and hands the components to the next step."
+    send: parts->scheme
+  - say: "The scheme is right, so the next `flatMap` runs `route(from:)`."
+    send: scheme->route
+  - say: "Every step succeeded: the pipeline's result is `.success(.product(id: 42))`."
+    send: route->ok
+    state: { ok: ok }
+  - say: "Now `myshop://product/abc`. The first two steps succeed again..."
+    send: [link->parts, parts->scheme, scheme->route]
+    state: { ok: null }
+  - say: "...but `abc` isn't a number, so `route(from:)` returns `.failure(.badProductID)`. Any `flatMap` after this would skip its closure: the error rides the failure track to the end."
+    send: route->fail
+    state: { fail: error }
+```
+
+Scott Wlaschin's name for this style is **railway-oriented programming**: each function is a switch point, and once a value is on the failure track it stays there.
+
+## try is flatMap with nicer syntax
+
+Swift has the same pipeline built into the language. A throwing function is a function that returns "a value or an error", and every `try` is a point where an error short-circuits the rest, exactly like `flatMap`. With typed throws (Swift 6), the error type survives too:
+
+```swift
+func parseLink(_ link: String) throws(LinkError) -> Route {
+    let parts = try components(of: link).get()   // get() rethrows the Result's own error type
+    let checked = try checkingScheme(parts).get()
+    return try route(from: checked).get()
+}
+```
+
+For straight-line code, especially `async` code, `throws` usually reads better: each step gets a name, and `try await` works where `Result` has no `async` version of `map`. **`Result` earns its place where an outcome must be a value:**
+
+- **Storing it:** a view model's `lastSync: Result<Date, SyncError>?`.
+- **Collecting several:** uploading ten photos and showing which failed means `[Result<Photo, UploadError>]`, not ten `do` blocks.
+- **Passing it through something that can't throw:** an older completion-handler API, or a reducer action such as `.searchFinished(Result<[Item], SearchError>)`.
+
+## Translating errors where layers meet
+
+Each layer should speak its own language. The networking layer knows about status codes; the feed screen knows about "you're offline" and "please sign in again". Translate once, at the boundary between them, with `mapError` on a `Result` or a `do`/`catch` around throwing code:
+
+```swift check title="FeedError: the screen's view of a network failure"
+import Foundation
+
+enum NetworkError: Error {
+    case offline
+    case status(Int)
+    case undecodable
+}
+
+/// What the feed screen can do something about
+enum FeedError: Error, Equatable {
+    case offline
+    case signedOut
+    case unavailable
+
+    init(_ error: NetworkError) {
+        switch error {
+        case .offline: self = .offline
+        case .status(401): self = .signedOut
+        case .status, .undecodable: self = .unavailable
+        }
+    }
+}
+
+struct Post: Sendable {
+    let id: Int
+    let text: String
+}
+
+/// The feed layer's boundary: network errors go in, feed errors come out
+func loadFeed(_ fetch: () async throws(NetworkError) -> [Post]) async throws(FeedError) -> [Post] {
+    do {
+        return try await fetch()
+    } catch {
+        throw FeedError(error)   // `error` is a NetworkError here, not `any Error`
+    }
+}
+
+// The same translation for an outcome you're holding as a value
+let outcome: Result<[Post], NetworkError> = .failure(.status(401))
+let forTheScreen: Result<[Post], FeedError> = outcome.mapError(FeedError.init)
+```
+
+The `FeedError` initialiser is a pure function, so the mapping from "a 401 from the server" to "show the sign-in screen" is one test, not a scenario you stage with a stub server.
+
+## When you want every error, not the first
+
+`flatMap` stops at the first failure. That's right for a pipeline, where step two needs step one's output. It's wrong for a form: someone who gets "email is invalid", fixes it, and only then hears "password too short" has been made to submit twice. When the checks are **independent**, run them all and collect the problems:
+
+```swift run title="Collecting every problem with a sign-up form"
+struct SignUpForm {
+    var email: String
+    var password: String
+    var age: Int
+}
+
+struct NewAccount {
+    let email: String
+    let password: String
+}
+
+enum FieldProblem: Equatable {
+    case emailMissingAt
+    case passwordTooShort(needs: Int)
+    case tooYoung
+}
+
+/// Every problem with the form, not only the first: each check is independent of the others
+func validate(_ form: SignUpForm) -> Result<NewAccount, ValidationFailure> {
+    var problems: [FieldProblem] = []
+    if !form.email.contains("@") { problems.append(.emailMissingAt) }
+    if form.password.count < 10 { problems.append(.passwordTooShort(needs: 10 - form.password.count)) }
+    if form.age < 13 { problems.append(.tooYoung) }
+    guard problems.isEmpty else { return .failure(ValidationFailure(problems: problems)) }
+    return .success(NewAccount(email: form.email, password: form.password))
+}
+
+/// Result's failure must be an Error, and an array isn't one, so wrap it
+struct ValidationFailure: Error {
+    let problems: [FieldProblem]
+}
+
+let forms = [
+    SignUpForm(email: "sam@example.com", password: "correct-horse", age: 30),
+    SignUpForm(email: "sam.example.com", password: "hunter2", age: 12),
+]
+for form in forms {
+    switch validate(form) {
+    case .success(let account):
+        print("OK: \(account.email)")
+    case .failure(let failure):
+        print("\(failure.problems.count) problems:", failure.problems.map { "\($0)" }.joined(separator: ", "))
+    }
+}
+```
+
+```output
+OK: sam@example.com
+3 problems: emailMissingAt, passwordTooShort(needs: 3), tooYoung
+```
+
+Functional programmers call this **accumulating** (or applicative) validation, in contrast to the short-circuiting kind. The design question is whether a later check needs an earlier one's result. "The two passwords match" can run alongside "the email has an @"; "the username is free" needs a valid username first.
+
+## Trade-offs
+
+| Tool | Error detail | Reads best for | Async | When it wins |
+| --- | --- | --- | --- | --- |
+| `Optional` with `map`, `flatMap`, `?.` | None: only "absent" | Short chains | No `async` `map`; use `if let` with `await` | When "missing" is the only way to fail: a lookup, an optional field |
+| `Result` with `flatMap` and `mapError` | Full, typed | Pipelines of named steps; outcomes as values | No `async` `map` | Storing, collecting or passing outcomes; actions in a reducer |
+| `throws` and `try`, typed or not | Full; typed with `throws(E)` | Straight-line code, especially `async` | Built in | Most functions that can fail |
+| Accumulating validation | Every problem at once | Independent checks | Not needed | Forms and anything a person fixes by hand |
+
+<Callout kind="interview">
+
+**Say** "Each step is a small function that can fail with a specific error; I compose them with `try` or `flatMap`, and translate errors once at each layer boundary so the screen gets errors it can act on." **Ask** what the user should see for each failure, because that decides how much detail the error types need. **Red flags:** `try?` on anything whose failure the user should hear about, one giant `AppError` with forty cases that every layer shares, and string error messages created deep in the networking code.
+
+</Callout>
+
+<Callout kind="gotcha" title="Swift gotcha: try? throws the reason away">
+
+`try?` turns every error into `nil`. That's fine for a cache read, where any failure means "fetch it instead". It's a bug when the reason matters: "That code isn't valid" shown to someone who is actually offline is what `guard let x = try? …` produces. Keep the error until the place that decides what to show.
+
+</Callout>
+
+<Callout kind="gotcha" title="Swift gotcha: map with a failing transform nests the box">
+
+`results.map(decode)`, where `decode` returns a `Result`, gives `Result<Result<Model, DecodeError>, NetworkError>`, and `Int("4").map { Int("\($0)2") }` is `Int??`. When you see a doubled type, you wanted `flatMap`. On sequences the equivalent for optionals is `compactMap`, which drops the `nil`s.
+
+</Callout>
+
+## Practice
+
+In the review **a promo code tangled in side effects**, two `try?`s on one `guard` turn being offline, a server error and a changed response format into "That code isn't valid". Work out the error type you'd give the promo client, and where you'd translate it into a message.
+
+```cards
+- id: map-or-flatmap
+  front: "How do you choose between `map` and `flatMap` on an Optional or a Result?"
+  back: "Ask whether the transform can fail. If it can't, `map`; if it returns its own Optional or Result, `flatMap`, so the boxes don't nest."
+- id: result-or-throws
+  front: "When is `Result` better than `throws`?"
+  back: "When the outcome must be a value: stored in state, collected from several operations, or passed through something that can't throw, such as a reducer action."
+- id: accumulate
+  front: "When should validation collect every error instead of stopping at the first?"
+  back: "When the checks are independent of each other, as in most forms, so the user can fix everything in one go."
+```
+
+```quiz
+- id: q1
+  type: mcq
+  prompt: "`fetchUser() -> Result<User, APIError>` and `loadAvatar(for: User) -> Result<Image, APIError>`. What type does `fetchUser().map(loadAvatar)` have?"
+  options:
+    - "`Result<Image, APIError>`"
+    - "`Result<Result<Image, APIError>, APIError>`"
+    - "`Result<User, APIError>`"
+    - "`Image?`"
+  answer: 1
+  explain: "`map` wraps whatever the transform returns, and `loadAvatar` already returns a `Result`, so the boxes nest. `flatMap(loadAvatar)` gives the flat `Result<Image, APIError>`."
+- id: q2
+  type: blank
+  prompt: "Finish the boundary so the screen only ever sees a `ProfileError`."
+  code: |
+    let fromNetwork: Result<Profile, NetworkError> = await client.profile()
+    let forScreen = fromNetwork.___(ProfileError.init)
+  answers: ["mapError"]
+  explain: "`mapError` transforms only the failure, leaving a success untouched, which is exactly what a layer boundary needs."
+- id: q3
+  type: sort
+  prompt: "Should each of these stop at the first failure, or collect every failure?"
+  buckets: [Stop at the first, Collect them all]
+  items:
+    - ["Parse a deep link into a route", 0]
+    - ["Check a sign-up form's email, password and date of birth", 1]
+    - ["Decode a response, then map it to a domain model", 0]
+    - ["Check a delivery address's postcode, street and phone number", 1]
+    - ["Refresh a token, then retry the request with it", 0]
+  explain: "When a step needs the previous step's output, there's nothing to do after a failure, so stop. Independent checks on something a person typed should all run, so they can fix everything at once."
+- id: q4
+  type: output
+  prompt: "What does this print?"
+  code: |
+    struct Address { let postcode: String? }
+    struct Order { let delivery: Address? }
+
+    let orders: [Order?] = [Order(delivery: Address(postcode: "LS1 4AP")), Order(delivery: nil), nil]
+    for order in orders {
+        print(order?.delivery?.postcode ?? "none")
+    }
+  answer: |
+    LS1 4AP
+    none
+    none
+  explain: "Optional chaining is a chain of `flatMap`s: it stops at the first `nil`, whether that's the order or its delivery address, and `??` supplies the default."
+- id: q5
+  type: truefalse
+  prompt: "With typed throws, `Result.get()` rethrows the result's own error type, so `try result.get()` inside a `throws(LinkError)` function compiles without a cast."
+  answer: true
+  explain: "Since Swift 6, `get()` is declared `throws(Failure)`, so a `Result<Route, LinkError>` throws exactly a `LinkError`."
+```

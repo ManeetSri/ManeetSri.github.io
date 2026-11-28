@@ -1,0 +1,217 @@
+<Brief>
+
+You've joined the platform team of a large retail banking app. Eight feature teams have built about **30 list screens** in UIKit: transactions, statements, payees, notifications, card activity, search results. Each was built differently. Some call `reloadData()`, some use diffable data sources with whole models as identifiers, and there are three different pagination implementations. Empty and error states look different on every screen, and half of them don't support the largest text sizes.
+
+The crash dashboard's top two UIKit crashes are both in lists: "Invalid update: invalid number of items" and a diffable data source complaining that item identifiers aren't unique, both on paginated screens. The transactions list hitches badly on older 60 Hz phones.
+
+Design the **reusable list screen component** every team will build list screens on.
+
+What the product and engineering leads care about:
+
+- **No list crashes**, whatever the data source does.
+- **Consistency:** the same loading, empty, error and paging behaviour everywhere, with Dynamic Type and VoiceOver handled once.
+- **Smooth scrolling** at 120 Hz, on lists of up to **20,000 rows** (a busy account's transactions), loaded in pages of 50.
+- **Incremental adoption:** a team must be able to move one screen at a time, without the platform team in the loop.
+- **SwiftUI rows:** the new design system's row components are SwiftUI views.
+
+Constraints: iOS 18 and later, Swift 6 language mode, navigation by UIKit coordinators, and every team owns its own data layer (repositories and API clients), so the component must not do networking itself.
+
+Spend about 40 minutes. Write in the sections on the right as if explaining it to the teams who'll use it.
+
+</Brief>
+
+```workspace
+template: component
+minutes: 40
+```
+
+<ModelAnswer section="requirements">
+
+**Who calls it:** feature teams, from their coordinators. They supply data and row content; the component supplies everything a list screen does.
+
+Questions worth asking first: do any lists need reordering or multiple selection? Do lists update live (a new transaction arriving by push)? How many screens group rows into sections (by day, by status)? Is there a design-system spec for empty and error states? Assume: grouping is common, live inserts happen on two screens, reordering is out.
+
+- **Functional:** sections of rows from any paged source; a state for each moment of a list's life: first load, loaded, empty, failed, loading more, paging failed, refreshing; pull to refresh; load the next page as the user nears the end; selection, swipe actions and context menus reported to the feature; rows as UIKit content configurations or SwiftUI views; section headers.
+- **Non-functional:** never crash on repeated identifiers or racing updates; configure a row in well under a millisecond, so 120 Hz scrolling holds on 20,000 rows; every text size up to AX5 and full VoiceOver support by default; clean under Swift 6 strict concurrency; adoptable one screen at a time.
+- **Out of scope:** networking, caching and persistence (each team's repository), navigation (coordinators). The component exposes hooks for both instead.
+
+</ModelAnswer>
+
+<ModelAnswer section="api">
+
+Features describe *what* to show; they don't subclass anything.
+
+```swift
+/// Supplied by each feature, usually wrapping its repository
+protocol PageSource<Item>: Sendable {
+    associatedtype Item: Identifiable & Sendable where Item.ID: Sendable
+    func page(after cursor: String?) async throws -> Page<Item>
+}
+
+struct Page<Item: Sendable>: Sendable {
+    let items: [Item]
+    let nextCursor: String?
+}
+
+struct ListConfiguration<Item: Identifiable & Sendable> {
+    var section: (Item) -> ListSection              // grouping key and header title
+    var row: (Item) -> ListRow                        // .system(UIListContentConfiguration) or .swiftUI(AnyView)
+    var trailingActions: ((Item) -> [ListAction])? = nil
+    var empty: ListMessage                            // title, symbol, optional action
+    var appearance: UICollectionLayoutListConfiguration.Appearance = .insetGrouped
+}
+
+@MainActor
+final class ListScreen<Item: Identifiable & Sendable>: UIViewController where Item.ID: Sendable {
+    init(source: some PageSource<Item>, configuration: ListConfiguration<Item>)
+    var onSelect: ((Item) -> Void)?
+    var onAction: ((ListAction, Item) -> Void)?
+    func refresh() async
+    func upsert(_ items: [Item])                      // live inserts and edits from the feature
+}
+```
+
+Usage, from the transactions coordinator:
+
+```swift
+let screen = ListScreen(
+    source: TransactionPages(repository: transactions),
+    configuration: .init(
+        section: { ListSection(id: $0.day.id, title: $0.day.title) },
+        row: { .swiftUI(AnyView(TransactionRow(state: mapper.row(for: $0)))) },
+        empty: .init(title: "No transactions yet", symbol: "creditcard")
+    )
+)
+screen.onSelect = { [weak self] transaction in self?.showDetail(transaction) }
+navigationController.pushViewController(screen, animated: true)
+```
+
+The row closure receives the item and returns content built from a **feature-owned pure mapper**, so presentation decisions stay testable in the feature.
+
+</ModelAnswer>
+
+<ModelAnswer section="internals">
+
+Three layers, and only the last touches UIKit:
+
+1. **`ListController`**, a pure state machine (Foundation only). States: `idle`, `loadingFirst`, `loaded(pages, nextCursor, paging)`, `empty`, `failed(error)`, with `paging` as `.idle`, `.loading` or `.failed`. Events: `appeared`, `refreshRequested`, `nearEnd`, `pageLoaded`, `pageFailed`, `retryTapped`, `upserted`. It decides when to call the source; nothing else does.
+2. **`SnapshotPlanner`**, a pure function from items to a plan: sections in first-appearance order, item identifiers in order, **repeated identifiers dropped and reported**, and identifiers whose row content changed, for `reconfigureItems`. Row content is compared through an `Equatable` row state the mapper returns, so only real changes reconfigure.
+3. **`ListScreen`**, the UIKit shell: a `UICollectionView` with a compositional list layout (`UICollectionLayoutListConfiguration`, swipe actions provider, supplementary headers) and a diffable data source keyed by `enum ListItem { case row(Item.ID), pagingFooter }`. Items live in a dictionary by ID; the cell registration looks them up, so a reconfigure always shows the latest. SwiftUI rows use `UIHostingConfiguration`; system rows use `UIListContentConfiguration`.
+
+The **paging footer** is its own item: a spinner while loading more, a "Couldn't load more. Retry" row after a failure. **Empty and first-load errors** use the view controller's `contentUnavailableConfiguration` (iOS 17), driven from `updateContentUnavailableConfiguration(using:)`, so every screen gets the same system-styled states.
+
+A call, end to end: the screen appears → the controller enters `loadingFirst` and asks the source for page one → `pageLoaded` → the planner builds the plan → the shell applies it without animation → as the user scrolls, `willDisplay` for one of the last ten rows sends `nearEnd` → the controller asks for the next page (if one isn't already loading) → the new items are appended, deduplicated and applied. A prefetch hook forwards `prefetchItemsAt` to an optional feature closure, for images.
+
+</ModelAnswer>
+
+<ModelAnswer section="concurrency">
+
+- **The UI side is `@MainActor`:** the screen, the controller's state and the item store. Items and identifiers are `Sendable`, which diffable requires anyway.
+- **The source does its own work** on whatever actor it likes; the controller only awaits it.
+- **One page request at a time.** The controller holds the in-flight `Task`; `nearEnd` while one is running is ignored, so fast scrolling can't fire five requests for the same cursor.
+- **Refresh supersedes paging.** A refresh cancels the in-flight page task and bumps a generation number. Responses carry the generation they were requested in; a response from an older generation is dropped, so a slow page 3 can't append to a list that was just refreshed to page 1.
+- **Live upserts** go through the same planner on the main actor, so they can't interleave with a page append halfway through.
+- **Big lists:** planning 20,000 items is cheap but not free. Above a threshold (say 5,000), plan in a detached task from `Sendable` inputs and apply on the main actor, discarding the result if the generation moved on meanwhile.
+- **Lifetime:** in-flight tasks are cancelled when the screen is deallocated or popped; loaded data stays while the screen exists, so going back and forth doesn't reload.
+
+</ModelAnswer>
+
+<ModelAnswer section="failure">
+
+- **First page fails:** full-screen error state with Retry, from the content-unavailable configuration.
+- **A later page fails:** keep every loaded row; the footer turns into a retry row. Don't retry automatically in a loop; retry on tap, or on the next `nearEnd` after a short backoff.
+- **Refresh fails:** keep the current rows, end the refresh control, show a small non-blocking message. Never replace good data with an error screen.
+- **Repeated identifiers** (a new transaction pushes the last item of page 1 into page 2): dropped by the planner, logged with the screen's name, and counted in a metric, because it points at offset-based paging. Recommend cursor-based pages to teams.
+- **An empty page with a next cursor:** keep paging; the list is only empty when the first page is empty and there's no cursor.
+- **Unbounded lists:** 20,000 small items are a few megabytes, which is fine. For truly endless feeds, offer a cap after which older pages are dropped.
+- **Misuse:** a feature returning non-unique identifiers gets an `assertionFailure` in debug builds and safe deduplication in release.
+- **Dynamic Type and VoiceOver:** rows self-size, the paging footer and errors are accessible elements with clear labels, and retry is reachable without scrolling.
+
+</ModelAnswer>
+
+<ModelAnswer section="testing">
+
+- **`ListController`** with Swift Testing and a scripted stub `PageSource`: first load success, empty and failure; paging, paging failure and retry; `nearEnd` ignored while a page is loading; a refresh during a slow page drops the stale response. A `TestClock` drives the retry backoff, so nothing waits in real time.
+- **`SnapshotPlanner`** as pure input and output: grouping, deduplication, reconfiguring only changed rows.
+- **Each feature's row mapper**, in the feature, with fixed locales and times.
+- **The UIKit shell:** snapshot tests of each state (loading, loaded, empty, error, paging error) at the default and AX5 text sizes, light and dark; one UI test for pull to refresh and infinite scroll.
+- **Performance:** a signposted measurement of row configuration in a performance test, and an Instruments hitch check on a 60 Hz device before each release.
+
+The seams that make this possible: the `PageSource` protocol, the row-mapping closure, and an injected clock.
+
+</ModelAnswer>
+
+<ModelAnswer section="tradeoffs">
+
+- **A configurable component over a base class to subclass.** Subclassing exposes internals as API and every override becomes something the platform team can't change. Composition keeps the surface to a source, a configuration and closures.
+- **Escape hatches over a god component.** Teams can register their own cell types and provide a custom section layout for the rare screen that needs it; the component doesn't try to anticipate every list.
+- **Collection view lists over `UITableView`.** Compositional lists cover table views' features, support `UIHostingConfiguration` and custom sections, and are where Apple's list work goes.
+- **UIKit now over a SwiftUI `List`.** Navigation is UIKit, and the component must work inside existing coordinators today. Because the controller, planner and mappers are pure Swift, a SwiftUI shell can reuse them unchanged later: only the third layer would be rewritten.
+- **The component owns paging state; features own fetching.** That's what removes the three pagination implementations without taking data access away from the teams who understand their APIs.
+- **Evolution:** version the component in its own module, with a migration guide per release; measure adoption by the number of screens on it and the list crash rate.
+
+</ModelAnswer>
+
+```rubric
+- id: scope
+  label: Scoped the component and named every state
+  skill: requirements
+  look_for:
+    - Feature teams as the callers, and networking and navigation explicitly out of scope
+    - First load, loaded, empty, error, loading more, paging error and refreshing as distinct states
+    - Non-functional goals with numbers or criteria (no crashes, 120 Hz on 20,000 rows, Dynamic Type)
+- id: api
+  label: An API that features compose rather than subclass
+  skill: api
+  look_for:
+    - The feature supplies a page source and row content, not a subclass
+    - Identifiers are stable, Hashable and Sendable
+    - Selection and actions reported through closures, so coordinators keep navigation
+    - SwiftUI rows supported, through UIHostingConfiguration
+- id: internals
+  label: Pure layers separated from the UIKit shell
+  skill: client
+  look_for:
+    - A pagination state machine and a snapshot planner that don't import UIKit
+    - Diffable with stable IDs, a model store looked up by ID, and reconfigure for content changes
+    - Repeated identifiers dropped before they reach the data source
+    - One page request at a time, and stale responses dropped after a refresh
+- id: performance
+  label: Kept scrolling smooth at 20,000 rows
+  skill: performance
+  look_for:
+    - Rows configured from precomputed state, with no formatting or I/O in cells
+    - Self-sizing rows and a compositional list layout
+    - A prefetch hook for images, and planning off the main actor for very large lists
+- id: failure
+  label: Failures keep good data on screen
+  skill: offline
+  look_for:
+    - A paging failure keeps loaded rows and shows a retry row, with no automatic retry loop
+    - A failed refresh keeps the current rows
+    - Duplicates logged and counted, with cursor-based paging recommended
+- id: testing
+  label: Testable without UIKit
+  skill: testing
+  look_for:
+    - State machine tests with a stub page source, including the refresh-during-paging race
+    - Planner tests as pure input and output
+    - Snapshot tests per state at large text sizes
+- id: tradeoffs
+  label: Weighed the component's shape and its future
+  skill: tradeoffs
+  look_for:
+    - Composition over a base class, with escape hatches
+    - Collection view list over table view, and UIKit now with a path to a SwiftUI shell
+    - How the component is versioned and adoption measured
+```
+
+<Pitfalls>
+
+- A `BaseListViewController` that every team subclasses: the internals become API, and every change breaks someone.
+- Putting networking in the component, which then has to understand thirty APIs.
+- Treating "loading more failed" like "loading failed" and replacing a screen of good data with an error.
+- Firing a page request on every `willDisplay` near the end, with no single-flight guard, so one scroll fetches the same page several times.
+- Whole models as diffable identifiers, which turns every edit into a delete and insert.
+
+</Pitfalls>

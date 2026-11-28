@@ -1,0 +1,68 @@
+The feed screen shows a spinner until its request finishes, and on a bad connection that can be a full minute: `URLSession`'s default request timeout only fires after 60 seconds without any data. Write a general timeout: run an operation, and if it hasn't finished in time, cancel it and say so.
+
+`ResilienceTimeout.run(within:clock:_:) async throws -> Value`
+
+- If the operation finishes first, return its value or throw its error, unchanged.
+- If `limit` passes first, cancel the operation and throw `TimedOut(limit:)`. Not `CancellationError`: the caller needs to know it was a timeout, so it can show "Taking too long" rather than nothing.
+- If the caller's own task is cancelled, cancel the operation and throw `CancellationError`, not `TimedOut`.
+- When `run` returns or throws, the operation has stopped and no timer is left waiting on the clock.
+
+## Examples
+
+With a 2-second limit, on a `TestClock`:
+
+| The operation | `run` |
+| --- | --- |
+| returns `42` at once | returns `42`, and the clock has no sleepers left |
+| would take 10 s | throws `TimedOut(limit: .seconds(2))` at 2 s; the operation sees cancellation |
+| takes 1 s | returns its value at 1 s, and the timer is cancelled |
+| throws `ServerError` at once | throws `ServerError` |
+| would take 10 s, and the caller is cancelled at 0 s | throws `CancellationError`; the operation sees cancellation |
+
+## Constraints
+
+- Sleep with `clock.sleep(for:)` on the clock you're given; the tests move a `TestClock` by hand.
+- Use structured concurrency, so cancellation reaches the operation without you passing anything to it.
+- The tests' operations cooperate with cancellation (a cancelled sleep throws). Yours must not ignore it either.
+
+<Hints>
+<Hint>
+This is a race between two pieces of work: the operation, and a timer that throws `TimedOut` when it wakes. `withThrowingTaskGroup` runs both as child tasks.
+</Hint>
+<Hint>
+`try await group.next()` gives you the first child to finish, value or error. That result is the answer, whichever child it came from.
+</Hint>
+<Hint>
+Call `group.cancelAll()` once you have the answer (a `defer` makes sure it runs on the error paths too). The group then waits for the loser to stop before `withThrowingTaskGroup` returns.
+</Hint>
+<Hint>
+You don't need to handle the caller being cancelled specially: cancelling the parent cancels both children, the operation throws `CancellationError`, and that's the first result.
+</Hint>
+</Hints>
+
+## Solutions
+
+<Approach title="Race the operation against a timer in a task group" time="O(1)" space="O(1)">
+
+```swift
+public static func run<Value: Sendable>(within limit: Duration, clock: some Clock<Duration>, _ operation: @escaping @Sendable () async throws -> Value) async throws -> Value {
+    try await withThrowingTaskGroup(of: Value.self) { group in
+        group.addTask {
+            try await operation()
+        }
+        group.addTask {
+            try await clock.sleep(for: limit)
+            throw TimedOut(limit: limit)
+        }
+        defer { group.cancelAll() }
+        guard let first = try await group.next() else { throw CancellationError() }
+        return first
+    }
+}
+```
+
+A task group never outlives its scope: before `withThrowingTaskGroup` returns, it waits for every child. That's what guarantees no timer is left behind, and it's also the trap. An operation that ignores cancellation (a tight loop that never calls `Task.checkCancellation()`, or a callback API wrapped without a cancellation handler) keeps running after the timeout, and `run` doesn't return until it finishes. A timeout can only be as prompt as the work it's cancelling.
+
+To return at once even from work that won't stop, you'd run the operation in an unstructured `Task` and stop waiting for it. That hides the problem rather than fixing it: the work goes on using the network and battery after the user has given up.
+
+</Approach>

@@ -1,0 +1,302 @@
+## Why it matters
+
+Retries help when a failure is brief; when a dependency is properly down, every retry costs the user a wait, the phone battery, and the struggling service another request it can't answer. A **circuit breaker** notices that a dependency keeps failing and stops calling it for a while, failing fast instead, and a **bulkhead** makes sure one part of the app in trouble can't take the rest down with it. Together they're how a home screen stays usable while its recommendations service is on fire, and they're the vocabulary interviewers listen for in senior and staff-level resilience discussions.
+
+## The circuit breaker
+
+The name comes from electrical wiring: when too much current flows, the breaker trips and cuts the circuit, so the fault doesn't burn the house down. Michael Nygard brought the idea to software in *Release It!* (2007). A software breaker wraps calls to one dependency and has three states:
+
+- **Closed:** calls go through as normal. The breaker counts failures.
+- **Open:** after too many failures, it trips. For a **cooldown** period, calls fail at once with a "circuit open" error, without touching the network.
+- **Half-open:** when the cooldown ends, the next call is a **trial**. If it succeeds, the dependency is back: close. If it fails, open again for another cooldown.
+
+Walk a day in the life of one:
+
+```visual states
+title: A circuit breaker guarding the recommendations service
+states:
+  - { id: closed, label: Closed, at: [0, 0] }
+  - { id: open, label: Open, at: [2, 0] }
+  - { id: halfOpen, label: Half-open, at: [1, 1] }
+initial: closed
+transitions:
+  - [closed, closed, success]
+  - [closed, closed, failure, failures < 3]
+  - [closed, open, failure, failures = 3]
+  - [open, open, call]
+  - [open, halfOpen, cooldownEnds]
+  - [halfOpen, closed, trialSucceeds]
+  - [halfOpen, open, trialFails]
+intro: "The breaker starts **closed**: every call goes to the service, and failures in a row are counted."
+events:
+  - { event: success, say: "A call succeeds. The failure count stays at zero." }
+  - { event: failure, guard: "failures < 3", say: "The service starts timing out. One failure: still closed, because one failure could be a blip." }
+  - { event: failure, guard: "failures < 3", say: "Two failures in a row." }
+  - { event: failure, guard: "failures = 3", say: "The third failure in a row trips the breaker: **open**. The service is probably down." }
+  - { event: call, say: "The home screen asks for recommendations. The breaker fails the call **at once**, without a request: no spinner, no battery, no extra load on the service." }
+  - { event: cooldownEnds, say: "After the cooldown, the breaker is **half-open**: the next call may go through, as a trial." }
+  - { event: trialFails, say: "The trial times out too. Back to **open** for another full cooldown." }
+  - { event: cooldownEnds, say: "Half-open again." }
+  - { event: trialSucceeds, say: "This trial succeeds: the service is back, so the breaker **closes** and calls flow normally." }
+```
+
+Here's that machine in code, an enum state machine like those in [State: enum state machines](/design/learn/sd-behavioural-state), with time passed in so the run is repeatable. The service is down until 20 seconds, and the app asks for recommendations every 3 seconds:
+
+```swift run title="CircuitBreaker.swift"
+// A circuit breaker as a plain state machine, with time passed in so the run is repeatable
+struct CircuitBreaker {
+    enum State: Equatable {
+        case closed(failures: Int)
+        case open(until: Int)
+        case halfOpen
+    }
+
+    let threshold: Int
+    let cooldown: Int
+    private(set) var state = State.closed(failures: 0)
+
+    init(threshold: Int, cooldown: Int) {
+        self.threshold = threshold
+        self.cooldown = cooldown
+    }
+
+    /// Whether a call at `now` may go to the server. After the cooldown, one call goes through as a trial.
+    mutating func allows(at now: Int) -> Bool {
+        guard case .open(let until) = state else { return true }
+        guard now >= until else { return false }
+        state = .halfOpen
+        return true
+    }
+
+    mutating func record(success: Bool, at now: Int) {
+        switch (state, success) {
+        case (_, true):
+            state = .closed(failures: 0)
+        case (.closed(let failures), false) where failures + 1 < threshold:
+            state = .closed(failures: failures + 1)
+        case (_, false):
+            state = .open(until: now + cooldown)
+        }
+    }
+}
+
+// The recommendations service is down until 20 s; the app asks every 3 s
+var breaker = CircuitBreaker(threshold: 3, cooldown: 10)
+var reachedServer = 0
+for now in stride(from: 0, through: 30, by: 3) {
+    var isTrial = false
+    if case .open = breaker.state { isTrial = true }
+    guard breaker.allows(at: now) else {
+        print("\(now) s: turned away")
+        continue
+    }
+    reachedServer += 1
+    let healthy = now >= 20
+    breaker.record(success: healthy, at: now)
+    print("\(now) s: \(isTrial ? "trial" : "sent"), \(healthy ? "succeeded" : "failed") -> \(breaker.state)")
+}
+print("Calls that reached the server: \(reachedServer) of 11")
+```
+
+```output
+0 s: sent, failed -> closed(failures: 1)
+3 s: sent, failed -> closed(failures: 2)
+6 s: sent, failed -> open(until: 16)
+9 s: turned away
+12 s: turned away
+15 s: turned away
+18 s: trial, failed -> open(until: 28)
+21 s: turned away
+24 s: turned away
+27 s: turned away
+30 s: trial, succeeded -> closed(failures: 0)
+Calls that reached the server: 5 of 11
+```
+
+Six of eleven calls never left the phone, and each of those was an instant answer instead of a timeout. Look at 21 and 24 seconds too: the service had recovered at 20, but the breaker didn't know yet. That's the price of a cooldown, and choosing its length is a trade-off between protecting the service and noticing recovery.
+
+### Breakers and retries together
+
+A retry loop and a breaker answer different questions. Retries ask "was that a blip?"; the breaker asks "is this dependency down?". Put the breaker *inside* the retry loop, so every attempt passes through it, and make "circuit open" an error the retry policy never retries. Then a burst of retries trips the breaker quickly, and once it's open, the remaining retries stop at once. (resilience4j, a widely used Java library, orders its retry and breaker this way by default: retry outside, breaker inside.) The same retry schedule as the last lesson, now behind a breaker:
+
+```visual retry
+title: Retries behind a breaker that opens after 3 failures
+base: 0.5
+factor: 2
+cap: 8
+attempts: 7
+jitter: none
+failUntil: 4
+breaker: { threshold: 3, cooldown: 3 }
+```
+
+The fourth attempt would have succeeded, but the breaker was open and turned it away. The trial after the cooldown finds the server healthy and closes the breaker.
+
+## Designing a breaker
+
+### What counts as a failure
+
+Count what says the **dependency** is unhealthy: timeouts, connection failures, `5xx` responses, `429`. Don't count what says the **request** is wrong (`400`, `404`, `422`): a user mistyping a coupon code mustn't open the breaker for everyone's checkout. And never count cancellations: the user scrolled away, the service did nothing wrong.
+
+### When it trips
+
+Two common rules:
+
+- **Consecutive failures** (3 in a row): simple, and fine when traffic is light, which it usually is from one phone.
+- **Failure rate in a rolling window** (more than 50% of the last 20 calls, with at least 10 calls in the window): steadier under heavy traffic, because one success among many failures doesn't keep a sick dependency in use. The minimum count stops two failures out of two from tripping it.
+
+### How long it stays open
+
+Long enough for a struggling service to recover, short enough that users don't wait for no reason after it has. Tens of seconds is typical in an app. Some breakers grow the cooldown on each failed trial, which is backoff applied to the breaker itself.
+
+### What the user sees
+
+A breaker is only half the design; the other half is the **fallback**. Throw a distinct error (`CircuitOpen`) so each screen can choose:
+
+- **Show cached data** with its age: yesterday's recommendations are better than none.
+- **Degrade quietly:** hide the recommendations shelf; the rest of the home screen is fine.
+- **Say so, honestly:** "Recommendations are unavailable right now", without a retry button that can only fail.
+- **Never block the critical path:** if reviews are down, the product page and the Buy button still work.
+
+### How many breakers
+
+One per **dependency**: per host, or per service behind a gateway, so the recommendations service being down doesn't stop calls to checkout. A single breaker for "the API" turns one sick endpoint into a total outage of your own making.
+
+On a phone, every device's breaker learns on its own from its own failures. That's still valuable, since it saves the user's time and the service's load, but it can't react to an outage before the device has seen it. Pair it with a **server-driven kill switch**: a remote config flag that turns a feature off for everyone at once. You'll meet those in D54.
+
+## Bulkheads
+
+A ship's hull is divided into watertight compartments, **bulkheads**, so that one breach floods one compartment, not the ship. In software, a bulkhead partitions resources so that one failing or overloaded part can only exhaust its own share.
+
+The classic failure a bulkhead prevents: the image CDN gets slow, the feed starts 60 image downloads, they hold every connection and worker for 30 seconds each, and the tap on "Checkout" waits behind them. Nothing about checkout was broken; it had nothing left to run on.
+
+Bulkheads in an iOS app:
+
+- **Separate `URLSession`s by traffic class.** Sessions don't share connections, so the media session can be slow without blocking API calls, and each gets its own timeouts and limits.
+- **Separate concurrency limits.** Image decoding, uploads and sync each get their own worker pool (the producer–consumer lesson), so a backlog in one can't take the workers of another.
+- **Separate breakers and rate budgets** per dependency and per priority: user-initiated work never queues behind background sync.
+- **Separate memory budgets.** An `NSCache` with a `totalCostLimit` for decoded images can't grow until it pushes the app into a memory warning.
+- **Separate processes, for free.** Extensions run in their own processes with their own memory limits, and a background `URLSession` runs transfers in a system process: if your app crashes, the upload carries on.
+
+```swift check title="NetworkSessions.swift"
+import Foundation
+
+enum NetworkSessions {
+    /// API calls: small, latency-sensitive, short timeouts
+    static let api: URLSession = {
+        let configuration = URLSessionConfiguration.default
+        configuration.timeoutIntervalForRequest = 15
+        configuration.httpMaximumConnectionsPerHost = 4
+        return URLSession(configuration: configuration)
+    }()
+
+    /// Images: big and numerous, allowed to wait longer, with their own cache
+    static let media: URLSession = {
+        let configuration = URLSessionConfiguration.default
+        configuration.timeoutIntervalForRequest = 30
+        configuration.httpMaximumConnectionsPerHost = 6
+        configuration.urlCache = URLCache(memoryCapacity: 20_000_000, diskCapacity: 200_000_000)
+        return URLSession(configuration: configuration)
+    }()
+}
+```
+
+The cost of bulkheads is idle capacity: a partition reserved for checkout sits unused while the feed would have liked it. Partition by what must keep working when something else fails, not by every feature.
+
+## Trade-offs
+
+| Approach | Fails fast when a dependency is down | Notices recovery | Isolates other features | Complexity | Wins when |
+| --- | --- | --- | --- | --- | --- |
+| Timeouts only | No: each call waits out its timeout | At once | No | Low | Rarely failing dependencies |
+| Retries with backoff | No: it waits longer | At once | No | Low | Brief, transient failures |
+| Circuit breaker | Yes, after the threshold | After the cooldown | Per dependency | Medium | A dependency that fails for minutes |
+| Breaker plus fallback | Yes, and the user sees something useful | After the cooldown | Per dependency | Medium | Non-critical features on busy screens |
+| Bulkheads | Not by themselves | Not applicable | Yes | Medium; idle capacity | Mixed traffic where some must always work |
+| Server kill switch | For everyone at once | When someone flips it back | Per feature | Needs remote config | Known outages and bad releases |
+
+<Callout kind="interview">
+
+**Say** the three states and what drives each transition, then the parts people forget: what counts as a failure (not 4xx, not cancellations), one breaker per dependency, the fallback the user sees, and a kill switch for fleet-wide outages. Mention bulkheads by example: "media and API traffic use separate sessions, so a slow CDN can't block checkout." **Ask** which features are critical and which may degrade. **Red flags:** a breaker with no half-open state (it never recovers until relaunch), one breaker for the whole API, and an open breaker shown to users as a generic error with a retry button.
+
+</Callout>
+
+<Callout kind="gotcha" title="iOS gotcha: cancellations that trip the breaker">
+
+When the user flings through a feed, cells scroll off screen and their image loads are cancelled, and `URLSession` reports each one as `URLError(.cancelled)`. A breaker that counts every thrown error as a failure opens after one fast scroll, and the images stop loading for everyone. Treat `URLError(.cancelled)` and `CancellationError` as "the caller gave up", not "the server failed".
+
+</Callout>
+
+<Callout kind="gotcha" title="Swift gotcha: the half-open stampede">
+
+If the half-open check and the move to "trial in progress" are separated by an `await`, every call that arrives while the trial is running also sees "half-open" and goes through: twenty requests hit a service that's barely back. Make the decision and record it in one synchronous step inside the actor, and turn away everyone else until the trial ends.
+
+</Callout>
+
+## Practice
+
+The kata **"Circuit breaker"** is the production version of the state machine above: an actor with an injected clock, a single trial at a time while half-open, cancellations that don't count, and a cooldown measured from the failed trial. The tests drive a test clock through every transition.
+
+```cards
+- id: breaker-states
+  front: "What are a circuit breaker's three states?"
+  back: "Closed: calls go through and failures are counted. Open: calls fail at once for a cooldown. Half-open: one trial call decides whether to close again or reopen."
+- id: breaker-failures
+  front: "What should and shouldn't count as a failure for a breaker?"
+  back: "Count signs the dependency is unhealthy: timeouts, connection errors, 5xx, 429. Don't count request errors (400, 404, 422) or cancellations."
+- id: breaker-retry-order
+  front: "How do a retry loop and a circuit breaker fit together?"
+  back: "The breaker sits inside the retry loop, so each attempt passes through it, and \"circuit open\" is never retried. Retries trip it quickly, and once it's open they stop."
+- id: bulkhead
+  front: "What is a bulkhead, and what's an iOS example?"
+  back: "Partitioning resources so one failing part can only exhaust its own share. Separate URLSessions for media and API calls, so a slow CDN can't block checkout."
+```
+
+```quiz
+- id: q1
+  type: order
+  prompt: "Put a breaker's journey through an outage in order."
+  lines:
+    - "Closed: calls go through, and failures in a row are counted"
+    - "The threshold is reached and the breaker opens"
+    - "Calls fail at once without reaching the service"
+    - "The cooldown ends and the breaker is half-open"
+    - "A single trial call goes through"
+    - "The trial succeeds and the breaker closes"
+  explain: "Failures trip it, the cooldown protects the service, and one trial tests recovery before traffic flows again. A failed trial would send it back to open."
+- id: q2
+  type: multi
+  prompt: "Which of these should count as failures for the breaker guarding a product-search service? Choose all that apply."
+  options:
+    - "A request that times out"
+    - "A 503 Service Unavailable"
+    - "A 400 because the query contained an invalid character"
+    - "`URLError(.cancelled)` after the user cleared the search box"
+    - "A connection refused by the host"
+  answer: [0, 1, 4]
+  explain: "Timeouts, 503s and refused connections say the service is unhealthy. A 400 says this request was wrong, and a cancellation says the user changed their mind; counting them would trip the breaker when nothing is down."
+- id: q3
+  type: mcq
+  prompt: "The reviews service is down, and its breaker is open. What should the product page do?"
+  options:
+    - "Show a full-screen error with a Retry button"
+    - "Keep retrying reviews in a loop until they load"
+    - "Show the product and the Buy button as usual, with cached reviews or a short note that reviews are unavailable"
+    - "Disable the Buy button until reviews are back"
+  answer: 2
+  explain: "A breaker without a fallback is only a faster error. Reviews are not on the critical path, so the page degrades gracefully, and a retry button can only fail while the breaker is open."
+- id: q4
+  type: mcq
+  prompt: "Your app uses one `URLSession` for everything. The image CDN slows to 20 seconds a response, and taps on Checkout start to hang. Which change addresses the cause?"
+  options:
+    - "Lower the image timeout to 5 seconds"
+    - "Put media and API traffic on separate sessions, with their own connection limits and timeouts"
+    - "Add a circuit breaker to Checkout"
+    - "Retry Checkout requests more often"
+  answer: 1
+  explain: "Checkout isn't failing; it's queued behind slow image downloads competing for the same connections. A bulkhead gives API traffic its own resources. A breaker on the CDN would also help, but the isolation fixes the starvation."
+- id: q5
+  type: truefalse
+  prompt: "A circuit breaker inside the app protects the backend from an outage before any phone has seen a failure."
+  answer: false
+  explain: "Each device's breaker learns from its own failures, so it can only react after its first few. To switch a feature off for everyone at once, pair breakers with a server-driven kill switch in remote config."
+```

@@ -1,0 +1,524 @@
+## Why it matters
+
+Some objects are *assembled* rather than constructed: a request that several layers add headers to, a notification with a sound and a thread, a snapshot with sections that depend on the data, a query string with optional filters. A builder keeps that assembly readable and makes sure the result is valid. Builders are also all over Apple's APIs, and SwiftUI's syntax is itself a builder that the compiler writes for you, so you'll read and design them constantly.
+
+## What a builder is for
+
+The Gang of Four: *separate the construction of a complex object from its representation, so that the same construction process can create different representations.* In practice, a builder is a helper you feed parts to, step by step, and then ask for the finished product.
+
+In Java, the classic motivation is the **telescoping constructor**: `Pizza(size)`, `Pizza(size, cheese)`, `Pizza(size, cheese, pepperoni)`, and so on. Swift mostly doesn't have that problem. Default arguments and memberwise initialisers already let callers name only what they need:
+
+```swift check
+import Foundation
+
+struct ImageRequest {
+    enum Priority { case low, normal, high }
+
+    var url: URL
+    var targetSize: CGSize? = nil
+    var priority: Priority = .normal
+    var allowsCellular = true
+}
+
+let thumbnail = ImageRequest(url: URL(string: "https://img.example.com/1.jpg")!, targetSize: CGSize(width: 80, height: 80))
+```
+
+So in Swift, a builder must earn its place. It does when one of these is true:
+
+1. **The parts arrive over time or from different places.** An authentication layer adds a token, a localisation layer adds `Accept-Language`, a tracing layer adds a request ID. No single call site knows every argument.
+2. **The rules span several parts.** "A GET has no body", "a multipart form needs a boundary once it has a file". Checking them once, in `build()`, is clearer than checking after every step.
+3. **You want a mutable workspace and an immutable result.** Assemble freely, then hand out something nobody can change.
+4. **The call site should read like a description.** Fluent chains and result builders make structure visible.
+
+## Apple's builders
+
+Once you know the shape, you'll see it everywhere in Apple's frameworks:
+
+| Builder | Product | What the builder adds |
+| --- | --- | --- |
+| `URLComponents` | `URL` | Set scheme, host, path and query items in any order; `url` is `nil` if the parts don't make a valid URL |
+| `UNMutableNotificationContent` | `UNNotificationContent` | A mutable subclass you fill in; the request then holds an immutable copy |
+| `NSDiffableDataSourceSnapshot` | The collection view's state | Append sections and items conditionally, then `apply` the whole snapshot at once |
+| `NSMutableAttributedString` | `NSAttributedString` | Append and style runs, then hand out the immutable version |
+| `UIButton.Configuration`, `UIListContentConfiguration` | A configured view | A value you adjust, then assign to the view |
+
+```swift check ios
+import UIKit
+import UserNotifications
+
+func orderURL(id: String, includeItems: Bool) -> URL? {
+    var components = URLComponents()
+    components.scheme = "https"
+    components.host = "api.example.com"
+    components.path = "/orders/\(id)"
+    if includeItems {
+        components.queryItems = [URLQueryItem(name: "include", value: "items")]
+    }
+    return components.url
+}
+
+func deliveryReminder(orderID: String, at date: DateComponents) -> UNNotificationRequest {
+    let content = UNMutableNotificationContent()
+    content.title = "Your order arrives today"
+    content.body = "Order \(orderID) is out for delivery."
+    content.sound = .default
+    content.threadIdentifier = "orders"
+    content.userInfo = ["orderID": orderID]
+
+    let trigger = UNCalendarNotificationTrigger(dateMatching: date, repeats: false)
+    return UNNotificationRequest(identifier: "delivery-\(orderID)", content: content, trigger: trigger)
+}
+
+struct Contact: Hashable, Sendable {
+    let id: Int
+    let name: String
+}
+
+@MainActor
+func show(favourites: [Contact], others: [Contact], in dataSource: UICollectionViewDiffableDataSource<String, Contact>) {
+    var snapshot = NSDiffableDataSourceSnapshot<String, Contact>()
+    if !favourites.isEmpty {
+        snapshot.appendSections(["Favourites"])
+        snapshot.appendItems(favourites, toSection: "Favourites")
+    }
+    snapshot.appendSections(["Everyone"])
+    snapshot.appendItems(others, toSection: "Everyone")
+    dataSource.apply(snapshot, animatingDifferences: true)
+}
+```
+
+The snapshot is the clearest case for a builder. Building it step by step, with the "Favourites" section only when there are favourites, is natural. Applying the **finished** snapshot in one call is what lets the data source diff old against new and animate the change, rather than reacting to a half-built state.
+
+## Fluent builders: class or struct?
+
+A **fluent** builder returns something from every method, so calls chain: `.path("/orders").header("Accept", "application/json")`. In Swift you can write one as a class that mutates itself and returns `self`, or as a struct that returns a changed copy. They look identical at the call site and behave very differently once a builder is shared:
+
+```swift run
+struct Request: CustomStringConvertible {
+    let method: String
+    let path: String
+    let headers: [String: String]
+
+    var description: String {
+        let headerList = headers.keys.sorted().map { "\($0): \(headers[$0]!)" }.joined(separator: ", ")
+        return "\(method) \(path) [\(headerList)]"
+    }
+}
+
+// A reference builder: every call mutates the one object and returns it
+final class ClassRequestBuilder {
+    private var method = "GET"
+    private var path = "/"
+    private var headers: [String: String] = [:]
+
+    func path(_ path: String) -> ClassRequestBuilder {
+        self.path = path
+        return self
+    }
+
+    func header(_ name: String, _ value: String) -> ClassRequestBuilder {
+        headers[name] = value
+        return self
+    }
+
+    func build() -> Request { Request(method: method, path: path, headers: headers) }
+}
+
+// A value builder: every call returns a changed copy and leaves the original alone
+struct RequestBuilder {
+    private var method = "GET"
+    private var path = "/"
+    private var headers: [String: String] = [:]
+
+    func path(_ path: String) -> RequestBuilder {
+        var copy = self
+        copy.path = path
+        return copy
+    }
+
+    func header(_ name: String, _ value: String) -> RequestBuilder {
+        var copy = self
+        copy.headers[name] = value
+        return copy
+    }
+
+    func build() -> Request { Request(method: method, path: path, headers: headers) }
+}
+
+let sharedObject = ClassRequestBuilder().header("Authorization", "Bearer abc")
+let ordersFromObject = sharedObject.path("/orders")
+let profileFromObject = sharedObject.path("/profile")
+print("class:", ordersFromObject.build())
+print("class:", profileFromObject.build())
+
+let sharedValue = RequestBuilder().header("Authorization", "Bearer abc")
+let orders = sharedValue.path("/orders")
+let profile = sharedValue.path("/profile").header("Accept-Language", "en-GB")
+print("value:", orders.build())
+print("value:", profile.build())
+print("value:", sharedValue.build())
+```
+
+```output
+class: GET /profile [Authorization: Bearer abc]
+class: GET /profile [Authorization: Bearer abc]
+value: GET /orders [Authorization: Bearer abc]
+value: GET /profile [Accept-Language: en-GB, Authorization: Bearer abc]
+value: GET / [Authorization: Bearer abc]
+```
+
+The class version has a bug that's easy to write and hard to spot: `sharedObject`, `ordersFromObject` and `profileFromObject` are three names for **one** object, so the second `.path` overwrote the first and the orders request goes to `/profile`. The struct version gives each branch its own copy.
+
+```visual flow
+title: Branching from a shared base builder
+nodes:
+  - { id: base, label: "base (auth header)", kind: service, at: [0, 1] }
+  - { id: orders, label: orders, kind: service, at: [2, 0] }
+  - { id: profile, label: profile, kind: service, at: [2, 2] }
+  - { id: object, label: one builder object, kind: store, at: [4, 1] }
+edges:
+  - [base, orders, '.path("/orders")']
+  - [base, profile, '.path("/profile")']
+  - [base, object, refers to, { style: data }]
+  - [orders, object, refers to, { style: data }]
+  - [profile, object, refers to, { style: data }]
+steps:
+  - say: "**Struct builder:** `base.path(\"/orders\")` returns a *new* value with the path set."
+    show: [base, orders]
+    send: base->orders
+    state: { orders: ok }
+    label: { orders: /orders }
+  - say: The second call starts from `base` again, which is unchanged, so each branch is independent.
+    show: [profile]
+    send: base->profile
+    state: { profile: ok }
+    label: { profile: /profile }
+  - say: "**Class builder:** every method returns `self`, so all three names point at the same object."
+    reset: true
+    show: [base, orders, profile, object, base->object, orders->object, profile->object]
+    state: { object: active }
+  - say: The second `.path` mutated that object, so `orders` builds a request to `/profile` too.
+    state: { orders: error, object: null }
+    label: { orders: /profile, profile: /profile }
+```
+
+That's why value builders are the default in Swift, and why SwiftUI's modifiers work the same way: each modifier returns a new value wrapping the old one. Value builders are also `Sendable` for free when their parts are, so they can cross actors in Swift 6; a class builder with mutable state can't. Copying a small struct is cheap, and `Array` and `Dictionary` fields share their storage until one copy is written to. You'll see that mechanism in [Prototype: NSCopying and value copies](/design/learn/sd-creational-prototype).
+
+## Validating in `build()`
+
+A builder's last step is the place to check rules that involve several parts. With typed throws, callers know exactly what can go wrong:
+
+```swift check
+import Foundation
+
+struct APIRequest {
+    let method: String
+    let path: String
+    let body: Data?
+}
+
+struct APIRequestBuilder {
+    enum Problem: Error, Equatable {
+        case pathMustStartWithSlash(String)
+        case bodyNotAllowed(method: String)
+    }
+
+    private var method = "GET"
+    private var path = "/"
+    private var body: Data?
+
+    func method(_ method: String) -> Self {
+        var copy = self
+        copy.method = method
+        return copy
+    }
+
+    func path(_ path: String) -> Self {
+        var copy = self
+        copy.path = path
+        return copy
+    }
+
+    func body(_ body: Data) -> Self {
+        var copy = self
+        copy.body = body
+        return copy
+    }
+
+    func build() throws(Problem) -> APIRequest {
+        guard path.hasPrefix("/") else { throw .pathMustStartWithSlash(path) }
+        if method == "GET", body != nil { throw .bodyNotAllowed(method: method) }
+        return APIRequest(method: method, path: path, body: body)
+    }
+}
+```
+
+Because the product is only produced by `build()`, an invalid `APIRequest` never exists. That's the same guarantee a throwing initialiser gives, extended to objects that are assembled in several steps.
+
+### The configuration-closure style
+
+For an object with many optional fields and no need to branch, Swift has a lighter idiom than one method per field: hand the caller a mutable draft through an `inout` closure, then validate.
+
+```swift check
+import Foundation
+
+struct UploadRequest {
+    let url: URL
+    let fileURL: URL
+    let allowsCellular: Bool
+    let priority: Float
+
+    struct Draft {
+        var url: URL?
+        var fileURL: URL?
+        var allowsCellular = true
+        var priority: Float = 0.5
+    }
+
+    enum Problem: Error {
+        case missingURL
+        case missingFile
+        case priorityOutOfRange(Float)
+    }
+
+    static func make(_ configure: (inout Draft) -> Void) throws(Problem) -> UploadRequest {
+        var draft = Draft()
+        configure(&draft)
+        guard let url = draft.url else { throw .missingURL }
+        guard let fileURL = draft.fileURL else { throw .missingFile }
+        guard (0...1).contains(draft.priority) else { throw .priorityOutOfRange(draft.priority) }
+        return UploadRequest(url: url, fileURL: fileURL, allowsCellular: draft.allowsCellular, priority: draft.priority)
+    }
+}
+
+func backgroundUpload(of file: URL) throws(UploadRequest.Problem) -> UploadRequest {
+    try UploadRequest.make {
+        $0.url = URL(string: "https://upload.example.com/photos")
+        $0.fileURL = file
+        $0.allowsCellular = false
+        $0.priority = 0.2
+    }
+}
+```
+
+The draft is mutable and private to the closure; the product is immutable. It's a builder without the fluent methods.
+
+### Directors: named recipes
+
+The GoF book adds a **director**: an object that runs a builder's steps in a fixed order to produce a known kind of product. In Swift, a director is usually a static factory that returns a preconfigured builder, such as `static func authenticated(token: String) -> APIRequestBuilder`. Callers start from the recipe and add what's specific to them. It's the static factory from [Static factories and convenience initialisers](/design/learn/sd-creational-static-factories) and the builder working together.
+
+### Test data builders
+
+The builder you'll write most often lives in your test target. Tests need models, and a test about cancelled orders shouldn't have to spell out an order's id, currency, line items and delivery address just to compile. A **test data builder** supplies a valid default for everything, so each test names only what it's about. In Swift, a static factory with default arguments does the job:
+
+```swift check
+import Foundation
+
+struct LineItem: Equatable {
+    var name: String
+    var quantity: Int
+    var unitPrice: Decimal
+}
+
+struct Order: Equatable {
+    enum Status { case placed, shipped, cancelled }
+
+    var id: String
+    var status: Status
+    var items: [LineItem]
+    var placedAt: Date
+}
+
+// In the test target: a valid default for every field, overridable one at a time
+extension LineItem {
+    static func fixture(name: String = "Tea", quantity: Int = 1, unitPrice: Decimal = 4) -> LineItem {
+        LineItem(name: name, quantity: quantity, unitPrice: unitPrice)
+    }
+}
+
+extension Order {
+    static func fixture(
+        id: String = "order-1",
+        status: Status = .placed,
+        items: [LineItem] = [.fixture()],
+        placedAt: Date = Date(timeIntervalSince1970: 1_700_000_000)
+    ) -> Order {
+        Order(id: id, status: status, items: items, placedAt: placedAt)
+    }
+}
+
+let cancelled = Order.fixture(status: .cancelled)
+let bulk = Order.fixture(items: [.fixture(quantity: 12)])
+```
+
+The payoff comes later: when `Order` gains a `deliveryAddress`, you add one default to `fixture` instead of editing two hundred tests. Keep the defaults boring and valid, and never let a test depend on a default it doesn't name. If a test's assertion relies on the order being `.placed`, it should say `status: .placed` itself.
+
+## Result builders: a builder the compiler writes
+
+A **result builder** (Swift 5.4, SE-0289) turns the statements in a closure into calls to static methods on a builder type: `buildExpression` for each expression, `buildOptional` for an `if` without `else`, `buildEither(first:)` and `buildEither(second:)` for `if`/`else`, `buildArray` for a `for` loop, and `buildBlock` (or `buildPartialBlock`, from Swift 5.7) to combine them. You took the mechanism apart in [Result builders and DSLs](/design/learn/sd-swift-design-result-builders). As a *design* choice, it's the builder pattern with the steps written as plain Swift statements.
+
+Here's one that builds query items, with conditions and loops reading like ordinary code:
+
+```swift run
+import Foundation
+
+@resultBuilder
+enum QueryBuilder {
+    static func buildExpression(_ item: URLQueryItem) -> [URLQueryItem] { [item] }
+    static func buildBlock(_ parts: [URLQueryItem]...) -> [URLQueryItem] { parts.flatMap { $0 } }
+    static func buildOptional(_ part: [URLQueryItem]?) -> [URLQueryItem] { part ?? [] }
+    static func buildEither(first part: [URLQueryItem]) -> [URLQueryItem] { part }
+    static func buildEither(second part: [URLQueryItem]) -> [URLQueryItem] { part }
+    static func buildArray(_ parts: [[URLQueryItem]]) -> [URLQueryItem] { parts.flatMap { $0 } }
+}
+
+func searchQuery(@QueryBuilder _ items: () -> [URLQueryItem]) -> String {
+    var components = URLComponents()
+    components.queryItems = items()
+    return components.percentEncodedQuery ?? ""
+}
+
+func productSearch(text: String, page: Int, tags: [String], inStockOnly: Bool) -> String {
+    searchQuery {
+        URLQueryItem(name: "q", value: text)
+        if page > 1 {
+            URLQueryItem(name: "page", value: String(page))
+        }
+        for tag in tags {
+            URLQueryItem(name: "tag", value: tag)
+        }
+        if inStockOnly {
+            URLQueryItem(name: "stock", value: "in")
+        } else {
+            URLQueryItem(name: "stock", value: "any")
+        }
+    }
+}
+
+print(productSearch(text: "green tea", page: 1, tags: [], inStockOnly: false))
+print(productSearch(text: "green tea", page: 3, tags: ["loose", "organic"], inStockOnly: true))
+```
+
+```output
+q=green%20tea&stock=any
+q=green%20tea&page=3&tag=loose&tag=organic&stock=in
+```
+
+SwiftUI's `@ViewBuilder`, `@ToolbarContentBuilder`, `@SceneBuilder` and `@CommandsBuilder` are result builders, and so is the `Regex { … }` syntax from RegexBuilder. `@ViewBuilder` goes further than this example: its `buildEither` returns a `_ConditionalContent` that records *which* branch you took in the type, which is how SwiftUI knows that switching branches replaces a view rather than updating it.
+
+A result builder is worth writing when:
+
+- the product is a **list or tree** that callers describe declaratively, with conditionals and loops;
+- call sites are **written often** by many people, so a DSL pays back its learning cost;
+- you're happy to own the cost: compiler diagnostics inside builder closures are weaker, and every new statement form needs another `build…` method.
+
+For a request with five settings, a fluent value builder is simpler. For a settings screen, a menu or a document described by dozens of call sites, a result builder can be worth it.
+
+## Trade-offs
+
+| | Memberwise `init` with defaults | `inout` configuration closure | Class fluent builder | Struct fluent builder | Result builder |
+| --- | --- | --- | --- | --- | --- |
+| Parts arriving over time | No: all at once | No: inside one closure | Yes | Yes | No: one block |
+| Safe to share and branch | Yes | Yes | No | Yes | Yes |
+| `Sendable` in Swift 6 | If the fields are | If the fields are | Only with locking | If the fields are | If the product is |
+| Cross-field validation | In the `init` | In `make` | In `build()` | In `build()` | In the builder's methods |
+| Code to write | None | A draft type | A method per part | A method per part | A builder type and its `build…` methods |
+| Best for | Most value types | Many optional fields | Rarely the right choice in Swift | Requests, queries, layered assembly | Declarative trees and lists |
+
+<Callout kind="interview">
+
+**What to say:** "Requests are built by a value-type builder. The auth layer adds a token, the locale layer adds `Accept-Language`, and `build()` validates once at the end, so every layer can add to it without knowing the others and nothing invalid reaches `URLSession`."
+
+**What to ask:** "Do several layers contribute to this object, or does one call site know everything?" If one call site knows everything, an initialiser with defaults is simpler.
+
+**Red flags:** a builder for a three-field struct; a class builder shared between requests; a builder whose `build()` can't fail but whose product can still be invalid; a result builder where a plain array literal would do.
+
+</Callout>
+
+<Callout kind="gotcha" title="Swift gotcha: a value builder's result must be used">
+
+`builder.header("Accept", "application/json")` on its own does nothing to a struct builder: it returns a new value and throws it away. Swift warns that the result is unused, which is exactly the warning you want, so **don't** mark value-builder methods `@discardableResult`. That attribute belongs on class builders, where the call mutates the object anyway.
+
+</Callout>
+
+<Callout kind="gotcha" title="iOS gotcha: URLComponents leaves + alone">
+
+`URLComponents` percent-encodes spaces, `&` and `=` in query values, but not `+`. Many servers decode `+` in a query as a space, so `q=tea+cake` arrives as "tea cake". If values can contain `+`, encode them yourself and set `percentEncodedQueryItems`, as the kata asks you to.
+
+</Callout>
+
+## Practice
+
+The **request builder** kata asks for a value-type, fluent builder for `URLRequest` with ordered query items, case-insensitive headers, a JSON body and validation in `build()`. Its tests branch from a shared base builder, so a class-style builder fails them.
+
+```cards
+- id: builder-when-swift
+  front: "When does a builder earn its place in Swift, given default arguments?"
+  back: "When parts arrive over time or from several layers, when rules span several parts and are best checked once in `build()`, when you want a mutable workspace and an immutable product, or when the call site should read as a description."
+- id: value-vs-class-builder
+  front: "Why prefer a struct fluent builder to a class one in Swift?"
+  back: "Each call returns a new value, so branching from a shared base builder is safe, and the builder is `Sendable` when its parts are. A class builder returns `self`, so every branch mutates the same object."
+- id: snapshot-builder
+  front: "Why is `NSDiffableDataSourceSnapshot` a builder?"
+  back: "You append sections and items step by step, conditionally, and then apply the finished snapshot in one call, which lets the data source diff and animate from old to new."
+- id: result-builder-fit
+  front: "When is a result builder the right kind of builder?"
+  back: "When callers describe a list or tree declaratively, with conditionals and loops, at many call sites. For a few settings, a fluent value builder is simpler."
+```
+
+```quiz
+- id: q1
+  type: output
+  prompt: "What does this print?"
+  code: |
+    final class Builder {
+        var path = "/"
+        func path(_ value: String) -> Builder {
+            path = value
+            return self
+        }
+    }
+
+    let base = Builder()
+    let a = base.path("/a")
+    let b = base.path("/b")
+    print(a.path, b.path, base.path)
+  answer: "/b /b /b"
+  explain: "`path(_:)` mutates the object and returns `self`, so `base`, `a` and `b` are the same object. The last call wins for all three. A struct builder would print `/a /b /`."
+- id: q2
+  type: mcq
+  prompt: "A networking layer adds an auth header, an `Accept-Language` header and a tracing ID, each in a different component, before a request is sent. Which way of building requests fits best?"
+  options:
+    - "A memberwise initialiser on a `Request` struct with every header as a parameter"
+    - "A struct fluent builder passed through the components, validated by `build()` at the end"
+    - "A shared class builder that each component mutates"
+    - "A result builder with one statement per header"
+  answer: 1
+  explain: "Parts arrive from different places, so no one call site can call an initialiser with everything. A value builder can be passed along and extended safely, and `build()` checks the whole thing once. A shared class builder risks cross-request contamination."
+- id: q3
+  type: truefalse
+  prompt: "Swift's default arguments and memberwise initialisers remove the telescoping-constructor problem that motivates builders in Java."
+  answer: true
+  explain: "Callers can name just the fields they need. That's why a Swift builder needs a different reason to exist: parts arriving over time, validation across fields, or a readable DSL."
+- id: q4
+  type: bug
+  prompt: "This helper should add a JSON `Accept` header to a value-type `RequestBuilder`. Which line is the bug?"
+  code: |
+    func withJSON(_ builder: RequestBuilder) -> RequestBuilder {
+        var result = builder
+        result.header("Accept", "application/json")
+        return result
+    }
+  answer: 3
+  explain: "On a struct builder, `header(_:_:)` returns a new value and leaves `result` unchanged, so the header is lost. Write `return builder.header(\"Accept\", \"application/json\")`. Without `@discardableResult`, Swift warns about exactly this line."
+- id: q5
+  type: sort
+  prompt: "Which construction style fits each case best?"
+  buckets: ["Memberwise init with defaults", "Struct fluent builder", "Result builder"]
+  items:
+    - ["An `ImageRequest` with a URL and three optional settings, made in one place", 0]
+    - ["Requests that interceptors add headers to before sending", 1]
+    - ["A settings screen described as sections and rows, with rows that depend on flags", 2]
+    - ["A `Money` value with an amount and a currency", 0]
+    - ["A base request for an API, branched into a request per endpoint", 1]
+  explain: "When one call site knows everything, the initialiser is simplest. When parts arrive over time or you branch from a base, a value builder fits. Declarative trees and lists with conditions suit a result builder."

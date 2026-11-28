@@ -1,0 +1,305 @@
+## Why it matters
+
+UIKit makes it easy to put a rule wherever you happen to be typing: a discount calculated in a cell, a cancellation window checked in `didSelectRowAt`, a stock limit enforced by disabling a button. Each one works, and each one is now untestable without a running UI, duplicated by the next screen that needs it, and lost when that screen is rewritten in SwiftUI. Knowing where logic must *not* live is most of what separates a maintainable UIKit app from a Massive View Controller, and interviewers test it directly: "here's a rule from the product team; where does it go?"
+
+## Three kinds of code in every screen
+
+Most code in a screen falls into one of three kinds, and each has a natural home:
+
+| Kind | Example | Home | Tested by |
+| --- | --- | --- | --- |
+| **Business rules** | "A customer can add at most 10 of one item." "Orders can be cancelled within 30 minutes, unless they've shipped." | The domain: models, use cases, services | Fast unit tests, no UI |
+| **Presentation logic** | "Show *Save 20%* when the price has dropped." "Show *Only 3 left* under 5 in stock." "Format the price for the user's locale." | A view model, presenter or pure mapper that produces view state | Fast unit tests, no UI |
+| **View code** | Labels, constraints, cell reuse, animations, accessibility traits | Views, cells, view controllers | Snapshot and UI tests, or by eye |
+
+The line between the first two is "is this true everywhere, or only how this screen shows it?" The line between the last two is "does this need UIKit to exist?" Presentation logic is the kind that most often ends up in the wrong place, because it *looks* like view code: it produces strings and colours. But "Save 20%" is a decision, and decisions belong in code you can test.
+
+## Three questions that place a line of code
+
+When you're unsure where something goes, ask:
+
+1. **Could I test this without UIKit?** If it doesn't need a view to be true, it shouldn't need one to be tested.
+2. **Would the Android, web or watch app need the same rule?** Then it's a business rule, and it belongs in the domain, possibly on the server.
+3. **Would a SwiftUI rewrite of this screen have to copy it?** Then it doesn't belong in the view, because views are the part you rewrite.
+
+Here's the shape that falls out, for a row in a product list:
+
+```visual flow
+title: Rules, then presentation, then pixels
+layers:
+  - { label: Domain, rows: [0, 0] }
+  - { label: Screen, rows: [2, 2] }
+nodes:
+  - { id: rules, label: Pricing and cart rules, kind: service, at: [0, 0], w: 1.4 }
+  - { id: tests, label: Unit tests, kind: actor, at: [3, 0] }
+  - { id: mapper, label: Row state mapper, kind: service, at: [0, 2], w: 1.4 }
+  - { id: cell, label: Product cell, kind: view, at: [3, 2] }
+edges:
+  - [rules, mapper, "percentSaved, canAdd"]
+  - [mapper, cell, ProductRowState]
+  - [tests, rules, checks, { style: data }]
+  - [tests, mapper, checks, { style: data }]
+steps:
+  - say: "The **rules** decide what's true: how much a product is reduced, whether another can be added. They know nothing about screens."
+    show: [rules]
+  - say: "The **mapper** turns rules and models into what this row shows: the badge text, the formatted price, whether the button is enabled."
+    send: rules->mapper
+  - say: "The **cell** copies the state into its views and reports taps. It makes no decisions, so there's nothing in it to get wrong."
+    send: mapper->cell
+  - say: "Every decision is now in plain Swift, so tests check it in milliseconds, with no simulator, and the cell can be rewritten freely."
+    show: [tests]
+    send: [tests->rules, tests->mapper]
+```
+
+## Where logic hides in UIKit code
+
+Some places attract misplaced logic more than others. When you review a UIKit screen, look here first:
+
+- **`cellForRowAt` and cell `configure(with:)` methods**: discounts, thresholds, eligibility, date maths and formatter creation.
+- **`didSelectRowAt` and button actions**: "if the order hasn't shipped and it's within 30 minutes, show the cancel sheet, otherwise show an alert". That's a business rule deciding a navigation.
+- **`textField(_:shouldChangeCharactersIn:replacementString:)`**: validation rules for postcodes, card numbers and quantities, which a web form will also need.
+- **`viewWillAppear(_:)`**: "refresh if the last refresh was more than five minutes ago" is a caching policy, not a lifecycle concern.
+- **Alert builders**: the code that decides *which* alert to show, with which choices, is often a hidden state machine.
+- **Custom view setters**: a `price` property on a view that formats, rounds and picks a colour.
+
+## A worked example
+
+Here's a product cell's configuration, as it's often first written:
+
+```swift title="Before: the cell decides"
+func configure(with product: Product) {
+    nameLabel.text = product.name
+    let formatter = NumberFormatter()
+    formatter.numberStyle = .currency
+    formatter.currencyCode = "GBP"
+    priceLabel.text = formatter.string(from: product.price as NSDecimalNumber)
+    if let was = product.wasPrice, was > product.price {
+        let saving = (was - product.price) / was * 100
+        badgeLabel.text = "Save \(NSDecimalNumber(decimal: saving).intValue)%"
+    } else if product.stock < 5 {
+        badgeLabel.text = "Only \(product.stock) left"
+    }
+    addButton.isEnabled = product.stock > 0 && CartService.shared.quantity(of: product.id) < 10
+}
+```
+
+Four decisions live in this view: the discount maths, the low-stock threshold, the per-product limit and the locale. None can be tested without creating a cell, the product detail screen will copy them (and drift), and a SwiftUI rewrite must find and port each one. It also has a bug that comes from mixing decisions into view code: nothing clears the badge for a product that has neither a discount nor low stock.
+
+Pull the decisions out in two layers. The domain rules are true everywhere; the mapper decides what this row shows. Both are plain Foundation:
+
+```swift run title="After: rules and a row mapper, testable without UIKit"
+import Foundation
+
+// Domain: true on every screen and every platform
+struct Product: Sendable {
+    let id: String
+    let name: String
+    let price: Decimal
+    let wasPrice: Decimal?
+    let stock: Int
+}
+
+enum CartRules {
+    static let maximumPerProduct = 10
+
+    static func canAdd(_ product: Product, alreadyInCart: Int) -> Bool {
+        product.stock > alreadyInCart && alreadyInCart < maximumPerProduct
+    }
+}
+
+enum Pricing {
+    /// Whole percent saved, rounded down; nil unless there's a real reduction
+    static func percentSaved(_ product: Product) -> Int? {
+        guard let was = product.wasPrice, was > product.price else { return nil }
+        let saving = (was - product.price) / was * 100
+        return NSDecimalNumber(decimal: saving).intValue
+    }
+}
+
+// Presentation: how this list shows it. Still plain Foundation.
+struct ProductRowState: Equatable, Sendable {
+    let title: String
+    let price: String
+    let badge: String?
+    let canAdd: Bool
+}
+
+struct ProductRowMapper {
+    let locale: Locale
+
+    func row(for product: Product, inCart: Int) -> ProductRowState {
+        let badge: String? = if let percent = Pricing.percentSaved(product) {
+            "Save \(percent)%"
+        } else if product.stock == 0 {
+            "Sold out"
+        } else if product.stock < 5 {
+            "Only \(product.stock) left"
+        } else {
+            nil
+        }
+        return ProductRowState(
+            title: product.name,
+            price: product.price.formatted(.currency(code: "GBP").locale(locale)),
+            badge: badge,
+            canAdd: CartRules.canAdd(product, alreadyInCart: inCart)
+        )
+    }
+}
+
+let mapper = ProductRowMapper(locale: Locale(identifier: "en_GB"))
+let products = [
+    Product(id: "p1", name: "Desk lamp", price: 24, wasPrice: 30, stock: 12),
+    Product(id: "p2", name: "Notebook", price: 4.5, wasPrice: nil, stock: 3),
+    Product(id: "p3", name: "Fountain pen", price: 18.99, wasPrice: nil, stock: 0),
+]
+for product in products {
+    let row = mapper.row(for: product, inCart: product.id == "p2" ? 3 : 0)
+    print(row.title, row.price, row.badge ?? "-", row.canAdd ? "can add" : "can't add", separator: " · ")
+}
+```
+
+```output
+Desk lamp · £24.00 · Save 20% · can add
+Notebook · £4.50 · Only 3 left · can't add
+Fountain pen · £18.99 · Sold out · can't add
+```
+
+The badge is now an optional in the state, so "no badge" is a value the cell has to handle, not a branch someone forgot. The locale is injected, so tests are deterministic and the app passes `.current`. The cart quantity comes in as a parameter, so the rule doesn't reach for a singleton.
+
+What's left in the cell is view code only:
+
+```swift check ios title="After: the cell renders"
+import UIKit
+
+struct ProductRowState: Equatable, Sendable {
+    let title: String
+    let price: String
+    let badge: String?
+    let canAdd: Bool
+}
+
+final class ProductCell: UICollectionViewListCell {
+    var onAdd: (() -> Void)?
+    private let nameLabel = UILabel()
+    private let priceLabel = UILabel()
+    private let badgeLabel = UILabel()
+    private lazy var addButton = UIButton(configuration: .filled(), primaryAction: UIAction(title: "Add") { [weak self] _ in
+        self?.onAdd?()
+    })
+
+    func render(_ state: ProductRowState) {
+        nameLabel.text = state.title
+        priceLabel.text = state.price
+        badgeLabel.text = state.badge
+        badgeLabel.isHidden = state.badge == nil
+        addButton.isEnabled = state.canAdd
+    }
+}
+```
+
+`badgeLabel.isHidden = state.badge == nil` is still an `if` of sorts, and that's fine. It decides nothing about the business; it maps one field of the state to one property of a view.
+
+## Not everything has to move
+
+Extraction has costs: more types, more files, more indirection to follow. Keep these in the view without guilt:
+
+- **Pure view state** that nothing else cares about: an in-progress animation, which tooltip is showing, the scroll offset.
+- **Trivial mappings** from state to view properties, like hiding a label when its text is `nil`.
+- **Screens with no decisions**: an About screen that shows a version number doesn't need a view model.
+
+The test is the same three questions. If none of them flags a line, it can stay where it is.
+
+## Trade-offs
+
+| Where the logic lives | Speed to write | Testability | Reuse across screens | Survives a SwiftUI rewrite |
+| --- | --- | --- | --- | --- |
+| Cells and view controllers | Fastest | Needs UIKit and the real screen | Copy and paste | No: it must be found and ported |
+| A view model or presenter per screen | Medium | Good | Within the screen | Yes |
+| Pure mappers from models to view state | Medium | Excellent: functions in, values out | Any screen showing the same thing | Yes |
+| Domain rules and use cases | Slower to design | Excellent | Every screen, and the server can mirror them | Yes |
+
+Put business rules in the domain from the start; they're the code that outlives every UI. For presentation logic, a per-screen view model is enough until a second screen shows the same thing, and then a shared mapper pays for itself. You'll compare MVVM, MVP and the rest properly in D27.
+
+<Callout kind="interview">
+
+**What to say:** "Business rules in the domain, presentation decisions in a view model or mapper that produces plain view state, and views that only render state and report intent. Then every decision is unit-tested without a simulator, and swapping UIKit for SwiftUI only touches the views."
+
+**What to ask:** is this rule the same on every platform (then it's domain, maybe the server's)? Does another screen show the same thing (then share the mapper)?
+
+**Red flags:** formatters and thresholds in `cellForRowAt`; a cell calling `CartService.shared`; validation rules in text field delegates; "we test it manually because it's in the view controller".
+
+</Callout>
+
+<Callout kind="gotcha" title="iOS gotcha: formatting is a decision">
+
+Choosing a currency, a date style or a number of decimal places is presentation logic, and so is the locale it uses. Put formatting in the mapper, inject the `Locale` (and `TimeZone` and `Calendar` for dates), and use the `formatted()` APIs or a cached format style rather than creating a `NumberFormatter` or `DateFormatter` per cell. Tests then pin `en_GB`, and the app passes `.current`.
+
+</Callout>
+
+## Practice
+
+Three items finish the module's argument. The [inbox row state kata](/design/practice/sd-kata-uikit-inbox-row-state) builds a mapper like the one above for a mail app, with every rule tested. The [product cell review](/design/practice/sd-review-uikit-product-cell) asks you to find the decisions hiding in a cell. And the [reusable list screen design](/design/practice/sd-design-uikit-list-screen) puts the boundary into a component other teams will build on.
+
+```cards
+- id: three-kinds-of-code
+  front: "What are the three kinds of code in a screen, and where does each live?"
+  back: "Business rules (true everywhere) in the domain; presentation logic (how this screen shows it) in a view model or mapper that produces view state; view code (labels, constraints, reuse) in views and cells."
+- id: placement-questions
+  front: "Which three questions tell you a line of code is in the wrong place if it's in a view?"
+  back: "Could I test it without UIKit? Would another platform need the same rule? Would a SwiftUI rewrite have to copy it? A yes to any means it doesn't belong in the view."
+- id: optional-in-state
+  front: "Why make a cell's badge an optional in its view state?"
+  back: "\"No badge\" becomes a value the cell must render, so a reused cell can't keep the last item's badge because someone forgot an `else` branch."
+```
+
+```quiz
+- id: q1
+  type: sort
+  prompt: "Which kind of code is each of these?"
+  buckets: ["Business rule", "Presentation logic", "View code"]
+  items:
+    - ["Orders over £40 get free delivery", 0]
+    - ["An order can be cancelled within 30 minutes, unless it has shipped", 0]
+    - ["Show \"Arrives tomorrow\" instead of a date when delivery is tomorrow", 1]
+    - ["Show the saving as a whole percentage, rounded down", 1]
+    - ["Pin the badge 8 points from the cell's trailing edge", 2]
+    - ["Fade a row in when it's inserted", 2]
+  explain: "Rules are true on every screen and platform. Presentation logic decides how this screen shows the facts, and is still testable without UIKit. Layout and animation need views."
+- id: q2
+  type: mcq
+  prompt: "The product team says a customer may add at most 10 of any one item. Where should the check live?"
+  options:
+    - "In the cell, by disabling the Add button when the cart has 10"
+    - "In the view controller's add action, before calling the cart"
+    - "In the domain's cart rules, used by the cart when adding and by the row mapper to enable the button"
+    - "In a `UIAlertController` that warns when the limit is reached"
+  answer: 2
+  explain: "It's a business rule, so the domain enforces it: even a deep link or a widget adding to the cart must respect it. The presentation layer asks the same rule whether to enable the button, so the two can't disagree."
+- id: q3
+  type: multi
+  prompt: "Which of these suggest logic is in the wrong place?"
+  options:
+    - "`didSelectRowAt` checks the order status and time to decide whether to show the cancel sheet"
+    - "A cell's `configure(with:)` creates a `NumberFormatter` and applies a 5-item low-stock threshold"
+    - "A view model exposes `isCancelVisible`, computed from the order and the current time"
+    - "A cell sets `badgeLabel.isHidden = state.badge == nil`"
+  answer: [0, 1]
+  explain: "The first is a business rule deciding navigation inside a delegate method; the second puts a rule and formatting in a view. The view model's flag is exactly where that decision should be, and hiding a label for a nil badge is a trivial mapping."
+- id: q4
+  type: bug
+  prompt: "This configuration contains a business rule that belongs outside the cell. Click the line."
+  code: |
+    func render(_ state: OrderRowState, order: Order) {
+        titleLabel.text = state.title
+        statusLabel.text = state.status
+        let canCancel = order.status != .shipped && Date().timeIntervalSince(order.placedAt) < 1800
+        cancelButton.isHidden = !canCancel
+        accessibilityLabel = state.accessibilityLabel
+    }
+  answer: 4
+  explain: "The cancellation window is a business rule, and it reads the clock directly, so it can't be tested reliably either. Compute `canCancel` in the domain (with an injected clock) and pass it in the row state."
+- id: q5
+  type: recall
+  prompt: "A teammate says: \"It's only one `if` in the cell. Moving it to a mapper is over-engineering.\" When are they right, and when not?"
+  model: "They're right when the `if` maps state to a view property without deciding anything, such as hiding a label when its text is nil, or when it's pure view state like an animation. They're wrong when the `if` encodes a rule or a presentation decision (a threshold, a time window, eligibility, formatting): then it can't be tested without UIKit, other screens will copy it, and a rewrite has to find it. The three questions decide it, not the size of the code."
+```

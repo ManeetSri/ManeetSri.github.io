@@ -1,0 +1,384 @@
+## Why it matters
+
+Frameworks constantly need to create objects whose type only *you* know: the layer behind your view, the `UIView` inside your SwiftUI wrapper, the cell for each row. The factory method is how they ask. You'll also use it the other way round, to give legacy code a seam for tests, and to let a server decide which card a feed shows. Interviewers like it because it tests whether you understand *who* should decide a type, not just how to write a protocol.
+
+## The classic shape
+
+The Gang of Four put it as: *define an interface for creating an object, but let subclasses decide which class to instantiate.* There are four roles:
+
+- The **product**: what gets made, described by a protocol or base class.
+- The **creator**: a type whose own logic needs a product. Instead of calling an initialiser, it calls its **factory method**.
+- A **concrete creator**: overrides the factory method to return a particular product.
+- A **concrete product**: the type it returns.
+
+The important part is easy to miss: the creator **uses** the product inside its own logic. A factory method isn't a free-standing "maker" function; it's a hook in the middle of an algorithm, which is why it's a close cousin of the template method you'll meet in D12.
+
+### UIKit's textbook example: `layerClass`
+
+Every `UIView` is backed by a Core Animation layer, and `UIView` creates it while the view is initialised. Which class of layer? UIKit asks the view's class through `layerClass`, a class property that defaults to `CALayer`. Override it, and UIKit's own code builds your layer without ever naming its type. Apple's documentation for `AVPlayerLayer` uses exactly this:
+
+```swift check ios
+import AVFoundation
+import UIKit
+
+final class PlayerView: UIView {
+    // The factory method: UIKit asks the class which layer to create for each view
+    override class var layerClass: AnyClass { AVPlayerLayer.self }
+
+    var playerLayer: AVPlayerLayer { layer as! AVPlayerLayer }
+
+    var player: AVPlayer? {
+        get { playerLayer.player }
+        set { playerLayer.player = newValue }
+    }
+}
+```
+
+```visual sequence
+title: How UIView creates its layer through a factory method
+participants:
+  - { id: you, label: Your code }
+  - { id: view, label: PlayerView }
+  - { id: uiview, label: UIView's init }
+  - { id: layer, label: AVPlayerLayer }
+messages:
+  - [you, view, "PlayerView(frame:)"]
+  - [view, uiview, "super.init(frame:)"]
+  - [uiview, view, "layerClass?", { say: "UIView's initialiser asks the **class** for `layerClass`. Dynamic dispatch reaches the override in `PlayerView`." }]
+  - [view, uiview, AVPlayerLayer.self, { reply: true }]
+  - [uiview, layer, "init()", { say: "UIKit creates the layer. Its own code only knows it has *some* `CALayer` subclass." }]
+  - { note: "UIView never names AVPlayerLayer: the subclass decided.", over: [uiview, layer] }
+  - [uiview, you, a view backed by an AVPlayerLayer, { reply: true }]
+  - [you, view, "player = AVPlayer(url:)", { say: "Now `playerLayer` is safe to use: the force cast can't fail, because the factory method guarantees the type." }]
+```
+
+Note the `layer as! AVPlayerLayer`. A force cast is usually a smell, but here the factory method is a guarantee: the cast can only fail if someone changes `layerClass`, and they'd find out on the first launch. The same trick gives you `CAGradientLayer`, `CAShapeLayer` or `CAEmitterLayer` views whose layers resize with the view for free.
+
+## Factory methods as protocol requirements
+
+Swift code rarely subclasses to get a factory method. A **protocol requirement** plays the same role, and SwiftUI is built on them. In `UIViewRepresentable`, SwiftUI is the creator: it decides *when* to create, update and tear down. You're the concrete creator: you decide *what* gets created.
+
+```swift check ios
+import MapKit
+import SwiftUI
+
+struct ClassicMap: UIViewRepresentable {
+    let region: MKCoordinateRegion
+
+    func makeCoordinator() -> Coordinator { Coordinator() }
+
+    func makeUIView(context: Context) -> MKMapView {
+        let map = MKMapView()
+        map.delegate = context.coordinator
+        return map
+    }
+
+    func updateUIView(_ map: MKMapView, context: Context) {
+        map.setRegion(region, animated: true)
+    }
+
+    final class Coordinator: NSObject, MKMapViewDelegate {}
+}
+```
+
+Two factory methods here: `makeCoordinator()` and `makeUIView(context:)`. SwiftUI calls each **once** for the representable's lifetime in the view hierarchy, then calls `updateUIView` whenever your struct's values change. That division is the whole point: creation is expensive and stateful, so the framework controls how often it happens, while you control what's made. `ButtonStyle.makeBody(configuration:)` and `UIViewControllerRepresentable.makeUIViewController(context:)` follow the same shape.
+
+## A seam for legacy code: extract and override
+
+Michael Feathers' *Working Effectively with Legacy Code* names a technique that's often the fastest way to get an untestable class under test: **extract and override factory method**. Move the line that builds a dependency into its own overridable method, then subclass in the test and return a fake.
+
+```swift run
+protocol PostSource {
+    func posts() throws -> [String]
+}
+
+struct NetworkPostSource: PostSource {
+    func posts() throws -> [String] { ["(pretend this came from the network)"] }
+}
+
+class FeedLoader {
+    // The factory method: subclasses decide which source to use
+    func makeSource() -> any PostSource {
+        NetworkPostSource()
+    }
+
+    // The creator's own logic, which uses whatever the factory method returns
+    func headlines() -> [String] {
+        do {
+            return try makeSource().posts().map { $0.uppercased() }
+        } catch {
+            return ["Feed unavailable"]
+        }
+    }
+}
+
+struct CannedPostSource: PostSource {
+    let canned: [String]
+    func posts() throws -> [String] { canned }
+}
+
+struct FailingPostSource: PostSource {
+    struct Offline: Error {}
+    func posts() throws -> [String] { throw Offline() }
+}
+
+// In a test target, these would be the test doubles
+final class CannedFeedLoader: FeedLoader {
+    override func makeSource() -> any PostSource {
+        CannedPostSource(canned: ["swift 6 is out", "ios 18 ships"])
+    }
+}
+
+final class OfflineFeedLoader: FeedLoader {
+    override func makeSource() -> any PostSource {
+        FailingPostSource()
+    }
+}
+
+print(CannedFeedLoader().headlines().joined(separator: " | "))
+print(OfflineFeedLoader().headlines().joined(separator: " | "))
+```
+
+```output
+SWIFT 6 IS OUT | IOS 18 SHIPS
+Feed unavailable
+```
+
+This is a **stepping stone**, not a destination. It needs a non-`final` class and leaves the dependency hidden from callers. Once tests protect the behaviour, replace the override with an injected dependency, as in [Why to avoid singletons, and testable alternatives](/design/learn/sd-creational-singleton-alternatives). You'll practise the full refactoring sequence in D15.
+
+## Closures: a factory method without a type
+
+When there's exactly one product and one decision, a closure is all the factory method you need. `UICollectionViewDiffableDataSource` takes a **cell provider**: a closure that, given an index path and an item, returns a cell. The data source is the creator (it decides when a cell is needed); your closure decides which cell.
+
+```swift check ios
+import UIKit
+
+struct Contact: Hashable, Sendable {
+    let id: Int
+    let name: String
+}
+
+@MainActor
+func makeDataSource(for collectionView: UICollectionView) -> UICollectionViewDiffableDataSource<Int, Contact> {
+    let registration = UICollectionView.CellRegistration<UICollectionViewListCell, Contact> { cell, _, contact in
+        var content = cell.defaultContentConfiguration()
+        content.text = contact.name
+        cell.contentConfiguration = content
+    }
+    return UICollectionViewDiffableDataSource(collectionView: collectionView) { collectionView, indexPath, contact in
+        collectionView.dequeueConfiguredReusableCell(using: registration, for: indexPath, item: contact)
+    }
+}
+```
+
+Injecting a closure rather than an instance also matters when you need **a new product each time**. An upload queue that takes `makeUploader: @Sendable () -> Uploader` can give every upload its own uploader; one that takes an `Uploader` instance can only share one.
+
+## Parameterised factories: choosing by a key
+
+Often the decision depends on data: which cell for this item, which screen for this deep link, which card for this server payload. One factory method takes the key and returns the matching product. There are two ways to map keys to types, and they trade safety for openness.
+
+**An enum and a `switch`.** The compiler checks the mapping is complete. Adding a case forces you to update the factory, which is exactly what you want when the set of types is yours.
+
+```swift
+func makeCell(for item: FeedItem, in collectionView: UICollectionView, at indexPath: IndexPath) -> UICollectionViewCell {
+    switch item {
+    case .article(let article): collectionView.dequeueConfiguredReusableCell(using: articleCell, for: indexPath, item: article)
+    case .video(let video): collectionView.dequeueConfiguredReusableCell(using: videoCell, for: indexPath, item: video)
+    }
+}
+```
+
+**A registry of makers.** A dictionary from a key to a closure. New types can be registered by code the factory never imports, such as feature modules, and unknown keys are handled at run time. This is how server-driven UI works: the server sends a list of components with a `type` field, and an app version from six months ago must skip types it has never heard of rather than crash.
+
+```swift run
+struct Payload {
+    let type: String
+    let fields: [String: String]
+}
+
+protocol Card {
+    var summary: String { get }
+}
+
+struct ArticleCard: Card {
+    let title: String
+    var summary: String { "Article: \(title)" }
+}
+
+struct VideoCard: Card {
+    let seconds: Int
+    var summary: String { "Video, \(seconds) s" }
+}
+
+struct CardFactory {
+    typealias Maker = (Payload) -> (any Card)?
+    private var makers: [String: Maker] = [:]
+
+    mutating func register(_ type: String, make: @escaping Maker) {
+        makers[type] = make
+    }
+
+    func make(_ payload: Payload) -> (any Card)? {
+        makers[payload.type]?(payload)
+    }
+}
+
+var factory = CardFactory()
+factory.register("article") { payload in
+    payload.fields["title"].map { ArticleCard(title: $0) }
+}
+factory.register("video") { payload in
+    payload.fields["seconds"].flatMap(Int.init).map { VideoCard(seconds: $0) }
+}
+
+let feed = [
+    Payload(type: "article", fields: ["title": "Factories in Swift"]),
+    Payload(type: "poll", fields: ["question": "Tabs or spaces?"]),
+    Payload(type: "video", fields: ["seconds": "95"]),
+    Payload(type: "video", fields: ["seconds": "soon"]),
+]
+
+for payload in feed {
+    print(factory.make(payload)?.summary ?? "skipped \(payload.type)")
+}
+```
+
+```output
+Article: Factories in Swift
+skipped poll
+Video, 95 s
+skipped video
+```
+
+The poll is skipped because this app version has no maker for it, and the second video because its payload is malformed. Both are **forward compatibility**: the server can ship new card types without breaking old apps. This is the open–closed principle from [Open–closed: extending with protocols and enums](/design/learn/sd-solid-ocp), and the enum-versus-registry choice is the expression problem from [The expression problem: protocols vs enums](/design/learn/sd-solid-expression-problem) showing up at creation time.
+
+### Creating from a metatype
+
+A protocol can require an initialiser, and then a **metatype** (`any OnboardingStep.Type`) can create instances. That's handy when a list of types is configuration, such as the steps of an onboarding flow chosen by a feature flag:
+
+```swift check
+protocol OnboardingStep {
+    init()
+    var title: String { get }
+}
+
+struct WelcomeStep: OnboardingStep {
+    var title: String { "Welcome" }
+}
+
+struct NotificationsStep: OnboardingStep {
+    var title: String { "Stay in the loop" }
+}
+
+func makeSteps(_ types: [any OnboardingStep.Type]) -> [any OnboardingStep] {
+    types.map { $0.init() }
+}
+```
+
+A class conforming to such a protocol must mark the initialiser `required`, so subclasses can't drop it.
+
+## Trade-offs
+
+| | Subclass override | Protocol requirement | Injected closure | Enum + `switch` | String-keyed registry |
+| --- | --- | --- | --- | --- | --- |
+| Compile-time safety | High | High | High | Exhaustive | Unknown keys found at run time |
+| New product types without editing the factory | Yes, by subclassing | Yes, by conforming | Yes | No | Yes, even from other modules |
+| Boilerplate | A subclass each | A conformance each | Almost none | One `switch` | Registration code |
+| Works with structs and `final` classes | No | Yes | Yes | Yes | Yes |
+| Best for | UIKit hooks such as `layerClass`; legacy seams | Frameworks calling your code | One product, one decision | A closed set you own | Server-driven UI, plugins, deep links |
+
+Choose the **enum** when you own every type and want the compiler to keep you honest. Choose the **registry** when the set must grow without editing the factory, and pay for it with run-time handling of unknown keys.
+
+<Callout kind="interview">
+
+**What to say:** "The server sends a `type` per component. A registry maps each type to a maker; unknown types are skipped and logged, so old app versions survive new server features." Then mention the trade: no exhaustiveness check, so add a test that every type the current app claims to support has a maker.
+
+**What to ask:** "Who adds new types, and how often? Do we control the server and every client version?" A closed set you ship together points to an enum; a server that runs ahead of the app points to a registry.
+
+**Red flags:** a giant `switch` on strings scattered across several files; crashing on an unknown type; subclassing purely to change one constructor call in new code, where injection would do.
+
+</Callout>
+
+<Callout kind="gotcha" title="iOS gotcha: construct cells in a cell provider and reuse breaks">
+
+A cell provider is a factory method, but the table or collection view owns the pool of cells. Returning `UICollectionViewListCell()` from it instead of calling `dequeueConfiguredReusableCell(using:for:item:)` raises an exception, because the collection view needs every cell to come from its own reuse queue. The factory method's job is to *choose and configure*; the framework still does the creating. You'll see why in [Object pools and reuse, from cells to formatters](/design/learn/sd-creational-object-pools).
+
+</Callout>
+
+<Callout kind="gotcha" title="Swift gotcha: no abstract classes">
+
+Swift has no `abstract` keyword, so ported code often writes a base class whose factory method calls `fatalError("Subclasses must override")`. Forget to override, and you find out in production. A protocol requirement makes the same mistake a compile error. Keep the subclass form for UIKit's own hooks and temporary legacy seams.
+
+</Callout>
+
+## Practice
+
+Try the **server-driven card factory** kata. You'll build a registry-based factory with validation, a static `standard()` factory, and a rule for unknown types, then prove with tests that new card types can be added without editing it.
+
+```cards
+- id: factory-method-roles
+  front: "In the factory method pattern, who decides the product's type, and who uses it?"
+  back: "A subclass or conforming type decides, by implementing the factory method. The creator calls it from inside its own logic and uses whatever comes back."
+- id: layer-class
+  front: "What is `UIView.layerClass`, as a pattern?"
+  back: "A factory method. UIView's initialiser asks the class which layer class to instantiate; overriding it gives your view an `AVPlayerLayer`, `CAGradientLayer` and so on."
+- id: enum-vs-registry
+  front: "Enum + switch or a string-keyed registry: what does each give up?"
+  back: "The enum gives up openness: new types mean editing the switch. The registry gives up compile-time completeness: unknown keys must be handled at run time."
+- id: extract-override
+  front: "What is 'extract and override factory method' for?"
+  back: "Getting legacy code under test quickly: move a dependency's construction into an overridable method and override it in a test subclass. Replace it with injection once tests exist."
+```
+
+```quiz
+- id: q1
+  type: mcq
+  prompt: "Your feed's card types come from the server, which ships new types every few weeks. App versions up to a year old are still in use. How should the app map a payload's `type` to a card?"
+  options:
+    - "A `switch` on the type string with `fatalError()` in `default`"
+    - "A registry of makers keyed by type, skipping and logging unknown types"
+    - "An enum with a case per type, decoded with `Codable`'s synthesised decoding, so unknown types fail the whole feed"
+    - "A subclass of a `FeedViewController` per card type"
+  answer: 1
+  explain: "Old app versions will receive types they've never seen, so unknown types must be skipped, not fatal. A registry handles that and lets new types be added without editing the factory. Synthesised `Codable` would throw for the whole array on one unknown case."
+- id: q2
+  type: truefalse
+  prompt: "SwiftUI calls `makeUIView(context:)` every time the representable struct's properties change."
+  answer: false
+  explain: "It calls `makeUIView` once for the representable's lifetime in the hierarchy, and `updateUIView` on every change. Creation is expensive and stateful, so the framework controls how often it happens."
+- id: q3
+  type: bug
+  prompt: "This view should be backed by a gradient layer. Which line is the mistake?"
+  code: |
+    final class GradientView: UIView {
+        override var layerClass: AnyClass { CAGradientLayer.self }
+
+        var gradientLayer: CAGradientLayer { layer as! CAGradientLayer }
+
+        func apply(colors: [UIColor]) {
+            gradientLayer.colors = colors.map(\.cgColor)
+        }
+    }
+  answer: 2
+  explain: "`layerClass` is a **class** property: UIKit asks the class before an instance's layer exists. It must be `override class var layerClass`. As written, it won't compile, because `UIView` has no instance property of that name to override."
+- id: q4
+  type: sort
+  prompt: "Which way of choosing the product fits each situation best?"
+  buckets: ["Enum + switch", "String-keyed registry", "Injected closure"]
+  items:
+    - ["Choosing one of four cell types for items your own code defines", 0]
+    - ["Feature modules each adding deep-link handlers the app target doesn't import", 1]
+    - ["Giving every upload in a queue its own fresh uploader", 2]
+    - ["Mapping server component types, where the server runs ahead of the app", 1]
+    - ["Picking a payment sheet for one of three providers you ship in the app", 0]
+  explain: "Closed sets you own want exhaustive `switch`es. Open sets, extended from elsewhere or by the server, want a registry. One product made repeatedly wants a closure."
+- id: q5
+  type: mcq
+  prompt: "A 3,000-line `SyncManager` class creates `URLSession(configuration: .default)` inside `sync()`. You need a test today, before a bigger refactor. What's the smallest safe step?"
+  options:
+    - "Rewrite `SyncManager` with a protocol for every dependency first"
+    - "Move the session creation into an overridable `makeSession()` and override it in a test subclass"
+    - "Add a `static var testSession` that `sync()` checks for"
+    - "Test it against the real staging server"
+  answer: 1
+  explain: "Extract and override factory method gives a seam with a tiny, low-risk change. A static test hook adds global mutable state, and the real server makes tests slow and flaky. Move to constructor injection once the tests exist."

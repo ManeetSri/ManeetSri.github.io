@@ -1,0 +1,315 @@
+## Why it matters
+
+A list of 10,000 rows has perhaps fifteen cells. UIKit creates enough to fill the screen, and as the user scrolls it hands the ones that leave to the rows that arrive. That recycling is why lists are fast, and also why they show the wrong image, a badge from another row, or a button in the wrong state. On top of reuse sit two more mechanisms, prefetching and self-sizing, each with its own way to go wrong. Cells are where UIKit architecture meets performance, and interviewers know it: "how would you load images in a feed?" is one of the most common mobile design questions there is.
+
+## A cell is a costume, not an actor
+
+A cell isn't *the row for item 42*. It's a view that's showing item 42 at the moment, and will show item 97 a second from now. Everything you set on it stays set until you set it again. Two rules follow:
+
+1. **Configure everything, every time.** Whatever a configuration sets for one item, it must set (or clear) for every item. A badge that's shown for delayed orders must be explicitly hidden for on-time ones, or a reused cell keeps it.
+2. **Anything still running belongs to the old item.** A network request, a timer or an animation started for item 42 doesn't know the cell now shows item 97. When it finishes, it must not touch the cell, or it must be cancelled first.
+
+`prepareForReuse()` is called on a cell just before it's handed out again. Apple's guidance is to reset only state that isn't content there (an in-progress animation, an editing mode, a transient highlight) and to cancel work the cell started, and to set all content in the configuration code. Content set in `prepareForReuse()` is set twice, and content you forget there is still forgotten in configuration.
+
+### The wrong-image race
+
+Here's what goes wrong when a cell loads its own image and the user scrolls fast:
+
+```visual timeline
+title: One cell, two image requests
+unit: ms
+lanes:
+  - { id: cell, label: Cell 7 }
+  - { id: first, label: Row 3 image }
+  - { id: second, label: Row 40 image }
+spans:
+  - { lane: cell, from: 0, to: 300, label: shows row 3 }
+  - { lane: cell, from: 300, to: 900, label: shows row 40, tone: active }
+  - { lane: cell, from: 900, to: 1300, label: "row 40, row 3's photo", tone: error }
+  - { lane: first, from: 0, to: 900, label: loading, tone: wait }
+  - { lane: second, from: 300, to: 700, label: loading, tone: wait }
+markers:
+  - { at: 300, label: reused }
+  - { at: 700, label: set }
+  - { at: 900, label: set }
+steps:
+  - { at: 0, say: "Cell 7 is configured for row 3 and starts loading row 3's photo." }
+  - { at: 300, say: "The user flicks the list. Row 3 scrolls off, and the **same cell** is reused for row 40, which starts its own load." }
+  - { at: 700, say: "Row 40's photo arrives first, perhaps from the cache, and is set. Correct, for now." }
+  - { at: 900, say: "Row 3's slower response arrives and sets its photo on cell 7, which now shows row 40. The **wrong photo** stays until the cell is reused again." }
+```
+
+The race doesn't need a slow network, only responses that finish in a different order from the one they started in. It's also nondeterministic, so it's the bug that "only happens on the train".
+
+### Two fixes
+
+The **minimal fix** keeps loading in the cell, but makes old work harmless: cancel it on reuse, and check for cancellation before touching the view.
+
+```swift check ios title="ThumbnailCell.swift"
+import UIKit
+
+final class ThumbnailCell: UICollectionViewCell {
+    private let imageView = UIImageView()
+    private var load: Task<Void, Never>?
+
+    func show(_ url: URL, using loader: @escaping @Sendable (URL) async -> UIImage?) {
+        load?.cancel()
+        imageView.image = nil
+        load = Task { [weak self] in
+            let image = await loader(url)
+            // Cancelled while loading: this image belongs to an item the cell no longer shows
+            guard !Task.isCancelled else { return }
+            self?.imageView.image = image
+        }
+    }
+
+    override func prepareForReuse() {
+        super.prepareForReuse()
+        load?.cancel()
+        load = nil
+    }
+}
+```
+
+The check matters as much as the cancel. Cancelling only *asks* the loader to stop; one that ignores cancellation still returns its image, and without the check it lands on the wrong item. Because the cell and the task both run on the main actor, the check can't race with a later `show`.
+
+The **better design** takes loading out of the cell altogether. The screen owns the image cache and the in-flight requests, keyed by item ID. The cell registration shows whatever is cached; when a request finishes, the screen **reconfigures** that item, which reruns the registration for whichever cell is showing it now (if any). A late response can't reach the wrong row, because it never talks to a cell at all:
+
+```swift check ios title="PhotosViewController.swift"
+import UIKit
+
+struct Photo: Identifiable, Sendable {
+    let id: String
+    let title: String
+    let thumbnailURL: URL
+}
+
+/// Owns caching and decoding; the screen only asks
+@MainActor
+protocol ThumbnailLoading: AnyObject {
+    func cachedThumbnail(for id: Photo.ID) -> UIImage?
+    func loadThumbnail(for photo: Photo) async
+}
+
+final class PhotosViewController: UIViewController {
+    private let thumbnails: any ThumbnailLoading
+    private var photos: [Photo.ID: Photo] = [:]
+    private var loads: [Photo.ID: Task<Void, Never>] = [:]
+    private var dataSource: UICollectionViewDiffableDataSource<Int, Photo.ID>!
+    private lazy var collectionView = UICollectionView(
+        frame: .zero,
+        collectionViewLayout: UICollectionViewCompositionalLayout.list(using: .init(appearance: .plain))
+    )
+
+    init(thumbnails: any ThumbnailLoading) {
+        self.thumbnails = thumbnails
+        super.init(nibName: nil, bundle: nil)
+    }
+
+    required init?(coder: NSCoder) { nil }
+
+    override func viewDidLoad() {
+        super.viewDidLoad()
+        collectionView.frame = view.bounds
+        collectionView.autoresizingMask = [.flexibleWidth, .flexibleHeight]
+        collectionView.prefetchDataSource = self
+        view.addSubview(collectionView)
+
+        // Runs for whichever item the cell shows now, so a late image can't land on the wrong row
+        let registration = UICollectionView.CellRegistration<UICollectionViewListCell, Photo.ID> { [weak self] cell, _, id in
+            guard let self, let photo = photos[id] else { return }
+            var content = cell.defaultContentConfiguration()
+            content.text = photo.title
+            if let thumbnail = thumbnails.cachedThumbnail(for: id) {
+                content.image = thumbnail
+            } else {
+                content.image = UIImage(systemName: "photo")
+                startLoading(photo)
+            }
+            cell.contentConfiguration = content
+        }
+        dataSource = UICollectionViewDiffableDataSource(collectionView: collectionView) { collectionView, indexPath, id in
+            collectionView.dequeueConfiguredReusableCell(using: registration, for: indexPath, item: id)
+        }
+    }
+
+    private func startLoading(_ photo: Photo) {
+        guard loads[photo.id] == nil else { return } // one request per photo, however often it's asked for
+        loads[photo.id] = Task { [weak self] in
+            await self?.thumbnails.loadThumbnail(for: photo)
+            self?.thumbnailArrived(for: photo.id)
+        }
+    }
+
+    private func thumbnailArrived(for id: Photo.ID) {
+        loads[id] = nil
+        var snapshot = dataSource.snapshot()
+        guard snapshot.indexOfItem(id) != nil else { return }
+        snapshot.reconfigureItems([id])
+        dataSource.apply(snapshot, animatingDifferences: false)
+    }
+}
+
+extension PhotosViewController: UICollectionViewDataSourcePrefetching {
+    func collectionView(_ collectionView: UICollectionView, prefetchItemsAt indexPaths: [IndexPath]) {
+        for id in indexPaths.compactMap(dataSource.itemIdentifier(for:)) {
+            if let photo = photos[id], thumbnails.cachedThumbnail(for: id) == nil { startLoading(photo) }
+        }
+    }
+
+    func collectionView(_ collectionView: UICollectionView, cancelPrefetchingForItemsAt indexPaths: [IndexPath]) {
+        for id in indexPaths.compactMap(dataSource.itemIdentifier(for:)) {
+            loads.removeValue(forKey: id)?.cancel()
+        }
+    }
+}
+```
+
+This is the pattern Apple showed when it introduced `reconfigureItems` in iOS 15, and it scales: the same request serves the prefetch, the visible cell and a cell that scrolls off and back, and the loader behind the protocol can grow into the full image pipeline you'll design in D40 without the screen changing.
+
+## Prefetching
+
+Prefetching starts work for rows *before* they're visible, so their content is ready when they arrive. There are two kinds, and they're easy to confuse:
+
+- **Data prefetching** (`UICollectionViewDataSourcePrefetching`, iOS 10). The collection view tells your `prefetchDataSource` which index paths are likely to be needed soon, and which ones it no longer expects. Start network requests and decoding in `prefetchItemsAt`; cancel them in `cancelPrefetchingForItemsAt`, as the screen above does. It's a hint: when the user jumps to the top or drags very fast, rows can appear without ever being prefetched, so the visible-cell path must still work alone.
+- **Cell prefetching** (iOS 15). The collection view dequeues and configures cells a few frames *ahead*, in idle time between frames, which roughly doubles the time a cell has to get ready. It's on by default (`isPrefetchingEnabled`).
+
+Cell prefetching has a consequence for design: **configuring a cell no longer means it's on screen.** Work that must only happen while visible (playing a video, counting an impression, starting an animation) belongs in the delegate's `willDisplay` and `didEndDisplaying` callbacks, not in the registration handler.
+
+### Decoding is the hidden cost
+
+A downloaded JPEG is compressed. Showing it means decoding it into a bitmap, at 4 bytes per pixel, and by default that happens on the main thread the first time the image is drawn. A 12-megapixel photo (4,032 × 3,024) decodes to about 49 MB, to fill a thumbnail 60 points wide. Do the work off the main thread and at the size you'll show:
+
+```swift check ios title="Decoding a thumbnail off the main thread"
+import UIKit
+
+// 60 × 60 points on a 3× screen is 180 × 180 pixels: about 130 KB decoded, not 49 MB
+func thumbnail(from data: Data) async -> UIImage? {
+    await UIImage(data: data)?.byPreparingThumbnail(ofSize: CGSize(width: 180, height: 180))
+}
+```
+
+`byPreparingThumbnail(ofSize:)` and `byPreparingForDisplay()` (iOS 15) decode on a background thread and return an image that's ready to draw. Cache the prepared thumbnail, not the original data.
+
+## Self-sizing cells
+
+A self-sizing cell works out its own height from its content: a message that wraps to four lines, a title at the largest Dynamic Type size. In a compositional layout, give the item and its group an `.estimated` height; in a table view, leave `rowHeight` as `UITableView.automaticDimension` and set a reasonable `estimatedRowHeight`. The cell then sizes itself with Auto Layout, so its content view needs an **unbroken vertical chain** of constraints from top to bottom. A chain with a gap makes the height ambiguous; a chain that fights the row's provisional height is the `UIView-Encapsulated-Layout-Height` conflict from [How the Auto Layout engine solves constraints](/design/learn/sd-uikit-auto-layout-engine), fixed by giving one vertical constraint a priority of 999.
+
+Cells that change size while visible, such as a "Read more" that expands a description, used to need `performBatchUpdates` gymnastics. Since iOS 16 they can resize themselves. A collection view's `selfSizingInvalidation` is `.enabled` by default: the cell calls `invalidateIntrinsicContentSize()` and the layout resizes it, animating the rows around it. With `.enabledIncludingConstraints`, constraint changes inside the cell trigger it automatically, and so does applying a new content configuration.
+
+Self-sizing has two costs to keep in mind. Every newly displayed cell runs an Auto Layout pass to measure itself, which is a good reason for flat, simple constraint chains in cells that appear thousands of times. And estimates that are far from the real heights make the scroll indicator jump and `scrollToItem` land in the wrong place, because the content height is a guess until the cells have been measured. Estimate the common case, not the minimum.
+
+## What a cell should do, and nothing more
+
+At 120 Hz each frame lasts 8.3 ms, and a fast flick can bring two or three new cells into one frame alongside everything else the main thread is doing. A cell's configuration has to fit in a small slice of that, which is the performance argument for a rule that's also good design:
+
+- **A cell renders state it's given.** Text, images that are already decoded, which symbols to show, the accessibility label. Formatting, business rules and decisions happen before it's configured.
+- **A cell reports intent.** "Like tapped" goes out through a closure or delegate set at configuration time.
+- **A cell doesn't fetch, persist or call singletons.** No `URLSession`, no `UserDefaults`, no `CartService.shared`, no creating a `DateFormatter` per row.
+
+Content configurations (iOS 14) push cells in this direction: `UIListContentConfiguration` describes what a list cell shows as a value, a cell's `configurationUpdateHandler` recomputes it for each state (selected, highlighted, disabled), and `UIHostingConfiguration` (iOS 16) lets that content be a SwiftUI view, which you'll use later in this module. The module's last lesson, on where business logic must not live, finishes the argument.
+
+## Trade-offs
+
+| Image loading design | Wrong-image race | Duplicate requests | Testability | Effort |
+| --- | --- | --- | --- | --- |
+| The cell loads its own image, no cancellation | Yes | Yes, on every reuse | Poor | Lowest, and broken |
+| The cell loads, cancels on reuse and checks | No | Yes, unless the loader caches and coalesces | Fair | Low |
+| The screen loads by ID and reconfigures the item | No | No: one request per ID | Good: test the loader alone | Medium |
+| A shared image pipeline (memory and disk cache, coalescing, decoding, priorities) | No | No, across screens | Good | High, once for the app |
+
+For a single screen, the screen-loads-and-reconfigures design is the right default: it's not much more code than the cell version and removes the race by construction. A shared pipeline earns its cost once several screens show the same images, which is most apps with a feed; then the screen's code stays the same and only the loader behind the protocol grows.
+
+<Callout kind="interview">
+
+**What to say:** "Cells are reused, so configuration sets everything every time and any async work is keyed by item ID, not by cell. The screen or an image pipeline loads and caches thumbnails, decoded off the main thread at display size; when one arrives I reconfigure that item. Prefetching starts requests early and cancels them when rows are no longer expected. Cells are self-sizing with a single vertical constraint chain."
+
+**What to ask:** how big are the images, and what size are they shown at? How fast do users scroll (a photo grid or a settings list)? Are the same images on other screens (then share a pipeline)?
+
+**Red flags:** `URLSession` inside a cell with no cancellation; storing the model in the cell and mutating it; `DateFormatter()` in `cellForItemAt`; decoding full-size images for thumbnails; doing visible-only work in the configuration handler.
+
+</Callout>
+
+<Callout kind="gotcha" title="iOS gotcha: configured is not visible">
+
+With cell prefetching, the registration handler can run for a cell that won't be on screen for several frames, or ever, if the user changes direction. Start videos, count impressions and begin animations in `collectionView(_:willDisplay:forItemAt:)`, and stop them in `collectionView(_:didEndDisplaying:forItemAt:)`.
+
+</Callout>
+
+## Practice
+
+The [product cell review](/design/practice/sd-review-uikit-product-cell) is a cell that loads its own image, keeps a badge from the last product, and decides prices and limits itself. Then the [inbox row state kata](/design/practice/sd-kata-uikit-inbox-row-state) builds the alternative: everything a cell shows, decided before it's configured.
+
+```cards
+- id: configure-everything
+  front: "What's the first rule of configuring a reusable cell?"
+  back: "Set or clear everything, every time. A reused cell keeps whatever the last item set, so a badge shown for one item must be explicitly hidden for the next."
+- id: wrong-image-fix
+  front: "How do you stop images landing on the wrong reused cell?"
+  back: "Either cancel the cell's load on reuse and check for cancellation before setting the image, or better, load by item ID outside the cell and `reconfigureItems` that ID when the image arrives."
+- id: two-prefetchings
+  front: "Data prefetching vs cell prefetching?"
+  back: "Data prefetching (`prefetchDataSource`) tells you which rows will be needed soon so you can start loading, and cancel. Cell prefetching (iOS 15) configures cells a few frames early, so configuring a cell doesn't mean it's visible."
+- id: decode-at-size
+  front: "Why decode thumbnails with `byPreparingThumbnail(ofSize:)`?"
+  back: "Decoded images cost 4 bytes per pixel: a 12-megapixel photo is about 49 MB. Preparing a thumbnail decodes off the main thread at the size you show, about 130 KB for 180 × 180 pixels."
+```
+
+```quiz
+- id: q1
+  type: mcq
+  prompt: "In a photo feed, flicking quickly sometimes leaves a row showing another row's photo until it's scrolled away and back. What's the cause?"
+  options:
+    - "The image cache returns the wrong key"
+    - "A slow response for the cell's previous item arrives after the cell was reused, and sets its image"
+    - "The diffable data source has duplicate identifiers"
+    - "Cell prefetching configures cells in the wrong order"
+  answer: 1
+  explain: "Requests finish in a different order from the one they started in, and the old request still holds the cell. Cancel and check on reuse, or load by item ID and reconfigure the item."
+- id: q2
+  type: estimate
+  prompt: "Roughly how much memory does a 4,032 × 3,024 photo take once decoded for display, at 4 bytes per pixel?"
+  answer: 49
+  unit: MB
+  within: { factor: 1.5 }
+  explain: "4,032 × 3,024 ≈ 12.2 million pixels × 4 bytes ≈ 49 MB. Ten of those in memory for thumbnails is enough to get an app terminated; decode at the displayed size instead."
+- id: q3
+  type: bug
+  prompt: "Scrolling a list of orders, on-time orders sometimes show a \"Delayed\" badge. Click the line where the problem starts."
+  code: |
+    func configure(with order: OrderRowState) {
+        titleLabel.text = order.title
+        priceLabel.text = order.price
+        if order.isDelayed {
+            badge.isHidden = false
+            badge.text = "Delayed"
+        }
+    }
+  answer: 4
+  explain: "The badge is only touched for delayed orders, so a cell reused from a delayed order keeps it. Set it for every item: `badge.isHidden = !order.isDelayed`."
+- id: q4
+  type: multi
+  prompt: "Which of these belong in a cell's `prepareForReuse()`?"
+  options:
+    - "Cancelling the cell's in-flight image load"
+    - "Stopping an in-progress animation"
+    - "Setting the title for the next item"
+    - "Starting the next item's image load"
+  answer: [0, 1]
+  explain: "Reuse is the moment to stop what belonged to the old item and reset transient state. The cell doesn't know its next item yet: content is set when it's configured."
+- id: q5
+  type: truefalse
+  prompt: "On iOS 15 and later, when a cell registration's handler runs, the cell is about to appear on screen in this frame."
+  answer: false
+  explain: "Cell prefetching configures cells a few frames ahead, and some are never displayed if the user changes direction. Use `willDisplay` and `didEndDisplaying` for work tied to visibility."
+- id: q6
+  type: mcq
+  prompt: "A review cell has a \"Read more\" button that expands the text to its full length. On iOS 18, what's the simplest correct way to make the cell grow?"
+  options:
+    - "Call `reloadData()` on the collection view"
+    - "Change the label's `numberOfLines` to 0 and call `invalidateIntrinsicContentSize()` on the cell"
+    - "Compute the new height and set the cell's frame"
+    - "Apply a new snapshot with the item deleted and reinserted"
+  answer: 1
+  explain: "Since iOS 16, self-sizing invalidation is on by default: invalidating the cell's intrinsic size makes the layout re-measure it and animate the rows around it. The others lose state, fight the layout or animate the wrong thing."
+```

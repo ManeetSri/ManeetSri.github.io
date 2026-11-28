@@ -1,0 +1,324 @@
+## Why it matters
+
+[Higher-order functions as seams](/design/learn/sd-functional-seams) injected one function. Real features need several: an API, the clock, storage, notifications. The **environment style** gathers them into plain structs whose properties are closures. Each dependency becomes a value: a `live` one for the app, a `preview` one for SwiftUI previews, and one-line overrides in tests. Point-Free popularised it for Swift in a 2018 episode, *How to Control the World*, and it grew into their swift-dependencies library, which you'll meet in D21. In interviews it's a strong answer to "how do you inject dependencies without a container?" and "how do your previews work offline?".
+
+## A dependency as a struct of closures
+
+Take local notifications. The protocol version would declare a `NotificationScheduling` protocol, a class that wraps `UNUserNotificationCenter`, and a mock class for tests. The environment version is one struct, with one property per operation:
+
+```swift check ios title="NotificationsClient: live, preview, and an @Entry in the environment"
+import SwiftUI
+import UserNotifications
+
+struct Reminder: Equatable, Sendable {
+    let id: String
+    let title: String
+    let fireDate: Date
+}
+
+/// Everything the app needs from notifications, as values
+struct NotificationsClient: Sendable {
+    var requestAuthorization: @Sendable () async -> Bool
+    var schedule: @Sendable (Reminder) async -> Void
+}
+
+extension NotificationsClient {
+    /// The real thing
+    static let live = NotificationsClient(
+        requestAuthorization: {
+            (try? await UNUserNotificationCenter.current().requestAuthorization(options: [.alert, .sound])) ?? false
+        },
+        schedule: { reminder in
+            let content = UNMutableNotificationContent()
+            content.title = reminder.title
+            let parts = Calendar.current.dateComponents([.year, .month, .day, .hour, .minute], from: reminder.fireDate)
+            let trigger = UNCalendarNotificationTrigger(dateMatching: parts, repeats: false)
+            try? await UNUserNotificationCenter.current().add(UNNotificationRequest(identifier: reminder.id, content: content, trigger: trigger))
+        }
+    )
+
+    /// For previews: always allowed, never shows anything
+    static let preview = NotificationsClient(requestAuthorization: { true }, schedule: { _ in })
+}
+
+extension EnvironmentValues {
+    @Entry var notifications: NotificationsClient = .live
+}
+
+struct RemindMeButton: View {
+    @Environment(\.notifications) private var notifications
+    let reminder: Reminder
+
+    var body: some View {
+        Button("Remind me") {
+            Task {
+                guard await notifications.requestAuthorization() else { return }
+                await notifications.schedule(reminder)
+            }
+        }
+    }
+}
+
+#Preview {
+    RemindMeButton(reminder: Reminder(id: "preview", title: "Call the bank", fireDate: .now))
+        .environment(\.notifications, .preview)
+}
+```
+
+What to notice:
+
+- **The struct is the interface.** Its properties say exactly what the app uses, and nothing it doesn't. `UNUserNotificationCenter` has dozens of methods; the app needs two.
+- **Implementations are values, not types.** `live` and `preview` are static constants. There's no `MockNotificationCenter` class anywhere.
+- **The properties are `var`.** That's what makes overriding a single operation possible, as you'll see in a moment.
+- **Every closure is `@Sendable`**, so the struct is `Sendable` and can be handed to any task or actor in Swift 6.
+- **`@Entry`** (Xcode 16 and later) puts it in the SwiftUI environment in one line, so a preview can swap in `.preview` for a whole subtree.
+
+## A feature's environment
+
+A feature takes everything it touches as one value: its environment. Here's "remind me tomorrow", which needs the time, a calendar, fresh ids and notifications:
+
+```swift run title="remindTomorrow, run in a test's world"
+import Foundation
+
+struct Reminder: Equatable, Sendable {
+    let id: String
+    let title: String
+    let fireDate: Date
+}
+
+/// Everything the feature needs from notifications, as values
+struct NotificationsClient: Sendable {
+    var requestAuthorization: @Sendable () async -> Bool
+    var schedule: @Sendable (Reminder) async -> Void
+}
+
+/// The feature's whole view of the outside world
+struct ReminderEnvironment: Sendable {
+    var now: @Sendable () -> Date
+    var calendar: Calendar
+    var newID: @Sendable () -> String
+    var notifications: NotificationsClient
+}
+
+enum ReminderOutcome: Equatable {
+    case scheduled(Date)
+    case notAllowed
+}
+
+/// "Remind me tomorrow": 9am the next day, in the environment's calendar
+func remindTomorrow(_ title: String, in environment: ReminderEnvironment) async -> ReminderOutcome {
+    guard await environment.notifications.requestAuthorization() else { return .notAllowed }
+    let calendar = environment.calendar
+    let tomorrow = calendar.date(byAdding: .day, value: 1, to: environment.now())!
+    let fireDate = calendar.date(bySettingHour: 9, minute: 0, second: 0, of: tomorrow)!
+    await environment.notifications.schedule(Reminder(id: environment.newID(), title: title, fireDate: fireDate))
+    return .scheduled(fireDate)
+}
+
+// A test's world: a fixed time, a fixed id, and notifications that are recorded instead of shown
+actor Scheduled {
+    private(set) var reminders: [Reminder] = []
+    func add(_ reminder: Reminder) { reminders.append(reminder) }
+}
+
+let scheduled = Scheduled()
+var utc = Calendar(identifier: .gregorian)
+utc.timeZone = TimeZone(identifier: "UTC")!
+
+let testWorld = ReminderEnvironment(
+    now: { Date(timeIntervalSince1970: 1_767_225_600) },   // 1 January 2026, 00:00 UTC
+    calendar: utc,
+    newID: { "reminder-1" },
+    notifications: NotificationsClient(
+        requestAuthorization: { true },
+        schedule: { await scheduled.add($0) }
+    )
+)
+
+print(await remindTomorrow("Call the bank", in: testWorld))
+for reminder in await scheduled.reminders {
+    print(reminder.id, reminder.title, reminder.fireDate.formatted(.iso8601))
+}
+
+// Override one endpoint, keep the rest
+var deniedWorld = testWorld
+deniedWorld.notifications.requestAuthorization = { false }
+print(await remindTomorrow("Call the bank", in: deniedWorld))
+print(await scheduled.reminders.count)
+```
+
+```output
+scheduled(2026-01-02 09:00:00 +0000)
+reminder-1 Call the bank 2026-01-02T09:00:00Z
+notAllowed
+1
+```
+
+The last four lines are the reason people adopt this style. **`deniedWorld` is `testWorld` with one closure replaced.** With protocols, "the same fake, except permission is denied" means a configurable mock class or a second fake type. Here it's a copy and an assignment, because the environment is a value.
+
+Two smaller things are worth copying:
+
+- **Each feature declares only what it uses.** `ReminderEnvironment` has four properties, not the app's forty. A test can see at a glance what the feature can touch.
+- **Recording uses an actor.** `@Sendable` closures can't capture a mutable `var`, so the test collects scheduled reminders in a tiny actor. DesignKit's `Recorder` in the companion package is the same thing, ready-made.
+
+## Where environments come from
+
+The same feature, wired two ways. The feature can't tell which world it's in:
+
+```visual flow
+title: One feature, a live world and a test world
+nodes:
+  - { id: app, label: App (composition root), kind: client, at: [0, 0] }
+  - { id: live, label: ".live environment", at: [2, 0] }
+  - { id: system, label: UNUserNotificationCenter, kind: external, at: [4, 0] }
+  - { id: feature, label: remindTomorrow, kind: view, at: [2, 1] }
+  - { id: test, label: Test, kind: actor, at: [0, 2] }
+  - { id: fake, label: test environment, at: [2, 2] }
+  - { id: recorder, label: Recorder actor, kind: store, at: [4, 2] }
+edges:
+  - [app, live, builds]
+  - [live, system, calls]
+  - [live, feature]
+  - [test, fake, builds]
+  - [fake, recorder, records]
+  - [fake, feature]
+steps:
+  - say: "In the app, the **composition root** (the `App` struct, or a scene) builds the live environment once."
+    show: [app, live, system]
+    send: app->live
+  - say: "The live closures call the real frameworks. This is the only code that imports UserNotifications."
+    send: live->system
+  - say: "The feature receives the environment as a value and calls its closures. It never names a framework type."
+    show: [feature]
+    send: live->feature
+  - say: "A test builds its own world: a fixed clock, a fixed id, notifications that land in a recorder."
+    show: [test, fake, recorder]
+    send: [test->fake, fake->recorder]
+  - say: "The feature runs unchanged. Same function, different world: that's the seam."
+    send: fake->feature
+    state: { feature: ok }
+```
+
+There are three common ways to get the environment from the root to the feature:
+
+1. **Through initialisers.** `ReminderModel(environment: .live)`. Explicit and checked by the compiler; the cost is passing it through every layer in between.
+2. **Through the SwiftUI environment,** as `@Entry` did for `NotificationsClient`. No plumbing, and previews override it per subtree; the cost is that it's only readable inside views, so view models still need it passed in.
+3. **Through a global.** Point-Free's original version was `var Current = World.live`, overwritten in tests. It's the least plumbing, but in Swift 6 a mutable global is a compile error, and tests running in parallel would share it. swift-dependencies keeps the convenience safely by storing values in task-local storage; D21 covers how.
+
+Most apps mix 1 and 2: initialisers for view models and services, the SwiftUI environment for what views use directly.
+
+## Test doubles that fail loudly
+
+A test that doesn't expect notifications should *fail* if the feature schedules one, rather than silently passing. Give each client an **unimplemented** value in the test target, whose closures record a test issue, and override only what the test expects to be used:
+
+```swift
+// In the test target, where Swift Testing is available
+extension NotificationsClient {
+    static let unimplemented = NotificationsClient(
+        requestAuthorization: { Issue.record("requestAuthorization wasn't expected"); return false },
+        schedule: { _ in Issue.record("schedule wasn't expected") }
+    )
+}
+
+@Test func deniedPermissionSchedulesNothing() async {
+    var notifications = NotificationsClient.unimplemented
+    notifications.requestAuthorization = { false }
+    // ...build the environment with it, run the feature, check the outcome
+}
+```
+
+The test now states its whole contract with the outside world: permission is asked for, and nothing else happens. If a later change starts scheduling a fallback reminder, this test catches it.
+
+## When a protocol is still better
+
+The environment style has a real weakness: anyone can replace one closure, so a fake can be **inconsistent**. A storage client whose `save` was overridden but whose `load` still returns canned data behaves like no real store. Protocols and classes keep related operations together:
+
+- Use a **protocol with a fake type** when operations share state and must agree: an in-memory database, a keychain, a cache.
+- Use a **struct of closures** when operations are independent capabilities, each easy to stub alone: an API endpoint, the clock, analytics, permissions, haptics.
+
+## Trade-offs
+
+| Approach | Per-test overrides | Plumbing | Swift 6 safety | Consistency of fakes | When it wins |
+| --- | --- | --- | --- | --- | --- |
+| Protocol and conforming types | A new type or a configurable mock | Initialisers | Fine with `Sendable` types | Strong: one type holds the state | Stateful dependencies whose operations must agree |
+| Struct of closures, passed in initialisers | One assignment | Through every layer | Fine with `@Sendable` closures | Weaker: closures can disagree | Independent capabilities, most app services |
+| Struct of closures in the SwiftUI environment | One modifier per subtree | None, for views | Fine | Weaker | Things views use directly; previews |
+| Mutable global `Current` | One assignment | None | Rejected by the compiler | Weaker, and shared between tests | Older codebases; replace it |
+| A library such as swift-dependencies | One line, scoped to a test | None | Safe, via task-locals | Weaker | Larger apps that want the style without the plumbing |
+
+<Callout kind="interview">
+
+**Say** "Each dependency is a struct of `@Sendable` closures with `live` and `preview` values. A feature takes a small environment of only what it uses, built at the composition root, and tests override single closures." **Ask** which dependencies have state that must stay consistent, because those may be better as protocols. **Red flags:** one giant `AppEnvironment` passed everywhere, so every feature can touch everything; live defaults that silently reach the network from tests; and a mutable global that tests overwrite.
+
+</Callout>
+
+<Callout kind="gotcha" title="iOS gotcha: a live default reaches the network from previews">
+
+`@Entry var notifications: NotificationsClient = .live` means any preview or test that forgets to override it uses the real framework: previews ask for permission, and tests talk to real servers. Pick defaults deliberately. Some teams default to `.preview` and set `.live` once at the root; swift-dependencies chooses a preview value automatically inside Xcode previews.
+
+</Callout>
+
+<Callout kind="gotcha" title="Swift gotcha: @Sendable closures can't capture a mutable var">
+
+A test that writes `var scheduled: [Reminder] = []` and then `schedule: { scheduled.append($0) }` won't compile: the closure is `@Sendable`, and a captured `var` could be changed from two tasks at once. Record into an actor, as the example does, or into DesignKit's `Recorder`.
+
+</Callout>
+
+## Practice
+
+In the kata **queued likes outbox**, `Dependencies` is exactly this style: four closures, built by tests from fixed data and a recorder. When you've solved it, sketch the `live` value: `NWPathMonitor` for `isOnline`, a file in Application Support for `load` and `save`, and `URLSession` for `send`.
+
+```cards
+- id: environment-style
+  front: "What is the environment style of dependency injection?"
+  back: "Each dependency is a struct whose properties are closures, with `live`, `preview` and test values; a feature takes a small struct of only the dependencies it uses."
+- id: override-one
+  front: "What's the main advantage of a struct of closures over a protocol in tests?"
+  back: "A test copies an environment and replaces one closure, for example permission denied, without writing a new fake type."
+- id: closures-weakness
+  front: "When is a protocol a better fit than a struct of closures?"
+  back: "When operations share state and must agree, like an in-memory store's load and save. Replacing closures one at a time can make a fake inconsistent."
+```
+
+```quiz
+- id: q1
+  type: mcq
+  prompt: "A test needs the reminders feature with everything as in `testWorld`, except that scheduling fails silently. What's the environment-style way?"
+  options:
+    - "Write a `FailingNotificationsClient` class that conforms to a protocol"
+    - "Copy `testWorld` into a `var` and assign a new closure to `notifications.schedule`"
+    - "Add a `shouldFail` flag to the live client"
+    - "Swap `UNUserNotificationCenter.current()` with method swizzling"
+  answer: 1
+  explain: "Environments are values with `var` closure properties, so a variation is a copy and an assignment. No new types, and the live code never learns about tests."
+- id: q2
+  type: multi
+  prompt: "Which would you model as a struct of closures rather than a protocol with a fake type? Choose all that apply."
+  options:
+    - "The current time and calendar"
+    - "Asking for notification permission"
+    - "An in-memory database whose `insert`, `fetch` and `delete` must agree with each other"
+    - "Sending an analytics event"
+    - "A keychain wrapper whose fake must return what was last saved"
+  answer: [0, 1, 3]
+  explain: "Independent capabilities stub well one closure at a time. Stores whose operations share state are safer as a type that keeps that state consistent."
+- id: q3
+  type: truefalse
+  prompt: "In Swift 6, a feature's environment struct can be `Sendable` only if its closure properties are `@Sendable`."
+  answer: true
+  explain: "A non-`@Sendable` closure might capture mutable state, so a struct holding one isn't `Sendable`. Marking the closures `@Sendable` makes the compiler check what they capture."
+- id: q4
+  type: order
+  prompt: "Put the life of a dependency value in order, from definition to a test that uses it."
+  lines:
+    - "Declare the client as a struct of `@Sendable` closures"
+    - "Write `static let live` over the real framework"
+    - "Build the feature's environment from `.live` at the composition root"
+    - "In a test, start from an `unimplemented` value"
+    - "Override only the closures the test expects to be called"
+  explain: "The client's shape comes first, then its real implementation, then wiring at the root. Tests start from values that fail if used and switch on only what they expect."
+- id: q5
+  type: recall
+  prompt: "Why did the original `var Current = World.live` global fall out of favour, and what replaced it?"
+  model: "A mutable global is shared by every test running in parallel and is a compile error in Swift 6 language mode. Explicit environments passed through initialisers or the SwiftUI environment replaced it, and swift-dependencies keeps the convenience by storing values in task-local storage, scoped to each test."
+```

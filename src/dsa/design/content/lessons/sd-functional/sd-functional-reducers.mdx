@@ -1,0 +1,334 @@
+## Why it matters
+
+A busy screen changes state from many places: taps, typing, timers, network responses arriving in any order. When each of those writes to properties directly, states that should be impossible appear ("posting" and "editable" at once) and nobody can say how the screen got there. A **reducer** puts every change through one pure function: given the current state and one thing that happened, it returns the next state. It's the heart of Redux, the Elm architecture and TCA, which you'll study in D28, but it's as useful inside a plain view model. Interviewers ask how you keep complex state consistent and testable; this is one of the best answers.
+
+## The shape of a reducer
+
+Three types and one function:
+
+- **State:** a value type holding everything the screen shows.
+- **Action:** an enum of everything that can happen: what the user did (`postTapped`) and what came back from the world (`postFinished`).
+- **Effect:** an enum of work for the shell to do, returned as values, exactly as in [Functional core, imperative shell](/design/learn/sd-functional-core-shell).
+- **`reduce(_ state: inout State, _ action: Action) -> [Effect]`:** applies one action, and says what should happen outside.
+
+On paper a reducer is `(State, Action) -> State`. Swift's `inout` is the same thing in practice: the function gets the caller's value, changes its own copy, and the result is written back when it returns. Nobody else can see the state mid-change, so it's still pure, and it avoids rebuilding a large struct by hand.
+
+The name comes from `reduce`, the fold over a sequence. The state at any moment is every action so far, folded over the initial state, and in Swift that's one line: `actions.reduce(into: State()) { _ = reduce(&$0, $1) }`.
+
+## Example: composing a post
+
+A social app's composer has text, up to four photos, and a Post button. Posting takes a while, can fail, and must never happen twice:
+
+```swift run title="Composer: state, actions, effects and the reducer"
+enum Composer {
+    struct State: Equatable {
+        var text = ""
+        var photos: [String] = []
+        var isPosting = false
+        var error: String?
+
+        var remaining: Int { 280 - text.count }
+        var canPost: Bool { !isPosting && remaining >= 0 && (!text.isEmpty || !photos.isEmpty) }
+    }
+
+    enum Action {
+        case textChanged(String)
+        case photoAdded(String)
+        case postTapped
+        case postFinished(succeeded: Bool)
+    }
+
+    enum Effect: Equatable {
+        case upload(text: String, photos: [String])
+    }
+
+    static func reduce(_ state: inout State, _ action: Action) -> [Effect] {
+        switch action {
+        case .textChanged(let text):
+            guard !state.isPosting else { return [] }
+            state.text = text
+            state.error = nil
+            return []
+        case .photoAdded(let id):
+            guard !state.isPosting, state.photos.count < 4 else { return [] }
+            state.photos.append(id)
+            return []
+        case .postTapped:
+            guard state.canPost else { return [] }
+            state.isPosting = true
+            state.error = nil
+            return [.upload(text: state.text, photos: state.photos)]
+        case .postFinished(succeeded: true):
+            state = State()
+            return []
+        case .postFinished(succeeded: false):
+            state.isPosting = false
+            state.error = "Couldn't post. Your draft is saved."
+            return []
+        }
+    }
+}
+
+let actions: [Composer.Action] = [
+    .textChanged("Sunset over the bay"),
+    .photoAdded("IMG_0412"),
+    .postTapped,
+    .postTapped,
+    .textChanged("Too late to edit"),
+    .postFinished(succeeded: false),
+    .postTapped,
+    .postFinished(succeeded: true),
+]
+
+var state = Composer.State()
+for action in actions {
+    let effects = Composer.reduce(&state, action)
+    var line = "\(action) → \(state.isPosting ? "posting" : "editing"), \(state.text.count) chars, \(state.photos.count) photo(s)"
+    if state.error != nil { line += ", error shown" }
+    if !effects.isEmpty { line += ", effect: upload" }
+    print(line)
+}
+
+// The state after any sequence of actions is a fold over them
+let replayed = actions.reduce(into: Composer.State()) { state, action in _ = Composer.reduce(&state, action) }
+print(replayed == state)
+```
+
+```output
+textChanged("Sunset over the bay") → editing, 19 chars, 0 photo(s)
+photoAdded("IMG_0412") → editing, 19 chars, 1 photo(s)
+postTapped → posting, 19 chars, 1 photo(s), effect: upload
+postTapped → posting, 19 chars, 1 photo(s)
+textChanged("Too late to edit") → posting, 19 chars, 1 photo(s)
+postFinished(succeeded: false) → editing, 19 chars, 1 photo(s), error shown
+postTapped → posting, 19 chars, 1 photo(s), effect: upload
+postFinished(succeeded: true) → editing, 0 chars, 0 photo(s)
+true
+```
+
+What to notice:
+
+- **The double tap is harmless.** The second `postTapped` finds `canPost` false and returns no effect, so one upload is sent. There's no `isButtonEnabled` to keep in step, and no debounce.
+- **Editing while posting is refused in one place.** The text stays at 19 characters; the view can't get it wrong, because the view never writes state.
+- **`remaining` and `canPost` are computed, not stored.** Derived values can't drift out of step with the text they're derived from.
+- **Failure keeps the draft.** That's a product rule, and it's one line you can point a test at.
+- **The last line is the fold.** Replaying the same actions from scratch gives the same state. That's what makes bug reports reproducible: log the actions, replay them.
+
+## Results come back as actions
+
+The reducer never waits for the upload. It returns the effect and finishes; the shell runs the effect and, when the network answers, **sends the result back as another action**. So a tap and a server response change state through the same door, one at a time. Step through one post:
+
+```visual flow
+title: Every change goes through reduce
+nodes:
+  - { id: action, label: Action, kind: client, at: [0, 0] }
+  - { id: reduce, label: reduce, at: [2, 0] }
+  - { id: state, label: State, kind: store, at: [4, 0] }
+  - { id: effects, label: "[Effect]", kind: queue, at: [4, 2] }
+  - { id: shell, label: Shell, kind: external, at: [2, 2] }
+edges:
+  - [action, reduce, send]
+  - [reduce, state, new state]
+  - [reduce, effects, returns]
+  - [effects, shell, run]
+  - [shell, action, result]
+code: |
+  static func reduce(_ state: inout State, _ action: Action) -> [Effect] {
+      switch action {
+      case .textChanged(let text):
+          guard !state.isPosting else { return [] }
+          state.text = text
+          state.error = nil
+          return []
+      case .photoAdded(let id):
+          guard !state.isPosting, state.photos.count < 4 else { return [] }
+          state.photos.append(id)
+          return []
+      case .postTapped:
+          guard state.canPost else { return [] }
+          state.isPosting = true
+          state.error = nil
+          return [.upload(text: state.text, photos: state.photos)]
+      case .postFinished(succeeded: true):
+          state = State()
+          return []
+      case .postFinished(succeeded: false):
+          state.isPosting = false
+          state.error = "Couldn't post. Your draft is saved."
+          return []
+      }
+  }
+steps:
+  - say: "`photoAdded` arrives. Under four photos and not posting, so the guard passes."
+    send: action->reduce
+    line: 9
+  - say: "The photo is appended and the new state replaces the old. No effects: this only changes what's on screen."
+    send: reduce->state
+    line: 10
+  - say: "`postTapped`: `canPost` is true, so the draft is marked as posting..."
+    send: action->reduce
+    line: 14
+  - say: "...and the reducer returns an `upload` effect as a **value**. It uploads nothing itself."
+    send: [reduce->state, reduce->effects]
+    line: 16
+  - say: "The shell runs the effect. The reducer has already returned; nothing is waiting on it."
+    send: effects->shell
+    state: { shell: wait }
+  - say: "The upload fails. The shell turns the result into an action, `postFinished(succeeded: false)`, and sends it like a tap."
+    send: shell->action
+    state: { shell: error }
+  - say: "The reducer handles it: stop posting, show the error, keep the draft. Async results change state through the same door as the user."
+    send: [action->reduce, reduce->state]
+    line: 22
+    state: { shell: null }
+```
+
+## A minimal store
+
+Something has to own the state, call the reducer and run the effects. It's small enough to write yourself:
+
+```swift check ios title="Store: one owner, one way in"
+import Observation
+
+/// One owner for a feature's state: actions are the only way in, effects the only way out
+@MainActor
+@Observable
+final class Store<State, Action, Effect> {
+    private(set) var state: State
+    @ObservationIgnored private let reduce: (inout State, Action) -> [Effect]
+    @ObservationIgnored private let run: @MainActor (Effect) async -> Action?
+
+    init(_ state: State, reduce: @escaping (inout State, Action) -> [Effect], run: @escaping @MainActor (Effect) async -> Action?) {
+        self.state = state
+        self.reduce = reduce
+        self.run = run
+    }
+
+    func send(_ action: Action) {
+        for effect in reduce(&state, action) {
+            Task {
+                if let next = await run(effect) { send(next) }
+            }
+        }
+    }
+}
+```
+
+The view reads `store.state` and calls `store.send(.postTapped)`; `state` is `private(set)`, so there's no other way to change it. The composer's `run` closure performs `.upload` with the real API client and returns `.postFinished(succeeded:)`. Because the store is `@MainActor`, actions are reduced one at a time, in the order they're sent. `run` is `@MainActor` too, so an effect never leaves the actor that owns the state; the API client it awaits does its own work elsewhere. Without that, Swift 6 rejects the store: handing a non-`Sendable` effect to a closure that runs off the main actor risks a data race.
+
+This is deliberately bare. Production versions add cancellation (a new search should cancel the old one), effects that send several actions, and logging of every action. D28 looks at how Redux-style stores and TCA handle those.
+
+## Testing a reducer
+
+A reducer test is a list of actions and an expectation. No mocks, no waiting, no main thread:
+
+```swift
+@Test func doubleTapPostsOnce() {
+    var state = Composer.State(text: "Hello")
+    #expect(Composer.reduce(&state, .postTapped) == [.upload(text: "Hello", photos: [])])
+    #expect(Composer.reduce(&state, .postTapped) == [])
+    #expect(state.isPosting)
+}
+
+@Test func failureKeepsTheDraft() {
+    var state = Composer.State(text: "Hello", isPosting: true)
+    _ = Composer.reduce(&state, .postFinished(succeeded: false))
+    #expect(state.text == "Hello")
+    #expect(state.error != nil)
+    #expect(!state.isPosting)
+}
+```
+
+Because effects are values, the test checks *what the screen would do* (upload this text with these photos) without doing it. The shell's job, turning `.upload` into a network call, gets one integration test of its own.
+
+## Growing: one reducer per part
+
+A checkout screen with an address form, a payment section and a summary doesn't need one giant `switch`. Give each part its own state, actions and reducer, and let the parent hold the children and pass each one its slice: `case .address(let action): return Address.reduce(&state.address, action)`. The parent's own cases handle what spans parts, such as "place order" needing a valid address *and* payment. This is called **composing** reducers, and scoping it neatly is much of what TCA adds.
+
+## Trade-offs
+
+| Approach | Testability | Traceability | Boilerplate | When it wins |
+| --- | --- | --- | --- | --- |
+| View model methods that set properties directly | Good for simple screens; harder as paths multiply | Low: any method can write anything | Least | Forms and screens with a handful of states |
+| A reducer with effects as values, in your own small store | Excellent: actions in, state and effects out | High: every change is a logged action | An action enum and a switch | Screens with async results, double-tap risks, or rules worth testing exhaustively |
+| A framework such as TCA | Excellent, with exhaustive test helpers | High, with tooling | The framework's conventions | Large apps that want one consistent style, and teams willing to learn it |
+
+A reducer is easy to over-apply. A settings screen with five toggles doesn't need actions for each; plain `@Observable` properties are simpler. Reach for it when the *interactions* between events are the hard part.
+
+<Callout kind="interview">
+
+**Say** "I'd model the screen as one state value, an action enum for user events and async results, and a pure reducer that returns effects as values. Then a double tap or a late response is one more action the reducer can refuse, and every rule is a unit test." **Ask** which events can arrive out of order or twice, because those decide the state's shape. **Red flags:** a `Task` or network call inside the reducer, stored values that could be computed, and one app-wide reducer that every feature edits.
+
+</Callout>
+
+<Callout kind="gotcha" title="Swift gotcha: Task inside a reducer breaks everything it promised">
+
+`case .postTapped: Task { await api.post(state.text) }` compiles, but the reducer is no longer pure, tests start making network calls, and the result has no way back in except by writing state from outside. Return `.upload(…)` instead, and let the store's shell run it and send the result back as an action.
+
+</Callout>
+
+<Callout kind="gotcha" title="iOS gotcha: one observable state property invalidates every view">
+
+Observation tracks the properties of an `@Observable` class. A view that reads `store.state.text` depends on the whole `state` property, so typing a character also re-evaluates the photo grid and the Post button that read other fields. Usually that's fine. When profiling shows it isn't, split state across several observable properties or child models, or use a library that makes the state struct itself observable, as TCA's `@ObservableState` does.
+
+</Callout>
+
+## Practice
+
+The kata **typeahead search reducer** is a search-as-you-type screen with a reducer whose effects are searches. Its hard part is the one the composer avoided: responses that arrive after the user has typed something else.
+
+```cards
+- id: reducer-shape
+  front: "What's the signature of a reducer in Swift, and why is `inout` still pure?"
+  back: "`reduce(_ state: inout State, _ action: Action) -> [Effect]`. The function changes the caller's copy only, and the result is written back when it returns, so no one else sees the state mid-change."
+- id: results-as-actions
+  front: "How does the result of an async effect change the state?"
+  back: "The shell runs the effect and sends its result back as an action, which the reducer handles like a tap. State only ever changes through the reducer."
+- id: reducer-fold
+  front: "Why is a reducer's state reproducible from a log of actions?"
+  back: "The state is a fold of the actions over the initial state, `actions.reduce(into: State()) { reduce(&$0, $1) }`, and the reducer is pure, so replaying the same actions gives the same state."
+```
+
+```quiz
+- id: q1
+  type: trace
+  prompt: "Starting from an empty composer, run `photoAdded` five times, with ids a, b, c, d and e. List `photos.count` after each action, separated by commas."
+  answer: "1, 2, 3, 4, 4"
+  explain: "The guard `state.photos.count < 4` refuses the fifth photo. The view doesn't need its own check; the reducer is the only place the rule lives."
+- id: q2
+  type: bug
+  prompt: "This reducer case was added in review. Click the line that breaks the reducer's contract."
+  code: |
+    case .draftSaved:
+        state.lastSavedText = state.text
+        state.savedAt = Date()
+        state.hasUnsavedChanges = false
+        return [.writeDraft(state.text)]
+  answer: 3
+  explain: "`Date()` is a hidden input: the reducer's output now depends on when it runs, so tests can't predict it and replays differ. Put the time in the action, `.draftSaved(at: Date)`, and let the shell read the clock."
+- id: q3
+  type: mcq
+  prompt: "Which screen gains the most from a reducer?"
+  options:
+    - "A settings screen with five independent toggles"
+    - "An about screen showing the app version"
+    - "A chat composer where sending, retries, attachments uploading and typing all overlap"
+    - "A static onboarding page"
+  answer: 2
+  explain: "Reducers pay off when events interact: overlapping async work, retries and things that must be refused in some states. Independent toggles are simpler as plain properties."
+- id: q4
+  type: truefalse
+  prompt: "Storing `canPost` as a property that the reducer updates in every case is safer than computing it from the state."
+  answer: false
+  explain: "A stored derived value must be updated in every case that affects it, and one forgotten case leaves it wrong. A computed property can't drift."
+- id: q5
+  type: multi
+  prompt: "What does returning effects as values, instead of performing them, give you? Choose all that apply."
+  options:
+    - "Tests can check exactly which effects a sequence of actions asks for"
+    - "The reducer stays pure and synchronous"
+    - "Network calls become faster"
+    - "A double tap can be refused before any effect exists"
+  answer: [0, 1, 3]
+  explain: "Effects as data keep the reducer pure and make the screen's intentions testable values; refusing an action means returning no effect. Performance of the work itself doesn't change."
+```

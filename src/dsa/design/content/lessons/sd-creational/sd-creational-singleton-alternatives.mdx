@@ -1,0 +1,468 @@
+## Why it matters
+
+Singletons are the most common reason iOS code can't be tested, the reason a SwiftUI preview calls your real server, and the reason "log out" sometimes leaves the last user's data on screen. "How would you test code that calls `URLSession.shared`?" is a staple interview question, and the answer is a set of techniques, not a slogan. This lesson covers what global access costs, a ladder of alternatives from a one-line change to a composition root, and how to move a real codebase from one to the other without a big-bang rewrite.
+
+## What global access costs
+
+The previous lesson split the singleton into two promises: one instance, and global access. Here's what the second one costs.
+
+**Hidden dependencies.** `func placeOrder() async throws` says nothing about the network, the Keychain, analytics or the cart. The signature lies by omission, so readers and reviewers can't see what a change might affect. In [Kinds of coupling, from content to data](/design/learn/sd-coupling-kinds) this was **common coupling**: modules talking through shared global data.
+
+**No seam.** If a type reaches out for `APIClient.shared`, there's nowhere to hand it something else. Tests hit the network, and previews show a spinner forever, or real customer data.
+
+**State that leaks between tests.** One test signs in and leaves `Session.shared.user` set; the next test passes or fails depending on whether it ran first. Watch it happen:
+
+```swift run
+// A cart reached through a singleton: every "test" shares it
+@MainActor
+final class SharedCart {
+    static let shared = SharedCart()
+    private(set) var items: [String] = []
+    func add(_ item: String) { items.append(item) }
+}
+
+@MainActor
+func checkoutTotalWithSingleton() -> Int {
+    SharedCart.shared.items.count * 5
+}
+
+@MainActor
+func testEmptyCartCostsNothing() -> Bool {
+    checkoutTotalWithSingleton() == 0
+}
+
+@MainActor
+func testOneItemCostsFive() -> Bool {
+    SharedCart.shared.add("Tea")
+    return checkoutTotalWithSingleton() == 5
+}
+
+print("singleton, empty first:", testEmptyCartCostsNothing(), testOneItemCostsFive())
+print("singleton, run again:", testOneItemCostsFive(), testEmptyCartCostsNothing())
+
+// The same logic with the cart passed in: each test makes its own
+final class Cart {
+    private(set) var items: [String] = []
+    func add(_ item: String) { items.append(item) }
+}
+
+func checkoutTotal(for cart: Cart) -> Int {
+    cart.items.count * 5
+}
+
+func testEmptyCart() -> Bool {
+    checkoutTotal(for: Cart()) == 0
+}
+
+func testOneItem() -> Bool {
+    let cart = Cart()
+    cart.add("Tea")
+    return checkoutTotal(for: cart) == 5
+}
+
+print("injected, any order:", testOneItem(), testEmptyCart(), testOneItem(), testEmptyCart())
+```
+
+```output
+singleton, empty first: true true
+singleton, run again: false false
+injected, any order: true true true true
+```
+
+The singleton tests are correct individually and wrong together. Swift Testing makes this worse: it runs tests **in parallel** by default, in one process, so two tests touching the same singleton can now race as well as leak. The `.serialized` trait only serialises the tests inside one suite; tests in other suites still run alongside them.
+
+**A lifetime you can't end.** A `static let` lives until the process dies. When a user logs out and another logs in, every singleton still holds the first user's cache, drafts and settings unless someone remembers to reset each one. That's a privacy bug waiting for a shared iPad.
+
+**Ordering you don't control.** First access decides when a singleton is created, and singletons often use each other. If `A`'s initialiser reads `B.shared` and `B`'s reads `A.shared`, the app crashes the first time either is touched, because each once-only initialisation is waiting on the other.
+
+**Tangled modules.** A feature module that calls `AppSession.shared` must import whatever module defines it. Do that across ten features and every module depends on the app's core, so nothing can be built, tested or reused on its own, including in an app extension.
+
+## The alternatives, smallest change first
+
+### 1. Pass it in
+
+The fix for hidden dependencies is to make them visible: the type asks for what it needs, as a protocol, in its initialiser.
+
+```swift check ios
+import SwiftUI
+
+struct Profile: Decodable, Sendable {
+    let name: String
+}
+
+protocol ProfileLoading: Sendable {
+    func profile() async throws -> Profile
+}
+
+struct LiveProfileAPI: ProfileLoading {
+    let session: URLSession
+    let baseURL: URL
+
+    func profile() async throws -> Profile {
+        let (data, _) = try await session.data(from: baseURL.appending(path: "me"))
+        return try JSONDecoder().decode(Profile.self, from: data)
+    }
+}
+
+struct PreviewProfileAPI: ProfileLoading {
+    func profile() async throws -> Profile { Profile(name: "Preview Person") }
+}
+
+@MainActor
+@Observable
+final class ProfileModel {
+    private let api: any ProfileLoading
+    private(set) var name = ""
+
+    init(api: any ProfileLoading) {
+        self.api = api
+    }
+
+    func load() async {
+        name = (try? await api.profile().name) ?? "Couldn't load"
+    }
+}
+
+struct ProfileView: View {
+    @State var model: ProfileModel
+
+    var body: some View {
+        Text(model.name)
+            .task { await model.load() }
+    }
+}
+
+// The composition root (marked @main in the app target): the one place that knows the concrete types
+struct ShopApp: App {
+    private let api = LiveProfileAPI(session: .shared, baseURL: URL(string: "https://api.example.com")!)
+
+    var body: some Scene {
+        WindowGroup {
+            ProfileView(model: ProfileModel(api: api))
+        }
+    }
+}
+
+#Preview {
+    ProfileView(model: ProfileModel(api: PreviewProfileAPI()))
+}
+```
+
+Three things changed. `ProfileModel`'s initialiser now **says** it needs something that loads profiles. The preview passes a stub and never touches the network. And `ShopApp` is the **composition root**: it creates the one `LiveProfileAPI` and hands it down. There's still only one API client in the app, so you kept the singleton's first promise and dropped the second. D21 builds a full composition root; this is the core of it.
+
+### 2. A default argument, as a stepping stone
+
+In a large codebase you can't change every call site at once. A **default argument** adds the seam without touching existing callers:
+
+```swift
+init(api: any ProfileLoading = LiveProfileAPI.shared) {
+    self.api = api
+}
+```
+
+Production code keeps calling `ProfileModel()`; tests call `ProfileModel(api: StubProfileAPI())`. It's a good first commit. It isn't a good last one: the dependency is still invisible at every call site that uses the default, and new production code can forget to pass the right instance. Plan to remove the defaults once the composition root passes everything explicitly.
+
+### 3. The SwiftUI environment
+
+For dependencies that many views deep in a hierarchy need, such as an image loader or the current user's settings, SwiftUI's environment passes values down without threading them through every initialiser:
+
+```swift check ios
+import SwiftUI
+
+protocol ImageLoading: Sendable {
+    func image(at url: URL) async throws -> Data
+}
+
+struct URLSessionImageLoader: ImageLoading {
+    func image(at url: URL) async throws -> Data {
+        try await URLSession.shared.data(from: url).0
+    }
+}
+
+struct PlaceholderImageLoader: ImageLoading {
+    func image(at url: URL) async throws -> Data { Data() }
+}
+
+extension EnvironmentValues {
+    @Entry var imageLoader: any ImageLoading = URLSessionImageLoader()
+}
+
+struct Avatar: View {
+    let url: URL
+    @Environment(\.imageLoader) private var imageLoader
+    @State private var loaded = false
+
+    var body: some View {
+        Circle()
+            .fill(loaded ? .green : .gray)
+            .task {
+                loaded = (try? await imageLoader.image(at: url)) != nil
+            }
+    }
+}
+
+#Preview {
+    Avatar(url: URL(string: "https://img.example.com/me.jpg")!)
+        .environment(\.imageLoader, PlaceholderImageLoader())
+}
+```
+
+The `@Entry` macro (Xcode 16) writes the `EnvironmentKey` boilerplate. For an `@Observable` model, use `.environment(model)` and `@Environment(Model.self)` instead. The environment is scoped: a preview or a subtree can override a value without affecting anything else. Its cost is that a missing override silently falls back to the default, so a preview can still reach the network if you forget one. You'll weigh it against other forms of injection in D21.
+
+### 4. Closures for the small, invisible singletons
+
+`Date()` and `UUID()` are globals too: they read the system clock and the random number generator. Code that calls them directly can't be tested for "expires after 30 days" or "creates the id we expect". Inject them as closures, as in [Dependencies as closures and structs: the environment style](/design/learn/sd-functional-environment):
+
+```swift check
+import Foundation
+
+struct SessionTimeout {
+    let now: @Sendable () -> Date
+    let limit: TimeInterval
+
+    init(limit: TimeInterval = 15 * 60, now: @escaping @Sendable () -> Date = { Date() }) {
+        self.limit = limit
+        self.now = now
+    }
+
+    func hasExpired(lastActivity: Date) -> Bool {
+        now().timeIntervalSince(lastActivity) >= limit
+    }
+}
+```
+
+For code that waits (debounce, retry, polling), inject `any Clock<Duration>` instead, so tests can use a test clock and never sleep.
+
+### 5. Task-local values: scoped overrides
+
+Sometimes passing a dependency through every layer is impractical, for example a clock used deep inside domain code. A **task-local** value is an ambient default that a scope can override, and Swift 6 accepts it because each task sees its own value:
+
+```swift run
+import Foundation
+
+struct Clock: Sendable {
+    var now: @Sendable () -> Date
+
+    static let live = Clock(now: { Date() })
+    static func fixed(_ seconds: TimeInterval) -> Clock {
+        Clock(now: { Date(timeIntervalSince1970: seconds) })
+    }
+}
+
+enum Current {
+    // A task-local: one default for the whole app, overridable for a scope and its child tasks
+    @TaskLocal static var clock = Clock.live
+}
+
+struct Coupon {
+    let expires: Date
+    var isValid: Bool { Current.clock.now() < expires }
+}
+
+let coupon = Coupon(expires: Date(timeIntervalSince1970: 1_000))
+
+Current.$clock.withValue(.fixed(999)) {
+    print("one second before expiry:", coupon.isValid)
+}
+Current.$clock.withValue(.fixed(1_000)) {
+    print("at expiry:", coupon.isValid)
+}
+
+await Current.$clock.withValue(.fixed(500)) {
+    let child = Task { coupon.isValid }
+    let detached = Task.detached { Current.clock.now() == Date(timeIntervalSince1970: 500) }
+    print("child task sees the override:", await child.value)
+    print("detached task sees the override:", await detached.value)
+}
+```
+
+```output
+one second before expiry: true
+at expiry: false
+child task sees the override: true
+detached task sees the override: false
+```
+
+Parallel tests can each set their own value without interfering, which a mutable global can't offer. Libraries such as Point-Free's swift-dependencies are built on task locals. But the dependency is still **hidden** from signatures, and the last line shows the trap: `Task.detached`, callbacks from GCD and delegate methods don't inherit the override, so code there quietly uses the live value.
+
+### 6. Apple's shared instances, wrapped
+
+You don't control Apple's singletons, but you control whether your code reaches for them:
+
+| Instead of reaching for | Inject | And in tests use |
+| --- | --- | --- |
+| `URLSession.shared` | A small `HTTPClient` protocol | A stub client that returns canned responses |
+| `UserDefaults.standard` | A `UserDefaults` instance | `UserDefaults(suiteName:)` with a unique name, removed afterwards |
+| `FileManager.default` paths | The base directory `URL` | A fresh temporary directory |
+| `NotificationCenter.default` | A `NotificationCenter` | `NotificationCenter()` |
+| `Date()`, `UUID()` | `() -> Date`, `() -> UUID`, or a `Clock` | Fixed values |
+| `UIApplication.shared.open(_:)` | An `(URL) -> Void` closure, or SwiftUI's `openURL` action | A closure that records the URL |
+
+## Migrating a singleton, one safe step at a time
+
+```visual flow
+title: From global access to a composition root
+nodes:
+  - { id: home, label: HomeView, kind: view, at: [0, 0] }
+  - { id: profile, label: ProfileView, kind: view, at: [0, 1] }
+  - { id: checkout, label: CheckoutView, kind: view, at: [0, 2] }
+  - { id: api, label: APIClient, kind: service, at: [4, 0] }
+  - { id: session, label: Session, kind: store, at: [4, 2] }
+  - { id: root, label: App root, kind: client, at: [2, 3] }
+edges:
+  - [home, api]
+  - [profile, api]
+  - [profile, session]
+  - [checkout, api]
+  - [checkout, session]
+  - [root, api, creates]
+  - [root, session, creates]
+  - [root, home, injects]
+  - [root, profile, injects]
+  - [root, checkout, injects]
+steps:
+  - say: "**Before:** each screen reaches out to `APIClient.shared` and `Session.shared` itself."
+    show: [home, profile, checkout, api, session]
+    send: [home->api, profile->session, checkout->api]
+  - say: A checkout test can't replace either global, and logging out has to remember to reset `Session` by hand.
+    active: [checkout->api, checkout->session]
+    state: { api: error, session: error }
+  - say: "**After:** the app's root creates one `APIClient` and one `Session`: still exactly one of each."
+    reset: true
+    show: [root, api, session]
+    send: [root->api, root->session]
+    state: { root: active }
+  - say: It passes them to each screen, so dependencies are visible and tests and previews pass their own. Logging out replaces the session in one place.
+    show: [home, profile, checkout]
+    send: [root->home, root->profile, root->checkout]
+    state: { root: null, api: ok, session: ok }
+```
+
+You rarely get to rewrite this in one go. Each of these steps leaves the app working and can ship on its own:
+
+1. **Extract a protocol** for the part of the singleton callers actually use, and make the singleton conform.
+2. **Add an initialiser parameter with a default** of `.shared` to one consumer at a time.
+3. **Write tests** for those consumers with fakes. This is where the payoff starts.
+4. **Create the instance at the composition root** and pass it in explicitly; remove the defaults.
+5. **Delete `shared`**, or make it private to the root, once nothing else uses it.
+
+D15 walks through this refactoring on a real view controller, with characterisation tests first.
+
+## Trade-offs
+
+| | Singleton (`.shared` everywhere) | Default argument | Constructor injection + composition root | SwiftUI environment | Task-local |
+| --- | --- | --- | --- | --- | --- |
+| Dependencies visible in signatures | No | Partly | Yes | No | No |
+| Tests and previews can substitute | No | Yes | Yes | Yes | Yes |
+| Safe with parallel tests | No | Yes | Yes | Yes | Yes |
+| Reset on log-out | Each one by hand | Each one by hand | Replace the graph in one place | Replace the value | Replace the value |
+| Effort to adopt | None | One line per type | Wiring at the root | A key per dependency | A key per dependency |
+| Best for | Truly global, stateless facilities | Migrating legacy code | Services, repositories, models | Values many views need | Deep, cross-cutting values like a clock |
+
+<Callout kind="interview">
+
+**What to say** to "How would you test code that uses `URLSession.shared`?": "I'd put a small protocol in front of the network, inject it through the initialiser and use a stub in unit tests. For the HTTP layer itself, I'd give a `URLSession` a configuration with a custom `URLProtocol` that returns recorded responses." Then add the migration story: default argument first, composition root later.
+
+**What to ask:** "How many places use this singleton, and does it hold per-user state?" Per-user state in a singleton is the first thing to fix.
+
+**Red flags:** "just make everything a singleton and mock with method swizzling"; a protocol that mirrors the whole singleton instead of what callers need; replacing every singleton with a service locator, which keeps the hidden dependencies (you'll compare them in D21).
+
+</Callout>
+
+<Callout kind="gotcha" title="Swift gotcha: default arguments are evaluated on every call">
+
+`init(store: Store = Store())` builds a **new** `Store` each time the default is used, so two view models created that way share nothing. If sharing was the intent, the default must refer to a shared instance (`= .shared`), and if it wasn't, check that each call really should get its own.
+
+</Callout>
+
+<Callout kind="gotcha" title="iOS gotcha: @Entry defaults are recreated on every read">
+
+The `@Entry` macro turns its default value into a computed property, so `@Entry var cache: ImageCache = ImageCache()` creates a fresh cache every time a view reads the default, and recent SDKs warn about exactly this. Use value types (as `URLSessionImageLoader` above), or point the default at an instance created once elsewhere.
+
+</Callout>
+
+<Callout kind="gotcha" title="iOS gotcha: UserDefaults suites outlive tests">
+
+`UserDefaults(suiteName: "tests")` is a real plist on disk, so whatever one run writes, the next run reads. Use a unique suite name per test and call `removePersistentDomain(forName:)` when the test ends, or inject a protocol with an in-memory implementation.
+
+</Callout>
+
+## Practice
+
+The **testable review prompter** kata rewrites a `ReviewPrompter.shared` that reads `UserDefaults.standard` and `Date()` into a prompter whose store and clock are injected, with a `live` factory for the composition root. The **singletons and hidden construction** review asks you to spot the same problems in a profile screen and plan the migration.
+
+```cards
+- id: global-access-costs
+  front: "Name four costs of reaching a dependency through a singleton."
+  back: "Hidden dependencies, no seam for tests and previews, state that leaks between (parallel) tests, and a lifetime you can't end on log-out. Also: initialisation order you don't control, and tangled module dependencies."
+- id: keep-one-drop-global
+  front: "How do you keep 'one instance' without 'global access'?"
+  back: "Create the single instance at the composition root and pass it to everything that needs it."
+- id: default-argument-step
+  front: "Why is `init(api: any API = LiveAPI.shared)` a step, not a destination?"
+  back: "It adds a seam without changing call sites, but the dependency stays invisible wherever the default is used, and new code can forget to pass the right instance."
+- id: task-local-limits
+  front: "What doesn't see a task-local override?"
+  back: "`Task.detached`, GCD callbacks and delegate methods: they run outside the task tree that set the value, so they quietly see the default."
+```
+
+```quiz
+- id: q1
+  type: mcq
+  prompt: "A suite of Swift Testing tests passes when run one at a time but fails randomly when the whole target runs. The code under test uses `Session.shared`. What's the most likely cause?"
+  options:
+    - "Swift Testing runs tests in a random order on a single thread"
+    - "Tests run in parallel and share the singleton's state"
+    - "`static let` is initialised more than once under parallel tests"
+    - "Swift Testing can't import types with static properties"
+  answer: 1
+  explain: "Swift Testing runs tests in parallel in one process, so tests that read and write one shared instance interfere. `static let` is still initialised exactly once, which is precisely why the state is shared."
+- id: q2
+  type: order
+  prompt: "Put the steps for migrating a widely used `AnalyticsManager.shared` in a safe order."
+  lines:
+    - "Extract a protocol with the methods callers actually use"
+    - "Add an initialiser parameter defaulting to `.shared`, one consumer at a time"
+    - "Write tests for those consumers with a fake"
+    - "Create the instance at the composition root and pass it explicitly"
+    - "Delete `shared` once nothing else uses it"
+  explain: "Each step compiles and ships on its own. The default argument creates the seam, tests make it pay off, and the composition root removes the hidden dependency for good."
+- id: q3
+  type: multi
+  prompt: "Which of these are hidden dependencies that make a type hard to test? Choose all that apply."
+  options:
+    - "Calling `Date()` to check whether a coupon has expired"
+    - "Receiving `any CouponRepository` in the initialiser"
+    - "Reading `UserDefaults.standard` for the last prompt date"
+    - "Calling `UUID()` to create a new order's id"
+    - "Taking a `now: () -> Date` closure"
+  answer: [0, 2, 3]
+  explain: "`Date()`, `UserDefaults.standard` and `UUID()` reach out to global facilities the caller can't control. The injected repository and the clock closure are seams tests can fill."
+- id: q4
+  type: output
+  prompt: "What does this print?"
+  code: |
+    enum Current {
+        @TaskLocal static var locale = "en_GB"
+    }
+
+    func greeting() -> String {
+        Current.locale == "fr_FR" ? "Bonjour" : "Hello"
+    }
+
+    Current.$locale.withValue("fr_FR") {
+        print(greeting())
+    }
+    print(greeting())
+  answer: "Bonjour\nHello"
+  explain: "The override applies only inside `withValue`'s scope (and its child tasks). Outside it, the default is back."
+- id: q5
+  type: mcq
+  prompt: "A view model is written `init(cart: Cart = Cart())`. Three screens create their view models without arguments and expect to share one cart. What happens?"
+  options:
+    - "They share one cart, because default arguments are evaluated once"
+    - "Each view model gets its own new cart, because the default is evaluated on every call"
+    - "It doesn't compile: defaults can't create objects"
+    - "The second screen crashes"
+  answer: 1
+  explain: "Swift evaluates a default argument expression each time the default is used. To share, create one cart at the composition root and pass it to all three."

@@ -1,0 +1,287 @@
+## Why it matters
+
+Auto Layout feels like magic until it doesn't: a date label vanishes when a title gets long, the console prints a wall of "Unable to simultaneously satisfy constraints", or a feed scrolls smoothly on your phone and stutters on an older one. Each of those is the engine doing exactly what its equations say. Once you can read constraints as equations and priorities as a ranking, you can predict which view gives way, fix conflicts deliberately rather than by trial, and keep layout cheap where it runs thousands of times. Senior interviews probe this with content hugging and compression resistance, and with "how would you make this cell faster?"
+
+## Constraints are equations
+
+Every constraint is one linear relation between two layout attributes:
+
+```text
+item1.attribute  =  multiplier × item2.attribute  +  constant      (or ≤, or ≥)
+```
+
+`label.leading = 1.0 × container.leading + 16` is one. So is `button.width ≥ 1.0 × 44`. Each view contributes a handful of unknowns to the system (in effect its position and size on each axis), and each constraint adds a relation between them, along with a **priority** from 1 to 1000.
+
+- **Required** constraints (priority 1000, `UILayoutPriority.required`) must hold exactly.
+- **Optional** constraints (anything below 1000) are satisfied as closely as possible. When two optional constraints pull against each other, the higher priority wins.
+
+The engine underneath is based on **Cassowary**, an incremental simplex solver designed for user interfaces in the late 1990s. It keeps a solution for all the constraints in a window and, when one changes, revises that solution rather than solving from scratch. That's the property that makes typical layout cheap, and the one you can accidentally throw away.
+
+```visual flow
+title: From constraints to frames
+nodes:
+  - { id: constraints, label: Your constraints, kind: client, at: [0, 0] }
+  - { id: content, label: Intrinsic sizes, kind: view, at: [0, 2] }
+  - { id: engine, label: Layout engine, kind: service, at: [2, 1] }
+  - { id: layout, label: Layout pass, kind: service, at: [4, 1] }
+edges:
+  - [constraints, engine, equations]
+  - [content, engine, "≤ and ≥"]
+  - [engine, layout, solution, { style: data }]
+steps:
+  - say: "Activating a constraint adds an equation or inequality, with its priority, to the engine for that window."
+    send: constraints->engine
+  - say: "A label's text, an image's size: each view's **intrinsic content size** becomes two optional inequalities per axis, one for hugging and one for compression resistance."
+    send: content->engine
+  - say: "The engine revises its solution **incrementally**. Changing one constant, or one label's text, updates the answer rather than starting again."
+    state: { engine: active }
+    label: { engine: solving }
+  - say: "In the layout pass, each view's `layoutSubviews` copies the solved values into its subviews' frames."
+    send: engine->layout
+    state: { engine: null, layout: ok }
+    label: { engine: null }
+```
+
+## Intrinsic size, hugging and compression resistance
+
+A label knows how wide its text is; an image view knows its image's size. That **intrinsic content size** isn't a fixed rule. It becomes two optional constraints per axis:
+
+- **Content hugging:** `width ≤ natural width`, at the view's hugging priority. High hugging means "don't stretch me".
+- **Compression resistance:** `width ≥ natural width`, at the view's compression-resistance priority. High resistance means "don't squash me".
+
+In code, a new label's horizontal hugging is `defaultLow` (250) and its compression resistance is `defaultHigh` (750). Interface Builder gives labels a hugging priority of 251, which is why the same layout can behave differently when built in code.
+
+So when a row of two labels is too wide or too narrow for the screen, the priorities decide who gives way. This toy solves one row's horizontal axis the way the engine resolves those optional constraints: when there's too little room, the lowest compression resistance shrinks first; when there's room to spare, the lowest hugging priority stretches.
+
+```swift run title="Who gives way in a row of labels"
+struct RowLabel {
+    let name: String
+    let natural: Double
+    var hugging = 250.0
+    var compression = 750.0
+}
+
+// One row's horizontal axis: margins, labels separated by spacing, filling `width` exactly.
+// Each label brings two optional constraints: width ≤ natural (at its hugging priority)
+// and width ≥ natural (at its compression resistance).
+func layOut(_ labels: [RowLabel], in width: Double, margins: Double = 16, spacing: Double = 8) -> [Double] {
+    var widths = labels.map(\.natural)
+    let gaps = margins * 2 + spacing * Double(labels.count - 1)
+    var spare = width - gaps - widths.reduce(0, +)
+    if spare < 0 {
+        // Too little room: the lowest compression resistance gives way first
+        for index in labels.indices.sorted(by: { labels[$0].compression < labels[$1].compression }) where spare < 0 {
+            let give = min(widths[index], -spare)
+            widths[index] -= give
+            spare += give
+        }
+    } else if spare > 0, let index = labels.indices.min(by: { labels[$0].hugging < labels[$1].hugging }) {
+        // Room to spare: the lowest hugging priority stretches
+        widths[index] += spare
+    }
+    return widths
+}
+
+func show(_ case: String, _ labels: [RowLabel], in width: Double) {
+    let parts = zip(labels, layOut(labels, in: width)).map { label, width in "\(label.name) \(Int(width)) pt" }
+    print("\(`case`): \(parts.joined(separator: ", "))")
+}
+
+var date = RowLabel(name: "date", natural: 60, hugging: 251, compression: 751)
+show("Room to spare", [RowLabel(name: "title", natural: 180), date], in: 320)
+show("Long title", [RowLabel(name: "title", natural: 300), date], in: 320)
+
+date.compression = 749
+show("Date resists less", [RowLabel(name: "title", natural: 300), date], in: 320)
+```
+
+```output
+Room to spare: title 220 pt, date 60 pt
+Long title: title 220 pt, date 60 pt
+Date resists less: title 280 pt, date 0 pt
+```
+
+The last line is the vanishing-date bug: the date's compression resistance dropped below the title's, so the date was squashed to nothing. In a real app the title label would then truncate or not, depending on its `lineBreakMode`, but the date is simply gone.
+
+The toy breaks ties by picking the first label. The real engine gives you no such promise: **two views with equal priorities competing for the same space make the layout ambiguous**, and which one shrinks can change between runs or iOS versions. Whenever two views share an axis and either could give way, set their priorities so they differ:
+
+```swift check ios title="Deciding who gives way"
+import UIKit
+
+func configureRow(title: UILabel, date: UILabel) {
+    // The date always stays whole; the title truncates first
+    title.setContentCompressionResistancePriority(.defaultHigh, for: .horizontal)
+    date.setContentCompressionResistancePriority(.defaultHigh + 1, for: .horizontal)
+    // With room to spare, the title stretches and the date hugs its text
+    title.setContentHuggingPriority(.defaultLow, for: .horizontal)
+    date.setContentHuggingPriority(.defaultLow + 1, for: .horizontal)
+    title.lineBreakMode = .byTruncatingTail
+}
+```
+
+## When the equations disagree
+
+Two things go wrong with a set of constraints, and they need different fixes.
+
+**Conflict (unsatisfiable):** the required constraints can't all hold. The engine can't refuse to lay out, so at runtime it breaks one of them, logs the set, and carries on. You don't choose which one it breaks.
+
+```text title="What you'll see"
+Unable to simultaneously satisfy constraints.
+	Probably at least one of the constraints in the following list is one you don't want.
+(
+    "<NSLayoutConstraint:0x6000021a4f00 'avatar.height' UIImageView:0x104f1c6b0.height == 44   (active)>",
+    "<NSLayoutConstraint:0x6000021a4f50 V:|-(8)-[UIImageView:0x104f1c6b0]   (active, names: '|':UITableViewCellContentView:0x104f1a2c0 )>",
+    "<NSLayoutConstraint:0x6000021a4fa0 V:[UIImageView:0x104f1c6b0]-(8)-|   (active, names: '|':UITableViewCellContentView:0x104f1a2c0 )>",
+    "<NSLayoutConstraint:0x6000021a5310 'UIView-Encapsulated-Layout-Height' UITableViewCellContentView:0x104f1a2c0.height == 44   (active)>"
+)
+
+Will attempt to recover by breaking constraint
+<NSLayoutConstraint:0x6000021a4f00 'avatar.height' UIImageView:0x104f1c6b0.height == 44   (active)>
+
+Make a symbolic breakpoint at UIViewAlertForUnsatisfiableConstraints to catch this in the debugger.
+```
+
+Read it as arithmetic: 8 + 44 + 8 = 60, but the table view has fixed the cell's content view at 44 (`UIView-Encapsulated-Layout-Height`, a constraint UIKit adds itself). The fix is to decide which equation is allowed to bend, usually by giving the avatar's height a priority of 999 (`.required - 1`), or to stop fixing the row height and let the cell size itself. The constraint's `identifier` (`'avatar.height'`) is what made the log readable: set identifiers on constraints you create.
+
+**Ambiguity:** the constraints don't pin down one answer. Nothing is logged at runtime; the layout looks right until it doesn't. A missing trailing constraint, a view with no width and no intrinsic size, or two equal priorities competing for space are the usual causes. Call `hasAmbiguousLayout` on a suspect view in the debugger, `exerciseAmbiguityInLayout()` to make it jump between valid answers, and look for the purple warnings in Xcode's View Debugger.
+
+The most common source of both is one forgotten line. A view you create in code has `translatesAutoresizingMaskIntoConstraints` set to `true`, so UIKit turns its frame and autoresizing mask into required constraints. Add your own constraints on top and the two sets conflict.
+
+<Callout kind="gotcha" title="iOS gotcha: required stays required">
+
+You can change an active constraint's priority between optional values freely, but changing it from required to optional (or back) while it's active raises an exception: "Mutating a priority from required to not on an installed constraint (or vice-versa) is not supported." Set the priority before activating it, or deactivate, change it, and activate again.
+
+</Callout>
+
+## What makes layout expensive
+
+Because the engine is incremental, the cost of a change depends on how much of the solution it disturbs:
+
+- **Changing a constant** (`heightConstraint.constant = 240`) is the cheapest edit there is: the engine adjusts the affected part of its solution.
+- **Toggling prebuilt constraints** costs a little more, and is the right way to switch between layouts.
+- **Churn**, removing every constraint and creating new ones on each update, throws the engine's work away and makes it re-derive everything. This is the classic cause of a slow cell: a `configure(with:)` that calls `removeConstraints(constraints)` and builds a fresh set for each item.
+
+Independent groups of views are cheap to solve; long chains where everything depends on everything else are not. Since iOS 12, Apple's engine handles common hierarchies in roughly linear time, so the cliffs you hit in practice come from churn, from deeply nested stack views repeated in every cell, and from forcing layout repeatedly with `layoutIfNeeded()` or `systemLayoutSizeFitting(_:)`.
+
+Build alternative layouts once and switch between them. Deactivate the old set before activating the new one, so the two never coexist and conflict:
+
+```swift check ios title="Switching layouts without churn"
+import UIKit
+
+final class ProfileHeaderView: UIView {
+    private let avatar = UIImageView()
+    private let nameLabel = UILabel()
+
+    // Built once; only switched afterwards
+    private lazy var sideBySide: [NSLayoutConstraint] = [
+        nameLabel.leadingAnchor.constraint(equalTo: avatar.trailingAnchor, constant: 12),
+        nameLabel.centerYAnchor.constraint(equalTo: avatar.centerYAnchor),
+    ]
+    private lazy var stacked: [NSLayoutConstraint] = [
+        nameLabel.topAnchor.constraint(equalTo: avatar.bottomAnchor, constant: 8),
+        nameLabel.centerXAnchor.constraint(equalTo: avatar.centerXAnchor),
+    ]
+
+    // For example, stacked at the accessibility text sizes
+    func useStackedLayout(_ isStacked: Bool) {
+        NSLayoutConstraint.deactivate(isStacked ? sideBySide : stacked)
+        NSLayoutConstraint.activate(isStacked ? stacked : sideBySide)
+    }
+}
+```
+
+`updateConstraints()` is the other tool Apple offers for performance: batch many constraint changes into the constraints pass instead of making them one at a time as events arrive. Most code doesn't need it. Reach for it when profiling shows the same constraints being changed many times per frame.
+
+## Trade-offs
+
+When a row doesn't fit, you have four honest choices. Pick per piece of content, by what the user can't do without:
+
+| Choice | Everything readable | Dynamic Type at the largest sizes | Effort |
+| --- | --- | --- | --- |
+| Truncate the less important label (lower compression resistance, tail truncation) | No: the end of the title is lost | Gets worse as text grows | Lowest |
+| Let the important label wrap (`numberOfLines = 0`) | Yes | Good, but rows get tall | Low |
+| Shrink the font to fit (`adjustsFontSizeToFitWidth`) | Mostly | Fights the user's text size: avoid for body text | Low |
+| Switch layouts, side by side to stacked, at accessibility sizes | Yes | Best | More: two prebuilt sets of constraints |
+
+Truncation suits secondary text that has a detail screen behind it. Wrapping suits anything the user must read in full. Switching layouts is what Apple's own apps do at the largest text sizes, and it's the answer interviewers like for accessibility: decide with `traitCollection.preferredContentSizeCategory.isAccessibilityCategory`.
+
+<Callout kind="interview">
+
+**What to say:** "Each constraint is a linear equation with a priority. Intrinsic size becomes two optional constraints per axis: hugging (don't grow) and compression resistance (don't shrink). When views compete, the lower priority gives way, so I make priorities differ wherever two views share an axis." For performance: "Change constants, don't churn constraints; build alternative layouts once and toggle them."
+
+**What to ask:** what must always stay visible in this row? Which text sizes do we support (all of them, if accessibility matters)?
+
+**Red flags:** fixing a conflict by deleting constraints until the log goes quiet; equal priorities on competing labels; `removeConstraints` and re-adding in `configure`; not knowing what `UIView-Encapsulated-Layout-Height` is.
+
+</Callout>
+
+## Practice
+
+The [dashboard container review](/design/practice/sd-review-uikit-dashboard-containment) activates the same constraints on every layout pass. Using this lesson, explain what that does to the engine's work over time, and how the fix keeps the engine's solution incremental.
+
+```cards
+- id: hugging-vs-compression
+  front: "What do content hugging and compression resistance mean as constraints?"
+  back: "Hugging is `size ≤ intrinsic size` at the hugging priority (don't stretch me). Compression resistance is `size ≥ intrinsic size` at its priority (don't squash me). The lower priority gives way when views compete."
+- id: conflict-vs-ambiguity
+  front: "Unsatisfiable vs ambiguous constraints?"
+  back: "Unsatisfiable: required constraints can't all hold, so the engine breaks one and logs it. Ambiguous: more than one layout satisfies them, nothing is logged, and the result can change between runs."
+- id: constraint-churn
+  front: "Why is removing and re-adding constraints in `configure(with:)` slow?"
+  back: "The engine is incremental: changing a constant or toggling prebuilt constraints revises its solution, but churn throws the solution away and rebuilds it for every item."
+- id: encapsulated-height
+  front: "What is `UIView-Encapsulated-Layout-Height` in a conflict log?"
+  back: "A constraint UIKit adds to fix a cell's content view to the height the table or collection view chose. Conflicts with it mean your cell's required vertical chain disagrees: lower one constraint to 999 or let the cell self-size."
+```
+
+```quiz
+- id: q1
+  type: mcq
+  prompt: "A row has a title label and a price label, both created in code with default priorities. On a narrow screen there isn't room for both. Which one shrinks?"
+  options:
+    - "The title, because it was added first"
+    - "The price, because it's on the trailing side"
+    - "Either: equal compression resistance makes the layout ambiguous"
+    - "Neither: the engine reports a conflict and breaks a margin"
+  answer: 2
+  explain: "Both have compression resistance 750, so the engine has two equally good answers and no rule for choosing. Give the one that must stay whole a higher priority, such as `.defaultHigh + 1`."
+- id: q2
+  type: match
+  prompt: "Match each priority to where you'll meet it."
+  pairs:
+    - ["1000 (`.required`)", "Constraints you activate without setting a priority"]
+    - ["750 (`.defaultHigh`)", "A label's compression resistance, created in code"]
+    - ["250 (`.defaultLow`)", "A label's hugging priority, created in code"]
+    - ["999 (`.required - 1`)", "The usual way to let one constraint bend against an encapsulated cell height"]
+  explain: "Required constraints must hold exactly; everything below 1000 is a preference. 999 is just below required, so it holds whenever it can and gives way only to a real conflict."
+- id: q3
+  type: trace
+  prompt: "A 300 pt wide row has 16 pt margins and 8 pt between a title (natural width 200, compression resistance 750) and a price (natural width 80, compression resistance 760). What widths do the title and price end up with? Answer as `title, price`."
+  answer: "180, 80"
+  explain: "Margins and spacing take 40 pt, leaving 260 for 280 pt of text, so 20 pt must go. The title's resistance is lower, so it gives up all 20: 180 and 80."
+- id: q4
+  type: mcq
+  prompt: "A self-sizing table view cell logs a conflict between your required `top 8`, `avatar height 44`, `bottom 8` and `UIView-Encapsulated-Layout-Height == 44`. What's the best fix?"
+  options:
+    - "Delete the top constraint so the arithmetic works"
+    - "Set the avatar height constraint's priority to 999 and let the row size itself"
+    - "Set `translatesAutoresizingMaskIntoConstraints = true` on the avatar"
+    - "Call `layoutIfNeeded()` on the cell in `cellForRowAt`"
+  answer: 1
+  explain: "The table fixed the row at 44 while your chain needs 60. Making one constraint 999 lets it bend while the row height is being worked out, and self-sizing then gives the row 60. Deleting constraints makes the layout ambiguous; the other two make it worse."
+- id: q5
+  type: truefalse
+  prompt: "Changing an active constraint's `constant` is cheaper for the engine than deactivating it and activating a new constraint with the new value."
+  answer: true
+  explain: "The engine keeps its solution and adjusts the part a constant affects. Replacing the constraint removes an equation and adds another, which is more work, and doing it for every update is constraint churn."
+- id: q6
+  type: multi
+  prompt: "Which of these cause an \"Unable to simultaneously satisfy constraints\" log rather than an ambiguous layout?"
+  options:
+    - "Constraining a view created in code without setting `translatesAutoresizingMaskIntoConstraints = false`"
+    - "A required fixed height that's shorter than the required vertical chain inside it"
+    - "Two labels with the same compression resistance competing for space"
+    - "Leaving out a view's trailing constraint"
+  answer: [0, 1]
+  explain: "The first two are required constraints that contradict each other, so the engine must break one. Equal priorities and missing constraints leave several valid answers instead: ambiguity, which is silent."
+```

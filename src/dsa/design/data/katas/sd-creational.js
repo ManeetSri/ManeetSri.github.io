@@ -1,2 +1,47 @@
 // Katas for D10 · Creational patterns
-export default [];
+export default [
+    {
+        id: 'sd-kata-creational-card-factory',
+        kind: 'problem',
+        title: 'Server-driven card factory',
+        difficulty: 'easy',
+        patterns: ['patterns', 'architecture'],
+        lessons: ['sd-creational-factory-method', 'sd-creational-static-factories'],
+        swiftTest: 'CreationalCardFactoryTests',
+        lists: [],
+        minutes: 25,
+    },
+    {
+        id: 'sd-kata-creational-request-builder',
+        kind: 'problem',
+        title: 'Request builder',
+        difficulty: 'medium',
+        patterns: ['patterns', 'networking', 'swift'],
+        lessons: ['sd-creational-builder', 'sd-creational-prototype'],
+        swiftTest: 'CreationalRequestBuilderTests',
+        lists: [],
+        minutes: 35,
+    },
+    {
+        id: 'sd-kata-creational-review-prompter',
+        kind: 'problem',
+        title: 'Testable review prompter',
+        difficulty: 'easy',
+        patterns: ['patterns', 'di', 'testing'],
+        lessons: ['sd-creational-singleton-alternatives', 'sd-creational-singleton'],
+        swiftTest: 'CreationalReviewPromptTests',
+        lists: [],
+        minutes: 25,
+    },
+    {
+        id: 'sd-kata-creational-reuse-pool',
+        kind: 'problem',
+        title: 'Reuse pool',
+        difficulty: 'easy',
+        patterns: ['patterns', 'performance', 'ui'],
+        lessons: ['sd-creational-object-pools'],
+        swiftTest: 'CreationalReusePoolTests',
+        lists: [],
+        minutes: 25,
+    },
+];

@@ -1,0 +1,361 @@
+## Why it matters
+
+Plenty of things in an app aren't one result but a series of them: location fixes, download progress, connection status, messages from a socket, StoreKit transactions. An **async sequence** models "values over time" so that a `for await` loop can consume them, and Apple now ships many of its event sources this way. Designing your own stream API means answering questions a single `async` function never raises (who stops it, what's buffered, who else is listening), and interviewers use exactly those questions to probe a design for a download manager or a live feed.
+
+## Pull, not push
+
+An `AsyncSequence` is like a `Sequence` whose `next()` can suspend: the iterator pattern from [Iterator: Sequence and AsyncSequence](/design/learn/sd-behavioural-iterator), with time added. A `for await` loop asks for the next element, waits until one is ready, runs the body, and asks again. The loop ends when the sequence returns `nil` (it's finished), when it throws, or when the task running the loop is cancelled.
+
+That last rule is the design feature. The consumer **pulls**, and the loop's lifetime is the task's lifetime. Tie the task to something with a lifetime, such as a SwiftUI view, and the stream stops when that thing goes away.
+
+Apple's frameworks hand you many streams already:
+
+| Stream | What it delivers |
+| --- | --- |
+| `URLSession.shared.bytes(for:)`, then `.lines` | A response line by line, as it downloads: streaming JSON, Server-Sent Events |
+| `NotificationCenter.default.notifications(named:)` | Notifications, without observer tokens to remove |
+| `CLLocationUpdate.liveUpdates()` (iOS 17) | Location fixes, with no delegate |
+| `Transaction.updates` (StoreKit 2) | Purchases completed outside the app or on another device |
+| `Activity.activityStateUpdates` (ActivityKit) | A Live Activity being ended or dismissed |
+
+Here's a run tracker on `CLLocationUpdate`. There's no delegate and no "stop updating" call: the `.task` modifier cancels the work when the view disappears, the loop ends, and location updates stop with it.
+
+```swift check ios title="RunTracker.swift"
+import CoreLocation
+import SwiftUI
+
+@MainActor
+@Observable
+final class RunTracker {
+    private(set) var distance: CLLocationDistance = 0
+    private var lastFix: CLLocation?
+
+    // Runs until the task that called it is cancelled: then the loop ends and location updates stop
+    func track() async {
+        do {
+            for try await update in CLLocationUpdate.liveUpdates(.fitness) {
+                guard let fix = update.location else { continue }
+                if let lastFix {
+                    distance += fix.distance(from: lastFix)
+                }
+                lastFix = fix
+            }
+        } catch {
+            // The updates failed; the screen shows the distance so far
+        }
+    }
+}
+
+struct RunView: View {
+    @State private var tracker = RunTracker()
+
+    var body: some View {
+        Text(Measurement(value: tracker.distance, unit: UnitLength.meters), format: .measurement(width: .abbreviated))
+            .task {
+                // Cancelled when the view goes away, which ends the for-await loop
+                await tracker.track()
+            }
+    }
+}
+```
+
+## Building a stream
+
+When the source is a delegate or a callback, `AsyncStream` adapts it. `AsyncStream.makeStream(of:bufferingPolicy:)` returns the stream and its **continuation**, the producer's end:
+
+- `yield(_:)` delivers a value. It's safe to call from any thread and never waits.
+- `finish()` ends the stream; the consumer's loop exits after the buffered values.
+- `onTermination` runs once when the stream ends for any reason: finished, or the consumer cancelled. That's where you release the underlying resource.
+
+Here's `NWPathMonitor` (connectivity changes) as a stream. The monitor exists only while someone is listening:
+
+```swift check title="NWPathMonitor+Stream.swift"
+import Network
+
+extension NWPathMonitor {
+    /// Network path changes as an async stream. The monitor runs only while someone is listening.
+    static func paths() -> AsyncStream<NWPath> {
+        AsyncStream(bufferingPolicy: .bufferingNewest(1)) { continuation in
+            let monitor = NWPathMonitor()
+            monitor.pathUpdateHandler = { path in
+                continuation.yield(path)
+            }
+            continuation.onTermination = { _ in
+                monitor.cancel()
+            }
+            monitor.start(queue: DispatchQueue(label: "network-path"))
+        }
+    }
+}
+```
+
+`AsyncThrowingStream` is the same with a `finish(throwing:)` for failures.
+
+## Five decisions behind every stream API
+
+### 1. Events or state?
+
+An **event** stream delivers things that each matter: messages received, purchases completed. A **state** stream delivers the latest value of something that's always there: connection status, download progress, the signed-in user. The difference decides the next two answers. Events must not be dropped; state can skip intermediate values. And a new listener to a state stream needs the **current** value straight away, while a new listener to events starts with the next one.
+
+### 2. What happens when the consumer is slow?
+
+`AsyncStream` buffers what the consumer hasn't read yet, and the policy is yours:
+
+```swift run title="BufferingPolicies.swift"
+// The producer runs ahead: five location fixes arrive before the consumer reads any
+func received(with policy: AsyncStream<Int>.Continuation.BufferingPolicy) async -> [Int] {
+    let (fixes, continuation) = AsyncStream.makeStream(of: Int.self, bufferingPolicy: policy)
+    for fix in 1...5 {
+        continuation.yield(fix)
+    }
+    continuation.finish()
+
+    var seen: [Int] = []
+    for await fix in fixes {
+        seen.append(fix)
+    }
+    return seen
+}
+
+print("unbounded:         ", await received(with: .unbounded))
+print("bufferingNewest(1):", await received(with: .bufferingNewest(1)))
+print("bufferingOldest(2):", await received(with: .bufferingOldest(2)))
+```
+
+```output
+unbounded:          [1, 2, 3, 4, 5]
+bufferingNewest(1): [5]
+bufferingOldest(2): [1, 2]
+```
+
+For state, `.bufferingNewest(1)` is usually right: a busy consumer skips straight to the latest progress instead of replaying stale ones. For events, `.unbounded` keeps everything, and memory grows with a slow consumer. `AsyncStream` never makes the producer wait; when it must (a chunked upload that mustn't race ahead of the network), you need a channel with backpressure, such as `AsyncChannel` from swift-async-algorithms, as the producer–consumer lesson explained.
+
+### 3. One consumer or many?
+
+`AsyncStream` is **unicast**. If two tasks iterate the same stream, they don't each get a copy: every element goes to whichever is waiting, so each sees part of the stream. For several listeners (a banner, the sync engine, a debug overlay), **broadcast**: give every subscriber its own stream and have the source yield into all of them.
+
+```visual flow
+title: Broadcasting connection status to two listeners
+nodes:
+  - { id: socket, label: Socket client, kind: service, at: [0, 1] }
+  - { id: status, label: ConnectionStatus actor, kind: service, at: [2, 1] }
+  - { id: banner, label: Offline banner, kind: view, at: [4, 0] }
+  - { id: sync, label: Sync engine, kind: service, at: [4, 2] }
+edges:
+  - [socket, status, set]
+  - [status, banner, stream]
+  - [status, sync, stream]
+steps:
+  - say: "The banner calls `updates()` and gets **its own** stream, which starts with the current state."
+    show: [status, banner]
+    send: status->banner
+    label: { banner: offline }
+  - say: "The socket connects. The actor yields `.online` into every subscriber's continuation."
+    show: [socket]
+    send: [socket->status, status->banner]
+    label: { status: online, banner: online }
+    state: { banner: ok }
+  - say: "The sync engine subscribes late. This is **state**, so its stream starts with the current value instead of waiting for the next change."
+    show: [sync]
+    send: status->sync
+    label: { sync: online }
+    state: { sync: ok }
+  - say: "The banner's view goes away and its task is cancelled. `onTermination` fires and the actor forgets that continuation."
+    hide: [status->banner]
+    state: { banner: null }
+    label: { banner: cancelled }
+  - say: "The socket drops. Only the sync engine still listens, so only it hears."
+    send: [socket->status, status->sync]
+    label: { status: offline, sync: offline }
+    state: { sync: error }
+```
+
+In code, the actor keeps one continuation per subscriber and removes it in `onTermination`:
+
+```swift run title="ConnectionStatus.swift"
+enum Connection: Sendable {
+    case offline, connecting, online
+}
+
+// One source, many listeners: every subscriber gets its own stream, starting with the current state
+actor ConnectionStatus {
+    private var current = Connection.offline
+    private var subscribers: [Int: AsyncStream<Connection>.Continuation] = [:]
+    private var nextID = 0
+
+    func updates() -> AsyncStream<Connection> {
+        let (stream, continuation) = AsyncStream.makeStream(of: Connection.self)
+        let id = nextID
+        nextID += 1
+        subscribers[id] = continuation
+        continuation.onTermination = { _ in
+            Task { await self.unsubscribe(id) }
+        }
+        continuation.yield(current)
+        return stream
+    }
+
+    func set(_ state: Connection) {
+        current = state
+        for continuation in subscribers.values {
+            continuation.yield(state)
+        }
+    }
+
+    func finishAll() {
+        for continuation in subscribers.values {
+            continuation.finish()
+        }
+    }
+
+    private func unsubscribe(_ id: Int) {
+        subscribers[id] = nil
+    }
+}
+
+func collect(_ stream: AsyncStream<Connection>) async -> [Connection] {
+    var states: [Connection] = []
+    for await state in stream {
+        states.append(state)
+    }
+    return states
+}
+
+let status = ConnectionStatus()
+let banner = await status.updates()
+await status.set(.connecting)
+await status.set(.online)
+let syncEngine = await status.updates()   // subscribes late
+await status.set(.offline)
+await status.finishAll()
+
+print("banner:     ", await collect(banner).map { "\($0)" }.joined(separator: " → "))
+print("sync engine:", await collect(syncEngine).map { "\($0)" }.joined(separator: " → "))
+```
+
+```output
+banner:      offline → connecting → online → offline
+sync engine: online → offline
+```
+
+`onTermination` is `@Sendable` and runs on whatever thread ended the stream, so it can't touch the actor's state directly; it hops back in with a `Task`. If you've used Combine, this actor is a hand-built `CurrentValueSubject`.
+
+### 4. Who ends it?
+
+A finite stream ends itself: a download's progress calls `finish()` when the file is complete. An infinite one (location, connectivity) only ends when its consumer stops, so its lifetime must belong to something: a view's `.task`, a service's stored `Task` that's cancelled on sign-out. A stream with no owner is a leak with a battery cost.
+
+### 5. What does an error mean?
+
+An `AsyncThrowingStream` ends at its first error: the loop throws and there's no next element. That fits "the download failed". It doesn't fit "the socket dropped, reconnecting", which is a moment in a longer story. Model recoverable trouble as values (`case reconnecting(attempt: Int)`) and keep the stream going.
+
+## Operators
+
+`AsyncSequence` comes with `map`, `filter`, `compactMap`, `prefix`, `first(where:)`, `contains` and `reduce`, which cover most needs. Apple's open-source **swift-async-algorithms** package adds the time-based and combining ones: `debounce`, `throttle`, `merge`, `combineLatest`, `zip`, `chunked` and `removeDuplicates`, plus `AsyncChannel`. Combine still has the richer operator set and schedulers; streams have the tighter fit with tasks, cancellation and `Sendable` checking, which is why new Apple APIs ship as async sequences.
+
+## Trade-offs
+
+| Option | Listeners | When the consumer is slow | Lifetime | Wins when |
+| --- | --- | --- | --- | --- |
+| `AsyncStream` | One | Buffers or drops by policy | The consuming task's | A single consumer of events or state |
+| Broadcasting actor (one stream each) | Many | Per subscriber | Each subscriber's task | Shared state many parts of the app watch |
+| Combine publisher or subject | Many | Demand-based backpressure | An `AnyCancellable` | Existing Combine code and UI bindings |
+| Delegate or callback | One | You decide, by hand | Until you unregister | Old APIs, and very hot paths |
+| `@Observable` model | Any SwiftUI view | Only the latest value | The model's | UI state: views re-render on change |
+| `AsyncChannel` | One or many | The producer waits | The tasks' | The producer must not run ahead |
+
+<Callout kind="interview">
+
+**Say** which kind of stream it is and design from there: "Download progress is state, so the manager exposes `progress(for:) -> AsyncStream<Progress>` with `.bufferingNewest(1)`, replays the current value to new subscribers, and finishes the stream when the download ends." **Ask** how many parts of the app need it, and whether a slow listener may miss values. **Red flags:** one `AsyncStream` iterated by two screens, streams that never finish and have no owner, and `onTermination` that doesn't release the location manager or socket.
+
+</Callout>
+
+<Callout kind="gotcha" title="Swift gotcha: a computed property that returns a new stream">
+
+`var updates: AsyncStream<Connection> { … }` that builds a stream on every access gives each caller a different stream, and if it starts a monitor each time, each caller starts another monitor. Decide explicitly: return a new per-subscriber stream from a method (`updates()`), registered with the source as above, or create one stream once and give it to exactly one consumer.
+
+</Callout>
+
+<Callout kind="gotcha" title="Swift gotcha: a stream that's never finished keeps its loop waiting">
+
+If the producer forgets `finish()` and the consumer's task is never cancelled, `for await` waits forever, along with everything the task holds, often `self`. Every stream needs a story for how it ends: `finish()` from the producer, or cancellation from an owner with a lifetime.
+
+</Callout>
+
+## Practice
+
+The kata **"Debounce an async stream"** builds an operator: it reads one `AsyncStream`, returns another, and has to get finishing and cancellation right in both directions. It's also the practice for the debounce lesson that comes next.
+
+```cards
+- id: pull
+  front: "What ends a `for await` loop over an async sequence?"
+  back: "The sequence finishing (`next()` returns nil), an error being thrown, or the task running the loop being cancelled."
+- id: events-state
+  front: "Why does it matter whether a stream carries events or state?"
+  back: "Events must all be delivered and new listeners start at the next one. State can skip to the latest value (`.bufferingNewest(1)`), and a new listener needs the current value at once."
+- id: unicast
+  front: "What happens when two tasks iterate the same `AsyncStream`?"
+  back: "Each element goes to only one of them, so each sees part of the stream. To broadcast, give every subscriber its own stream and yield into all of them."
+- id: on-termination
+  front: "What is `onTermination` for?"
+  back: "Releasing the source when the stream ends, whether it finished or the consumer was cancelled: stop the location updates, cancel the monitor, remove the subscriber."
+```
+
+```quiz
+- id: q1
+  type: output
+  prompt: "What does this print?"
+  code: |
+    let (stream, continuation) = AsyncStream.makeStream(of: Int.self, bufferingPolicy: .bufferingNewest(2))
+    for value in 1...4 {
+        continuation.yield(value)
+    }
+    continuation.finish()
+    var seen: [Int] = []
+    for await value in stream {
+        seen.append(value)
+    }
+    print(seen)
+  answer: "[3, 4]"
+  explain: "All four values are yielded before anyone reads. `.bufferingNewest(2)` keeps the two most recent and drops older ones as new ones arrive."
+- id: q2
+  type: sort
+  prompt: "Is each of these an event stream or a state stream?"
+  buckets: [Events, State]
+  items:
+    - [Chat messages arriving over a WebSocket, 0]
+    - [Whether the device is online, 1]
+    - [A download's fraction complete, 1]
+    - [StoreKit transactions completed on another device, 0]
+    - [The currently signed-in user, 1]
+  explain: "Messages and transactions each matter and must not be skipped. Connectivity, progress and the current user are values that are always there: a listener needs the latest, and may skip intermediate ones."
+- id: q3
+  type: mcq
+  prompt: "An offline banner and the sync engine both run `for await status in monitor.updates` over the **same** `AsyncStream` instance. What happens when the status changes?"
+  options:
+    - "Both receive every change"
+    - "Each change goes to only one of them"
+    - "The second loop crashes the app"
+    - "Only the first subscriber ever receives anything"
+  answer: 1
+  explain: "`AsyncStream` is unicast: each element is delivered to one waiting consumer. Broadcast by giving each subscriber its own stream, registered with the source."
+- id: q4
+  type: multi
+  prompt: "You wrap a Bluetooth heart-rate sensor's delegate in an `AsyncStream`. Which belong in the design? Choose all that apply."
+  options:
+    - "Stop scanning and disconnect in `onTermination`"
+    - "Call `finish()` when the sensor disconnects for good"
+    - "Use `.bufferingNewest(1)` if the UI only shows the current heart rate"
+    - "Iterate the stream from both the chart and the label, to save memory"
+  answer: [0, 1, 2]
+  explain: "Releasing the sensor, ending the stream when the source ends, and choosing a policy that fits state are all part of the API. Two loops over one stream would split the readings between them."
+- id: q5
+  type: mcq
+  prompt: "A live-scores stream throws when the socket drops for a few seconds, and the view's `for try await` loop exits, so scores stop updating even after the connection returns. What's the better design?"
+  options:
+    - "Catch the error and start a second loop over the same stream"
+    - "Yield a value such as `.reconnecting` and keep the stream going; throw only for failures that end it"
+    - "Use `.bufferingOldest(1)` so the error is dropped"
+    - "Wrap the loop in `Task.detached`"
+  answer: 1
+  explain: "A throwing stream ends at its first error. A temporary disconnect is part of the stream's story, so model it as a value the UI can show, and reserve errors for the end."
+```

@@ -1,0 +1,338 @@
+## Why it matters
+
+Connecting to a Bluetooth accessory, signing in with a one-time code, uploading a video, checking out: each is a flow that is in exactly one **mode** at a time, and each event means something different depending on the mode. Code that tracks the mode with booleans ends up with "connected and scanning at once" bugs, double callbacks that run twice and late callbacks that resurrect a cancelled flow. An **enum state machine** names every mode, carries exactly the data each needs, and lists the allowed transitions in one pure function. Interviewers love it because the first step is a diagram: "draw the states, then tell me what happens when the response arrives after cancel."
+
+## From flags to states
+
+A fitness app connects to a heart-rate strap over Bluetooth. A first version might track `isPoweredOn`, `isScanning`, `isConnecting`, `isConnected` and an optional `deviceName`: sixteen combinations of the four flags, and five that mean anything. Every method has to work out the mode from the flags, and every new method is a chance to forget one.
+
+You saw how to remove impossible combinations in [Making illegal states unrepresentable with enums](/design/learn/sd-modelling-illegal-states). A state machine adds the other half: **which changes are allowed**, written as a function from the current state and an event to the next state.
+
+- **States** are the modes, as enum cases. Each case carries the data that exists only in that mode.
+- **Events** are what can happen: taps, framework callbacks, timers.
+- **The transition function** takes a state and an event and returns the next state, or `nil` when the event can't happen in that state.
+
+## The transition function
+
+```swift run title="Connecting to a heart-rate strap"
+enum Connection: Equatable {
+    case bluetoothOff
+    case idle
+    case scanning
+    case connecting(device: String, attempt: Int)
+    case connected(device: String)
+}
+
+enum Event {
+    case poweredOn, poweredOff
+    case scanTapped, cancelTapped
+    case discovered(device: String)
+    case didConnect, didFailToConnect, timedOut
+    case didDisconnect
+}
+
+extension Connection {
+    static let maxAttempts = 3
+
+    /// The next state, or nil when the event can't happen in this state
+    static func next(_ state: Connection, _ event: Event) -> Connection? {
+        switch (state, event) {
+        case (_, .poweredOff):
+            return .bluetoothOff
+        case (.bluetoothOff, .poweredOn):
+            return .idle
+        case (.idle, .scanTapped):
+            return .scanning
+        case (.scanning, .discovered(let device)):
+            return .connecting(device: device, attempt: 1)
+        case (.connecting(let device, _), .didConnect):
+            return .connected(device: device)
+        case (.connecting(let device, let attempt), .didFailToConnect),
+             (.connecting(let device, let attempt), .timedOut):
+            return attempt < maxAttempts ? .connecting(device: device, attempt: attempt + 1) : .idle
+        case (.connected(let device), .didDisconnect):
+            return .connecting(device: device, attempt: 1)
+        case (.scanning, .cancelTapped), (.connecting, .cancelTapped), (.connected, .cancelTapped):
+            return .idle
+        default:
+            return nil
+        }
+    }
+}
+
+let events: [Event] = [
+    .poweredOn, .scanTapped, .discovered(device: "Polar H10"), .timedOut, .didConnect,
+    .didDisconnect, .scanTapped, .cancelTapped, .didConnect, .poweredOff,
+]
+
+var state = Connection.bluetoothOff
+for event in events {
+    if let next = Connection.next(state, event) {
+        state = next
+        print("\(event) → \(state)")
+    } else {
+        print("\(event) refused in \(state)")
+    }
+}
+```
+
+```output
+poweredOn → idle
+scanTapped → scanning
+discovered(device: "Polar H10") → connecting(device: "Polar H10", attempt: 1)
+timedOut → connecting(device: "Polar H10", attempt: 2)
+didConnect → connected(device: "Polar H10")
+didDisconnect → connecting(device: "Polar H10", attempt: 1)
+scanTapped refused in connecting(device: "Polar H10", attempt: 1)
+cancelTapped → idle
+didConnect refused in idle
+poweredOff → bluetoothOff
+```
+
+What to notice:
+
+- **`switch (state, event)` is the whole transition table.** Each `case` is one arrow on the diagram. A reviewer can check the code against a drawing line by line.
+- **Data lives in the state that needs it.** Only `connecting` has an attempt count; only `connecting` and `connected` have a device. There's no `deviceName: String?` to be `nil` at the wrong moment.
+- **The late callback is refused.** The user cancelled while CoreBluetooth was still connecting, and `didConnect` arrived anyway. In `idle` there's no transition for it, so nothing happens. No "if not cancelled" check anywhere.
+- **The guard is a value.** "Retry unless this was the third attempt" is a ternary inside one case, with the count carried by the state itself.
+- **It's pure.** It never touches Bluetooth. That's the shell's job, below.
+
+## Watching it run
+
+Here's the same machine as a diagram. To keep it readable, `poweredOff` is drawn only from Idle; in the code it applies to every state.
+
+```visual states
+title: Connecting to a heart-rate strap
+states:
+  - { id: off, label: Bluetooth off, at: [0, 1] }
+  - { id: idle, label: Idle, at: [1, 1] }
+  - { id: scanning, label: Scanning, at: [1, 0] }
+  - { id: connecting, label: Connecting, at: [2, 0] }
+  - { id: connected, label: Connected, at: [2, 1] }
+initial: off
+transitions:
+  - [off, idle, poweredOn]
+  - [idle, off, poweredOff]
+  - [idle, scanning, scanTapped]
+  - [scanning, idle, cancelTapped]
+  - [scanning, connecting, discovered]
+  - [connecting, connecting, timedOut, attempt < 3]
+  - [connecting, idle, timedOut, attempt = 3]
+  - [connecting, idle, cancelTapped]
+  - [connecting, connected, didConnect]
+  - [connected, connecting, didDisconnect]
+  - [connected, idle, cancelTapped]
+intro: "The app starts with Bluetooth off, or not yet reported: CoreBluetooth tells you its state through a callback."
+events:
+  - { event: poweredOn, say: "`centralManagerDidUpdateState` reports `.poweredOn`, so the machine moves to **Idle**." }
+  - scanTapped
+  - { event: discovered, say: "A strap advertising the Heart Rate service is found. The machine moves to **Connecting** and carries the device name with it, at attempt 1." }
+  - { event: timedOut, guard: attempt < 3, say: "Ten seconds pass with no answer. CoreBluetooth never times out a connection itself, so the shell's timer sends `timedOut`; the guard allows another attempt." }
+  - { event: didConnect, say: "Connected. The device name came along from **Connecting**, so **Connected** has it without looking anything up." }
+  - { event: didDisconnect, say: "The strap goes out of range. Reconnecting is the next state, with the attempt count reset: the machine decides, not the callback." }
+  - { event: cancelTapped, say: "The user gives up. Any `didConnect` that arrives after this has no transition out of **Idle**, so it changes nothing." }
+  - poweredOff
+```
+
+## Designing the states
+
+### Give each state exactly its data
+
+Ask of every property: "in which states does this exist?" If the answer is "some", it belongs in those cases' associated values, not beside the enum. When several states share data, factor it out into a struct around the enum, such as `struct Upload { let file: URL; var phase: Phase }`, rather than repeating `file` in every case.
+
+### Guards decide between transitions
+
+A guard is a condition on the event's data or the state's data that picks which transition happens: "fewer than three attempts" sends `timedOut` back to Connecting, otherwise to Idle. Keep guards simple and based only on the state and event, so the function stays pure. "Is the user a subscriber?" belongs in the state if the machine needs it, not read from a global inside the switch.
+
+### Refuse, don't ignore
+
+Returning `nil` for an impossible event is different from returning the same state. `nil` tells the caller "this shouldn't have happened here", which a debug build can log or assert on; returning `state` silently hides it. Some events really are expected to do nothing in some states, like a second `scanTapped` while scanning. Make those explicit self-transitions, and keep `nil` for events that signal a bug or a race.
+
+### Some events apply everywhere
+
+`poweredOff` means the same thing in every state, so its case comes first and matches any state with `_`. When a group of states shares several transitions (every "active" state handles `cancelTapped` and `poweredOff`), nest them: `case active(Active)`, where `Active` is its own enum of scanning, connecting and connected. One case then covers the whole group. D13 develops nested machines further.
+
+### Time is an event
+
+The machine can't wait, because waiting is a side effect. Timeouts, debounces and "retry in five seconds" are all timers in the shell that send an event when they fire. The machine only decides what that event means in the current state. This is also what makes timeouts testable: a test sends `.timedOut` directly.
+
+### Derive the screen from the state
+
+The view shouldn't decide on its own what a mode looks like. Give `Connection` computed properties, each a `switch self`: a `statusText` such as "Connecting to Polar H10, attempt 2 of 3", and a `primaryAction` that is Scan, Cancel or nothing. The view reads them. Adding a state then means one more case in each switch, and the compiler lists every one you missed.
+
+### Decide which states survive a relaunch
+
+If the state is saved, for state restoration or a long-running job, decide per state what it comes back as. `connecting` and `connected` describe a live link that died with the process, so they restore to `idle`, or straight to `connecting` if the app reconnects automatically. A sign-in flow can restore `enteringCode` but never `verifying`, because the request it was waiting for is gone. Write that as another pure function, `restored(from saved: Connection) -> Connection`, and test it like the transitions.
+
+### The default case is a trade-off
+
+`default: return nil` keeps the switch short, but when you add a state or an event, the compiler no longer asks what each existing case should do with it. With 5 states and 9 events, listing all 45 pairs would bury the 15 that matter. The usual compromise is the `default`, plus tests that walk the invalid pairs you care about. D13 shows a middle way: a catch-all that names each state with `_` patterns, so a new state still breaks the build.
+
+## The shell: callbacks in, commands out
+
+The machine decides; something still has to talk to CoreBluetooth. A small shell turns delegate callbacks into events, and **entering a state** into commands:
+
+```swift
+@MainActor
+final class StrapConnection: NSObject, @preconcurrency CBCentralManagerDelegate {
+    private(set) var state = Connection.bluetoothOff
+    private var central: CBCentralManager?
+    private var strap: CBPeripheral?
+    private var timeout: Task<Void, Never>?
+
+    override init() {
+        super.init()
+        central = CBCentralManager(delegate: self, queue: .main)
+    }
+
+    /// The one way in: refused events change nothing and run nothing
+    func send(_ event: Event) {
+        guard let next = Connection.next(state, event) else { return }
+        let previous = state
+        state = next
+        enter(next, from: previous)
+    }
+
+    /// Entering a state is what triggers the side effects
+    private func enter(_ new: Connection, from old: Connection) {
+        guard let central else { return }
+        if old == .scanning { central.stopScan() }
+        timeout?.cancel()
+        switch new {
+        case .scanning:
+            central.scanForPeripherals(withServices: [CBUUID(string: "180D")])   // the Heart Rate service
+        case .connecting:
+            guard let strap else { return }
+            central.connect(strap)
+            timeout = Task { [weak self] in   // CoreBluetooth's connect never times out by itself
+                try? await Task.sleep(for: .seconds(10))
+                if !Task.isCancelled { self?.send(.timedOut) }
+            }
+        case .idle, .bluetoothOff:
+            if let strap { central.cancelPeripheralConnection(strap) }
+        case .connected:
+            break
+        }
+    }
+
+    func centralManagerDidUpdateState(_ central: CBCentralManager) {
+        send(central.state == .poweredOn ? .poweredOn : .poweredOff)
+    }
+
+    func centralManager(_ central: CBCentralManager, didDiscover peripheral: CBPeripheral, advertisementData: [String: Any], rssi RSSI: NSNumber) {
+        strap = peripheral
+        send(.discovered(device: peripheral.name ?? "Heart-rate strap"))
+    }
+
+    func centralManager(_ central: CBCentralManager, didConnect peripheral: CBPeripheral) {
+        send(.didConnect)
+    }
+
+    // didFailToConnect and didDisconnectPeripheral send their events the same way
+}
+```
+
+The shell has no rules about *when* to retry or *whether* a callback counts. It translates. `@preconcurrency` on the conformance lets these main-actor methods satisfy CoreBluetooth's older, non-isolated protocol; Swift checks at run time that each call really arrives on the main actor, which it does because the manager was given the main queue.
+
+## Testing a machine
+
+A transition function is the easiest thing in an app to test thoroughly, because every test is one call. Swift Testing's arguments make the table explicit:
+
+```swift
+@Test(arguments: [
+    (Connection.idle, Event.didConnect),                       // a late callback after cancel
+    (.connected(device: "H10"), .scanTapped),                  // scanning while connected
+    (.bluetoothOff, .scanTapped),                              // the button shouldn't be live, but might be
+    (.connecting(device: "H10", attempt: 1), .discovered(device: "Other")),
+])
+func refused(state: Connection, event: Event) {
+    #expect(Connection.next(state, event) == nil)
+}
+
+@Test func thirdTimeoutGivesUp() {
+    #expect(Connection.next(.connecting(device: "H10", attempt: 3), .timedOut) == .idle)
+}
+```
+
+Test the paths users take, then the races you're afraid of: late callbacks, double taps, events during transitions. Those are where flag-based code breaks, and where a machine makes the answer obvious.
+
+## Trade-offs
+
+| Approach | Impossible states | Adding a mode | Testability | When it wins |
+| --- | --- | --- | --- | --- |
+| Boolean flags and optionals | Possible, and common | Easy to add, easy to get wrong | Hard: which combinations matter? | Two independent on/off settings, nothing more |
+| Enum plus a pure transition function | Unrepresentable | A case, then the compiler finds the switches | Excellent: one call per test | Any flow with modes: connections, sign-in, uploads, players, checkout |
+| One object per state, the GoF State pattern | Unrepresentable | A new class | Good, but each state is a type to construct | Many states with a lot of behaviour each; rare in Swift (D13) |
+| A statechart library or framework | Unrepresentable, with nesting and history built in | A configuration change | Good | Very large machines, often shared across platforms |
+
+<Callout kind="interview">
+
+**Say** "I'd draw the states first. Each state is an enum case carrying only its data, events are another enum, and a pure `next(state, event)` lists the allowed transitions. The shell turns callbacks into events and performs side effects when a state is entered." **Ask** which events can arrive late, twice or never: those are the edges worth drawing. **Red flags:** `isLoading` and `isConnected` both true in a bug report, side effects inside the transition function, timers inside the machine, and no answer to "what if the callback arrives after cancel?".
+
+</Callout>
+
+<Callout kind="gotcha" title="iOS gotcha: Apple's enums need @unknown default">
+
+`CBManagerState`, `AVPlayer.TimeControlStatus` and most other framework enums aren't frozen: a future iOS can add cases. A `switch` that lists every known case still needs an `@unknown default:` branch. In Swift 6 language mode its absence is an error ("switch covers known cases, but 'CBManagerState' may have additional unknown values"); in Swift 5 mode it was only a warning. Map framework values into your own events at the edge (as the shell does with `.poweredOn` and `.poweredOff`), so your machine's own enums stay exhaustive.
+
+</Callout>
+
+<Callout kind="gotcha" title="Swift gotcha: an Error payload stops Equatable">
+
+`case failed(any Error)` makes the enum lose its synthesised `Equatable`, which breaks `==` in tests and SwiftUI's change detection. Store what the screen needs instead, such as a message or your own `Equatable` error enum: `case failed(reason: ConnectionFailure)`.
+
+</Callout>
+
+## Practice
+
+The kata **one-time code sign-in machine** is a six-state machine with guards on its input, an attempt count carried through the states, and late and repeated events that must be refused. Draw the diagram before writing the switch.
+
+```cards
+- id: state-machine-parts
+  front: "What are the three parts of an enum state machine?"
+  back: "States as enum cases carrying their own data, events as another enum, and a pure transition function from (state, event) to the next state, or nil when the event can't happen."
+- id: late-callbacks
+  front: "How does a state machine handle a callback that arrives after the user cancelled?"
+  back: "The cancelled state has no transition for that event, so the function returns nil and nothing changes. No 'if cancelled' flag is needed."
+- id: time-as-events
+  front: "Where do timeouts live in a pure state machine?"
+  back: "In the shell: a timer sends a `timedOut` event when it fires. The machine only decides what that event means in the current state."
+```
+
+```quiz
+- id: q1
+  type: trace
+  prompt: "Starting in `.scanning`, apply `discovered(device: \"H10\")`, `timedOut`, `didFailToConnect`, `timedOut`. List the attempt number after each event, or `idle` if the machine gives up."
+  answer: "1, 2, 3, idle"
+  explain: "Discovery starts at attempt 1. The first two failures retry (2, then 3); at attempt 3 the guard `attempt < maxAttempts` is false, so the machine gives up and returns to Idle."
+- id: q2
+  type: mcq
+  prompt: "A bug report says the app showed 'Connected' after the user tapped Cancel. With the machine above, what happened?"
+  options:
+    - "Nothing in the machine can cause it: `didConnect` in Idle returns nil, so the shell must be writing `state` directly somewhere"
+    - "`didConnect` arrived late and moved Idle to Connected"
+    - "The machine needs a `wasCancelled` flag"
+    - "The default case should return `.connected`"
+  answer: 0
+  explain: "The machine refuses `didConnect` in Idle. If the screen still showed Connected, some code changed state without going through `next`: exactly the bug a single `send` entry point prevents."
+- id: q3
+  type: sort
+  prompt: "Where does each piece belong?"
+  buckets: [Transition function, Shell]
+  items:
+    - [Deciding whether a timeout should retry or give up, 0]
+    - [Starting a 10-second timer when entering Connecting, 1]
+    - ["Calling `central.connect(strap)`", 1]
+    - [Refusing `didConnect` while Idle, 0]
+    - ["Turning `CBManagerState.poweredOn` into a `.poweredOn` event", 1]
+  explain: "Decisions about what an event means are pure and belong in the function. Timers, framework calls and translating framework types into events are effects, so they belong in the shell."
+- id: q4
+  type: truefalse
+  prompt: "Returning the unchanged state is the same as returning nil for an event that can't happen."
+  answer: false
+  explain: "Both leave the state alone, but nil tells the caller the event was refused, which a debug build can log or assert on. Returning the same state hides races and bugs; reserve it for events that are genuinely expected to do nothing."
+- id: q5
+  type: recall
+  prompt: "Why is `default: return nil` a trade-off in a transition function, and what protects you if you use it?"
+  model: "It keeps the switch short, but the compiler stops asking what each state does with a newly added event or state, so new cases are refused silently. Tests that walk the important invalid pairs, and listing states explicitly in the catch-all where practical, restore the safety."
+```

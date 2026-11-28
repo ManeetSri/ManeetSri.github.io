@@ -1,0 +1,331 @@
+## Why it matters
+
+Modern home screens mix layouts: a paging carousel of featured items, a grid of categories, a list of recent orders, each with a header, all in one vertical scroll. Before iOS 13 that meant a table view with a collection view inside some cells, and every team that built one fought the same bugs: scroll positions lost on reuse, prefetching that didn't coordinate, sizes computed twice. Compositional layout describes all of it in one collection view, section by section. It's the layout behind most App Store–style screens, and "how would you build this home feed?" is a common mobile design interview prompt.
+
+## Items, groups and sections
+
+A compositional layout is built from four nested pieces:
+
+- **Item:** one cell (or supplementary view) and its size.
+- **Group:** arranges items horizontally, vertically, or in a custom pattern. Groups can contain groups.
+- **Section:** repeats one group as many times as it has items, and adds spacing, insets, headers, backgrounds and, optionally, sideways scrolling.
+- **Layout:** asks for a section for each section index.
+
+```visual flow
+title: How a compositional layout is built
+caption: "The layout asks for one section at a time. Each section repeats a group, each group arranges items, and headers and backgrounds attach to the section."
+nodes:
+  - { id: layout, label: Layout, kind: service, at: [0, 0] }
+  - { id: section, label: Section, kind: service, at: [2, 0] }
+  - { id: group, label: Group, kind: service, at: [4, 0] }
+  - { id: item, label: Item, kind: view, at: [4, 2] }
+  - { id: extras, label: "Header, background", kind: view, at: [2, 2], w: 1.2 }
+edges:
+  - [layout, section, per index]
+  - [section, group, repeats]
+  - [group, item, arranges]
+  - [section, extras, attaches]
+```
+
+Every size is an `NSCollectionLayoutDimension`, and there are only four kinds:
+
+| Dimension | Means | Use it for |
+| --- | --- | --- |
+| `.fractionalWidth(0.5)` | Half the width of the container (the group, for an item) | Columns that scale with the screen |
+| `.fractionalHeight(1)` | The full height of the container | Items that fill their group |
+| `.absolute(220)` | Exactly 220 points | Fixed-height banners |
+| `.estimated(44)` | A first guess; the cell's own Auto Layout decides | Text that can wrap, Dynamic Type |
+
+An item's fractional sizes are relative to its group; a group's are relative to the section's available width. That's why the item in a single-item group is usually `fractionalWidth(1), fractionalHeight(1)`: the group decides the real size.
+
+## A home screen, one section at a time
+
+The **section provider** is a closure the layout calls with a section index and a layout environment. Choose the layout from the section's identifier, which a diffable data source gives you with `sectionIdentifier(for:)` (iOS 15):
+
+```swift check ios title="HomeLayout.swift"
+import UIKit
+
+enum HomeSection: Hashable, Sendable {
+    case featured, categories, recent
+}
+
+final class SectionBackgroundView: UICollectionReusableView {
+    override init(frame: CGRect) {
+        super.init(frame: frame)
+        backgroundColor = .secondarySystemBackground
+        layer.cornerRadius = 12
+    }
+
+    required init?(coder: NSCoder) { nil }
+}
+
+@MainActor
+enum HomeLayout {
+    static let backgroundKind = "section-background"
+
+    static func make(section: @escaping (Int) -> HomeSection?) -> UICollectionViewCompositionalLayout {
+        let layout = UICollectionViewCompositionalLayout { index, environment in
+            switch section(index) {
+            case .featured: featured()
+            case .categories: categories(width: environment.container.effectiveContentSize.width)
+            case .recent: recent(environment)
+            case nil: nil
+            }
+        }
+        layout.register(SectionBackgroundView.self, forDecorationViewOfKind: backgroundKind)
+        return layout
+    }
+
+    /// One large card at a time, paging sideways
+    static func featured() -> NSCollectionLayoutSection {
+        let item = NSCollectionLayoutItem(layoutSize: .init(widthDimension: .fractionalWidth(1), heightDimension: .fractionalHeight(1)))
+        let group = NSCollectionLayoutGroup.horizontal(
+            layoutSize: .init(widthDimension: .fractionalWidth(0.9), heightDimension: .absolute(220)),
+            subitems: [item]
+        )
+        let section = NSCollectionLayoutSection(group: group)
+        section.orthogonalScrollingBehavior = .groupPagingCentered
+        section.interGroupSpacing = 12
+        return section
+    }
+
+    /// As many columns of about 160 points as fit, never fewer than two
+    static func categories(width: CGFloat) -> NSCollectionLayoutSection {
+        let columns = max(2, Int(width / 160))
+        let item = NSCollectionLayoutItem(layoutSize: .init(widthDimension: .fractionalWidth(1 / CGFloat(columns)), heightDimension: .fractionalHeight(1)))
+        item.contentInsets = .init(top: 4, leading: 4, bottom: 4, trailing: 4)
+        let group = NSCollectionLayoutGroup.horizontal(
+            layoutSize: .init(widthDimension: .fractionalWidth(1), heightDimension: .absolute(100)),
+            repeatingSubitem: item,
+            count: columns
+        )
+        let section = NSCollectionLayoutSection(group: group)
+        section.boundarySupplementaryItems = [header()]
+        section.decorationItems = [.background(elementKind: backgroundKind)]
+        section.contentInsets = .init(top: 0, leading: 12, bottom: 16, trailing: 12)
+        return section
+    }
+
+    /// A system list section: self-sizing rows, separators and swipe actions
+    static func recent(_ environment: any NSCollectionLayoutEnvironment) -> NSCollectionLayoutSection {
+        var configuration = UICollectionLayoutListConfiguration(appearance: .insetGrouped)
+        configuration.headerMode = .supplementary
+        configuration.trailingSwipeActionsConfigurationProvider = { _ in
+            UISwipeActionsConfiguration(actions: [
+                UIContextualAction(style: .destructive, title: "Remove") { _, _, done in done(true) },
+            ])
+        }
+        return NSCollectionLayoutSection.list(using: configuration, layoutEnvironment: environment)
+    }
+
+    static func header() -> NSCollectionLayoutBoundarySupplementaryItem {
+        NSCollectionLayoutBoundarySupplementaryItem(
+            layoutSize: .init(widthDimension: .fractionalWidth(1), heightDimension: .estimated(44)),
+            elementKind: UICollectionView.elementKindSectionHeader,
+            alignment: .top
+        )
+    }
+}
+
+final class HomeViewController: UIViewController {
+    private var dataSource: UICollectionViewDiffableDataSource<HomeSection, String>!
+    private lazy var collectionView = UICollectionView(
+        frame: .zero,
+        collectionViewLayout: HomeLayout.make { [weak self] index in
+            self?.dataSource.sectionIdentifier(for: index)
+        }
+    )
+}
+```
+
+A few things make this a design rather than a pile of layout code:
+
+- **The section identifier drives everything.** The same `HomeSection` value picks the layout here and the cell registration in the data source. Adding a section kind is one new case, and the compiler finds every `switch` that must handle it.
+- **The layout adapts from the environment.** The provider runs again whenever the layout is invalidated, including on rotation and iPad resizing, so `categories` shows two columns on an iPhone and six in a wide iPad window with no extra code. `environment.traitCollection` is there too, for size classes and Dynamic Type.
+- **The list section is a real list.** `NSCollectionLayoutSection.list(using:layoutEnvironment:)` gives a section the system list's look, self-sizing rows, separators and swipe actions, so a collection view can replace a table view entirely. Since iOS 14 that's Apple's direction for new list code.
+
+## Sideways scrolling without nested views
+
+`orthogonalScrollingBehavior` makes one section scroll on the other axis. That replaces the old trick of a collection view inside a table view cell, and with it the bugs: each rail's scroll position is kept for you, cells come from one reuse pool, and one data source drives the whole screen.
+
+| Behaviour | What the user feels |
+| --- | --- |
+| `.continuous` | Free scrolling, stops wherever the finger leaves it |
+| `.continuousGroupLeadingBoundary` | Free scrolling that settles on a group's leading edge |
+| `.paging` | Pages the width of the collection view |
+| `.groupPaging` | One group at a time |
+| `.groupPagingCentered` | One group at a time, centred: a carousel |
+
+The internal scroll view of an orthogonal section isn't yours, so the collection view delegate's `scrollViewDidScroll(_:)` doesn't hear about sideways scrolling. To react to it, for a parallax effect or a page indicator, set the section's `visibleItemsInvalidationHandler`, which receives the visible items and the section's scroll offset each time they change:
+
+```swift check ios title="Scaling carousel cards as they move away from the centre"
+import UIKit
+
+func addCarouselScaling(to section: NSCollectionLayoutSection) {
+    section.visibleItemsInvalidationHandler = { items, offset, environment in
+        let width = environment.container.contentSize.width
+        let centre = offset.x + width / 2
+        for item in items where item.representedElementCategory == .cell {
+            let distance = abs(item.center.x - centre)
+            let scale = max(0.92, 1 - distance / width * 0.1)
+            item.transform = CGAffineTransform(scaleX: scale, y: scale)
+        }
+    }
+}
+```
+
+The handler runs on every frame of scrolling, so keep it to arithmetic on the items it's given.
+
+## Server-driven sections
+
+Big apps often let the server decide which sections a home screen shows and in what order: a promotion for a week, a "live now" rail during an event. The client then maps a section **kind** from the response to one of its layouts. The essential rule is that the app must survive kinds it doesn't know yet, because versions from months ago are still installed when the server team ships a new one:
+
+```swift run title="Mapping server sections to layouts, safely"
+import Foundation
+
+enum SectionKind: String {
+    case carousel, grid, list
+}
+
+struct FeedSection: Decodable {
+    let id: String
+    let title: String
+    let kind: SectionKind? // nil when this version of the app doesn't know the layout
+
+    private enum CodingKeys: String, CodingKey {
+        case id, title, kind
+    }
+
+    init(from decoder: any Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        id = try container.decode(String.self, forKey: .id)
+        title = try container.decode(String.self, forKey: .title)
+        kind = SectionKind(rawValue: try container.decode(String.self, forKey: .kind))
+    }
+}
+
+let response = Data("""
+[
+    { "id": "hero", "kind": "carousel", "title": "Featured" },
+    { "id": "cats", "kind": "grid", "title": "Categories" },
+    { "id": "live", "kind": "liveScores", "title": "Live now" },
+    { "id": "recent", "kind": "list", "title": "Recently viewed" }
+]
+""".utf8)
+
+let sections = try JSONDecoder().decode([FeedSection].self, from: response)
+for section in sections {
+    if let kind = section.kind {
+        print("\(section.title): \(kind) section")
+    } else {
+        print("\(section.title): skipped, unknown kind")
+    }
+}
+```
+
+```output
+Featured: carousel section
+Categories: grid section
+Live now: skipped, unknown kind
+Recently viewed: list section
+```
+
+Decoding `kind` as a plain `SectionKind` enum would have thrown for `liveScores` and failed the **whole** response, leaving old versions with an empty home screen. Skipping (or falling back to a generic list) keeps them working. You'll design the API side of this in D34.
+
+## Trade-offs
+
+| Layout | Mixed sections | Sideways rails | Self-sizing | Effort | When it wins |
+| --- | --- | --- | --- | --- | --- |
+| `UICollectionViewFlowLayout` | Awkward | Only by nesting | Fiddly | Low for simple grids | Existing code with one uniform grid |
+| Compositional layout | Yes, per section | Built in | `.estimated` dimensions | Medium | Almost every new UIKit list or grid |
+| Custom `UICollectionViewLayout` subclass | Anything | Anything | You implement it | High | Layouts groups can't express: calendars, timelines, Pinterest-style masonry |
+| SwiftUI `LazyVStack`, `LazyVGrid`, `ScrollView` | Yes | Nested `ScrollView` | Natural | Low in SwiftUI | SwiftUI screens, and simpler UIKit apps adopting SwiftUI |
+
+Compositional layout is the default for UIKit. A custom layout subclass is worth its cost only when the geometry depends on data in a way groups can't describe, such as a calendar where an event's height is its duration. Masonry layouts that must place each item in the shortest column are the usual example; compositional layout's custom groups can do it, but you'll compute every frame yourself either way.
+
+<Callout kind="interview">
+
+**What to say:** "One collection view, a compositional layout with a section provider. Each section kind (carousel, grid, list) is an enum case that picks both the layout and the cell registration. Rails are orthogonal sections, not nested collection views. The provider reads the container width, so columns adapt to iPad. If the server drives the sections, unknown kinds are skipped so old app versions keep working."
+
+**What to ask:** is the section order fixed or server-driven? How many items per rail (prefetching and image sizes)? iPad and landscape?
+
+**Red flags:** a collection view inside each table cell for rails; hard-coded column counts; decoding server section kinds into an enum that throws on unknown values.
+
+</Callout>
+
+<Callout kind="gotcha" title="iOS gotcha: estimated sizes in orthogonal sections">
+
+Self-sizing works best on the axis that scrolls with the collection view. In a sideways-scrolling section, an `.estimated` **height** makes the whole rail's height depend on its tallest visible cell, so the rail can grow as new cells scroll in and push everything below it. Prefer an absolute or fractional height for rails, sized for the largest Dynamic Type you support, and keep estimated heights for vertically scrolling sections.
+
+</Callout>
+
+## Practice
+
+In the [reusable list screen design](/design/practice/sd-design-uikit-list-screen), the layout is part of the component's public API: decide how much of compositional layout feature teams see, and how they add a new section kind without editing the shared component.
+
+```cards
+- id: compositional-hierarchy
+  front: "What are the four building blocks of a compositional layout?"
+  back: "Items (cells and their size), groups (arrange items, can nest), sections (repeat a group, add insets, headers, backgrounds and sideways scrolling) and the layout (asks for a section per index)."
+- id: layout-dimensions
+  front: "What are the four kinds of `NSCollectionLayoutDimension`?"
+  back: "`.fractionalWidth` and `.fractionalHeight` (of the container), `.absolute` points, and `.estimated`, where the cell's own Auto Layout decides the final size."
+- id: orthogonal-vs-nested
+  front: "Why use an orthogonal section rather than a collection view inside a cell for a sideways rail?"
+  back: "One collection view, one data source and one reuse pool; scroll positions kept per section; no saving and restoring offsets on reuse."
+- id: unknown-section-kinds
+  front: "Why must a server-driven home screen tolerate unknown section kinds?"
+  back: "Old app versions stay installed for months. If an unknown kind fails decoding, the whole response fails and they show nothing; skipping or falling back keeps them working."
+```
+
+```quiz
+- id: q1
+  type: trace
+  prompt: "The categories section uses `max(2, Int(width / 160))` columns. How many columns does it show at content widths of 390, 744 and 1,024 points? Answer as three numbers, separated by commas."
+  answer: "2, 4, 6"
+  explain: "390 / 160 is 2.4, so 2. 744 / 160 is 4.65, so 4. 1,024 / 160 is 6.4, so 6. The provider runs again when the size changes, so rotating or resizing an iPad window updates the grid on its own."
+- id: q2
+  type: order
+  prompt: "Put the pieces in order, from the innermost to the outermost."
+  lines:
+    - "NSCollectionLayoutItem"
+    - "NSCollectionLayoutGroup"
+    - "NSCollectionLayoutSection"
+    - "UICollectionViewCompositionalLayout"
+  explain: "Items are arranged by groups, a section repeats one group, and the layout asks for a section for each index."
+- id: q3
+  type: mcq
+  prompt: "A product wants Netflix-style rows: a vertical feed of titled rails, each scrolling sideways. What's the best UIKit approach?"
+  options:
+    - "A table view whose cells each contain a horizontal collection view"
+    - "One collection view with a compositional layout, one orthogonally scrolling section per rail"
+    - "A vertical stack view of horizontal scroll views"
+    - "A custom `UICollectionViewLayout` subclass that computes every frame"
+  answer: 1
+  explain: "Orthogonal sections give each rail its own sideways scrolling inside one collection view: one data source, one reuse pool, scroll positions kept. Nested collection views were the workaround before iOS 13; a stack view of scroll views doesn't reuse anything."
+- id: q4
+  type: mcq
+  prompt: "Your home screen decodes server sections with `let kind: SectionKind`, a `String` enum. The server team adds a new kind, `liveScores`. What happens to app versions already installed?"
+  options:
+    - "They show the new section with a default layout"
+    - "They skip that section and show the rest"
+    - "Decoding the whole response throws, so the home screen fails to load"
+    - "Nothing: unknown enum cases decode as `nil`"
+  answer: 2
+  explain: "A `RawRepresentable` enum throws `dataCorrupted` for an unknown raw value, and the error fails the whole array. Decode the raw string and map it to an optional kind, then skip or fall back."
+- id: q5
+  type: multi
+  prompt: "What can a section provider use to decide a section's layout?"
+  options:
+    - "`environment.container.effectiveContentSize`"
+    - "`environment.traitCollection`, such as the size class or text size"
+    - "The section's identifier, from the diffable data source"
+    - "How far the user has scrolled sideways in that section"
+  answer: [0, 1, 2]
+  explain: "The provider is about structure: the available size, the traits and which section it is. Scroll position is reported separately, through the section's `visibleItemsInvalidationHandler`."
+- id: q6
+  type: truefalse
+  prompt: "Scrolling an orthogonal section sideways calls the collection view delegate's `scrollViewDidScroll(_:)`."
+  answer: false
+  explain: "The sideways scrolling happens in an internal scroll view that isn't exposed. Use the section's `visibleItemsInvalidationHandler`, which receives the section's offset and visible items."
+```

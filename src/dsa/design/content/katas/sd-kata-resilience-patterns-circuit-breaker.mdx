@@ -1,0 +1,132 @@
+Your app's recommendations service falls over every few weeks. While it's down, every screen that shows recommendations waits for a timeout, retries, and waits again, and the struggling service gets hammered by every phone at once. Write a circuit breaker that notices the failures, turns calls away at once while the service recovers, and lets a single trial call find out when it's back.
+
+`ResilienceCircuitBreaker.Breaker(failureThreshold:cooldown:clock:)`, with `run(_:) async throws -> Value` and `state: State`
+
+- **Closed:** run every call. Count failures in a row; a success resets the count. When the count reaches `failureThreshold`, the breaker opens.
+- **Open:** for `cooldown` after opening, throw `CircuitOpen` without running the operation.
+- **Half-open:** once the cooldown has passed, the next call is a **trial**. While it runs, every other call gets `CircuitOpen`. A successful trial closes the breaker with a clean count; a failed trial opens it again for a full cooldown, measured from the failure.
+- `state` reports what the breaker would do with a call right now: an open breaker whose cooldown has passed is `.halfOpen`, and so is one with a trial running.
+- `CancellationError` and `URLError(.cancelled)` aren't failures: they mean the caller gave up, not that the service is unhealthy. They're thrown on to the caller but change nothing.
+- Every error the operation throws reaches the caller unchanged.
+
+## Examples
+
+Threshold 2 and a 10-second cooldown, on a `TestClock`:
+
+| Time | Call | Result | State after |
+| --- | --- | --- | --- |
+| 0 s | fails | its error | closed (1 failure) |
+| 0 s | fails | its error | open |
+| 0 s | any | `CircuitOpen`, not run | open |
+| 9 s | any | `CircuitOpen`, not run | open |
+| 10 s | (none yet) | | half-open |
+| 10 s | succeeds | its value | closed |
+| 10 s | fails | its error | closed (1 failure) |
+
+If the trial at 10 s had failed instead, the breaker would stay open until 20 s.
+
+## Constraints
+
+- Read the time from the clock you're given (`clock.now`), never `Date` or `ContinuousClock`: the tests move a `TestClock` by hand.
+- The breaker is an actor, so calls can arrive from many tasks at once. Decide and record the state change before you `await` the operation, or two callers can both become the trial.
+- `failureThreshold` is at least 1.
+
+<Hints>
+<Hint>
+Model the state as one private enum with associated values: `closed(failures: Int)`, `open(until: C.Instant)` and `trial`. "Half-open with nobody trying yet" is `open` with a time in the past.
+</Hint>
+<Hint>
+`clock.now.advanced(by: cooldown)` is the moment an open breaker becomes half-open. Store that, rather than the moment it opened.
+</Hint>
+<Hint>
+Set the state to `trial` *before* `try await operation()`. The actor can run other calls while this one is suspended, and they must see that a trial is already under way.
+</Hint>
+<Hint>
+A call that started while closed can finish after the breaker has opened. Only update the failure count if the state is still `closed` when it finishes.
+</Hint>
+</Hints>
+
+## Solutions
+
+<Approach title="An actor around a three-case state enum" time="O(1) per call" space="O(1)">
+
+```swift
+public actor Breaker<C: Clock> where C.Duration == Duration {
+    private enum Phase {
+        case closed(failures: Int)
+        case open(until: C.Instant)
+        case trial
+    }
+
+    private let failureThreshold: Int
+    private let cooldown: Duration
+    private let clock: C
+    private var phase = Phase.closed(failures: 0)
+
+    public init(failureThreshold: Int, cooldown: Duration, clock: C) {
+        self.failureThreshold = max(1, failureThreshold)
+        self.cooldown = cooldown
+        self.clock = clock
+    }
+
+    public var state: State {
+        switch phase {
+        case .closed: .closed
+        case .open(let until): clock.now >= until ? .halfOpen : .open
+        case .trial: .halfOpen
+        }
+    }
+
+    public func run<Value: Sendable>(_ operation: @Sendable () async throws -> Value) async throws -> Value {
+        switch phase {
+        case .closed:
+            return try await runClosed(operation)
+        case .open(let until):
+            guard clock.now >= until else { throw CircuitOpen() }
+            phase = .trial
+            return try await runTrial(operation)
+        case .trial:
+            throw CircuitOpen()
+        }
+    }
+
+    private func runClosed<Value: Sendable>(_ operation: @Sendable () async throws -> Value) async throws -> Value {
+        do {
+            let value = try await operation()
+            if case .closed = phase { phase = .closed(failures: 0) }
+            return value
+        } catch {
+            if Self.counts(error), case .closed(let failures) = phase {
+                phase = failures + 1 >= failureThreshold
+                    ? .open(until: clock.now.advanced(by: cooldown))
+                    : .closed(failures: failures + 1)
+            }
+            throw error
+        }
+    }
+
+    private func runTrial<Value: Sendable>(_ operation: @Sendable () async throws -> Value) async throws -> Value {
+        do {
+            let value = try await operation()
+            phase = .closed(failures: 0)
+            return value
+        } catch {
+            // A cancelled trial proves nothing, so the next call may try again straight away
+            phase = .open(until: Self.counts(error) ? clock.now.advanced(by: cooldown) : clock.now)
+            throw error
+        }
+    }
+
+    private static func counts(_ error: any Error) -> Bool {
+        if error is CancellationError { return false }
+        if let urlError = error as? URLError, urlError.code == .cancelled { return false }
+        return true
+    }
+}
+```
+
+Every decision happens between suspension points, which is what makes the actor safe here: the switch in `run` and the move to `trial` happen in one uninterrupted step, so a second caller arriving during the trial always sees `trial`. One enum instead of separate flags means the breaker can't be "open with three failures" or "closed with a trial running".
+
+Production breakers often trip on a **failure rate** over a rolling window (say, 50% of the last 20 calls, with at least 10 calls) rather than failures in a row, so that one success among many failures doesn't keep a sick service in use. The state machine is the same; only the trip condition changes.
+
+</Approach>

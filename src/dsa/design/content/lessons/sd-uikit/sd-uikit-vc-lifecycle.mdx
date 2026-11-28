@@ -1,0 +1,343 @@
+## Why it matters
+
+Every UIKit screen is a view controller, and every view controller gets the same sequence of callbacks. Where you put setup, observation and teardown decides whether a screen fetches twice, leaks a timer, lays out with the wrong size or misses an update after a sheet closes. Interviewers ask about the lifecycle because the answers show whether you've shipped UIKit or only read about it: "where would you start location updates?" has a right answer and several that work until the user swipes back halfway.
+
+## Three lifetimes, not one
+
+A view controller has three overlapping lifetimes, and most lifecycle bugs come from mixing them up.
+
+1. **The object.** From `init` to `deinit`. This is where its dependencies live: the view model, the services it was given, the identifiers it shows.
+2. **The view.** A view controller creates its view lazily, the first time something reads `view`. `loadView()` builds it and `viewDidLoad()` runs once, straight after. On iOS today a loaded view stays loaded until the controller is freed: UIKit stopped unloading views under memory pressure in iOS 6, so `viewDidLoad()` runs at most once per controller.
+3. **Appearance.** Each time the view goes on or off screen: `viewWillAppear`, `viewIsAppearing`, `viewDidAppear`, then `viewWillDisappear`, `viewDidDisappear`. This can happen dozens of times in one object's life, every time the user pushes something on top and comes back.
+
+So "set up once" belongs to the first two, and "start and stop while visible" belongs to the third. A tab the user never opens has an object but no view. A screen deep in a navigation stack has a view but isn't appearing.
+
+<Callout kind="analogy">
+
+A theatre production: the **company** is hired once (init), the **set** is built before the first night (viewDidLoad), and the **curtain** goes up and down every performance (appearance). You don't rebuild the set every night, and you don't leave the stage lights on while the curtain is down.
+
+</Callout>
+
+## The callbacks, in order
+
+| Callback | When it runs | What it's for |
+| --- | --- | --- |
+| `init(…)` | Once, when you create it | Store dependencies. Don't touch `view`. |
+| `loadView()` | Once, when `view` is first read | Only if you build the root view yourself: assign `view` and don't call `super`. |
+| `viewDidLoad()` | Once, after the view exists | Build the hierarchy and constraints, register cells, create the data source, bind to the view model. |
+| `viewWillAppear(_:)` | Before each appearance, **before** the view is in the window | Work that pairs with `viewWillDisappear`, and animations alongside the transition. |
+| `viewIsAppearing(_:)` | Each appearance, once the view is in the window and laid out | Update the UI for the current state: traits, size, safe area and the superview chain are all valid. |
+| `viewWillLayoutSubviews()` / `viewDidLayoutSubviews()` | Every layout pass, often many times | Cheap, idempotent adjustments that depend on the final size. |
+| `viewDidAppear(_:)` | After each appearance animation finishes | Things that need the screen to really be visible: a screen-view event, the camera, the keyboard. |
+| `viewWillDisappear(_:)` | Before each disappearance starts | Stop editing, save a draft, start transition-alongside animations. |
+| `viewDidDisappear(_:)` | After each disappearance finishes | Stop expensive work: timers, location, video, live updates. |
+| `deinit` | Once, when the last reference goes | A last safety net. Never the place for work tied to being visible. |
+
+`viewIsAppearing(_:)` arrived with the iOS 17 SDK and is back-deployed to iOS 13, so you can use it on any deployment target you're likely to have. Apple's header now recommends it over `viewWillAppear` "by default": in `viewWillAppear` the view isn't in the window yet, so its trait collection, safe area and size can still be wrong. If you've ever scrolled to a selected row in `viewWillAppear` and landed in the wrong place on iPad, this is why.
+
+Here's a screen that follows the table. It shows the live status of an order, and only listens for updates while it's visible:
+
+```swift check ios title="OrderTrackingViewController.swift"
+import UIKit
+
+@MainActor
+protocol OrderTracking: AnyObject {
+    func updates(for orderID: String) -> AsyncStream<String>
+}
+
+final class OrderTrackingViewController: UIViewController {
+    private let orderID: String
+    private let tracker: any OrderTracking
+    private let statusLabel = UILabel()
+    private var updates: Task<Void, Never>?
+
+    init(orderID: String, tracker: any OrderTracking) {
+        self.orderID = orderID
+        self.tracker = tracker
+        super.init(nibName: nil, bundle: nil)
+    }
+
+    required init?(coder: NSCoder) { nil }
+
+    // Once: build the hierarchy
+    override func viewDidLoad() {
+        super.viewDidLoad()
+        view.backgroundColor = .systemBackground
+        statusLabel.font = .preferredFont(forTextStyle: .title2)
+        statusLabel.adjustsFontForContentSizeCategory = true
+        statusLabel.translatesAutoresizingMaskIntoConstraints = false
+        view.addSubview(statusLabel)
+        NSLayoutConstraint.activate([
+            statusLabel.centerXAnchor.constraint(equalTo: view.centerXAnchor),
+            statusLabel.centerYAnchor.constraint(equalTo: view.centerYAnchor),
+        ])
+    }
+
+    // Each appearance: listen while visible
+    override func viewDidAppear(_ animated: Bool) {
+        super.viewDidAppear(animated)
+        updates = Task { [weak self, tracker, orderID] in
+            for await status in tracker.updates(for: orderID) {
+                self?.statusLabel.text = status
+            }
+        }
+    }
+
+    override func viewDidDisappear(_ animated: Bool) {
+        super.viewDidDisappear(animated)
+        updates?.cancel()
+        updates = nil
+    }
+
+    deinit {
+        updates?.cancel()
+    }
+}
+```
+
+Three details carry the design. The dependencies arrive in `init`, so a test can hand in a fake tracker. The task captures `self` weakly, so a forgotten cancel can't keep the screen alive. And `deinit` only cancels: in Swift 6 a main-actor class's `deinit` isn't isolated to the main actor, so it can touch the `Sendable` task handle but not the label.
+
+## Appearance isn't a straight line
+
+It's tempting to picture appearance as will, did, will, did, forever. The interactive swipe back breaks that picture. When the user starts dragging from the left edge, the top screen gets `viewWillDisappear`. If they change their mind and let go early, the transition is cancelled, and the same screen gets `viewWillAppear` and `viewDidAppear` without ever having disappeared. Step through it:
+
+```visual states
+title: A view controller's appearance states
+states:
+  - { id: disappeared, label: Disappeared, at: [0, 1] }
+  - { id: appearing, label: Appearing, at: [2, 0] }
+  - { id: disappearing, label: Disappearing, at: [2, 2] }
+  - { id: appeared, label: Appeared, at: [4, 1] }
+initial: disappeared
+transitions:
+  - [disappeared, appearing, viewWillAppear]
+  - [appearing, appeared, viewDidAppear]
+  - [appeared, disappearing, viewWillDisappear]
+  - [disappearing, disappeared, viewDidDisappear]
+  - [disappearing, appearing, viewWillAppear]
+  - [appearing, disappearing, viewWillDisappear]
+intro: A pushed screen starts **Disappeared**. UIKit only moves it along these six arrows.
+events:
+  - { event: viewWillAppear, say: "The push starts: `viewWillAppear`, then `viewIsAppearing` once the view is in the window." }
+  - { event: viewDidAppear, say: "The push animation finishes. The screen is on top and visible." }
+  - { event: viewWillDisappear, say: "The user starts swiping back from the left edge: `viewWillDisappear`." }
+  - { event: viewWillAppear, say: "They let go early. The pop is **cancelled**, so the screen goes straight back to Appearing. There was no `viewDidDisappear`." }
+  - { event: viewDidAppear, say: "Back to Appeared. Anything you started in `viewWillAppear` has now started **twice**." }
+  - { event: viewWillDisappear, say: "This time they tap Back." }
+  - { event: viewDidDisappear, say: "The pop completes. Only now has the screen really gone." }
+```
+
+The rule that falls out: **a will-callback isn't a promise that the matching did-callback follows.** Pair work so it stays balanced whichever way a transition ends:
+
+- Start in `viewDidAppear` and stop in `viewDidDisappear` when the work must run exactly while visible. The did-callbacks only arrive once a transition has really finished.
+- Or start in `viewWillAppear` and stop in `viewWillDisappear`, the other pair that always alternates. A cancelled pop calls both, in order.
+- Don't mix the pairs. Starting in `viewWillAppear` and stopping in `viewDidDisappear` starts the work twice after a cancelled swipe.
+
+When you need to know whether the screen is leaving for good rather than being covered, check `isMovingFromParent` (popped) or `isBeingDismissed` (dismissed), and if a transition can be cancelled, wait for its outcome:
+
+```swift check ios title="Waiting for the transition's outcome"
+import UIKit
+
+final class DraftViewController: UIViewController {
+    private func discardDraft() {}
+
+    override func viewWillDisappear(_ animated: Bool) {
+        super.viewWillDisappear(animated)
+        guard let coordinator = transitionCoordinator else {
+            if isMovingFromParent { discardDraft() }
+            return
+        }
+        coordinator.animate(alongsideTransition: nil) { context in
+            if !context.isCancelled && self.isMovingFromParent {
+                self.discardDraft()
+            }
+        }
+    }
+}
+```
+
+## Sheets change the rules
+
+Since iOS 13 the default modal style on iPhone is a **page sheet**: the presented screen slides up as a card, and the presenting screen stays in the window behind it. Because the presenter's view never leaves the window, it gets **no** `viewWillDisappear` when the sheet opens and **no** `viewWillAppear` when it closes. Of the common styles, only `.fullScreen` removes the presenter's view, so only a full-screen presentation sends the presenter its appearance callbacks; `.overFullScreen`, `.formSheet` and the sheets all leave it in place.
+
+The classic bug: a profile screen refreshes itself in `viewWillAppear`, someone edits the profile in a sheet, saves, the sheet closes, and the profile still shows the old name. It worked before iOS 13, when every modal was full screen.
+
+The fix is to stop treating appearance as a data-changed signal. Tell the presenter directly:
+
+```swift check ios title="ProfileViewController.swift"
+import UIKit
+
+struct Profile: Sendable {
+    var name: String
+}
+
+final class EditProfileViewController: UIViewController {
+    var onSave: ((Profile) -> Void)?
+}
+
+final class ProfileViewController: UIViewController, UIAdaptivePresentationControllerDelegate {
+    private var profile = Profile(name: "")
+
+    private func show(_ profile: Profile) {
+        self.profile = profile
+        title = profile.name
+    }
+
+    @objc private func editTapped() {
+        let editor = EditProfileViewController()
+        editor.onSave = { [weak self] updated in
+            self?.show(updated)
+            self?.dismiss(animated: true)
+        }
+        let navigation = UINavigationController(rootViewController: editor)
+        navigation.presentationController?.delegate = self
+        present(navigation, animated: true)
+    }
+
+    // Only called when the user swipes the sheet away, never for dismiss(animated:)
+    func presentationControllerDidDismiss(_ presentationController: UIPresentationController) {}
+}
+```
+
+Better still, let both screens read the same model (an `@Observable` store or a repository the profile screen observes), so the profile updates because the data changed, not because a screen moved. You'll build that in D19.
+
+## Where work belongs
+
+| Work | Where | Why there |
+| --- | --- | --- |
+| Subviews, constraints, cell registrations, data source | `viewDidLoad` | Once per view. Doing it on each appearance duplicates views and constraints. |
+| Binding to a view model or store | `viewDidLoad` | Lives as long as the view; observation keeps it current. |
+| Refreshing data when the user comes back | `viewIsAppearing`, or better, observation | Runs on each return, but not after page sheets: don't rely on it alone. |
+| Anything that reads the final size or traits | `viewIsAppearing` or the layout callbacks | `viewWillAppear` runs before the view is in the window. |
+| A screen-view analytics event | `viewDidAppear` | Cancelled transitions don't count as views. |
+| Timers, location, video, live updates | `viewDidAppear` and `viewDidDisappear` | The did pair is only called once a transition has really finished. |
+| Saving a draft | `viewWillDisappear`, and on scene background | The view controller isn't told when the app goes to the background. |
+
+That last row surprises people. **Appearance callbacks don't fire when the app moves to the background or the user locks the phone.** The screen is still "appeared" as far as UIKit is concerned. If a video must pause or a draft must save then, observe the scene: `UIScene.didEnterBackgroundNotification` or `sceneDidEnterBackground(_:)`, which you met in [App states, UIApplicationDelegate and UISceneDelegate](/design/learn/sd-runtime-app-states).
+
+Two newer hooks are worth knowing. Since iOS 17, `registerForTraitChanges(_:handler:)` replaces the deprecated `traitCollectionDidChange(_:)`, and since iOS 18 UIKit records which traits you read inside `viewWillLayoutSubviews` and the other update methods and calls them again when those traits change. iOS 26 adds `updateProperties()`, a pass that runs before layout for setting view properties from your model, and UIKit tracks any `@Observable` properties you read there and reruns it when they change.
+
+## Trade-offs
+
+Where should a screen load its data? Each answer is right somewhere:
+
+| Approach | Freshness | Extra requests | Works after sheets | Testability |
+| --- | --- | --- | --- | --- |
+| Load once in `viewDidLoad` | Stale on return | None | Stays stale | Easy |
+| Reload in `viewIsAppearing` | Fresh on every return | One per return, including quick back-and-forth | No | Needs the view controller |
+| Observe a store or view model | Fresh whenever data changes | Only when something changed | Yes | Easy: test the model |
+| Explicit triggers (pull to refresh, a save callback) | Fresh when the user acts | Only on demand | Yes | Easy |
+
+Load once when the data rarely changes while the screen exists (settings, a static detail page). Reloading on appear is a reasonable quick fix for a list that other screens edit, if you can afford the requests. For anything shared between screens, observation wins: the lifecycle then only decides *when the screen listens*, not *whether its data is right*. Most production screens combine observation with an explicit refresh.
+
+<Callout kind="interview">
+
+**What to say:** separate the three lifetimes (object, view, appearance), then place work by what it depends on: "Hierarchy in `viewDidLoad`, geometry-dependent work in `viewIsAppearing`, visibility-bound work paired in `viewDidAppear` and `viewDidDisappear`."
+
+**What to ask:** how is the screen presented (pushed, page sheet, full screen)? Does its data change while it's on screen, or while it's covered?
+
+**Red flags:** fetching in `viewWillAppear` "to keep it fresh" with no thought for sheets or cancelled swipes; reading `view.bounds` in `viewDidLoad` and expecting the final size; relying on `deinit` to stop work that should stop when the screen disappears; forgetting that backgrounding the app sends no appearance callbacks.
+
+</Callout>
+
+<Callout kind="gotcha" title="iOS gotcha: touching view loads it">
+
+Reading `vc.view` anywhere, even `vc.view.backgroundColor = .red` from the code that creates it, runs `loadView` and `viewDidLoad` right there, before the controller has been pushed, sized or given its traits. Configure a screen through its own properties or its `init`, and use `viewIfLoaded` or `isViewLoaded` when you only want to update a view that already exists.
+
+</Callout>
+
+<Callout kind="gotcha" title="iOS gotcha: always call super">
+
+Every appearance and layout override must call `super`. Skipping `super.viewWillAppear(animated)` in a container breaks forwarding to its children, and some UIKit subclasses (navigation and tab bar controllers among them) do real work in these methods. The one exception is `loadView`: when you assign `view` yourself, don't call `super.loadView()`.
+
+</Callout>
+
+## Practice
+
+The [dashboard container review](/design/practice/sd-review-uikit-dashboard-containment) hides a lifecycle bug among its containment problems: work started on every appearance and never stopped. Find it, say what it costs after ten visits to the screen, and say where the work should live instead.
+
+```cards
+- id: three-lifetimes
+  front: "What are a view controller's three lifetimes?"
+  back: "The object (init to deinit), the view (loaded lazily once, then `viewDidLoad`), and appearance (will/did appear and disappear, repeated every time the screen goes on or off screen)."
+- id: view-is-appearing
+  front: "Why prefer `viewIsAppearing(_:)` over `viewWillAppear(_:)`?"
+  back: "In `viewWillAppear` the view isn't in the window yet, so traits, size and safe area can be wrong. `viewIsAppearing` runs moments later with all of them valid, and it's back-deployed to iOS 13."
+- id: cancelled-pop
+  front: "What does a cancelled interactive swipe back send to the top screen?"
+  back: "`viewWillDisappear`, then `viewWillAppear` and `viewDidAppear`, with no `viewDidDisappear`. Pair work within the will pair or within the did pair, never across them."
+- id: sheets-no-appearance
+  front: "Why doesn't a presenter's `viewWillAppear` run when a page sheet closes?"
+  back: "A page sheet leaves the presenter's view in the window, so it never disappeared. Use a callback, the presentation controller delegate, or shared observed state instead."
+```
+
+```quiz
+- id: q1
+  type: order
+  prompt: "Put the callbacks in order, for a screen created and pushed for the first time."
+  lines:
+    - "init(orderID:tracker:)"
+    - "loadView()"
+    - "viewDidLoad()"
+    - "viewWillAppear(_:)"
+    - "viewIsAppearing(_:)"
+    - "viewDidAppear(_:)"
+  explain: "The object comes first, then the view is loaded lazily when the navigation controller reads it, then the appearance callbacks. `viewIsAppearing` sits between will and did, once the view is in the window and laid out."
+- id: q2
+  type: mcq
+  prompt: "A profile screen reloads its data in `viewWillAppear`. After the user edits their name in a sheet and taps Save, the profile still shows the old name. What's the cause?"
+  options:
+    - "The sheet's save ran off the main thread"
+    - "A page sheet leaves the profile screen in the window, so `viewWillAppear` never runs when it closes"
+    - "`viewWillAppear` only runs the first time a screen appears"
+    - "The sheet should have called `viewWillAppear` on the profile screen when it closed"
+  answer: 1
+  explain: "Since iOS 13 the default page sheet keeps the presenter's view in place, so it gets no appearance callbacks. Calling them yourself would break UIKit's bookkeeping. Pass the change back with a callback or let both screens observe the same model."
+- id: q3
+  type: multi
+  prompt: "The user starts swiping back from the top screen, then lets go before the halfway point. Which callbacks does the top screen receive?"
+  options:
+    - "`viewWillDisappear(_:)`"
+    - "`viewDidDisappear(_:)`"
+    - "`viewWillAppear(_:)`"
+    - "`viewDidAppear(_:)`"
+    - "`viewDidLoad()`"
+  answer: [0, 2, 3]
+  explain: "The swipe starts a disappearance (`viewWillDisappear`); cancelling it turns into an appearance (`viewWillAppear`, `viewDidAppear`). It never finished disappearing, so there's no `viewDidDisappear`, and the view was already loaded."
+- id: q4
+  type: bug
+  prompt: "After a few cancelled swipes back, this screen's clock ticks several times a second. Click the line that causes it."
+  code: |
+    final class ClockViewController: UIViewController {
+        private var timer: Timer?
+
+        override func viewWillAppear(_ animated: Bool) {
+            super.viewWillAppear(animated)
+            timer = Timer.scheduledTimer(withTimeInterval: 1, repeats: true) { _ in }
+        }
+
+        override func viewDidDisappear(_ animated: Bool) {
+            super.viewDidDisappear(animated)
+            timer?.invalidate()
+        }
+    }
+  answer: 6
+  explain: "Starting in `viewWillAppear` and stopping in `viewDidDisappear` mixes the two pairs. A cancelled swipe calls `viewWillAppear` again without `viewDidDisappear`, so a second timer starts and the first is never invalidated. Start in `viewDidAppear` (or stop in `viewWillDisappear`)."
+- id: q5
+  type: truefalse
+  prompt: "Under memory pressure, UIKit unloads the views of off-screen view controllers, so `viewDidLoad()` can run again when the user comes back."
+  answer: false
+  explain: "That was true before iOS 6 (`viewDidUnload`). Today a loaded view stays loaded until its controller is freed; memory warnings ask you to drop caches, not views."
+- id: q6
+  type: sort
+  prompt: "Where does each piece of work belong?"
+  buckets: ["viewDidLoad", "viewIsAppearing", "viewDidAppear and viewDidDisappear"]
+  items:
+    - ["Create subviews and activate constraints", 0]
+    - ["Register cells and create the diffable data source", 0]
+    - ["Scroll to the selected item, using the final size", 1]
+    - ["Update for a size class that may have changed while covered", 1]
+    - ["Log a screen-view analytics event", 2]
+    - ["Start and stop location updates", 2]
+  explain: "One-time construction goes in `viewDidLoad`. Work that needs the real geometry and traits goes in `viewIsAppearing`. Work that must match real visibility, not attempted transitions, goes in the did pair."
+```

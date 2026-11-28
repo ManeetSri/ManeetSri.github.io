@@ -1,0 +1,144 @@
+The app decides when to ask for an App Store review with this singleton, and nobody can test it: the rules depend on the date, the state lives in `UserDefaults.standard`, and every test sees whatever the last one left behind.
+
+```swift
+final class ReviewPrompter {
+    static let shared = ReviewPrompter()
+
+    func appDidLaunch() {
+        let defaults = UserDefaults.standard
+        defaults.set(defaults.integer(forKey: "launches") + 1, forKey: "launches")
+        if defaults.object(forKey: "firstLaunch") == nil {
+            defaults.set(Date(), forKey: "firstLaunch")
+        }
+    }
+
+    func shouldAskForReview() -> Bool {
+        // …reads UserDefaults.standard and compares against Date()
+    }
+}
+```
+
+Rewrite it so the **store** and the **clock** are injected: tests pass a `MemoryStore` and a clock they control, and the app builds the real one once, at its composition root, with `live(appVersion:)`.
+
+`CreationalReviewPrompt.Prompter(store:appVersion:now:)` with `recordLaunch()`, `shouldPrompt() -> Bool`, `recordPrompt()` and `static func live(appVersion:)`, plus `CreationalReviewPrompt.DefaultsStore(defaults:key:)`
+
+- **`recordLaunch()`** adds one to `launches` and, the first time only, sets `firstLaunch` to now.
+- **`shouldPrompt()`** is `true` only when all of these hold:
+  - at least **5** launches;
+  - at least **3 days** since the first launch;
+  - the user hasn't been asked **in this app version**;
+  - if they were ever asked (in another version), at least **90 days** have passed since then.
+- **`recordPrompt()`** sets `lastPrompt` to now and `lastPromptVersion` to the prompter's app version.
+- **The prompter keeps no state of its own.** Every call loads the `State` from its store and saves any change back, so two prompters over the same store agree, exactly as one launch and the next must.
+- **`DefaultsStore`** saves the `State` as JSON `Data` in the `UserDefaults` it's given, under `key` (`"reviewPrompt"` by default). `load()` returns a fresh `State()` when nothing is saved or the data can't be decoded.
+- **`live(appVersion:)`** returns a prompter over `DefaultsStore(defaults: .standard)` that reads the system clock. It's the only place that names either.
+
+`MemoryStore` and the `State` struct are already written.
+
+## Examples
+
+| Steps (clock starting at day 0, version "1.0") | `shouldPrompt()` |
+| --- | --- |
+| 4 launches, then 10 days pass | `false`: too few launches |
+| 5 launches on day 0 | `false`: too soon |
+| 5 launches, then 3 days pass | `true` |
+| …then `recordPrompt()`, then 400 days pass | `false`: already asked in 1.0 |
+| …a "1.1" prompter over the same store, 30 days after the prompt | `false`: asked too recently |
+| …the same "1.1" prompter, 90 days after the prompt | `true` |
+| 3 launches with one prompter, 2 with another over the same store, then 3 days | `true` for both |
+
+## Constraints
+
+- Never touch `UserDefaults.standard` or call `Date()` anywhere except inside `live(appVersion:)`. The tests can't see it if you do, but they'll fail, because their clock starts in 2023.
+- A day is exactly 86,400 seconds; "at least 3 days" includes exactly 3 days.
+- `StateStore` is a class-bound protocol, and the prompter is a `struct` that holds one: the store is the shared, mutable part; the prompter is just rules.
+
+<Hints>
+<Hint>
+Store `store`, `appVersion` and `now` in the initialiser. Each method starts with `var state = store.load()` and, if it changes anything, ends with `store.save(state)`.
+</Hint>
+<Hint>
+Write `shouldPrompt()` as one `guard` for the first three rules (unwrapping `firstLaunch` on the way) and a final check for the 90 days, which only applies when `lastPrompt` isn't `nil`. `now.timeIntervalSince(firstLaunch)` gives seconds.
+</Hint>
+<Hint>
+`DefaultsStore` is `JSONEncoder().encode(state)` into `defaults.set(_:forKey:)`, and `defaults.data(forKey:)` into `try? JSONDecoder().decode(State.self, from:)`, falling back to `State()`.
+</Hint>
+</Hints>
+
+## Solutions
+
+<Approach title="Rules in a struct; state behind an injected store; time from an injected clock" time="O(1) per call" space="O(1)">
+
+```swift
+public final class DefaultsStore: StateStore {
+    private let defaults: UserDefaults
+    private let key: String
+
+    public init(defaults: UserDefaults, key: String = "reviewPrompt") {
+        self.defaults = defaults
+        self.key = key
+    }
+
+    public func load() -> State {
+        guard let data = defaults.data(forKey: key),
+              let state = try? JSONDecoder().decode(State.self, from: data) else { return State() }
+        return state
+    }
+
+    public func save(_ state: State) {
+        guard let data = try? JSONEncoder().encode(state) else { return }
+        defaults.set(data, forKey: key)
+    }
+}
+
+public struct Prompter {
+    private static let day: TimeInterval = 86_400
+
+    private let store: any StateStore
+    private let appVersion: String
+    private let now: () -> Date
+
+    public init(store: any StateStore, appVersion: String, now: @escaping () -> Date) {
+        self.store = store
+        self.appVersion = appVersion
+        self.now = now
+    }
+
+    public static func live(appVersion: String) -> Prompter {
+        Prompter(store: DefaultsStore(defaults: .standard), appVersion: appVersion, now: { Date() })
+    }
+
+    public func recordLaunch() {
+        var state = store.load()
+        state.launches += 1
+        if state.firstLaunch == nil {
+            state.firstLaunch = now()
+        }
+        store.save(state)
+    }
+
+    public func shouldPrompt() -> Bool {
+        let state = store.load()
+        let now = now()
+        guard state.launches >= Self.minimumLaunches,
+              let firstLaunch = state.firstLaunch,
+              now.timeIntervalSince(firstLaunch) >= Self.minimumDaysSinceFirstLaunch * Self.day,
+              state.lastPromptVersion != appVersion else { return false }
+        if let lastPrompt = state.lastPrompt {
+            return now.timeIntervalSince(lastPrompt) >= Self.minimumDaysBetweenPrompts * Self.day
+        }
+        return true
+    }
+
+    public func recordPrompt() {
+        var state = store.load()
+        state.lastPrompt = now()
+        state.lastPromptVersion = appVersion
+        store.save(state)
+    }
+}
+```
+
+The rules didn't change; only **where the world comes from** did. That's the whole move from a singleton to a testable design: the one-instance part (one store per app) is decided by `live(appVersion:)` at the composition root, and the global-access part is gone. In the app, the screen that might ask calls `shouldPrompt()`, and if it's `true`, calls SwiftUI's `requestReview` action and then `recordPrompt()`. The system still decides whether the review sheet actually appears, and limits how often, so treat `shouldPrompt()` as "a good moment", not "show it now".
+
+</Approach>

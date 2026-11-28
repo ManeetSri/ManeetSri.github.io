@@ -1,0 +1,110 @@
+A shopping app's home feed is **server-driven**: the server sends a list of components, each with a `type`, an `id` and some string fields, and the app turns each into a card. The server ships new card types every few weeks, and app versions from last year are still in use, so a type the app doesn't know must be skipped, never fatal. Build the factory: a registry of makers, one per type, with the app's two built-in types ready to go.
+
+`CreationalCardFactory.Factory`: `standard()`, `register(_:make:)`, `make(_:) throws -> any Card` and `feed(from:) -> Feed`
+
+- `Factory()` knows no types. `Factory.standard()` has makers for `"article"` and `"promo"` registered.
+- `register(_:make:)` adds a maker for a type, **replacing** any maker already registered for it. Types match exactly, so `"Article"` is not `"article"`.
+- `make(_:)` returns the card for one payload. It throws `MakeError.unknownType(type)` when no maker is registered, and otherwise whatever the maker throws.
+- `feed(from:)` makes every card it can, **in order**. A payload that can't be made, for any reason, is left out and its `id` is added to `skipped`, also in order.
+- `Factory` is a value type: registering on a copy must not change the original.
+
+The two standard makers check their fields in this order, and throw the first problem they find:
+
+| Type | Fields | Card |
+| --- | --- | --- |
+| `"article"` | `title`: present and not empty, else `missingField("title")`. `url`: present and not empty, else `missingField("url")`; an absolute `https` URL with a host, else `invalidField("url")` | `Article(id:title:url:)` |
+| `"promo"` | `headline`: present and not empty, else `missingField("headline")`. `code`: present and not empty, else `missingField("code")` | `Promo(id:headline:code:)`, with the code upper-cased |
+
+## Examples
+
+| Call | Result |
+| --- | --- |
+| `standard().make(article "a1", title "Factories", url "https://example.com/f")` | `Article(id: "a1", title: "Factories", url: https://example.com/f)` |
+| `standard().make(promo "p1", headline "Spring sale", code "spring25")` | `Promo(id: "p1", headline: "Spring sale", code: "SPRING25")` |
+| `standard().make(article with url "http://example.com" and a title)` | throws `invalidField("url")` |
+| `standard().make(poll "q1")` | throws `unknownType("poll")` |
+| `standard().feed(from: [article a1, poll q1, promo p1, article a2 with no url])` | `cards` ids `["a1", "p1"]`, `skipped` `["q1", "a2"]` |
+| `var f = standard(); f.register("poll") { … }` then `f.make(poll "q1")` | the poll card; `standard()` still throws for polls |
+
+## Constraints
+
+- A maker is `@Sendable (Payload) throws -> any Card`, so the factory can be shared across actors.
+- Don't decide a payload's type with a `switch` inside `make`: the point is that new types can be added by registering, without editing the factory.
+- `feed(from:)` must never throw or crash, whatever the server sends.
+
+<Hints>
+<Hint>
+Store the makers in a `[String: Maker]` dictionary. A `struct` with a dictionary property is already a value type, so copies are independent for free.
+</Hint>
+<Hint>
+`standard()` is a static factory: make an empty `Factory`, register the two built-in makers on it, and return it. The makers can be `private static` functions marked `@Sendable`.
+</Hint>
+<Hint>
+For the URL rule, `URL(string:)` alone isn't enough: `"not a link"` and `"http://example.com"` both produce a URL. Check `url.scheme == "https"` and that `url.host()` isn't `nil`.
+</Hint>
+</Hints>
+
+## Solutions
+
+<Approach title="A dictionary of maker closures, with a static factory for the built-ins" time="O(n) for a feed of n payloads" space="O(t) for t registered types">
+
+```swift
+public struct Factory: Sendable {
+    private var makers: [String: Maker] = [:]
+
+    public init() {}
+
+    public static func standard() -> Factory {
+        var factory = Factory()
+        factory.register("article", make: makeArticle)
+        factory.register("promo", make: makePromo)
+        return factory
+    }
+
+    public mutating func register(_ type: String, make: @escaping Maker) {
+        makers[type] = make
+    }
+
+    public func make(_ payload: Payload) throws -> any Card {
+        guard let maker = makers[payload.type] else { throw MakeError.unknownType(payload.type) }
+        return try maker(payload)
+    }
+
+    public func feed(from payloads: [Payload]) -> Feed {
+        var cards: [any Card] = []
+        var skipped: [String] = []
+        for payload in payloads {
+            do {
+                cards.append(try make(payload))
+            } catch {
+                skipped.append(payload.id)
+            }
+        }
+        return Feed(cards: cards, skipped: skipped)
+    }
+}
+
+@Sendable private static func makeArticle(_ payload: Payload) throws -> any Card {
+    let title = try required("title", in: payload)
+    let link = try required("url", in: payload)
+    guard let url = URL(string: link), url.scheme == "https", url.host() != nil else {
+        throw MakeError.invalidField("url")
+    }
+    return Article(id: payload.id, title: title, url: url)
+}
+
+@Sendable private static func makePromo(_ payload: Payload) throws -> any Card {
+    let headline = try required("headline", in: payload)
+    let code = try required("code", in: payload)
+    return Promo(id: payload.id, headline: headline, code: code.uppercased())
+}
+
+private static func required(_ field: String, in payload: Payload) throws -> String {
+    guard let value = payload.fields[field], !value.isEmpty else { throw MakeError.missingField(field) }
+    return value
+}
+```
+
+The registry trades compile-time completeness for openness: nothing checks that every type the server sends has a maker, which is exactly what lets an old app survive a new type. In a real app, `feed(from:)` would also **log** each skipped type, so you can see when the server is ahead of the apps in use. Because `Factory` is a struct, a feature module can start from `standard()`, register its own types on a copy, and hand that copy to its screen without affecting anyone else's.
+
+</Approach>

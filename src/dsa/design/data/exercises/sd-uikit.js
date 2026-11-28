@@ -1,2 +1,36 @@
 // Design exercises and architecture reviews for D17 · UIKit architecture
-export default [];
+export default [
+    {
+        id: 'sd-review-uikit-dashboard-containment',
+        kind: 'critique',
+        title: 'Review: the dashboard container',
+        difficulty: 'medium',
+        patterns: ['ui', 'architecture'],
+        lessons: ['sd-uikit-containment', 'sd-uikit-vc-lifecycle', 'sd-uikit-layout-passes', 'sd-uikit-auto-layout-engine', 'sd-uikit-swiftui-interop'],
+        minutes: 25,
+        summary: 'A dashboard that embeds UIKit and SwiftUI children without the containment calls, and pays for it in leaks, doubled callbacks and a chart stuck at zero.',
+    },
+    {
+        id: 'sd-review-uikit-product-cell',
+        kind: 'critique',
+        title: 'Review: the product cell',
+        difficulty: 'medium',
+        patterns: ['ui', 'architecture', 'performance'],
+        lessons: ['sd-uikit-cells', 'sd-uikit-logic-boundaries', 'sd-uikit-responder-chain'],
+        minutes: 25,
+        summary: 'A collection view cell that prices, discounts, loads images, talks to the cart and hunts for its view controller. Find what breaks when it’s reused.',
+    },
+    {
+        id: 'sd-design-uikit-list-screen',
+        kind: 'design',
+        title: 'A reusable list screen for many teams',
+        difficulty: 'hard',
+        patterns: ['ui', 'architecture', 'performance'],
+        lessons: ['sd-uikit-diffable', 'sd-uikit-compositional-layout', 'sd-uikit-cells', 'sd-uikit-logic-boundaries'],
+        minutes: 40,
+        template: 'component',
+        mock: true,
+        lists: [],
+        summary: 'Design the list component eight feature teams will build thirty screens on: paging, states, diffable updates, self-sizing rows and SwiftUI cells.',
+    },
+];

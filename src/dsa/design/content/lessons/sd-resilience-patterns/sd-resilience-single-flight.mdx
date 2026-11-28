@@ -1,0 +1,275 @@
+## Why it matters
+
+The app returns to the foreground, five screens refresh at once, and all five requests come back `401 Unauthorized`. If each asks for a new token, the auth server sees five refreshes, and a server that **rotates** refresh tokens (each works once) treats the four that arrive with a spent token as theft and signs the user out. **Single-flight** makes concurrent callers who want the same thing share one call: it's the standard answer to the token-refresh race, a favourite interview question, and it also stops three cells showing the same avatar from downloading it three times.
+
+## Duplicate work in flight
+
+Single-flight is easy to confuse with caching, so be precise:
+
+- A **cache** shares a *finished* result with later callers.
+- **Single-flight** shares an *in-progress* call with callers who arrive while it's running. Once the call ends, the next caller starts a new one.
+
+They solve different windows of time, so they combine well: check the cache, then the in-flight calls, and only then start a new one. Go's standard library extension has a package called `singleflight`; CDNs call the same idea **request collapsing**; on servers its absence causes the **cache stampede** you'll meet in D38.
+
+Where duplicates come from in an app:
+
+- **Token refresh:** every request that fails with `401` wants a new token, and they fail together.
+- **Images:** the same avatar appears in a list, a header and a notification, and all three ask for it as the screen appears.
+- **Launch-time config:** feature flags, the current user and remote config are each requested by several features during the first second.
+- **Pull to refresh:** the user pulls again while the first refresh is still running.
+
+## The shape in Swift
+
+An actor keeps a dictionary from what's being fetched to the `Task` fetching it. The first caller creates the task and stores it; everyone who arrives while it runs awaits the same task.
+
+```swift check title="AvatarLoader.swift"
+import Foundation
+
+actor AvatarLoader {
+    private var cache: [URL: Data] = [:]
+    private var inFlight: [URL: Task<Data, any Error>] = [:]
+    private let download: @Sendable (URL) async throws -> Data
+
+    init(download: @escaping @Sendable (URL) async throws -> Data) {
+        self.download = download
+    }
+
+    func avatar(at url: URL) async throws -> Data {
+        if let cached = cache[url] {
+            return cached                           // finished before: share the result
+        }
+        if let running = inFlight[url] {
+            return try await running.value          // running now: share the call
+        }
+        let task = Task { [download] in try await download(url) }
+        inFlight[url] = task                        // before the first await
+        defer { inFlight[url] = nil }               // on success and on failure
+        let data = try await task.value
+        cache[url] = data
+        return data
+    }
+}
+```
+
+The two commented lines at the end of the method are the pattern. **Store the task before the first `await`**: the actor is re-entrant (see [The actor model as a design pattern](/design/learn/sd-resilience-actor-model)), and every caller who arrives during the suspension must find the entry. **Remove the entry however the call ends**: forget a failed one and every later caller gets that same error without trying again.
+
+## Token refresh, the classic case
+
+```visual sequence
+title: Three 401s, one refresh
+participants:
+  - { id: feed, label: Feed request }
+  - { id: profile, label: Profile request }
+  - { id: store, label: TokenStore }
+  - { id: auth, label: Auth server }
+messages:
+  - [feed, store, "401: fresh token?", { say: "The feed request fails with `401` and asks the token store for a fresh token." }]
+  - [store, auth, POST /token, { say: "Nothing is refreshing yet, so the store starts **one** refresh and stores its task before awaiting it." }]
+  - [profile, store, "401: fresh token?", { say: "The profile request fails too, while the refresh is in flight." }]
+  - { note: "A refresh is running: join it, don't start another.", over: store }
+  - [auth, store, token-1, { reply: true, say: "The auth server issues `token-1`, once." }]
+  - [store, feed, token-1, { reply: true }]
+  - [store, profile, token-1, { reply: true, say: "Both waiters get the same token, and each retries its request once with it." }]
+```
+
+Token refresh adds a subtlety the image case doesn't have. A request can fail *after* the refresh has finished, because it was sent with the old token before the refresh began. If the store refreshes again for it, you're back to two refreshes. The fix is to pass in the token the request used: if the store already holds a different one, someone has refreshed since, and that one is the answer.
+
+The fake server below holds each refresh until the program opens it, so all three requests are guaranteed to arrive during the refresh:
+
+```swift run title="TokenStore.swift"
+// A fake auth server: counts refreshes, and holds each one until the demo opens it
+actor AuthServer {
+    private(set) var refreshes = 0
+    private var isOpen = false
+    private var waiting: [CheckedContinuation<Void, Never>] = []
+
+    func refresh() async -> String {
+        refreshes += 1
+        let issued = "token-\(refreshes)"
+        if !isOpen {
+            await withCheckedContinuation { waiting.append($0) }
+        }
+        return issued
+    }
+
+    func open() {
+        isOpen = true
+        waiting.forEach { $0.resume() }
+        waiting.removeAll()
+    }
+}
+
+actor TokenStore {
+    private var token = "token-0"
+    private var refreshing: Task<String, Never>?
+    private(set) var requests = 0
+    private let server: AuthServer
+
+    init(server: AuthServer) {
+        self.server = server
+    }
+
+    // Every request that got a 401 calls this with the token it used
+    func freshToken(replacing stale: String) async -> String {
+        requests += 1
+        if token != stale {
+            return token                          // already refreshed since that request was sent
+        }
+        if let refreshing {
+            return await refreshing.value         // join the refresh in flight
+        }
+        let refresh = Task { await server.refresh() }
+        refreshing = refresh                      // stored before the first await
+        let fresh = await refresh.value
+        token = fresh
+        refreshing = nil
+        return fresh
+    }
+}
+
+let server = AuthServer()
+let store = TokenStore(server: server)
+
+// Three requests fail with 401 at about the same moment, all sent with token-0
+async let feed = store.freshToken(replacing: "token-0")
+async let profile = store.freshToken(replacing: "token-0")
+async let inbox = store.freshToken(replacing: "token-0")
+while await store.requests < 3 { await Task.yield() }
+await server.open()
+print("New tokens:", await [feed, profile, inbox])
+
+// A fourth request, sent before the refresh, fails late: it gets the new token, not a second refresh
+print("Late 401:", await store.freshToken(replacing: "token-0"))
+print("Refreshes:", await server.refreshes)
+```
+
+```output
+New tokens: ["token-1", "token-1", "token-1"]
+Late 401: token-1
+Refreshes: 1
+```
+
+A real token store also handles the refresh failing. Every waiter gets the error, and the app signs the user out **once**, not once per waiting request. Each request retries at most once with the new token; a second `401` with a fresh token means something else is wrong, and retrying again would loop. You'll put this store inside a networking layer's interceptor chain in D33.
+
+## Decisions to make
+
+### What's the key?
+
+The key must include everything that changes the answer. An avatar keyed by URL alone is fine. A `GET /me` keyed by path alone, in an app that supports switching accounts, can hand one user's profile to another if the switch happens mid-flight. Include the user, the locale, and any header that changes the response.
+
+### Are errors shared?
+
+Yes, with everyone waiting for that call: they asked the same question at the same moment, and the answer was "it failed". But don't keep the error. Remove the entry so the next caller tries again, or combine single-flight with a retry policy so one caller's retries serve everyone.
+
+### What happens when a waiter is cancelled?
+
+Because the work runs in its own unstructured `Task`, cancelling one caller doesn't cancel it, and usually that's right: the other callers still want the result. There are three options, and the choice depends on the work:
+
+| Policy | How | Fits |
+| --- | --- | --- |
+| Keep the work running | The default with a stored `Task` | Token refresh, config: someone will need the result |
+| Let the cancelled waiter leave early | Race `task.value` against cancellation in the waiter | A screen that's gone shouldn't wait for an answer it won't show |
+| Cancel the work when the last waiter leaves | Count waiters; `task.cancel()` at zero | Large downloads nobody wants any more |
+
+### Could the shared result be stale for this caller?
+
+A caller that has just saved a new profile photo mustn't join a `GET /me` that started *before* the save: it would get the old photo back. Writes should either bypass single-flight for the next read, or bump a version that's part of the key.
+
+## Trade-offs
+
+| Approach | Duplicate requests | Staleness | Complexity | Wins when |
+| --- | --- | --- | --- | --- |
+| No de-duplication | One per caller | None | None | Calls are cheap and rarely concurrent |
+| Cache only | Concurrent callers all miss | Up to the cache's lifetime | Low | Results reused over time, rarely requested together |
+| Single-flight only | One per burst | Only within one call | Low | Bursts of identical requests for live data |
+| Cache plus single-flight | One per cache lifetime | Up to the cache's lifetime | Medium | Images, config, the current user |
+| Collapsing at the server or CDN | One per edge location | Up to the edge's cache | Owned by the backend | Huge fleets requesting the same resource |
+
+<Callout kind="interview">
+
+**Say** "token refresh goes through one actor that stores the in-flight refresh task, so concurrent 401s share one refresh, and each request retries once." Then cover the edges: a late `401` compares tokens, a refresh failure signs out once, and refresh-token rotation is why duplicates sign users out. **Ask** whether the server rotates refresh tokens, and whether the app supports several accounts (it changes the key). **Red flags:** a lock or semaphore around the refresh that blocks threads, no handling of the request that fails after the refresh, and retrying a `401` in a loop.
+
+</Callout>
+
+<Callout kind="gotcha" title="Swift gotcha: awaiting before storing the task">
+
+`let data = try await download(url)` followed by `inFlight[url] = …` looks like single-flight but isn't: during that first `await`, every other caller finds the dictionary empty and starts its own download. The entry must exist before the actor suspends. Create the `Task`, store it, *then* await `task.value`.
+
+</Callout>
+
+<Callout kind="gotcha" title="Swift gotcha: a Task made inside an actor runs on the actor">
+
+`Task { … }` created in an actor method inherits the actor's isolation. Its `await`s still free the actor, but any synchronous work in it, such as decoding a large image, runs *on* the actor and blocks every other caller. Keep the task's body to the call itself, and do heavy processing in a `nonisolated` function or after the result has left the actor.
+
+</Callout>
+
+## Practice
+
+The kata **"Single-flight request group"** generalises `AvatarLoader` to any key and any work: concurrent callers share one run and its errors, nothing is cached, and cancelling one caller mustn't cancel the work the others need. The tests hold the work open until every caller has arrived, so a check-then-await bug fails every time.
+
+```cards
+- id: sf-vs-cache
+  front: "How does single-flight differ from caching?"
+  back: "A cache shares a finished result with later callers. Single-flight shares an in-progress call with callers who arrive while it runs; once it ends, the next call starts afresh."
+- id: sf-order
+  front: "What are the two rules that make an actor-based single-flight correct?"
+  back: "Store the in-flight task before the first `await`, so callers arriving during the suspension find it. Remove the entry however the call ends, so a failure isn't returned forever."
+- id: late-401
+  front: "How does a token store avoid a second refresh for a request that fails after the refresh has finished?"
+  back: "Each request passes the token it used. If the store's token is already different, someone has refreshed since: return the current token instead of refreshing."
+- id: sf-key
+  front: "What must a single-flight key include?"
+  back: "Everything that changes the answer: the resource, and the user, locale or headers that affect the response. Otherwise one caller can receive another's result."
+```
+
+```quiz
+- id: q1
+  type: bug
+  prompt: "Three cells ask for the same avatar at once, and it's downloaded three times. Which line causes it?"
+  code: |
+    func avatar(at url: URL) async throws -> Data {
+        if let running = inFlight[url] {
+            return try await running.value
+        }
+        let data = try await download(url)
+        inFlight[url] = Task { data }
+        return data
+    }
+  answer: 5
+  explain: "The actor suspends during the download before anything is stored, so the other two callers find the dictionary empty and start their own. Create the task, store it, then await it."
+- id: q2
+  type: mcq
+  prompt: "A refresh fails with a network error while four requests are waiting for it. What should the token store do?"
+  options:
+    - "Retry the refresh once for each waiting request"
+    - "Give every waiter the error, remove the in-flight entry, and let a later request try again"
+    - "Keep the error, so later calls fail fast without contacting the server"
+    - "Return the old token to every waiter"
+  answer: 1
+  explain: "The waiters asked the same question at the same moment, so they share the answer. Keeping the failure would block every later refresh; retrying per waiter recreates the stampede."
+- id: q3
+  type: multi
+  prompt: "Which of these are good uses of single-flight? Choose all that apply."
+  options:
+    - "Refreshing an expired access token"
+    - "Loading the same thumbnail for several visible cells"
+    - "Submitting two different orders the user placed one after the other"
+    - "Fetching remote config requested by several features at launch"
+  answer: [0, 1, 3]
+  explain: "Single-flight merges identical requests for the same result. Two orders are different writes with different outcomes; merging them would lose one."
+- id: q4
+  type: mcq
+  prompt: "Your app supports switching between two accounts. `GET /me` is single-flighted with the key `\"/me\"`. What can go wrong?"
+  options:
+    - "Nothing: the path identifies the resource"
+    - "A switch mid-flight can hand the previous account's profile to the new account's screen"
+    - "The request is sent twice"
+    - "The cache grows without bound"
+  answer: 1
+  explain: "The answer depends on who's asking, so the key must include the account. Any input that changes the response belongs in the key."
+- id: q5
+  type: truefalse
+  prompt: "In the actor-based design, cancelling the task of the first caller, the one that started the shared `Task`, cancels the download for everyone waiting."
+  answer: false
+  explain: "The work runs in its own unstructured task, which isn't a child of any caller, so cancelling a caller doesn't reach it. If the work should stop when nobody is waiting, count the waiters and cancel the shared task when the count reaches zero."
+```

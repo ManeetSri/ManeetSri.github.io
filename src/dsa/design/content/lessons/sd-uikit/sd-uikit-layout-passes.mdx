@@ -1,0 +1,342 @@
+## Why it matters
+
+When you set `label.text`, nothing is drawn. UIKit notes that something changed and does the real work later, in passes it runs once per turn of the main run loop. Almost every confusing layout bug comes from forgetting that: a frame that's still zero in `viewDidLoad`, an animation that jumps instead of sliding, `layoutSubviews` running two hundred times, a list that hitches as it scrolls. Knowing the passes lets you reason about those bugs instead of sprinkling `layoutIfNeeded()` until they go away, and "what's the difference between `setNeedsLayout` and `layoutIfNeeded`?" is a staple of senior iOS interviews.
+
+## Change now, draw later
+
+UIKit's rendering is **deferred and batched**. Changing a view only marks it as needing work. At the end of the current turn of the main run loop, just before the thread goes to sleep waiting for the next event, Core Animation commits the current transaction, and that commit runs the passes over every view that asked for one:
+
+1. **Update constraints.** Views that called `setNeedsUpdateConstraints()` get `updateConstraints()`, from the leaves up to the window, so a superview sees its subviews' constraints already updated. The Auto Layout engine then has the latest equations.
+2. **Layout.** Views marked with `setNeedsLayout()` get `layoutSubviews()`, from the top down, so each view positions its subviews inside a frame its own superview has just settled. For Auto Layout views, the base implementation copies the engine's solution into the frames.
+3. **Display.** Views marked with `setNeedsDisplay()` get `draw(_:)`, which renders their content into a bitmap.
+4. **Commit.** The layer tree, now up to date, is encoded and sent to the **render server**, a separate system process that composites and renders it on the GPU.
+
+That's why a hundred changes in one event handler cost one layout, and why the screen never shows a half-updated state: the render server only ever sees the tree as it was at the end of a turn. You met the run loop itself in [The main thread and the run loop](/design/learn/sd-runtime-run-loop).
+
+Here's one frame on a 120 Hz iPhone, where a new frame starts every 8.3 ms:
+
+```visual timeline
+title: One frame, from a touch to the screen
+unit: ms
+lanes:
+  - { id: code, label: Your code }
+  - { id: constraints, label: Constraints }
+  - { id: layout, label: Layout }
+  - { id: display, label: Display pass }
+  - { id: commit, label: Commit }
+  - { id: render, label: Render server }
+  - { id: screen, label: On screen }
+spans:
+  - { lane: code, from: 0, to: 2, label: touch handler sets text, tone: active }
+  - { lane: constraints, from: 2, to: 3, label: "updateConstraints()" }
+  - { lane: layout, from: 3, to: 4.5, label: "layoutSubviews()" }
+  - { lane: display, from: 4.5, to: 5.5, label: "draw(_:)" }
+  - { lane: commit, from: 5.5, to: 6.2, label: layer tree sent, tone: ok }
+  - { lane: render, from: 8.3, to: 13, label: render, tone: wait }
+  - { lane: screen, from: 16.7, to: 25, label: new frame visible, tone: ok }
+markers:
+  - { at: 8.3, label: vsync }
+  - { at: 16.7, label: vsync }
+steps:
+  - { at: 0, say: "A touch arrives. Your handler updates state and sets `text` on three labels. Nothing has been drawn: the labels are only **marked** as needing layout and display." }
+  - { at: 2, say: "The run loop is about to sleep, so Core Animation commits the transaction, still on the main thread. First the **constraints** pass, leaves up." }
+  - { at: 3, say: "Then **layout**, top down: `layoutSubviews` on every view marked with `setNeedsLayout`." }
+  - { at: 4.5, say: "Then **display**: `draw(_:)` for views that called `setNeedsDisplay`. Most views skip it." }
+  - { at: 5.5, say: "The layer tree goes to the render server. All of the app's work, your code and the three passes, has to finish before the **8.3 ms** vsync." }
+  - { at: 8.3, say: "During the next frame interval the render server composites and renders it on the GPU." }
+  - { at: 16.7, say: "One interval later it's on screen. If the app's work had run past 8.3 ms, every step slides a frame later: that's a **hitch**." }
+```
+
+Everything above the render server happens on the main thread, and it all has to fit before the first vsync. At 120 Hz that's under 8.3 ms for your event handling *and* all three passes; at 60 Hz, 16.7 ms. You'll measure hitches properly in D51.
+
+## Asking for work, and forcing it
+
+Each pass has a pair of methods: one marks a view and waits for the next pass, the other runs the pass now if the view is marked. There's a third, the override, that you never call yourself.
+
+| Pass | Mark it (cheap, coalesced) | Do it now | Override |
+| --- | --- | --- | --- |
+| Constraints | `setNeedsUpdateConstraints()` | `updateConstraintsIfNeeded()` | `updateConstraints()` |
+| Layout | `setNeedsLayout()` | `layoutIfNeeded()` | `layoutSubviews()` |
+| Display | `setNeedsDisplay()` | none: it always waits | `draw(_:)` |
+| Natural size | `invalidateIntrinsicContentSize()` | (re-solved in the next layout) | `intrinsicContentSize` |
+
+The `setNeeds…` methods are what you want almost always: they're idempotent flags, so calling them a hundred times costs the same as once. `layoutIfNeeded()` runs layout synchronously, for that view and everything it contains, if anything there is marked. It has two legitimate uses: animating a layout change, and measuring a view mid-method. Every other call is a smell, usually covering for code that reads a frame before layout has happened.
+
+<Callout kind="note">
+
+iOS 26 adds a fourth pass that runs with layout, just before `layoutSubviews()`: `updateProperties()`, requested with `setNeedsUpdateProperties()`. It's for setting view properties (colours, text, images) from your model, separately from geometry, and UIKit reruns it automatically when `@Observable` properties it read change. On iOS 18 you'd do the same work in `layoutSubviews` or from an observation callback.
+
+</Callout>
+
+You can see why coalescing matters with a toy model of the layout flag. Setting `text` marks the view; the end of the run loop turn lays out whatever is marked:
+
+```swift run title="Deferred vs forced layout"
+final class ToyView {
+    private(set) var layoutPasses = 0
+    private var needsLayout = false
+
+    var text = "" {
+        didSet { setNeedsLayout() }
+    }
+
+    func setNeedsLayout() {
+        needsLayout = true
+    }
+
+    func layoutIfNeeded() {
+        guard needsLayout else { return }
+        needsLayout = false
+        layoutPasses += 1
+    }
+}
+
+// What UIKit does once per run loop turn: lay out every view that's marked
+func endOfRunLoopTurn(_ views: [ToyView]) {
+    views.forEach { $0.layoutIfNeeded() }
+}
+
+let batched = ToyView()
+for row in 1...100 {
+    batched.text = "Row \(row)"
+}
+endOfRunLoopTurn([batched])
+print("Deferred: 100 changes, \(batched.layoutPasses) layout pass")
+
+let forced = ToyView()
+for row in 1...100 {
+    forced.text = "Row \(row)"
+    forced.layoutIfNeeded() // say, to measure the view after each change
+}
+endOfRunLoopTurn([forced])
+print("Forced: 100 changes, \(forced.layoutPasses) layout passes")
+```
+
+```output
+Deferred: 100 changes, 1 layout pass
+Forced: 100 changes, 100 layout passes
+```
+
+In UIKit the forced version is worse than it looks, because a real `layoutIfNeeded()` lays out the whole subtree and may re-solve constraints each time. A loop that changes a value and calls `layoutIfNeeded()` per row is a common cause of a slow screen that "only does a bit of layout".
+
+## Writing layoutSubviews well
+
+`layoutSubviews()` runs whenever the view is marked and a pass happens: on its first appearance, on rotation, on Dynamic Type changes, when a subview's intrinsic size changes, when a parent resizes it, during every frame of some animations. Write it so running it twice is harmless and cheap:
+
+- **Read `bounds`, set frames.** Position subviews from the current size. Don't change your own frame or your superview's: that marks the superview, which lays you out again, which can loop forever.
+- **No new views or constraints.** Create them once, in `init` or `viewDidLoad`. Adding constraints in `layoutSubviews` or `viewDidLayoutSubviews` adds another copy on every pass.
+- **No work that isn't geometry.** No formatting, no image decoding, no network. It runs far more often than you think.
+- **Call `super`.** For views that use Auto Layout, `super.layoutSubviews()` is what applies the solved constraints.
+
+A small view laid out by hand shows the pieces fitting together: the intrinsic size tells Auto Layout how big it wants to be, and `layoutSubviews` places its contents inside whatever size it's given.
+
+```swift check ios title="BadgeView.swift"
+import UIKit
+
+final class BadgeView: UIView {
+    private let label = UILabel()
+    private let padding = UIEdgeInsets(top: 2, left: 8, bottom: 2, right: 8)
+
+    var text: String? {
+        get { label.text }
+        set {
+            label.text = newValue
+            invalidateIntrinsicContentSize() // my natural size changed
+            setNeedsLayout()                 // and my contents need placing
+        }
+    }
+
+    override init(frame: CGRect) {
+        super.init(frame: frame)
+        backgroundColor = .systemRed
+        label.font = .preferredFont(forTextStyle: .caption1)
+        label.adjustsFontForContentSizeCategory = true
+        label.textColor = .white
+        addSubview(label)
+        // A bigger text size changes the label's size, so ours changes too
+        registerForTraitChanges([UITraitPreferredContentSizeCategory.self]) { (badge: BadgeView, _: UITraitCollection) in
+            badge.invalidateIntrinsicContentSize()
+        }
+    }
+
+    required init?(coder: NSCoder) { nil }
+
+    override var intrinsicContentSize: CGSize {
+        let text = label.intrinsicContentSize
+        return CGSize(width: text.width + padding.left + padding.right, height: text.height + padding.top + padding.bottom)
+    }
+
+    override func sizeThatFits(_ size: CGSize) -> CGSize { intrinsicContentSize }
+
+    override func layoutSubviews() {
+        super.layoutSubviews()
+        label.frame = bounds.inset(by: padding)
+        layer.cornerRadius = bounds.height / 2
+    }
+}
+```
+
+The corner radius lives in `layoutSubviews` because it depends on the final height, which only layout knows. That's the test for what belongs there: *does it depend on the size?*
+
+### Animating a layout change
+
+Constraint changes animate through layout. Change the constraint, then run layout inside an animation block, so the frame changes that layout makes are animated:
+
+```swift check ios title="Expanding a section"
+import UIKit
+
+final class OrderDetailsViewController: UIViewController {
+    private let details = UIView()
+    private lazy var detailsHeight = details.heightAnchor.constraint(equalToConstant: 0)
+
+    func setExpanded(_ expanded: Bool) {
+        view.layoutIfNeeded()               // settle anything already pending, without animation
+        detailsHeight.constant = expanded ? 240 : 0
+        UIView.animate(withDuration: 0.3) {
+            self.view.layoutIfNeeded()      // lay out now, inside the animation
+        }
+    }
+}
+```
+
+The first `layoutIfNeeded()` is the one people leave out. Without it, any unrelated layout that was already pending (a label that changed a moment ago, a rotation) gets swept into the animation too, and things slide that shouldn't. Call it on the view that contains everything that moves, usually the view controller's root view, not on the view whose constraint changed.
+
+## The display pass and drawing
+
+Most views never draw. A `UILabel` renders its text, a `UIImageView` hands its image to its layer, and a plain `UIView` with a background colour, border and corner radius is drawn by the render server from its layer's properties, with no bitmap of its own.
+
+When you override `draw(_:)`, the view gets a **backing store**: a bitmap the size of the view in pixels, at 4 bytes a pixel or more (wide-colour content can need 8). That costs memory and main-thread time on every `setNeedsDisplay()`. A full-screen custom-drawn view on a 3× iPhone (1,320 × 2,868 pixels) needs about 15 MB for its backing store alone. Prefer composing views and layers (`CAShapeLayer` for paths, `CAGradientLayer` for gradients), which the render server draws without one, and keep `draw(_:)` for content that changes rarely and really is custom. Set `contentMode = .redraw` if the drawing must be redone when the bounds change; the default stretches the old bitmap.
+
+## Traits and layout
+
+Trait changes are one of the most common reasons layout runs: dark mode, a size class change when an iPad app goes into Split View, a new Dynamic Type size. Two recent changes make that easier:
+
+- **Since iOS 17**, register for exactly the traits you care about with `registerForTraitChanges(_:handler:)`, as `BadgeView` does. `traitCollectionDidChange(_:)` is deprecated.
+- **Since iOS 18**, UIKit tracks which traits you read inside `layoutSubviews()`, `updateConstraints()` and `draw(_:)` (and the view controller equivalents such as `viewWillLayoutSubviews()`), and marks the view for that pass again when one of them changes. Reading `traitCollection.horizontalSizeClass` in `layoutSubviews()` is then enough to relayout when it changes.
+
+## Trade-offs
+
+| Approach | Authoring | Adapts to Dynamic Type, RTL, size classes | Speed in long lists | Debugging |
+| --- | --- | --- | --- | --- |
+| Auto Layout | Declarative, verbose in code | Built in, with anchors and leading/trailing | Good; slower with many interdependent constraints | View Debugger, conflict logs |
+| Manual frames in `layoutSubviews` | You write the maths | You handle each case yourself | Fastest | Breakpoints and printouts |
+| `UIStackView` | Least code | Good | Fine for a few; adds constraints in every cell | As Auto Layout |
+| SwiftUI layout | Least code, different model | Built in | Good with lazy containers | Previews, fewer tools for edge cases |
+
+Auto Layout is the right default for screens: it adapts for free, and its cost is invisible outside long lists. Manual layout earns its keep in a hot path, such as a cell type that appears thousands of times and has a fixed structure, or a custom control with geometry that constraints describe badly (a radial menu). Stack views are good for forms and toolbars; nest them deeply inside cells and the constraint count adds up.
+
+<Callout kind="interview">
+
+**What to say:** "Changes only mark views. At the end of the run loop turn UIKit runs the constraints pass bottom-up, then layout and display top-down, then commits to the render server. `setNeedsLayout` marks; `layoutIfNeeded` forces it now, which I only use to animate or measure."
+
+**What to ask:** what's the frame budget (60 or 120 Hz)? Is this a screen or a cell that appears thousands of times? That decides how much layout cost matters.
+
+**Red flags:** "I call `layoutIfNeeded()` to make it work"; creating constraints in `viewDidLayoutSubviews`; reading `view.bounds` in `viewDidLoad` and expecting the final size; formatting or decoding images in `layoutSubviews`.
+
+</Callout>
+
+<Callout kind="gotcha" title="iOS gotcha: layout feedback loops">
+
+If `layoutSubviews` changes something that marks an ancestor for layout (its own frame, a superview constraint, `invalidateIntrinsicContentSize()` on itself), each pass schedules another, and the main thread spins without ever drawing. Run with the launch argument `-UIViewLayoutFeedbackLoopDebuggingThreshold 100`: UIKit then raises an exception when a view is laid out that many times in one turn and logs the views involved.
+
+</Callout>
+
+<Callout kind="gotcha" title="iOS gotcha: the frame in viewDidLoad isn't final">
+
+In `viewDidLoad` the root view has whatever size it was created with, usually the screen's, not the size it will have inside a navigation controller, a sheet, an iPad split view or a container. Setting child frames from `view.bounds` there looks right on one device and wrong everywhere else. Use constraints, or set frames in `viewDidLayoutSubviews` or `layoutSubviews`, where the size is real.
+
+</Callout>
+
+## Practice
+
+The [dashboard container review](/design/practice/sd-review-uikit-dashboard-containment) has two layout mistakes from this lesson: frames computed in `viewDidLoad`, and constraints activated in `viewDidLayoutSubviews`. For each, say what the user sees and what the fix is.
+
+```cards
+- id: deferred-rendering
+  front: "When does setting `label.text` actually change the pixels?"
+  back: "Not immediately. It marks the label; at the end of the run loop turn UIKit runs the constraints, layout and display passes, commits the layer tree to the render server, and the render server draws it for a later frame."
+- id: pass-order
+  front: "In what order and direction do the three passes run?"
+  back: "Update constraints from the leaves up, then layout from the top down, then display from the top down."
+- id: needs-vs-if-needed
+  front: "`setNeedsLayout()` vs `layoutIfNeeded()`?"
+  back: "`setNeedsLayout()` marks the view for the next layout pass and is cheap to repeat. `layoutIfNeeded()` runs layout now, for the whole subtree, if anything is marked. Use it to animate or measure."
+- id: layout-subviews-rule
+  front: "What belongs in `layoutSubviews()`?"
+  back: "Only work that depends on the size: setting subview frames from `bounds`, a corner radius from the height. No new views or constraints, no formatting, no I/O, and never changing your own or your superview's frame."
+```
+
+```quiz
+- id: q1
+  type: mcq
+  prompt: "In a button handler, you set a label's `text` to a much longer string and on the next line print the label's `frame`. The label is positioned with Auto Layout. What prints?"
+  options:
+    - "The new frame, sized for the long text"
+    - "The old frame: layout hasn't run yet"
+    - "A zero frame, because the label is waiting for layout"
+    - "It depends on whether the label is on screen"
+  answer: 1
+  explain: "Setting `text` only invalidates the label's intrinsic size and marks layout. The engine and the frames are updated in the next layout pass, at the end of the run loop turn, unless you force it with `layoutIfNeeded()`."
+- id: q2
+  type: order
+  prompt: "Put what happens at the end of a run loop turn in order."
+  lines:
+    - "updateConstraints() on marked views, leaves first"
+    - "layoutSubviews() on marked views, top down"
+    - "draw(_:) on views that called setNeedsDisplay()"
+    - "The layer tree is committed to the render server"
+    - "The render server renders the frame on the GPU"
+  explain: "Constraints must be up to date before layout reads the solution, layout must settle sizes before drawing, and only a finished tree is committed. Rendering happens in another process, a frame later."
+- id: q3
+  type: match
+  prompt: "Match each call to what it does."
+  pairs:
+    - ["`setNeedsLayout()`", "Mark the view for the next layout pass"]
+    - ["`layoutIfNeeded()`", "Run layout now for this subtree, if anything is marked"]
+    - ["`setNeedsDisplay()`", "Redraw the view's content in the next display pass"]
+    - ["`invalidateIntrinsicContentSize()`", "Tell Auto Layout the view's natural size has changed"]
+  explain: "The `setNeeds…` calls and `invalidateIntrinsicContentSize()` are cheap flags that coalesce. `layoutIfNeeded()` is the one that does work immediately."
+- id: q4
+  type: estimate
+  prompt: "A custom chart view overrides `draw(_:)` and fills the screen of a 3× iPhone, 1,320 × 2,868 pixels. Roughly how big is its backing store?"
+  answer: 15
+  unit: MB
+  within: { factor: 1.5 }
+  explain: "1,320 × 2,868 ≈ 3.8 million pixels × 4 bytes ≈ 15 MB, redrawn on the main thread every time it calls `setNeedsDisplay()`. Composing layers would cost no bitmap at all."
+- id: q5
+  type: bug
+  prompt: "This view gets a little slower every time it's laid out, and the number of constraints in the View Debugger keeps climbing. Click the faulty line."
+  code: |
+    final class AvatarView: UIView {
+        private let imageView = UIImageView()
+
+        override init(frame: CGRect) {
+            super.init(frame: frame)
+            imageView.translatesAutoresizingMaskIntoConstraints = false
+            addSubview(imageView)
+        }
+
+        required init?(coder: NSCoder) { nil }
+
+        override func layoutSubviews() {
+            super.layoutSubviews()
+            layer.cornerRadius = bounds.width / 2
+            NSLayoutConstraint.activate([
+                imageView.widthAnchor.constraint(equalTo: widthAnchor),
+                imageView.heightAnchor.constraint(equalTo: heightAnchor),
+            ])
+        }
+    }
+  answer: 15
+  explain: "Every layout pass activates two more copies of the same constraints, so they pile up and the engine has more to solve each time. Constraints are one-time setup: activate them in `init`, next to `addSubview`. The corner radius rightly stays in `layoutSubviews`, because it depends on the size."
+- id: q6
+  type: multi
+  prompt: "Which of these belong in a view's `layoutSubviews()`?"
+  options:
+    - "Setting subview frames from `bounds`"
+    - "Setting the corner radius to half the height"
+    - "Adding a subview the first time it's called"
+    - "Activating constraints for a subview"
+    - "Formatting the price shown in a label"
+  answer: [0, 1]
+  explain: "`layoutSubviews()` runs many times, so it should only do work that depends on the size. Creating views and constraints is one-time setup, and formatting is data work that doesn't change with size."
+```

@@ -1,0 +1,377 @@
+## Why it matters
+
+[Pure functions and side effects](/design/learn/sd-functional-pure) showed how to make one function testable. This lesson scales the idea to a whole feature: put every decision in a **functional core** of pure code, and every side effect in a thin **imperative shell** around it. It's the most practical idea in functional design for app developers, because it needs no framework and works in any architecture you already use. In interviews it's the clearest answer to "where do side effects live?" and "how would you test this?".
+
+## The core decides, the shell does
+
+Gary Bernhardt named the pattern in a 2012 talk, *Boundaries*. A feature splits into two parts with opposite shapes:
+
+- **The functional core** is pure functions over plain values. It holds the decisions: rules, policies, calculations, what should happen next. It has many paths through it and no dependencies, so it gets lots of fast unit tests with no test doubles at all.
+- **The imperative shell** gathers the inputs (reads the clock, the disk, the network), calls the core, and carries out what the core decided (writes, requests, UI). It has many dependencies but almost no paths, so it needs only a few integration tests, and sometimes none.
+
+The trick is that the core never calls the shell. Data flows in as arguments and out as return values. The shell is the only part that knows the outside world exists.
+
+<Callout kind="analogy">
+
+A satnav's route planner takes a map, your position and a destination, and returns a route. It never touches the steering wheel. The driver is the shell: they read the road, feed the planner, and turn the wheel. You can test the planner on a desk with a thousand imaginary journeys, and you only need a few real drives to check the driver can follow directions.
+
+</Callout>
+
+## Before: a review prompt, tangled
+
+A food-ordering app wants to ask for an App Store review at a good moment: after the third completed order, at most once per app version, and never within 120 days of the last ask. Here's how that often lands, straight in the confirmation screen:
+
+```swift check ios title="OrderConfirmationView.swift, tangled"
+import StoreKit
+import SwiftUI
+
+struct OrderConfirmationView: View {
+    @Environment(\.requestReview) private var requestReview
+
+    var body: some View {
+        Text("Thanks for your order!")
+            .task {
+                let defaults = UserDefaults.standard
+                let orders = defaults.integer(forKey: "completedOrders") + 1
+                defaults.set(orders, forKey: "completedOrders")
+                let version = Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? ""
+                let lastAsked = defaults.object(forKey: "lastReviewPrompt") as? Date ?? .distantPast
+                if orders >= 3,
+                   defaults.string(forKey: "lastReviewVersion") != version,
+                   Date().timeIntervalSince(lastAsked) > 120 * 86_400 {
+                    try? await Task.sleep(for: .seconds(2))
+                    requestReview()
+                    defaults.set(Date(), forKey: "lastReviewPrompt")
+                    defaults.set(version, forKey: "lastReviewVersion")
+                }
+            }
+    }
+}
+```
+
+It works, and it's only 20 lines. But the three rules product cares about are spread across six reads and writes, and checking any of them means a simulator, a scrubbed UserDefaults and either patience or a fiddled clock. When product changes "120 days" to "after a five-star delivery", someone edits this with no tests to catch a mistake.
+
+## After: the core
+
+First the decision, as plain values in and out. The history that used to be four UserDefaults keys becomes one `Codable` struct, and the result says *why*, which makes tests and logs readable:
+
+```swift run title="ReviewPolicy: the functional core"
+import Foundation
+
+struct ReviewHistory: Codable, Equatable {
+    var completedOrders = 0
+    var lastPrompt: Date?
+    var lastPromptVersion: String?
+}
+
+enum ReviewDecision: Equatable {
+    case ask
+    case tooFewOrders
+    case alreadyAskedInThisVersion
+    case askedRecently
+}
+
+enum ReviewPolicy {
+    static let minimumOrders = 3
+    static let minimumGap: TimeInterval = 120 * 86_400   // 120 days
+
+    /// Records a completed order and decides whether this is a good moment to ask for a review
+    static func afterOrder(_ history: ReviewHistory, now: Date, appVersion: String) -> (ReviewHistory, ReviewDecision) {
+        var history = history
+        history.completedOrders += 1
+        let decision = decide(history, now: now, appVersion: appVersion)
+        if decision == .ask {
+            history.lastPrompt = now
+            history.lastPromptVersion = appVersion
+        }
+        return (history, decision)
+    }
+
+    static func decide(_ history: ReviewHistory, now: Date, appVersion: String) -> ReviewDecision {
+        if history.completedOrders < minimumOrders { return .tooFewOrders }
+        if history.lastPromptVersion == appVersion { return .alreadyAskedInThisVersion }
+        if let last = history.lastPrompt, now.timeIntervalSince(last) < minimumGap { return .askedRecently }
+        return .ask
+    }
+}
+
+// Seven orders over five months, across three app versions
+let start = Date(timeIntervalSince1970: 1_750_000_000)
+var history = ReviewHistory()
+for (day, version) in [(0, "2.3"), (1, "2.3"), (2, "2.3"), (9, "2.3"), (40, "2.4"), (130, "2.4"), (131, "2.5")] {
+    let now = start.addingTimeInterval(Double(day) * 86_400)
+    let (updated, decision) = ReviewPolicy.afterOrder(history, now: now, appVersion: version)
+    history = updated
+    print("Day \(day), v\(version), order \(history.completedOrders): \(decision)")
+}
+```
+
+```output
+Day 0, v2.3, order 1: tooFewOrders
+Day 1, v2.3, order 2: tooFewOrders
+Day 2, v2.3, order 3: ask
+Day 9, v2.3, order 4: alreadyAskedInThisVersion
+Day 40, v2.4, order 5: askedRecently
+Day 130, v2.4, order 6: ask
+Day 131, v2.5, order 7: askedRecently
+```
+
+Five months of user behaviour ran in a millisecond. Every rule has a line that proves it, and "what if the user updates the app the day after being asked?" is the last line, not an afternoon with a test device.
+
+Notice that `afterOrder` uses `var history` internally and returns a new value. It's still pure: the caller's copy never changes behind its back.
+
+## After: the shell
+
+The view keeps everything that touches the world: UserDefaults, the clock, the app version and StoreKit. It has one branch, and that branch is about an effect ("should I call StoreKit?"), not a rule:
+
+```swift
+struct OrderConfirmationView: View {
+    @Environment(\.requestReview) private var requestReview
+    let appVersion: String
+
+    var body: some View {
+        Text("Thanks for your order!")
+            .task {
+                let defaults = UserDefaults.standard
+                let saved = defaults.data(forKey: "reviewHistory").flatMap { try? JSONDecoder().decode(ReviewHistory.self, from: $0) }
+                let (history, decision) = ReviewPolicy.afterOrder(saved ?? ReviewHistory(), now: .now, appVersion: appVersion)
+                defaults.set(try? JSONEncoder().encode(history), forKey: "reviewHistory")
+
+                guard decision == .ask else { return }
+                try? await Task.sleep(for: .seconds(2))   // let the confirmation land first
+                guard !Task.isCancelled else { return }
+                requestReview()
+            }
+    }
+}
+```
+
+Here's the conversation between the two halves. Watch the core's lifeline: one call in, one value out, and nothing else.
+
+```visual sequence
+title: One completed order, through the shell and the core
+participants:
+  - { id: view, label: Shell (view) }
+  - { id: defaults, label: UserDefaults }
+  - { id: core, label: ReviewPolicy }
+  - { id: storekit, label: StoreKit }
+messages:
+  - [view, defaults, load history]
+  - [defaults, view, ReviewHistory, { reply: true }]
+  - [view, view, "read now, app version"]
+  - [view, core, "afterOrder(history, now, version)"]
+  - { note: "Pure: no reads, no writes, no clock.", over: core }
+  - [core, view, "(history, .ask)", { reply: true }]
+  - [view, defaults, save history]
+  - [view, storekit, "requestReview()", { async: true }]
+steps:
+  - say: "The shell **gathers the inputs**: the saved history, the current time and the app version."
+    upTo: 2
+  - say: "It hands them to the core as plain values. The core can't reach anything else, so this is the only way in."
+    upTo: 4
+  - say: "The core answers with values too: the updated history and a decision. It never touched the disk or StoreKit."
+    upTo: 5
+  - say: "The shell **carries out** the decision. These are the only lines left that need a device to test, and they contain no rules."
+    upTo: 7
+```
+
+StoreKit decides whether the prompt actually appears (it shows at most three times a year per user), so the core's job is deciding when it's *worth asking*. That's a product rule, and now it has tests.
+
+## Testing each half
+
+The core gets the thorough tests, and they read like the product spec. Boundaries are where rules break, so test both sides of each one:
+
+```swift
+private let start = Date(timeIntervalSince1970: 1_750_000_000)
+private func day(_ n: Double) -> Date { start.addingTimeInterval(n * 86_400) }
+
+@Test func asksOnTheThirdOrder() {
+    let (history, decision) = ReviewPolicy.afterOrder(ReviewHistory(completedOrders: 2), now: start, appVersion: "2.3")
+    #expect(decision == .ask)
+    #expect(history.lastPromptVersion == "2.3")
+}
+
+@Test func waits120DaysEvenAcrossVersions() {
+    let asked = ReviewHistory(completedOrders: 5, lastPrompt: start, lastPromptVersion: "2.3")
+    #expect(ReviewPolicy.decide(asked, now: day(119), appVersion: "2.4") == .askedRecently)
+    #expect(ReviewPolicy.decide(asked, now: day(121), appVersion: "2.4") == .ask)
+}
+```
+
+The shell gets very little. It has one branch, it calls StoreKit, which you can't usefully fake in a unit test, and everything it decides came from the core. A UI test of the confirmation screen, or a manual check on a device, covers it. That isn't a gap in the testing: it's the design working. The less logic the shell has, the less there is to miss.
+
+## Returning effects as data
+
+`ReviewPolicy` returns a decision and the shell knows what to do with it. When a decision involves several effects, in an order that matters, go one step further: have the core return the effects themselves, as values, and give the shell a loop that runs them.
+
+Signing out is a good example. The token must be revoked before the Keychain item is deleted, caches are cleared only if no drafts are waiting to sync, and analytics comes last:
+
+```swift check title="Sign-out: the effects as values, and the shell that runs them"
+import Foundation
+
+struct Session: Equatable, Sendable {
+    var token: String
+    var hasUnsyncedDrafts: Bool
+}
+
+enum SignOutEffect: Equatable, Sendable {
+    case revokeToken(String)
+    case deleteKeychainItem(String)
+    case clearCaches
+    case track(String)
+}
+
+enum SignOutPolicy {
+    /// Everything signing out involves, in the order it must happen. Unsynced drafts stay on the device.
+    static func effects(for session: Session) -> [SignOutEffect] {
+        var effects: [SignOutEffect] = [.revokeToken(session.token), .deleteKeychainItem("auth")]
+        if !session.hasUnsyncedDrafts { effects.append(.clearCaches) }
+        effects.append(.track("signed_out"))
+        return effects
+    }
+}
+
+/// The shell: one closure per kind of effect, and a loop with no rules in it
+struct SignOutRunner: Sendable {
+    var revoke: @Sendable (String) async throws -> Void
+    var deleteKeychainItem: @Sendable (String) -> Void
+    var clearCaches: @Sendable () async -> Void
+    var track: @Sendable (String) -> Void
+
+    func run(_ effects: [SignOutEffect]) async {
+        for effect in effects {
+            switch effect {
+            case .revokeToken(let token): try? await revoke(token)
+            case .deleteKeychainItem(let key): deleteKeychainItem(key)
+            case .clearCaches: await clearCaches()
+            case .track(let event): track(event)
+            }
+        }
+    }
+}
+```
+
+The test is one comparison, and it checks the order too:
+
+```swift
+@Test func signingOutKeepsUnsyncedDrafts() {
+    let effects = SignOutPolicy.effects(for: Session(token: "t1", hasUnsyncedDrafts: true))
+    #expect(effects == [.revokeToken("t1"), .deleteKeychainItem("auth"), .track("signed_out")])
+}
+```
+
+The cost is a small language to maintain: an effect enum and an interpreter. It earns its place when *which* effects happen, and in what order, is itself the logic. That's exactly the shape of a reducer, which you'll write in [Reducers: state changes as pure functions](/design/learn/sd-functional-reducers).
+
+## Decide, act, decide
+
+Real features rarely decide once. Refreshing a feed reads the cache, decides whether it's stale, fetches, merges, and saves. The pattern still holds; you stack it. Mark Seemann calls one layer an **impureim sandwich**: impure, pure, impure.
+
+1. **Impure:** read the cached feed and the time.
+2. **Pure:** `needsRefresh(cache, now) -> Bool`.
+3. **Impure:** fetch the latest page.
+4. **Pure:** `merged(cache, page) -> Feed`, handling duplicates and deletions.
+5. **Impure:** save, and show.
+
+Each pure step is a function you can test with values. The shell is a straight line of `await`s with the pure calls between them. If you find a rule creeping into the shell ("only fetch if the last fetch failed less than three times"), that's a sign it belongs in step 2.
+
+## Where the boundary sits in an iOS app
+
+- **In SwiftUI**, the view or its `@Observable` view model is usually the shell: it owns `async` calls, reads the environment and updates state. Policies, formatting, validation and state transitions are the core.
+- **In UIKit**, view controllers and services are the shell; the same kinds of logic are the core.
+- **The core imports only Foundation.** A useful guard is to put it in its own Swift package target. If someone adds `import UIKit` or a networking call, the dependency shows up in review, and the package's tests stay fast.
+- **The shell stays boring on purpose.** If it needs a unit test, a rule has probably leaked into it.
+
+## Trade-offs
+
+| Approach | Unit tests | Indirection | Effort to change a rule | When it wins |
+| --- | --- | --- | --- | --- |
+| Tangled: decisions and effects in one method | Hard: needs devices, defaults, real time | None | High, and risky | Tiny features with no rules worth testing |
+| Core returns a decision, shell acts on it | Many, with plain values | One function call | Low: change the core, run its tests | Most features with real rules: eligibility, pricing, scheduling |
+| Core returns effects as data, shell interprets them | The order of effects is testable too | An effect enum and an interpreter | Low, but each new effect touches both halves | Flows where which effects run, and in what order, is the logic |
+
+The middle row is the everyday default. Reach for effects as data when the sequence is the hard part, as in sign-out, checkout or onboarding.
+
+<Callout kind="interview">
+
+**Say** "I'd keep the rules in a pure core that takes values and returns a decision, and keep the view model as a thin shell that reads the world, calls the core and performs the result. The core gets the unit tests." **Ask** which rules are likely to change, because those are the ones worth extracting first. **Red flags:** a "core" that takes a `UserDefaults` or a protocol for the network (that's a shell with a seam, not a core), mocking five dependencies to test one `if`, and a shell full of business conditions.
+
+</Callout>
+
+<Callout kind="gotcha" title="Swift gotcha: try? await Task.sleep swallows cancellation">
+
+When SwiftUI cancels a `.task` because the view went away, `Task.sleep` throws `CancellationError`. With `try?` that error disappears and the next line runs anyway: the tangled version above asks for a review on a screen the user has already left. Check `Task.isCancelled` after the sleep, as the shell does, or use `try await` and let the error end the task.
+
+</Callout>
+
+<Callout kind="gotcha" title="iOS gotcha: a pure core can still be stuck on the main actor">
+
+Since Xcode 26 (Swift 6.2), new app targets set **Default Actor Isolation** to `MainActor`, so every type you declare there, including `ReviewPolicy`, is implicitly `@MainActor`. Calling it from a background task then needs an `await` hop to the main actor for no reason. Mark core types `nonisolated`, or keep the core in a Swift package, where the default is still nonisolated.
+
+</Callout>
+
+## Practice
+
+- The kata **queued likes outbox** has you split an offline outbox flush into a pure core (which likes to send, what's left afterwards) and a shell that runs through closures. Aim for a shell with two `guard`s and no other branches.
+- The review **a promo code tangled in side effects** is the "before" picture at full size. Plan the core you'd extract and what its return type would be.
+
+```cards
+- id: core-shell-split
+  front: "What goes in the functional core, and what goes in the imperative shell?"
+  back: "The core holds decisions as pure functions over values. The shell gathers inputs, calls the core, and performs the effects it decided on."
+- id: core-shell-tests
+  front: "How do tests divide between the core and the shell?"
+  back: "The core has many paths and no dependencies, so it gets many plain unit tests. The shell has many dependencies and few paths, so it gets a few integration tests, or none."
+- id: effects-as-data
+  front: "When should the core return effects as values instead of a decision?"
+  back: "When which effects happen, and in what order, is itself the logic, as in sign-out or checkout. The shell then runs them in a loop."
+```
+
+```quiz
+- id: q1
+  type: sort
+  prompt: "In a core-and-shell design, where does each piece belong?"
+  buckets: [Core, Shell]
+  items:
+    - [Deciding whether a cached feed is too old to show, 0]
+    - [Reading the cached feed from disk, 1]
+    - [Merging a fetched page into the cached feed, 0]
+    - ["Calling `requestReview()`", 1]
+    - [Working out the delivery fee for a basket, 0]
+    - [Reading `Date.now` and the app version, 1]
+  explain: "Decisions and calculations over values go in the core. Anything that reads or changes the world, including the clock and StoreKit, stays in the shell."
+- id: q2
+  type: order
+  prompt: "Put one 'decide, act, decide' refresh in order."
+  lines:
+    - "Read the cached feed and the current time"
+    - "Decide whether the cache needs refreshing"
+    - "Fetch the latest page"
+    - "Merge the page into the cache"
+    - "Save the merged feed and show it"
+  explain: "Impure, pure, impure, pure, impure. Each pure step is a function you can test with plain values; the shell is the straight line between them."
+- id: q3
+  type: mcq
+  prompt: "A teammate's `ReviewPolicy.decide` takes a `UserDefaults` parameter so it can read the history itself. What's the best response?"
+  options:
+    - "Fine: it's injected, so it's testable"
+    - "Pass the decoded `ReviewHistory` value instead, so the function stays pure"
+    - "Wrap UserDefaults in a protocol and mock it in tests"
+    - "Make `decide` async"
+  answer: 1
+  explain: "An injected UserDefaults is still I/O: tests need a suite, keys and cleanup. Reading belongs in the shell; the core should take the value that was read."
+- id: q4
+  type: multi
+  prompt: "Which are signs that a rule has leaked into the shell? Choose all that apply."
+  options:
+    - "You want to unit test the view model's `task` closure with mocks"
+    - "The shell contains `if orders >= 3 && version != lastVersion`"
+    - "The shell has a `guard decision == .ask else { return }`"
+    - "Product changes a threshold and the change touches the networking code"
+  answer: [0, 1, 3]
+  explain: "A guard on the core's decision is the shell's job. Business conditions, a need for mock-heavy unit tests, and rule changes landing in I/O code all mean a decision is in the wrong half."
+- id: q5
+  type: truefalse
+  prompt: "The core may call the shell through a protocol, as long as the protocol is injected."
+  answer: false
+  explain: "Then it isn't a core: its results depend on what the shell does. The core only receives values and returns values; the shell is the only part that calls out."
+```

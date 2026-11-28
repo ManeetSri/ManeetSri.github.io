@@ -1,0 +1,291 @@
+## Why it matters
+
+Pure functions need inputs that can't change behind their backs, so functional design leans on immutable data. Swift makes values the default, but day-to-day code still has to *update* things: mark a message as read, change a quantity, edit a draft. Doing that comfortably, knowing what it costs and deciding who is allowed to mutate is what this lesson is about. It builds on [Immutability by default and failing fast](/design/learn/sd-principles-immutability) and [Value vs reference semantics in architecture](/design/learn/sd-swift-design-value-semantics), and it's the groundwork for reducers. Interviewers probe it with "struct or class for your models, and why?".
+
+## What immutable means in Swift
+
+Two separate things make data immutable in Swift:
+
+- **The binding.** A `let` can't be reassigned, and for a value type it can't be mutated either: `let message = Message(...)` followed by `message.status = .read` doesn't compile.
+- **The semantics.** Structs, enums, tuples, `Array`, `Dictionary`, `Set` and `String` have **value semantics**: a copy is independent of the original, so nobody else's code can change the value you hold.
+
+Classes have neither by default. A `let` holding a class instance stops you pointing it at another object, but anyone holding the same reference can still change the object:
+
+```swift run title="let freezes a value, not an object"
+struct DraftValue { var title: String }
+final class DraftObject { var title: String; init(title: String) { self.title = title } }
+
+let value = DraftValue(title: "Groceries")
+var valueCopy = value
+valueCopy.title = "Shopping"
+
+let object = DraftObject(title: "Groceries")
+let sameObject = object
+sameObject.title = "Shopping"
+
+print(value.title, valueCopy.title)
+print(object.title, sameObject.title)
+```
+
+```output
+Groceries Shopping
+Shopping Shopping
+```
+
+### Shallow and deep
+
+A struct is only as immutable as what it stores. A `let` struct whose property is a class reference is **shallowly** immutable: the reference can't change, but the object it points to can. `struct Profile { let avatar: AvatarCache }`, where `AvatarCache` is a class, can change under a function that thought it had a value. Keep the types that functional code passes around made of values all the way down, or of classes that are themselves immutable (only `let` properties of value types).
+
+## Updating a value: copy, change, return
+
+Swift has no `copy(…)` method like a Kotlin data class. You don't need one, because of a property of value types that's easy to overlook: **mutating a value you own is invisible to everyone else**. So the idiomatic update is "make a local copy, change it, return it":
+
+```swift run title="Marking a message as read, without touching the original"
+struct Message: Equatable {
+    enum Status { case sending, sent, read }
+    let id: Int
+    var text: String
+    var status: Status
+}
+
+struct Conversation {
+    var messages: [Message]
+
+    /// A copy of the conversation with one message marked as read
+    func markingRead(_ id: Int) -> Conversation {
+        var copy = self
+        if let index = copy.messages.firstIndex(where: { $0.id == id }) {
+            copy.messages[index].status = .read
+        }
+        return copy
+    }
+}
+
+func sameBuffer(_ a: [Message], _ b: [Message]) -> Bool {
+    a.withUnsafeBufferPointer { x in b.withUnsafeBufferPointer { y in x.baseAddress == y.baseAddress } }
+}
+
+let before = Conversation(messages: (1...3).map { Message(id: $0, text: "Message \($0)", status: .sent) })
+let after = before.markingRead(2)
+
+print(before.messages.map { "\($0.status)" })
+print(after.messages.map { "\($0.status)" })
+
+var shared = before
+print(sameBuffer(before.messages, shared.messages))
+shared.messages[0].text = "Edited"
+print(sameBuffer(before.messages, shared.messages))
+print(before.messages[0].text)
+```
+
+```output
+["sent", "sent", "sent"]
+["sent", "read", "sent"]
+true
+false
+Message 1
+```
+
+What to notice:
+
+- **`markingRead` is pure** even though it says `var`. The mutation happens to its own copy, and the caller gets a new value back.
+- **Nested writes work.** `copy.messages[index].status = .read` reaches two levels down and Swift writes the whole path back. With classes you'd mutate a shared `Message` object, and every screen holding it would change at once, wanted or not.
+- **Copies are cheap until you write.** The last three lines are the cost model, which the next section explains.
+
+### Three spellings of the same update
+
+| Spelling | Looks like | Good for |
+| --- | --- | --- |
+| A non-mutating method returning a copy | `let read = conversation.markingRead(2)` | Domain operations with a name, used in expressions and pipelines |
+| A `mutating` method | `conversation.markRead(2)` | Owners that hold a `var` and change it in place, such as a reducer or a view model |
+| A generic `with` helper | `let read = message.with { $0.status = .read }` | One-off tweaks, especially in tests and previews |
+
+The helper is four lines and works on any value:
+
+```swift check title="with: change a copy in one expression"
+func with<Value>(_ value: Value, _ change: (inout Value) throws -> Void) rethrows -> Value {
+    var copy = value
+    try change(&copy)
+    return copy
+}
+
+struct Settings { var notificationsOn = true; var quietHours = false }
+
+let defaults = Settings()
+let night = with(defaults) { $0.quietHours = true }
+```
+
+Swift's standard library uses the same pairing for its own types: `sort()` mutates, `sorted()` returns a copy; `append` mutates, `+` returns a new array. Offer both when callers need both, and name them that way.
+
+## What copying costs: copy-on-write
+
+"Return a new value" sounds expensive when the value holds 5,000 messages. It isn't, because Swift's collections are **copy-on-write**: copying an array copies a reference to its storage, and the storage is only duplicated when someone writes to a buffer that's shared.
+
+```visual flow
+title: Copy-on-write when you update a value
+nodes:
+  - { id: before, label: before.messages, at: [0, 0] }
+  - { id: shared, label: shared.messages, at: [0, 2] }
+  - { id: buffer1, label: "buffer: 3 messages", kind: store, at: [3, 0] }
+  - { id: buffer2, label: "buffer: a copy", kind: store, at: [3, 2] }
+edges:
+  - [before, buffer1, owns, { style: data }]
+  - [shared, buffer1, shares, { style: data }]
+  - [shared, buffer2, owns, { style: data }]
+steps:
+  - say: "`before` holds an array, which is a small struct pointing at a heap buffer of three messages."
+    show: [before, buffer1, "before->buffer1"]
+  - say: "`var shared = before` copies the struct. The buffer only gains a second reference, so the copy is O(1) however big it is."
+    show: [shared, "shared->buffer1"]
+    active: ["shared->buffer1"]
+  - say: "The first write through `shared` finds the buffer isn't uniquely referenced, so Swift copies it once, O(n), and writes to the copy."
+    show: [buffer2, "shared->buffer2"]
+    hide: ["shared->buffer1"]
+    state: { buffer2: active }
+  - say: "Now each array owns its own buffer, so further writes happen in place. `before` never saw a thing."
+    state: { buffer2: ok, buffer1: ok }
+```
+
+So the rules of thumb:
+
+- Passing values around and returning updated copies is cheap. Most of the time the old value is dropped straight away, the buffer is uniquely referenced again, and writes are in place.
+- Holding on to old values while writing new ones costs one buffer copy per write. That's the price of undo history or a "before and after" diff, and it's usually worth it.
+- Structs with many stored properties copy all of them, but that's a memberwise copy of a few words each. Only reach for a class for size reasons after measuring.
+
+Your own types get copy-on-write for free whenever their bulk lives in standard collections. Writing it by hand, with `isKnownUniquelyReferenced` over a private class, is for rare cases such as a large custom buffer.
+
+## Values cross concurrency boundaries safely
+
+Immutable data is what makes Swift 6's data-race checking easy to satisfy. A struct or enum whose stored properties are all `Sendable` is itself `Sendable`; Swift infers that for types that aren't `public`, and public ones declare it. Handing a value to another task gives that task its own copy, so neither side can race on it:
+
+```swift check ios title="Exporting a snapshot while the user keeps typing"
+import Foundation
+import Observation
+
+struct Draft: Sendable {
+    var title: String
+    var paragraphs: [String]
+}
+
+/// Slow work over a value: it can run anywhere, because nobody else can change its input
+func renderPDF(_ draft: Draft) -> Data {
+    Data((draft.title + "\n" + draft.paragraphs.joined(separator: "\n")).utf8)
+}
+
+@MainActor
+@Observable
+final class EditorModel {
+    var draft = Draft(title: "Untitled", paragraphs: [])
+
+    func export() async -> Data {
+        let snapshot = draft   // a copy: typing can carry on while the export runs
+        return await Task.detached(priority: .utility) { renderPDF(snapshot) }.value
+    }
+}
+```
+
+Nothing is locked and nothing is copied eagerly: `snapshot` shares the paragraphs' storage until the user's next keystroke writes to the model's copy. A **final class with only `let` properties of Sendable types** can be `Sendable` too. Choose it when you want sharing without copying and identity matters, such as a large decoded catalogue that many screens read.
+
+## Where mutation lives
+
+Immutable data doesn't mean nothing ever changes. It means change happens in **one place, owned by one thing**, and everyone else receives values:
+
+- A view model or store owns `var state`. It's the only code that writes it.
+- Child views get `let` values and report what happened through closures or actions.
+- Background work gets snapshots and sends results back to the owner, which decides what to do with them.
+
+That one owner, changing its state with pure functions, is exactly a reducer. You'll write one two lessons from now.
+
+## Trade-offs
+
+| Model type | Updating | Sharing across tasks | Identity | When it wins |
+| --- | --- | --- | --- | --- |
+| Struct with `var` properties, updated by copy | Easy and local; cheap with copy-on-write | Safe: each side has its own copy | By an `id` you choose | The default for models, view state and anything a pure function takes |
+| Struct with only `let` properties | Must rebuild with an initialiser or helper | Safe | By `id` | Small values that never change once made: a currency amount, a coordinate |
+| `final class` with only `let` properties | Replace the whole object | Safe, and never copied | Built in (`===`) | Large read-only data shared by many readers |
+| Class with `var` properties, shared | In place, visible to every holder | Needs an actor or a lock | Built in | Things that really are one live object: a player, a connection, a cache |
+
+<Callout kind="interview">
+
+**Say** "Models are structs: values are copied, so no screen can change data another screen is showing, and they're `Sendable`, which Swift 6 needs. Copies are cheap thanks to copy-on-write. Mutation happens in one owner." **Ask** whether the data really needs shared identity, which is the main honest reason for a class. **Red flags:** "classes are faster" with no measurement, mutating a model object from two screens and calling it a sync feature, and treating `var` inside a function as impure.
+
+</Callout>
+
+<Callout kind="gotcha" title="Swift gotcha: reduce with + is quadratic">
+
+`ids.reduce([]) { $0 + [$1] }` builds a brand-new array at every step, copying everything so far: O(n²) for something that should be O(n). `reduce(into: [])` hands the closure an `inout` accumulator, which is uniquely referenced, so `$0.append($1)` happens in place. Same result, linear time, and still a pure expression.
+
+</Callout>
+
+<Callout kind="gotcha" title="Swift gotcha: a struct holding a class isn't a value">
+
+`struct Order { let items: NSMutableArray }` compiles, copies cheaply and looks immutable, but every copy shares one mutable array. The compiler hints at it: such a struct isn't `Sendable` unless you force it. If a "value" needs `@unchecked Sendable` to compile, it probably isn't one.
+
+</Callout>
+
+## Practice
+
+The kata **typeahead search reducer** keeps a whole screen in one value-type `State` and updates it through an `inout` parameter: mutation in one owner, invisible to anyone else until the function returns.
+
+```cards
+- id: let-value-vs-object
+  front: "What does `let` freeze for a struct, and for a class instance?"
+  back: "For a struct, the whole value: nothing in it can change. For a class, only the reference: the object it points to can still be mutated through any other reference."
+- id: local-mutation
+  front: "Why can a Swift function use `var` and still work with immutable data?"
+  back: "Mutating a value you own is invisible to everyone else, because value types are copied. Change a local copy and return it."
+- id: cow-cost
+  front: "When does copying an array actually copy its elements?"
+  back: "On the first write to a buffer that's shared by more than one copy. Copying the array itself only copies a reference."
+```
+
+```quiz
+- id: q1
+  type: output
+  prompt: "What does this print?"
+  code: |
+    struct Badge { var count = 0 }
+    final class Counter { var count = 0 }
+
+    var a = Badge()
+    var b = a
+    b.count += 1
+
+    let c = Counter()
+    let d = c
+    d.count += 1
+
+    print(a.count, b.count, c.count, d.count)
+  answer: "0 1 1 1"
+  explain: "`b` is a copy of the struct, so `a` stays 0. `c` and `d` are two references to one object, so both show 1, even though both are `let`."
+- id: q2
+  type: bigo
+  prompt: "What's the time complexity of building `[\"#1\", \"#2\", …]` from `n` ids with `ids.reduce([]) { $0 + [\"#\\($1)\"] }`?"
+  answer: "O(n²)"
+  explain: "Each step creates a new array and copies everything accumulated so far: 1 + 2 + … + n copies. `reduce(into:)` with `append` is O(n)."
+- id: q3
+  type: mcq
+  prompt: "A chat screen keeps `conversation` in its view model. Which way of marking a message as read fits functional design best?"
+  options:
+    - "Make `Message` a class and set `message.status = .read` wherever you have it"
+    - "`conversation = conversation.markingRead(id)` in the view model, with `markingRead` returning a copy"
+    - "Post a notification so each screen updates its own copy"
+    - "Store read IDs in a global `Set` that every screen checks"
+  answer: 1
+  explain: "One owner replaces its value with an updated copy computed by a pure function. A shared class or a global spreads mutation everywhere; notifications create several sources of truth."
+- id: q4
+  type: truefalse
+  prompt: "Returning an updated copy of a struct that holds a 10,000-element array copies all 10,000 elements."
+  answer: false
+  explain: "The array is copy-on-write. The copy shares the buffer; elements are only copied on the first write to a shared buffer, and if the old value is dropped first, not even then."
+- id: q5
+  type: multi
+  prompt: "Which of these types can safely be passed to another task as-is in Swift 6? Choose all that apply."
+  options:
+    - "`struct Draft { var title: String; var paragraphs: [String] }`"
+    - "`final class Catalogue: Sendable { let products: [Product] }`, where `Product` is a Sendable struct"
+    - "`struct Order { let items: NSMutableArray }`"
+    - "`final class Cart { var items: [Item] = [] }`"
+  answer: [0, 1]
+  explain: "Value types made of values, and immutable final classes, are Sendable. A struct holding a mutable class, and a class with `var` properties, share mutable state, so the compiler won't let them cross."
+```
