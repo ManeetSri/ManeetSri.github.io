@@ -9,7 +9,7 @@ import { formatDate, formatMinutes } from '../ui/format.js';
 import { useConsoleMeta, useNow } from '../ui/hooks.js';
 import { Button, Card, ProgressBar } from '../ui/primitives.jsx';
 
-const STEPS = ['welcome', 'goal', 'pace', 'placement', 'summary'];
+const ALL_STEPS = ['welcome', 'goal', 'pace', 'placement', 'summary'];
 const MINUTE_OPTIONS = [15, 30, 45, 60, 90, 120];
 // Every placement question in a course, built once per course
 const questionSets = new WeakMap();
@@ -89,6 +89,8 @@ const OnboardingPage = () => {
     const course = useCourse();
     const { GOALS, lessons: allLessons, moduleById, partByNumber, placement: PLACEMENT_GROUPS, links, onboarding } = course;
     const QUESTIONS = questionsFor(course);
+    // A course without placement questions skips that step
+    const STEPS = QUESTIONS.length ? ALL_STEPS : ALL_STEPS.filter((name) => name !== 'placement');
     useConsoleMeta('Set up your path', links.start);
     const navigate = useNavigate();
     const profile = useProfile();
@@ -158,12 +160,12 @@ const OnboardingPage = () => {
                 <section aria-labelledby="start-title">
                     <span className="swift-gradient mb-6 flex h-14 w-14 items-center justify-center rounded-2xl text-ink"><Compass size={26} aria-hidden="true" /></span>
                     <h1 id="start-title" className="font-display text-[clamp(2.2rem,6vw,3.5rem)] font-semibold leading-[1.05] tracking-tight">Let’s set up your path.</h1>
-                    <p className="mt-4 text-lg leading-relaxed text-muted">Two minutes, four questions about you, and an optional quick check of what you already know.</p>
+                    <p className="mt-4 text-lg leading-relaxed text-muted">{QUESTIONS.length ? 'Two minutes, four questions about you, and an optional quick check of what you already know.' : 'Two minutes and a few questions about you.'}</p>
                     <ul className="mt-6 space-y-3">
                         {[
                             'Your goal decides which lessons form your main path.',
                             'Your pace sizes each day’s plan and predicts when you’ll finish.',
-                            onboarding.skipPoint,
+                            ...(QUESTIONS.length ? [onboarding.skipPoint] : []),
                         ].map((text) => (
                             <li key={text} className="flex gap-3 text-paper/85"><CheckCircle2 size={20} aria-hidden="true" className="mt-0.5 shrink-0 text-[#30D158]" /> {text}</li>
                         ))}

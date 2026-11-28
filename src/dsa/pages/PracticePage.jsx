@@ -25,7 +25,7 @@ const Select = ({ label, value, onChange, options }) => (
 );
 
 const PracticePage = () => {
-    const { lessonById, lessons: allLessons, moduleById, DIFFICULTIES, LISTS, PATTERNS, practice: problems, links, practiceIntro } = useCourse();
+    const { lessonById, lessons: allLessons, moduleById, DIFFICULTIES, LISTS, PATTERNS, practice: problems, links, practiceIntro, patternLabel } = useCourse();
     useConsoleMeta('Practice', links.practice);
     const navigate = useNavigate();
     const { problems: records, cards, lessons } = useCourseStore();
@@ -124,7 +124,7 @@ const PracticePage = () => {
                     </span>
                 </label>
                 <Select label="Difficulty" value={difficulty} onChange={setDifficulty} options={Object.fromEntries(Object.entries(DIFFICULTIES).map(([key, value]) => [key, value.label]))} />
-                <Select label="Pattern" value={pattern} onChange={setPattern} options={PATTERNS} />
+                <Select label={patternLabel} value={pattern} onChange={setPattern} options={PATTERNS} />
                 <Select label="Status" value={status} onChange={setStatus} options={{ new: 'Not tried', attempted: 'Attempted', helped: 'Solved with help', solved: 'Solved', due: 'Due for a re-solve' }} />
                 <Select label="List" value={list} onChange={setList} options={LISTS} />
             </div>

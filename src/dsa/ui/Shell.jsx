@@ -5,6 +5,9 @@ import {
     ScrollText, Search, Settings, Sparkles, Sun, X,
 } from 'lucide-react';
 import { useCourse } from '../course/context.js';
+import { courseList } from '../course/courses.js';
+import { CourseList, CourseSwitcher } from './CourseSwitcher.jsx';
+import { useRememberCoursePath } from './courseSummaries.js';
 import { moduleCompletion } from '../engine/path.js';
 import { useCourseStore, useProfile, useStore } from '../store/store.js';
 import { useStats, useStudyTimer } from './hooks.js';
@@ -180,6 +183,7 @@ const searchIndexFor = (course) => {
         ...lessons.map((lesson) => ({ id: `lesson-${lesson.id}`, label: lesson.title, detail: `${moduleById[lesson.module].code} · Lesson${lesson.status === 'stub' ? ' · soon' : ''}`, to: links.lesson(lesson.id) })),
         ...practice.map((item) => ({ id: `practice-${item.id}`, label: item.title, detail: course.kindLabels?.[item.kind] ?? 'Problem', to: links.item(item.id) })),
         ...sheets.map((sheet) => ({ id: `sheet-${sheet.id}`, label: sheet.title, detail: 'Cheat sheet', to: links.sheet(sheet.id), keywords: sheet.keywords })),
+        ...courseList.filter((other) => other.id !== course.id).map((other) => ({ id: `course-${other.id}`, label: `Switch to ${other.title}`, detail: 'Course', to: other.base, keywords: 'course switch' })),
     ];
     indexes.set(course, index);
     return index;
@@ -281,7 +285,7 @@ const CommandPalette = ({ open, onClose }) => (
 );
 
 const TopBar = ({ onSearch, onModules }) => {
-    const { brand, links } = useCourse();
+    const { links } = useCourse();
     const { sync } = useStore();
     const { xp, rank, streak } = useStats();
     const status = SYNC[sync] ?? SYNC.synced;
@@ -296,9 +300,7 @@ const TopBar = ({ onSearch, onModules }) => {
                 <button type="button" onClick={onModules} aria-label="Browse modules" className="flex h-10 w-10 shrink-0 items-center justify-center rounded-full bg-white/8 hover:bg-white/12 lg:hidden">
                     <ListTree size={18} aria-hidden="true" />
                 </button>
-                <Link to={links.today} className="mr-2 hidden items-center gap-2 font-display text-lg font-semibold tracking-tight sm:flex">
-                    <BookOpen size={18} aria-hidden="true" className="text-swift" /> {brand.lead} {brand.joiner && <span className="text-muted">{brand.joiner}</span>} <span className="swift-gradient-text">{brand.accent}</span>
-                </Link>
+                <CourseSwitcher />
 
                 <button
                     type="button"
@@ -353,6 +355,7 @@ const Shell = ({ children }) => {
     const [modulesOpen, setModulesOpen] = useState(false);
     const { pathname } = useLocation();
     useStudyTimer();
+    useRememberCoursePath();
 
     useEffect(() => {
         const onKeyDown = (event) => {
@@ -398,6 +401,8 @@ const Shell = ({ children }) => {
                         </button>
                     </div>
                     <div className="flex-1 overflow-y-auto px-3 py-3">
+                        <CourseList onNavigate={() => setModulesOpen(false)} />
+                        <div className="my-4 border-t border-line" />
                         <PrimaryNav onNavigate={() => setModulesOpen(false)} />
                         <div className="my-4 border-t border-line" />
                         <ModuleTree onNavigate={() => setModulesOpen(false)} />

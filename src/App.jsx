@@ -89,6 +89,7 @@ function App() {
           {/* The private console: one gate and store, with a set of routes per course */}
           <Route element={<Suspense fallback={<div className="min-h-svh bg-ink" />}><ConsoleApp /></Suspense>}>
             <Route path="/dsa/*" element={<Suspense fallback={<div className="min-h-svh bg-ink" />}><CourseRoutes course="dsa" /></Suspense>} />
+            <Route path="/design/*" element={<Suspense fallback={<div className="min-h-svh bg-ink" />}><CourseRoutes course="design" /></Suspense>} />
           </Route>
           <Route path="*" element={<NotFoundPage />} />
         </Routes>

@@ -8,7 +8,7 @@ import { securityHeaders } from './security-headers-plugin.js'
 import { dsaExerciseWriter } from './scripts/dsa-exercise-writer.js'
 
 // The console's code, and the exercise stubs its solution editor starts from
-const isLearningConsole = (id) => id.includes('/src/dsa/') || id.includes('/dsa-swift/')
+const isLearningConsole = (id) => id.includes('/src/dsa/') || id.includes('/dsa-swift/') || id.includes('/design-swift/')
 
 // https://vite.dev/config/
 export default defineConfig({

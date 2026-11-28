@@ -1,6 +1,7 @@
 import { ArrowRight, Award, CalendarClock, CheckCircle2, Circle, Code2, Compass, Flame, Hourglass, Layers, Sparkles, Target } from 'lucide-react';
 import { Link } from 'react-router-dom';
 import { useCourse } from '../course/context.js';
+import { readLastPath, useCourseSummaries } from '../ui/courseSummaries.js';
 import { completion, isDone, isOnPath, projection } from '../engine/path.js';
 import { planToday } from '../engine/today.js';
 import { useCourseStore, useProfile } from '../store/store.js';
@@ -33,6 +34,23 @@ const Stat = ({ icon: Icon, label, value, children, tone = 'text-amber' }) => (
         {children}
     </div>
 );
+
+// The other courses at a glance, so their reviews don't pile up unseen
+const OtherCourses = () => {
+    const current = useCourse();
+    const others = useCourseSummaries().filter((summary) => summary.course.id !== current.id);
+    if (!others.length) return null;
+    return others.map(({ course, progress, due, next }) => (
+        <Link key={course.id} to={readLastPath(course)} className="block rounded-2xl border border-line bg-surface p-4 hover:border-white/25 sm:col-span-2 lg:col-span-1">
+            <p className="flex items-center justify-between gap-2 text-xs text-muted">
+                <span className="font-mono uppercase tracking-wider">Also learning</span>
+                <span className="font-mono">{Math.round(progress.ratio * 100)}%</span>
+            </p>
+            <p className="mt-1 font-semibold">{course.title}</p>
+            <p className="mt-1 text-sm text-muted">{due ? `${due} review${due === 1 ? '' : 's'} due` : 'No reviews due'}{next ? ` · next: ${next.title}` : ''}</p>
+        </Link>
+    ));
+};
 
 const TodayPage = () => {
     const course = useCourse();
@@ -162,6 +180,7 @@ const TodayPage = () => {
                             {profile.targetDate && <> · target {formatDate(new Date(profile.targetDate).getTime())}{behind && <Chip tone="red" className="ml-1">behind</Chip>}</>}
                         </p>
                     </Stat>
+                    <OtherCourses />
                 </aside>
             </div>
         </div>

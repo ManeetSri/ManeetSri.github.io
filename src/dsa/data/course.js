@@ -28,6 +28,7 @@ export const dsaCourse = {
     swift: { package: 'dsa', dir: 'dsa-swift' },
     // Course-specific wording used across pages
     placementName: 'Swift placement check',
+    patternLabel: 'Pattern',
     onboarding: {
         skipPoint: 'The quick check lets you skip Swift topics you already know. Starting from zero is completely fine.',
         placementIntro: 'Part I teaches Swift from the very beginning. If you already know some of it, a quick check can skip those modules.',

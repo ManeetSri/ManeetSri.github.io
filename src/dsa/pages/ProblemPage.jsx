@@ -133,7 +133,7 @@ const Workspace = ({ problem }) => {
 };
 
 const ProblemView = ({ problem }) => {
-    const { DIFFICULTIES, PATTERNS, lessonById, links } = useCourse();
+    const { DIFFICULTIES, PATTERNS, lessonById, links, patternLabel } = useCourse();
     useConsoleMeta(problem.title, links.item(problem.id));
     const content = useContent('problem', problem.id);
     const [showPatterns, setShowPatterns] = useState(false);
@@ -151,7 +151,7 @@ const ProblemView = ({ problem }) => {
                         <Chip>~{problem.minutes} min</Chip>
                         {showPatterns
                             ? problem.patterns.map((key) => <Chip key={key} tone="amber">{PATTERNS[key]}</Chip>)
-                            : <button type="button" onClick={() => setShowPatterns(true)} className="inline-flex items-center gap-1 rounded-full px-2.5 py-0.5 font-mono text-xs text-muted hover:bg-white/8"><Eye size={12} aria-hidden="true" /> Show pattern</button>}
+                            : <button type="button" onClick={() => setShowPatterns(true)} className="inline-flex items-center gap-1 rounded-full px-2.5 py-0.5 font-mono text-xs text-muted hover:bg-white/8"><Eye size={12} aria-hidden="true" /> Show {patternLabel.toLowerCase()}</button>}
                     </div>
                     <p className="mt-3 text-sm text-muted">
                         From {problem.lessons.map((id, index) => (

@@ -5,7 +5,7 @@ import reactRefresh from 'eslint-plugin-react-refresh'
 import { defineConfig, globalIgnores } from 'eslint/config'
 
 export default defineConfig([
-  globalIgnores(['dist', 'dsa-swift']),
+  globalIgnores(['dist', 'dsa-swift', 'design-swift']),
   {
     files: ['**/*.{js,jsx}'],
     extends: [
@@ -28,7 +28,7 @@ export default defineConfig([
   },
   // Build plugins, scripts and engine tests run in Node
   {
-    files: ['scripts/**/*.{js,mjs}', '*.config.js', '*-plugin.js', 'src/dsa/engine/**/*.test.js'],
+    files: ['scripts/**/*.{js,mjs}', '*.config.js', '*-plugin.js', 'src/dsa/**/*.test.js'],
     languageOptions: { globals: globals.node },
   },
 ])

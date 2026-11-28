@@ -1,6 +1,7 @@
 import { createHash } from 'node:crypto';
 import { readFileSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
+import { CONSOLE_BASES } from './src/utils/privatePaths.js';
 
 // Everything the site is allowed to load or talk to. A new third-party service has to be added here.
 const SOURCES = {
@@ -33,7 +34,7 @@ const SOURCES = {
 
 // The learning console and its code chunks are never indexed. These blocks only add a header:
 // repeating the CSP here would make Netlify join two policies into one header.
-const PRIVATE_PATHS = ['/dsa', '/dsa/*', '/assets/dsa/*'];
+const PRIVATE_PATHS = [...CONSOLE_BASES.flatMap((base) => [base, `${base}/*`]), '/assets/dsa/*'];
 
 const hashesOf = (html, pattern) => [...html.matchAll(pattern)]
     .map((match) => `'sha256-${createHash('sha256').update(match[1]).digest('base64')}'`);

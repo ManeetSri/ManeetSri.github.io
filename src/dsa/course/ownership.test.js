@@ -33,3 +33,14 @@ test('DSA keeps its settings at the top of the profile; other courses get their 
     assert.deepEqual(profilePatch(dsa, { goal: 'ios' }), { goal: 'ios' });
     assert.deepEqual(profilePatch(other, { goal: 'lead' }), { courses: { design: { goal: 'lead' } } });
 });
+
+test('ids with the design prefix belong to the design course, everywhere they appear', () => {
+    assert.equal(courseOfId('sd-quality-why'), 'design');
+    assert.equal(ownerOf('cards', 'sd-quality-why~card~x', { lessonId: 'sd-quality-why' }), 'design');
+    assert.equal(ownerOf('cards', 'design~sd-design-feed', { kind: 'design', ref: 'sd-design-feed' }), 'design');
+    assert.equal(ownerOf('designs', 'sd-design-feed'), 'design');
+    assert.equal(ownerOf('mocks', '9', { course: 'design' }), 'design');
+    const state = { lessons: { 'arr-basics': { completedAt: 1 }, 'sd-quality-why': { completedAt: 2 } }, cards: {}, activity: {} };
+    assert.deepEqual(Object.keys(filterState(state, 'dsa').lessons), ['arr-basics']);
+    assert.deepEqual(Object.keys(filterState(state, 'design').lessons), ['sd-quality-why']);
+});
