@@ -1,0 +1,132 @@
+<Brief>
+
+A streaming app is adding a **Family** plan next to Free and Plus. The pull request is small: it adds a `"family"` case wherever the author found a switch on the tier, and the parts it touched are collected below. It passed review once already and QA signed it off on a Plus account. Review it again, and say what the change itself tells you about the design.
+
+```swift check ios title="FamilyPlan.swift"
+import Foundation
+
+struct Subscription {
+    let tier: String  // "free", "plus", or "family" (new in this pull request)
+    let renewsAt: Date?
+    let seats: Int
+}
+
+struct Account {
+    let id: String
+    let subscription: Subscription
+    let deviceCount: Int
+}
+
+struct PaywallPresenter {
+    func title(for tier: String) -> String {
+        switch tier {
+        case "plus": return "Plus"
+        case "family": return "Family"
+        default: return "Free"
+        }
+    }
+
+    func price(for tier: String) -> String {
+        switch tier {
+        case "plus": return "£4.99 a month"
+        case "family": return "£7.99 a month"
+        default: return "Free"
+        }
+    }
+}
+
+struct FeatureGate {
+    func canAddDevice(_ account: Account) -> Bool {
+        switch account.subscription.tier {
+        case "plus": return account.deviceCount < 3
+        case "family": return account.deviceCount < 3 * account.subscription.seats
+        default: return account.deviceCount < 1
+        }
+    }
+
+    func canDownloadOffline(_ account: Account) -> Bool {
+        account.subscription.tier == "plus"
+    }
+}
+
+struct SettingsViewModel {
+    let account: Account
+
+    var renewalText: String {
+        let subscription = account.subscription
+        guard subscription.tier != "free", let renewsAt = subscription.renewsAt else {
+            return "Not subscribed"
+        }
+        let days = Calendar.current.dateComponents([.day], from: Date(), to: renewsAt).day ?? 0
+        if days <= 7 {
+            return "Renews in \(days) days"
+        }
+        return "Renews on " + renewsAt.formatted(date: .long, time: .omitted)
+    }
+
+    var canInviteFamily: Bool {
+        account.subscription.tier == "family" && account.subscription.seats > 1
+    }
+}
+```
+
+</Brief>
+
+```workspace
+template: critique
+minutes: 20
+```
+
+```findings
+- id: missed-case
+  title: Family subscribers can't download for offline use
+  severity: high
+  lines: 43
+  detail: "`canDownloadOffline` still checks only for `\"plus\"`, so customers on the dearer plan lose a feature the cheaper one has. Nothing failed to compile and no test failed: the places that needed the new tier were found by searching for strings, and this one was missed. It's the bug this design will keep producing."
+- id: shotgun-surgery
+  title: What a plan is lives in six places, so every new plan is shotgun surgery
+  severity: high
+  lines: 16-63
+  detail: "A plan's name, price, device limit and entitlements are spread over six members of three types, each switching on (or comparing with) the same string. Adding Family meant finding and editing all of them; the next plan, a trial or a student tier, will too, and each miss is a silent bug like the one above. Gather the knowledge into one `Plan` type so a new plan is one change the compiler checks."
+- id: default-free
+  title: "`default:` turns every unknown tier into Free"
+  severity: medium
+  lines: 38
+  detail: "Lines 20, 28 and 38 all treat any string they don't recognise as Free. A typo, `\"Plus\"` capitalised by the server, or a tier the server launches before this app version knows it, silently downgrades a paying customer to one device. With an enum and no `default`, the compiler lists every switch that needs the new case, and an unknown tier is caught once, where the response is decoded."
+- id: feature-envy
+  title: Subscription rules are worked out by the subscription's callers
+  severity: medium
+  lines: 50-64
+  detail: "The view model decides whether a subscription is active, how long until it renews and whether it can invite family, all from `account.subscription`'s fields, and `FeatureGate` computes the device limit the same way. These are facts about a subscription; when they live in each caller, the rule \"free means not subscribed\" is written several times and the copies drift. Move them onto `Subscription` and leave only the wording here."
+- id: hard-coded-prices
+  title: Prices are hard-coded strings
+  severity: medium
+  lines: 26-27
+  detail: "The App Store sets the price per storefront, in local currency, and it changes with tax and pricing updates. Hard-coded pounds show Irish customers the wrong currency and let the paywall disagree with the purchase sheet. Show StoreKit 2's `Product.displayPrice` instead."
+- id: untestable-renewal
+  title: 'The renewal text reads the clock and calendar itself, and says "1 days"'
+  severity: low
+  lines: 55-57
+  detail: "`Date()` and `Calendar.current` inside the property make the 7-day boundary untestable, and the text depends on the device's time zone. With no test there, \"Renews in 1 days\" shipped. Inject `now` and a calendar, and let a String Catalog plural variant word it."
+```
+
+<ReferenceReview>
+
+**Most important first.** The pull request ships a bug: Family subscribers can't download (line 43). Fix it before merging, with a test that checks every entitlement for every plan, so the next miss fails a test instead of reaching a customer.
+
+**What the change tells you.** Adding one plan meant finding every place, across three types, that reads the tier string, and one was missed. That's **shotgun surgery**, and its root is **primitive obsession**: a plan is a `String`, so the knowledge of what a plan *is* has nowhere to live except in every switch that reads it. The `default:` branches make it worse by failing quietly. Alongside it, the view model and the feature gate show **feature envy**: they compute subscription facts from the subscription's fields.
+
+**How I'd fix it, in small steps:**
+
+1. Characterise first: a table-driven test of every function for `"free"`, `"plus"`, `"family"` and an unknown string. It records today's behaviour, including the download bug, which you then fix in its own commit so the diff shows exactly what changed.
+2. Introduce `enum Plan: String, Codable { case free, plus, family }` and decode it at the API boundary. Decide there, once, what an unknown plan means (treat it as Free *and log it*, or fail the decode).
+3. Move each switch onto `Plan`, one per commit: `title`, `deviceLimit(seats:)`, `includesOfflineDownloads`, `canInviteFamily`. Write the switches without `default:`, so adding a case makes the compiler list every one.
+4. Move the envious logic onto `Subscription`: `isActive`, `deviceLimit`, `daysUntilRenewal(from:calendar:)`. The view model keeps only the words.
+5. Replace the price strings with `Product.displayPrice` from StoreKit 2, loaded with the products.
+6. Inject `now` and a `Calendar` into the view model, and move the wording into a String Catalog with plural variants.
+
+An enum fits here because the set of plans is small, closed and owned by the app, and you want the compiler to force a decision for each one. If plans came from the server as configuration, a `Plan` struct carrying its entitlements as data would beat both the enum and a protocol per plan.
+
+**Tests to add:** the plan × entitlement table; decoding a known and an unknown plan; renewal text at 0, 1, 7 and 8 days with a fixed clock and calendar.
+
+</ReferenceReview>

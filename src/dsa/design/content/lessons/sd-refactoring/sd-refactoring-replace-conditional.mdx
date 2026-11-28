@@ -1,0 +1,320 @@
+## Why it matters
+
+A `switch` on a type code is fine once. The same switch in six places is shotgun surgery waiting to ship a bug: each new case means finding every one, and the one you miss usually compiles. **Replace conditional with polymorphism** gives each case a single home that knows all its behaviour. Swift adds a twist, though: enums with exhaustive switches are a strong alternative to polymorphism. So the real skill, and the interview question, is choosing between a protocol, an enum and a plain table.
+
+## Recognising it
+
+The smell is a switch, or an `if`/`else if` chain, on a **type code** (a string, an integer, an enum case, or a chain of `as?` casts) that appears in several places. A news app's feed shows it well:
+
+```swift title="Before: the same switch, three times"
+struct FeedItem {
+    let kind: String          // "article", "video" or "podcast"
+    let title: String
+    let minutes: Int
+    let episode: Int?         // only podcasts have one
+}
+
+func icon(for item: FeedItem) -> String {
+    switch item.kind {
+    case "article": return "doc.text"
+    case "video": return "play.rectangle"
+    case "podcast": return "waveform"
+    default: return "questionmark"
+    }
+}
+
+func subtitle(for item: FeedItem) -> String {
+    switch item.kind {
+    case "article": return "\(item.minutes) min read"
+    case "podcast": return "Episode \(item.episode ?? 0) · \(item.minutes) min"
+    default: return "\(item.minutes) min"
+    }
+}
+
+func canDownload(_ item: FeedItem) -> Bool {
+    item.kind == "video" || item.kind == "podcast"
+}
+```
+
+Three signs give it away. The same type code is tested in several functions, which in a real app live in several files. Each new kind means visiting all of them. And `FeedItem` has grown an optional field that only one kind uses, so every other kind carries a meaningless `episode`.
+
+One switch is not a smell. Somewhere, a string from the server has to become something typed, and that switch belongs at the boundary. It's the *repetition* that hurts.
+
+## The mechanics
+
+Fowler's steps, adapted to Swift. Each leaves the code working.
+
+1. **Pin the behaviour.** A characterisation test for each function and each kind, including an unknown kind.
+2. **Create the polymorphic home**: a protocol with one requirement per switch, and one type per case. Each type holds only the data its case needs.
+3. **Create the factory at the boundary**, the one switch that stays, turning the server's code into a type.
+4. **Move one leg at a time.** Take the `"article"` branch of `icon`, make it `Article.icon`, run the tests, commit. Then the next leg.
+5. **Replace the conditional** with a call through the protocol once every leg has moved, and delete the switch.
+6. **Repeat** for the next switch.
+
+The result:
+
+```swift run
+protocol FeedContent {
+    var title: String { get }
+    var icon: String { get }
+    var subtitle: String { get }
+    var canDownload: Bool { get }
+}
+
+extension FeedContent {
+    // The usual answer, as a default for a requirement; media types override it
+    var canDownload: Bool { false }
+}
+
+struct Article: FeedContent {
+    let title: String
+    let readingMinutes: Int
+    var icon: String { "doc.text" }
+    var subtitle: String { "\(readingMinutes) min read" }
+}
+
+struct Video: FeedContent {
+    let title: String
+    let minutes: Int
+    var icon: String { "play.rectangle" }
+    var subtitle: String { "\(minutes) min" }
+    var canDownload: Bool { true }
+}
+
+struct Podcast: FeedContent {
+    let title: String
+    let minutes: Int
+    let episode: Int
+    var icon: String { "waveform" }
+    var subtitle: String { "Episode \(episode) · \(minutes) min" }
+    var canDownload: Bool { true }
+}
+
+// The one switch left: at the boundary, where the server's string becomes a type
+func content(kind: String, title: String, minutes: Int, episode: Int? = nil) -> (any FeedContent)? {
+    switch kind {
+    case "article":
+        return Article(title: title, readingMinutes: minutes)
+    case "video":
+        return Video(title: title, minutes: minutes)
+    case "podcast":
+        guard let episode else { return nil }
+        return Podcast(title: title, minutes: minutes, episode: episode)
+    default:
+        return nil
+    }
+}
+
+let feed = [
+    content(kind: "article", title: "Rain returns", minutes: 4),
+    content(kind: "podcast", title: "Morning brief", minutes: 22, episode: 118),
+    content(kind: "video", title: "Ferry rescue", minutes: 3),
+    content(kind: "livestream", title: "Election night", minutes: 0),
+].compactMap { $0 }
+
+// The feed never asks what kind an item is
+for item in feed {
+    print("[\(item.icon)] \(item.title): \(item.subtitle)\(item.canDownload ? " ↓" : "")")
+}
+```
+
+```output
+[doc.text] Rain returns: 4 min read
+[waveform] Morning brief: Episode 118 · 22 min ↓
+[play.rectangle] Ferry rescue: 3 min ↓
+```
+
+Notice the details. Each type carries only its own data, so a podcast without an episode number can't exist. The unknown `"livestream"` is dropped in one visible place, which is also where you'd log it. And `canDownload` is a requirement with a default in an extension, so `Video` and `Podcast` override it and are called correctly through `any FeedContent`.
+
+Step through what a new kind costs now:
+
+```visual flow
+title: Dispatch through a protocol
+nodes:
+  - { id: api, label: API response, kind: external, at: [0, 0] }
+  - { id: factory, label: "content(kind:)", at: [2, 0] }
+  - { id: feed, label: Feed screen, kind: view, at: [4, 0] }
+  - { id: proto, label: any FeedContent, at: [2, 2], w: 2 }
+  - { id: article, label: Article, at: [1, 4] }
+  - { id: video, label: Video, at: [2, 4] }
+  - { id: podcast, label: Podcast, at: [3, 4] }
+  - { id: live, label: Livestream, at: [4, 4] }
+edges:
+  - [api, factory, JSON]
+  - [factory, feed, items]
+  - [feed, proto, icon]
+  - [proto, article, { style: data }]
+  - [proto, video, { style: data }]
+  - [proto, podcast, { style: data }]
+  - [proto, live, { style: data }]
+steps:
+  - say: "The response says `kind: \"podcast\"`. The factory is the one place that turns that string into a type."
+    show: [api, factory, feed, proto, article, video, podcast]
+    send: api->factory
+  - say: "The feed receives a list of `any FeedContent`. It doesn't know, or need to know, which types are in it."
+    send: factory->feed
+  - say: "To draw a row it asks for the `icon` and `subtitle`, and Swift calls the podcast's own versions."
+    send: [feed->proto, proto->podcast]
+    active: [podcast]
+  - say: "Adding live streams is a new `Livestream` type and one line in the factory. The feed, and every other caller, is untouched."
+    show: [live]
+    send: proto->live
+    state: { live: ok }
+```
+
+## Three homes for the cases
+
+Polymorphism isn't the only way to give each case one home. Swift gives you three, and they fail in different ways.
+
+**A protocol with one type per case**, as above. The set of cases is *open*: a new kind is a new type and a line in the factory, with no edit to existing code, which is the [open–closed principle](/design/learn/sd-solid-ocp). Cases can hold different data, and other modules can add cases. The cost is on the other axis: adding an *operation* means a new requirement and an edit to every type, and each kind's behaviour is in its own file.
+
+**An enum whose methods switch over `self`.** The set of cases is *closed*, and the switches stay, but they all live in one type:
+
+```swift check title="The same three behaviours as an enum"
+enum FeedKind {
+    case article(readingMinutes: Int)
+    case video(minutes: Int)
+    case podcast(minutes: Int, episode: Int)
+
+    // Every switch lives here, with no default: add a case and the compiler lists each one to update
+    var icon: String {
+        switch self {
+        case .article: "doc.text"
+        case .video: "play.rectangle"
+        case .podcast: "waveform"
+        }
+    }
+
+    var subtitle: String {
+        switch self {
+        case .article(let minutes): "\(minutes) min read"
+        case .video(let minutes): "\(minutes) min"
+        case .podcast(let minutes, let episode): "Episode \(episode) · \(minutes) min"
+        }
+    }
+
+    var canDownload: Bool {
+        switch self {
+        case .article: false
+        case .video, .podcast: true
+        }
+    }
+}
+```
+
+Adding an operation is one new property. Adding a case touches every switch, but the compiler finds every one of them for you, which is most of what the refactoring was for. Associated values give each case its own data, as the separate types did. Choosing between these two is the [expression problem](/design/learn/sd-solid-expression-problem): which will you add more often, kinds or operations?
+
+**A table**, when the cases differ only in *data*. If each kind only has a different icon, label and flag, a struct of values per kind (or a dictionary from kind to that struct) is simpler than either. The ride-types kata uses both ideas at once: a shared `Tariff` for the rides that differ only in their rates, and separate types for behaviour that really differs.
+
+<Callout kind="tip">
+
+Converting a stringly-typed code into an enum with no `default:` often captures most of the value on its own, in an afternoon. Go further, to a protocol, when cases come from other modules or plug-ins, or keep arriving faster than operations.
+
+</Callout>
+
+## When not to
+
+- **Two branches in one place.** An `if` is clearer than two types and a protocol.
+- **One switch at the boundary.** Decoding a server's type field into types *is* the factory; it's meant to be there.
+- **SwiftUI view state.** `switch state { case .loading: ProgressView() … }` inside `body` is idiomatic: one switch over a view-state enum, in one place, and `@ViewBuilder` handles the different view types.
+- **Class hierarchies by habit.** In Swift, reach for protocols and value types before subclassing. Inheritance couples every subclass to the base class's implementation, and an `override` that forgets to call `super` is a classic bug.
+
+## Trade-offs
+
+| Approach | Adding a case | Adding an operation | Compiler help | Wins when |
+| --- | --- | --- | --- | --- |
+| Repeated switches on a string | edit every switch; misses compile | one new function | none | never, beyond one place |
+| Enum with switches inside it | add the case; the compiler lists every switch | one new property | exhaustive switches | a closed set, with operations added often |
+| Protocol and a type per case | a new type and one factory line | edit every type | missing requirements | an open set, cases from other modules, or very different data per case |
+| Table of values | a new row | a new column | little | cases that differ only in data |
+
+<Callout kind="interview">
+
+**What to say:** decide by how the code changes. "We add content kinds every few months and the operations are stable, so a protocol with a type per kind; the server's string becomes a type in one factory." Or: "The set is closed and we keep adding behaviour, so an enum with no `default:`." Mention the boundary switch that remains, and what happens to unknown values there.
+
+**What to ask:** How often do new cases arrive, and who adds them: this team, other modules, the server? Do the cases differ in behaviour or only in data? What should an old app version do with a case it doesn't know?
+
+**Red flags:** replacing every switch on principle; a deep class hierarchy for what an enum would do; `default:` cases in switches over your own enums; `if let video = item as? Video` chains, which are the type switch again.
+
+</Callout>
+
+<Callout kind="gotcha" title="Swift gotcha: default defeats exhaustiveness">
+
+A `default:` branch in a switch over your own enum compiles forever, including after someone adds a case that needed handling, so the compiler can no longer help. List every case. For enums from Apple's frameworks or other libraries that may grow, use `@unknown default:`: it still handles future cases, and warns you when one appears.
+
+</Callout>
+
+<Callout kind="gotcha" title="iOS gotcha: polymorphic SwiftUI views fight the type system">
+
+A protocol requirement like `func makeRow() -> some View` gives each conformer its own row type, so an array of `any FeedContent` can't build rows without erasing them into `AnyView`. That throws away the type information SwiftUI uses to diff efficiently and to keep each row's identity. Let the protocol provide *data* (icon, title, subtitle) and one row view display it, or switch over a view-state enum with `@ViewBuilder`.
+
+</Callout>
+
+## Practice
+
+The **ride types kata** is this refactoring with the tests already written: move each leg of two switches into its type, keep one factory at the boundary, and prove the picker works with a ride type it has never seen. **Adding a Family plan** shows what happens when nobody does: review a pull request that added a case to every switch it found, and missed one.
+
+```cards
+- id: when-it-smells
+  front: "When is a switch on a type code a smell?"
+  back: "When the same switch appears in several places, so each new case means finding them all. One switch at the boundary, turning a server code into a type, is fine."
+- id: mechanics
+  front: "What are the steps of replace conditional with polymorphism?"
+  back: "Pin behaviour, create a protocol and a type per case, add a factory at the boundary, move one leg at a time with the tests green, then delete the switch."
+- id: protocol-or-enum
+  front: "Protocol with types, or enum with switches?"
+  back: "Protocol when cases are open (new ones arrive often, or from other modules); enum with no `default:` when the set is closed and operations change more often. A table when cases differ only in data."
+```
+
+```quiz
+- id: q1
+  type: mcq
+  prompt: "A payments screen supports card, Apple Pay and bank transfer. Methods change about once a year, but each sprint adds an operation: a fee rule, a receipt line, an analytics name, a refund policy. Which design fits best?"
+  options:
+    - "A protocol with a type per payment method"
+    - "An enum of payment methods whose properties switch over `self`, with no `default:`"
+    - "Keep the string codes and add a switch wherever a new operation needs one"
+    - "A base class `PaymentMethod` with an overridable method per operation"
+  answer: 1
+  explain: "The set is closed and operations change often, so each new operation is one property on the enum, with every case handled in one place and the compiler checking it. With a protocol, every operation would mean editing every type."
+- id: q2
+  type: sort
+  prompt: "Which home suits each set of cases?"
+  buckets: [Protocol and types, Enum with switches, Table of values]
+  items:
+    - [Map annotation kinds that feature modules add themselves, 0]
+    - ["The four states of a download, which every screen handles differently", 1]
+    - ["Badge colours and labels for order statuses, differing only in values", 2]
+    - [Export formats where each one writes files in its own way and new ones arrive often, 0]
+    - ["Sort orders for a list, which gain new comparison rules each release", 1]
+  explain: "Cases added from outside the core, or arriving often with real behaviour, want a protocol. A closed set with changing operations wants an enum. Cases that differ only in data want a table."
+- id: q3
+  type: bug
+  prompt: "The Family plan has been added. Click the line that gives Family subscribers the wrong device limit, with no warning from the compiler."
+  code: |
+    enum Plan { case free, plus, family }
+
+    func deviceLimit(for plan: Plan) -> Int {
+        switch plan {
+        case .plus: return 3
+        default: return 1
+        }
+    }
+  answer: 6
+  explain: "`default:` quietly covers `.family`, so Family subscribers get one device. Listing every case (`case .free: return 1`) makes the compiler flag this switch the moment `.family` is added."
+- id: q4
+  type: truefalse
+  prompt: "Every `switch` over a type code should be replaced with polymorphism."
+  answer: false
+  explain: "One switch at the boundary, such as decoding a server's type field into types, is the factory and belongs there. A switch over a view-state enum in SwiftUI is idiomatic. The smell is the same switch repeated across the codebase."
+- id: q5
+  type: order
+  prompt: "Put the steps of replacing a repeated switch with polymorphism in order."
+  lines:
+    - "Write characterisation tests for each function and each case"
+    - "Declare a protocol with a requirement per switch, and a type per case"
+    - "Add a factory at the boundary that turns the type code into a type"
+    - "Move one branch at a time into its type, running the tests after each"
+    - "Call through the protocol and delete the old switch"
+  explain: "Tests first, then the new structure beside the old, then small moves with the tests green between them, and only at the end the deletion. At no point is the app broken."
+```

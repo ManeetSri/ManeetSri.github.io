@@ -1,0 +1,226 @@
+<Brief>
+
+You're on the editor team of a notes app for iPhone and iPad. A document is an ordered list of **blocks**: paragraph, heading, checklist, image, code, quote. Your team of four owns the editor core. This year, three other teams want to add their own block types: the **maps** team (a location block), the **billing** team (an invoice block), and a **partnerships** team (calendar events from other services).
+
+What you know:
+
+- About **12 block types** today; expect **40 within two years**, most written outside your team.
+- Documents have up to **5,000 blocks**. Typing must stay within one frame: 16 ms at 60 Hz, 8 ms on 120 Hz ProMotion displays.
+- The app must reach its first frame within **400 ms** of launch on a recent iPhone.
+- Documents **sync between devices**, and older app versions stay in use for months, so a document can contain block types, or newer versions of them, that a device has never heard of.
+- Everything ships in the app binary: no downloaded code.
+
+Design the **block plug-in system**: the contract a block type implements, how block types are registered and found, what the core does with blocks it can't read, and how your team keeps other teams' blocks fast and safe. Spend about 35 minutes.
+
+</Brief>
+
+```workspace
+template: component
+minutes: 35
+```
+
+<ModelAnswer section="requirements">
+
+- **Callers:** the editor core (rendering, editing, selection, drag and drop, copy and paste, undo), search indexing, export to plain text and Markdown, and the teams writing block types.
+- **Must:**
+  - Add a block type without changing the core, beyond one registration line.
+  - **Never lose data**: a block this build can't read must survive opening, editing the rest of the document, and saving, byte for byte.
+  - Each block type owns its data model and can migrate its own older versions.
+  - Stay within the typing and launch budgets with 40 types and 5,000 blocks.
+  - Searchable and exportable as text, accessible to VoiceOver.
+- **Constraints:** UI on the main actor; all blocks in one process, so a crash in a block crashes the app; plug-ins are compiled in (App Review Guideline 2.5.2).
+- **Out of scope:** real-time co-editing and third-party plug-ins from outside the company, though the contract shouldn't rule out either.
+
+</ModelAnswer>
+
+<ModelAnswer section="api">
+
+A block is stored as a `RawBlock`: an id, a kind, a version and an opaque payload. A block type turns payloads into a typed model and back, and draws it:
+
+```swift check ios title="The block contract, and one block type"
+import SwiftUI
+
+/// A block type's identity, reverse-DNS so teams can't clash: "com.acme.checklist"
+public struct BlockKind: Hashable, Sendable, Codable {
+    public let rawValue: String
+    public init(_ rawValue: String) { self.rawValue = rawValue }
+}
+
+/// A block as stored and synced. The core keeps it byte for byte, even when it can't read it.
+public struct RawBlock: Codable, Sendable, Identifiable {
+    public let id: UUID
+    public var kind: BlockKind
+    public var version: Int
+    public var payload: Data
+}
+
+/// What a block may use from the editor: deliberately narrow
+@MainActor public struct BlockContext {
+    public let isEditable: Bool
+    public let openURL: (URL) -> Void
+    public let log: (String) -> Void
+}
+
+/// The contract every block type implements
+public protocol BlockType: Sendable {
+    associatedtype Model: Codable & Sendable & Equatable
+    static var kind: BlockKind { get }
+    static var currentVersion: Int { get }
+    /// Decodes this version or any older one, migrating as it goes
+    static func decode(_ payload: Data, version: Int) throws -> Model
+    static func encode(_ model: Model) throws -> Data
+    /// Text for search and plain-text export. Pure, so it can run off the main actor.
+    static func plainText(of model: Model) -> String
+    @MainActor static func makeView(model: Binding<Model>, context: BlockContext) -> AnyView
+}
+
+extension BlockType {
+    public static func encode(_ model: Model) throws -> Data { try JSONEncoder().encode(model) }
+}
+
+// A block type from the tasks team
+public enum ChecklistBlock: BlockType {
+    public struct Model: Codable, Sendable, Equatable {
+        public var items: [Item]
+        public struct Item: Codable, Sendable, Equatable {
+            public var text: String
+            public var done: Bool
+        }
+    }
+
+    public static let kind = BlockKind("com.acme.checklist")
+    public static let currentVersion = 2
+
+    public static func decode(_ payload: Data, version: Int) throws -> Model {
+        switch version {
+        case 1:
+            // Version 1 stored a list of strings, none of them done
+            let texts = try JSONDecoder().decode([String].self, from: payload)
+            return Model(items: texts.map { .init(text: $0, done: false) })
+        default:
+            return try JSONDecoder().decode(Model.self, from: payload)
+        }
+    }
+
+    public static func plainText(of model: Model) -> String {
+        model.items.map { ($0.done ? "[x] " : "[ ] ") + $0.text }.joined(separator: "\n")
+    }
+
+    @MainActor public static func makeView(model: Binding<Model>, context: BlockContext) -> AnyView {
+        AnyView(ForEach(model.items.indices, id: \.self) { index in
+            Toggle(model.wrappedValue.items[index].text, isOn: model.items[index].done)
+                .disabled(!context.isEditable)
+        })
+    }
+}
+```
+
+Registration, in the app's composition root: `registry.register(ChecklistBlock.self)`. Each team's module exposes one `register(in:)` function that registers its types, so the app target has one line per team. Block types are caseless enums with static members: registering one costs a dictionary write, not an object.
+
+</ModelAnswer>
+
+<ModelAnswer section="internals">
+
+- **Document model:** an array of `RawBlock`s. The core never needs to understand a payload to keep, move, delete, copy or sync a block.
+- **Registry:** a dictionary from `BlockKind` to a type-erased entry, built once at launch from each `BlockType` with generic helpers: closures for decode, encode, plain text and make-view. That's the only place the associated type is erased. Duplicate kinds trip an assertion in debug builds; in release the first registration wins and the clash is logged.
+- **Rendering a block** (in a lazy list or a collection view keyed by block id): look up the kind. If it's known and the block's `version` is no newer than `currentVersion`, decode the payload (cached by block id and a payload hash) and call `makeView` with a binding. Otherwise render the core's **placeholder block**: "This block needs a newer version of the app", read-only, with the raw payload untouched.
+- **Editing:** the binding's setter re-encodes the model into the block's payload and records the change. The **core** owns undo (it stores the old and new `RawBlock`, so plug-ins needn't implement it), autosave (debounced writes) and sync.
+- **Side effects through events:** after a change, the core publishes `BlockChanged(id)`; the search indexer and the outline sidebar subscribe. Nothing in the editing path waits for them.
+- **Versioning the contract:** new requirements arrive with default implementations in a protocol extension, so existing block types still compile; anything bigger is a `BlockTypeV2` protocol that the registry adapts.
+- **Kill switch:** a remote flag can disable a kind, so the registry treats it as unknown and shows the placeholder: a safe way out of a crashing block without a release.
+
+</ModelAnswer>
+
+<ModelAnswer section="concurrency">
+
+- **The registry is frozen after launch.** It's filled during startup, then read-only, so it's safe to read from any thread or actor without a lock. Registration after `freeze()` is a programmer error.
+- **Document state** belongs to the editor, on the main actor. Block models are `Sendable` value types, so the core and plug-ins never share mutable state.
+- **Opening a large document:** read and decode the raw blocks off the main actor (they're `Sendable` values), then hand the array to the editor. Typed models are decoded lazily, only for blocks about to appear.
+- **Search indexing** runs on its own actor, consuming `BlockChanged` events and calling `plainText(of:)`, which the contract requires to be pure and non-isolated.
+- **Views** are created only on the main actor, as the contract's `@MainActor` says, so a block can't touch UI from a background thread without the compiler objecting.
+
+</ModelAnswer>
+
+<ModelAnswer section="failure">
+
+- **Unknown kind, or a newer version than this build knows:** the placeholder block. It can be moved or deleted (with confirmation) but not edited, and its payload is saved exactly as received, so the newer device still sees a working block.
+- **A payload that fails to decode:** the same placeholder, saying "This block couldn't be shown", plus a log line with the kind and version, never the content.
+- **A block that crashes:** it takes the app down, because plug-ins share the process. Mitigations: the contract test suite below, payload fuzzing in CI, crash reports tagged with the kind of the block being rendered, staged rollout of new kinds behind flags, and the kill switch.
+- **A slow block:** signposts around each kind's `makeView` and decode; a CI performance test renders 200 blocks of every kind against a per-block budget (say 2 ms to create a view).
+- **Misuse:** a block can't reach other blocks or the document, because `BlockContext` doesn't offer them. A capability a block needs is added to the context deliberately, by the core team.
+- **Copy and paste between apps:** the core writes the raw block under a custom type identifier and, alongside it, the block's plain text, so pasting into Mail still gives something sensible.
+
+</ModelAnswer>
+
+<ModelAnswer section="testing">
+
+- **A contract test suite every block type runs**, written once by the core team and applied to each `BlockType`: encode then decode returns an equal model; every recorded older payload (fixtures checked into the block's module) still decodes; `plainText` is non-empty for non-empty models; `makeView` doesn't crash for an empty model or a very large one.
+- **Core tests with fake block types:** registration and duplicates, freezing, the placeholder for unknown kinds and newer versions, and a **golden-file test**: open a document containing an unknown block, edit another block, save, and check the unknown block's bytes are identical.
+- **Performance tests** opening a 5,000-block document and typing into it, with a time budget.
+- **A demo app per team** that hosts their blocks in the real editor core, so they iterate without building the whole app.
+
+</ModelAnswer>
+
+<ModelAnswer section="tradeoffs">
+
+- **A registry over an enum with a `switch`:** with 40 kinds from four teams, a switch makes the core team a bottleneck for every new block. The cost is losing exhaustive checking, which the placeholder and the contract tests make up for.
+- **Opaque payloads per block over one shared schema:** teams evolve their data independently, and old builds can preserve what they don't understand. The cost is that the core can't query inside blocks, which it doesn't need to.
+- **Typed models with erasure only in the registry, over `Data` everywhere:** block code gets the compiler's help; the erasure is written once.
+- **In-process plug-ins over separate processes:** isolation would need app extensions, which don't fit inline editing and add inter-process costs on every keystroke. We accept the crash risk and manage it with tests, crash attribution and kill switches.
+- **Lazy decoding over decoding everything on open:** fast opens and low memory for large documents, at the cost of a decode cache to manage.
+- **Rejected for now:** server-driven blocks (display-only blocks rendered from a JSON description) would let partnerships ship simple blocks without a release; worth revisiting if most of their blocks turn out to be display-only.
+
+</ModelAnswer>
+
+```rubric
+- id: contract
+  label: Designed a small, typed, versioned contract
+  skill: api
+  look_for:
+    - A typed model per block type, with encode and decode and migration of older versions
+    - A narrow context instead of access to the editor's internals
+    - A plan for changing the contract without breaking existing block types
+- id: unknown
+  label: Never lost data the build couldn't read
+  skill: data
+  look_for:
+    - Blocks stored with kind, version and an opaque payload the core preserves
+    - A placeholder for unknown kinds and newer versions, read-only
+    - Unknown blocks saved back byte for byte
+- id: registry
+  label: Registered and found block types cleanly
+  skill: client
+  look_for:
+    - Registration in the composition root, with no instances made at launch
+    - Duplicate kinds detected
+    - The core never importing a block type
+- id: performance
+  label: Kept typing and launch within budget
+  skill: performance
+  look_for:
+    - Lazy decoding and view creation for large documents
+    - Per-kind measurement (signposts or performance tests) with a budget
+- id: safety
+  label: Kept other teams' blocks safe to ship
+  skill: testing
+  look_for:
+    - A shared contract test suite every block type runs
+    - Crash attribution by kind, and a remote kill switch
+    - Acknowledged that in-process plug-ins can crash the app
+- id: tradeoffs
+  label: Weighed the alternatives
+  skill: tradeoffs
+  look_for:
+    - Registry vs enum and switch, with the cost of losing exhaustiveness
+    - In-process vs separate processes
+```
+
+<Pitfalls>
+
+- Dropping blocks the build doesn't recognise, so the next save deletes another device's data.
+- A contract that passes the whole document or editor to each block, so blocks start depending on each other.
+- Creating every block type's objects at launch, then wondering where the 400 ms went.
+- Assuming plug-ins are isolated: in one process, one bad block crashes the app.
+- Making every block type implement undo, sync or persistence itself, instead of the core owning them once.
+
+</Pitfalls>

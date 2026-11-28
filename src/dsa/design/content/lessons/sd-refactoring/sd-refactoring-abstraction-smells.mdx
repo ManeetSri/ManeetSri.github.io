@@ -1,0 +1,271 @@
+## Why it matters
+
+Abstractions are how a large app stays understandable, and they fail in two opposite ways. A **leaky abstraction** hides too little: its callers end up depending on the details it promised to hide. **Speculative generality** builds for a future that never comes: protocols, layers and generic parameters that every reader pays for and nobody uses. Interviewers listen for both when you design a networking or persistence layer. Core Data objects reaching the view is a red flag; so is a protocol in front of every class.
+
+## Leaky abstractions
+
+Joel Spolsky's *law of leaky abstractions* (2002) says that every non-trivial abstraction leaks to some degree. You can't make leaks disappear, so the useful questions are whether a leak is **bounded** (it stops at a known edge) and **honest** (the API admits it).
+
+These four leaks turn up in most iOS codebases:
+
+1. **Managed objects escaping the store.** A repository that returns `NSManagedObject`s hands its callers Core Data's rules: use each object only on its context's queue, expect it to fault, and never touch it after the context resets or the object is deleted. Managed objects aren't `Sendable` either, so they can't cross actors. SwiftData has the same shape: `@Model` objects belong to their `ModelContext`, and what crosses actors is a `PersistentIdentifier`.
+2. **Transport errors in the UI.** A view model that checks for `URLError.notConnectedToInternet` or an HTTP 401 knows how requests travel. Swap the transport, or write a test double that fails its own way, and the screen behaves differently.
+3. **Query details in the caller.** The screen builds an `NSPredicate` format string, or carries the server's pagination cursor around, so the storage format is now part of the UI.
+4. **Hidden costs.** A computed property `var notes: [Note]` that runs a fetch on every access looks free, so someone reads it in a loop or in a SwiftUI `body`. An abstraction that hides its cost invites misuse.
+
+Some things can't be hidden, and shouldn't be. A network call is slow sometimes and fails sometimes. An API that pretends otherwise, like a property that silently fetches, leaks in the worst way: at run time, under load, on a train. `async throws` is an honest leak. It says "this can take a while and it can fail", and the compiler makes every caller deal with both. Pretending a remote call is local is the root of the classic *fallacies of distributed computing*: assuming the network is reliable and latency is zero.
+
+Here's the Core Data leak fixed. Managed objects are created, read and dropped inside `perform`, on the context's own queue, and only plain values and the app's own errors come out:
+
+```swift check group=notes title="A store that doesn't leak"
+import CoreData
+
+// What callers get: plain values that can cross actors and outlive any context
+struct Note: Sendable, Hashable, Identifiable {
+    let id: UUID
+    var title: String
+    var isPinned: Bool
+}
+
+// What can go wrong, in the app's words rather than Core Data's
+enum NotesError: Error {
+    case storageUnavailable
+}
+
+protocol NotesStore: Sendable {
+    func pinnedNotes() async throws(NotesError) -> [Note]
+}
+
+final class CoreDataNotesStore: NotesStore {
+    private let container: NSPersistentContainer
+
+    init(container: NSPersistentContainer) {
+        self.container = container
+    }
+
+    func pinnedNotes() async throws(NotesError) -> [Note] {
+        let context = container.newBackgroundContext()
+        do {
+            // Managed objects are created, read and dropped inside perform, on the context's queue
+            return try await context.perform {
+                let request = NSFetchRequest<NSManagedObject>(entityName: "CDNote")
+                request.predicate = NSPredicate(format: "pinned == YES")
+                return try context.fetch(request).compactMap(Note.init(managed:))
+            }
+        } catch {
+            throw .storageUnavailable
+        }
+    }
+}
+
+private extension Note {
+    init?(managed: NSManagedObject) {
+        guard let id = managed.value(forKey: "id") as? UUID,
+              let title = managed.value(forKey: "title") as? String else { return nil }
+        self.init(id: id, title: title, isPinned: managed.value(forKey: "pinned") as? Bool ?? false)
+    }
+}
+```
+
+Three details carry the design. The protocol speaks the app's language: `pinnedNotes()`, not `fetch(predicate:)`. The error is typed (`throws(NotesError)`, Swift 6), so callers know the complete list of failures and none of them mention Core Data. And the entity name and predicate syntax live in one file, which is the only file that changes if you move to SwiftData or SQLite.
+
+Mapping at the boundary has a cost: a struct per entity and the code that copies fields across. For a small app that shows Core Data objects in one or two screens, binding them directly can be the right trade. The leak starts hurting when managed objects spread across many screens and background tasks.
+
+```visual flow
+title: A repository that leaks its storage
+nodes:
+  - { id: view, label: NotesView, kind: view, at: [0, 0] }
+  - { id: model, label: NotesModel, at: [2, 0] }
+  - { id: store, label: NotesStore, at: [4, 0] }
+  - { id: coredata, label: Core Data, kind: db, at: [4, 2] }
+edges:
+  - [view, model, notes]
+  - [model, store, notes]
+  - [store, coredata, fetch, { style: data }]
+steps:
+  - say: The view asks its model for notes, and the model asks the store.
+    send: [view->model, model->store]
+  - say: The store fetches from Core Data.
+    send: store->coredata
+  - say: "In the leaky version, it returns the **managed objects** themselves, and they travel up to the view."
+    send: [coredata->store, store->model, model->view]
+    label: { model->store: NSManagedObject, view->model: NSManagedObject }
+  - say: "Now the model and the view hold objects tied to one context's queue. Read one from another thread, or after the context resets, and it faults or crashes. The boundary leaked."
+    state: { model: error, view: error }
+  - say: "The fix: map to a `Note` struct inside `perform`. Only plain, `Sendable` values cross the boundary, and Core Data's rules stay in one file."
+    send: [store->model, model->view]
+    state: { model: ok, view: ok, store: ok }
+    label: { model->store: Note, view->model: Note }
+```
+
+## Speculative generality
+
+Fowler names **speculative generality** after the sentence that produces it: "I think we'll need to do this kind of thing someday." It shows up in Swift codebases as:
+
+- a protocol with exactly one conformer and no test double, such as `UserServiceProtocol` and `UserService`;
+- a `BaseViewController<ViewModel: ViewModelType>` hierarchy built for screens that don't exist yet;
+- a generic `Repository<Entity, ID, Query, Sort>` used by one feature;
+- options, parameters and hooks that nothing passes or reads;
+- a plug-in registry with one plug-in.
+
+Here's a typical one. It was built for "every list screen we'll ever have", and one screen uses it:
+
+```swift check title="Before: generality nobody asked for"
+protocol ListDataSource: Sendable {
+    associatedtype Item: Sendable
+    associatedtype Query: Sendable
+    func fetch(_ query: Query, page: Int, pageSize: Int) async throws -> [Item]
+}
+
+@MainActor class BaseListViewModel<Source: ListDataSource> {
+    let source: Source
+    private(set) var items: [Source.Item] = []
+    var pageSize = 20                  // nobody changes it
+    var onWillLoad: (() -> Void)?      // nobody sets it
+    var transform: (([Source.Item]) -> [Source.Item])?   // nobody sets it
+
+    init(source: Source) {
+        self.source = source
+    }
+
+    func load(_ query: Source.Query) async throws {
+        onWillLoad?()
+        let page = try await source.fetch(query, page: 0, pageSize: pageSize)
+        items = transform?(page) ?? page
+    }
+}
+
+struct PinnedQuery: Sendable {}
+
+struct NotesListSource: ListDataSource {
+    func fetch(_ query: PinnedQuery, page: Int, pageSize: Int) async throws -> [String] { [] }
+}
+
+final class NotesListViewModel: BaseListViewModel<NotesListSource> {}
+```
+
+The costs are real even though nothing is broken:
+
+- **Every reader pays.** Jump to definition lands on a protocol or a generic base class, and the reader has to work out which of the hooks are live (none of them).
+- **The guess is usually wrong.** When a second list screen does arrive, it tends to vary along an axis nobody predicted, such as sections or live updates. The abstraction then has to be bent or undone before the real work can start. Sandi Metz's advice applies: [the wrong abstraction](/design/learn/sd-principles-dry) costs more than duplication.
+- **The compiler pays too.** Deep generic hierarchies slow type-checking, and the type-erasing wrappers they tend to grow (`AnyListDataSource`) are boilerplate that exists only to undo the generics.
+
+The refactorings run in reverse: **inline class**, **collapse hierarchy**, **remove parameter**, and replacing a generic with the one concrete type it's used with. The after version is plainer and does more:
+
+```swift check group=notes title="After: named for what it does"
+import Observation
+
+// One protocol, NotesStore, which exists because tests and previews need a stand-in
+@MainActor @Observable
+final class PinnedNotesModel {
+    private(set) var notes: [Note] = []
+    private(set) var failed = false
+    private let store: any NotesStore
+
+    init(store: any NotesStore) {
+        self.store = store
+    }
+
+    func load() async {
+        do {
+            notes = try await store.pinnedNotes()
+        } catch {
+            failed = true
+        }
+    }
+}
+```
+
+So when is a protocol with one production conformer *not* speculative? When something else conforms to it today: a test double, a preview fake, a second platform. The variation it abstracts is real. The usual rule of thumb is the **rule of three**: notice a pattern the second time, abstract it the third, when you can see which parts actually vary. It's [YAGNI](/design/learn/sd-principles-simplicity) applied to structure.
+
+## Trade-offs
+
+| Choice | Readability | Leak risk | Flexibility | Wins when |
+| --- | --- | --- | --- | --- |
+| No abstraction (use the framework directly) | high | the framework spreads | low | one or two call sites, or a prototype |
+| A thin wrapper that passes types through | medium | high: callers still see the framework | low | wrapping only to make tests possible |
+| A deep module with its own types | high for callers | low | medium | many callers, or a likely change of framework |
+| A generic framework for future cases | low | low | high, on the axes you guessed | three real cases already vary the same way |
+
+<Callout kind="interview">
+
+**What to say:** when you introduce an abstraction, say what it hides and what it deliberately exposes. "The store hides Core Data entirely and returns `Sendable` structs; it exposes latency and failure as `async throws(NotesError)`." Then say why it exists today: a second implementation, test doubles, a planned migration.
+
+**What to ask:** How many implementations does this need now? Is moving off this framework likely? Where do the objects it returns end up: one screen, or across actors and background work?
+
+**Red flags:** a protocol in front of every class "for testability" when nothing is ever substituted; managed objects or `URLError` reaching views; "we might need it later" as the reason for a layer.
+
+</Callout>
+
+<Callout kind="gotcha" title="Swift gotcha: associated types breed type erasure">
+
+A protocol with an `associatedtype` can't be stored as a plain value before Swift 5.7, which is why older codebases are full of `AnyRepository` and `AnyDataSource` wrappers. Today you can write `any ListDataSource<Item>` with a primary associated type, but each layer of generics still costs readers and compile time. If a protocol has associated types and one conformer, inlining it usually deletes the eraser too.
+
+</Callout>
+
+<Callout kind="gotcha" title="iOS gotcha: SwiftData models don't cross actors">
+
+`@Model` classes aren't `Sendable`, and each instance belongs to the `ModelContext` that fetched it. Swift 6 flags passing one into a background task or a `@ModelActor` as a data-race risk, and it's right to. Pass its `persistentModelID` (a `PersistentIdentifier`, which is `Sendable`) and fetch it again on the other side, or map to a struct at the boundary as above.
+
+</Callout>
+
+## Practice
+
+**The profile sync** review has both smells: protocols that leak URLSession errors and Core Data entity names, and an options type full of settings nothing reads. It also practises the next lesson's callback and stringly-typed smells.
+
+```cards
+- id: leaky
+  front: "What makes a leaky abstraction acceptable?"
+  back: "When the leak is bounded (it stops at a known edge) and honest (the API admits it, as `async throws` admits latency and failure). Hidden leaks, like managed objects escaping a store, are the costly ones."
+- id: map-at-boundary
+  front: "How do you stop Core Data leaking out of a repository?"
+  back: "Fetch and read managed objects inside `perform`, map them to `Sendable` structs there, and translate errors into the app's own error type."
+- id: speculative
+  front: "When is a protocol with one production conformer not speculative generality?"
+  back: "When something else conforms to it today, such as a test double or preview fake. Abstract real variation; wait for the third case to generalise."
+```
+
+```quiz
+- id: q1
+  type: mcq
+  prompt: "A `NotesRepository` returns `[NSManagedObject]` from its view context. A background task now needs the notes to build a search index. What's the best change?"
+  options:
+    - "Pass the managed objects to the task and read them there"
+    - "Mark the managed objects `@unchecked Sendable`"
+    - "Have the repository map to `Sendable` `Note` structs inside `perform`, and return those to both callers"
+    - "Give the background task its own copy of the repository's view context"
+  answer: 2
+  explain: "Managed objects belong to their context's queue, so reading them from a background task is a data race and a crash risk; `@unchecked Sendable` only silences the compiler. Sharing the view context moves the same problem. Mapping to plain values at the boundary stops the leak for every caller."
+- id: q2
+  type: multi
+  prompt: "Which of these are leaky abstractions?"
+  options:
+    - "A view model that shows an offline banner when it catches `URLError.notConnectedToInternet`"
+    - "A store method declared `async throws(NotesError)`"
+    - "A repository that takes an `NSPredicate` format string from the screen"
+    - "A computed `var notes: [Note]` that runs a database fetch on every access"
+    - "A `Note` struct mapped from a managed object inside the store"
+  answer: [0, 2, 3]
+  explain: "The banner logic knows the transport's error type, the screen knows the storage's query language, and the property hides a real cost. `async throws(NotesError)` exposes latency and failure honestly in the app's own terms, and mapping to structs is how you stop a leak."
+- id: q3
+  type: truefalse
+  prompt: "`protocol AnalyticsTracking` has one production conformer, and the tests use a spy that conforms to it. That's speculative generality."
+  answer: false
+  explain: "The spy is a second conformer that exists today, so the protocol abstracts real variation: production versus test. Speculative generality is abstraction with nothing on the other side of it."
+- id: q4
+  type: sort
+  prompt: "Is each of these a leak, speculative generality, or reasonable?"
+  buckets: [Leaky abstraction, Speculative generality, Reasonable]
+  items:
+    - [A screen that reads the server's next-page cursor from the repository's result, 0]
+    - ["A `Repository<Entity, ID, Query, Sort>` used by one feature", 1]
+    - ["An `onWillLoad` hook that nothing sets", 1]
+    - ["A store returning `[Note]` structs and throwing `NotesError`", 2]
+    - ["`NSManagedObject`s passed into a SwiftUI view", 0]
+    - [Using URLSession directly in a two-screen prototype, 2]
+  explain: "Leaks put the hidden layer's details in the caller's hands. Speculative generality is flexibility nobody uses. Plain types at a boundary are the goal, and skipping an abstraction is fine when there are only a couple of call sites and nothing varies."
+- id: q5
+  type: recall
+  prompt: "A teammate proposes a generic `BaseListViewController<Item, Cell, Source>` because \"we'll have lots of lists\". The app has one list today. What do you say?"
+  model: "Build the one list plainly, and look again when the second and third arrive. We can't see yet which parts will vary (sections? live updates? pagination?), and a generic base guessed now will probably vary on the wrong axis, so we'd have to undo it first. In the meantime every reader pays for the indirection. If two real lists share code later, extract what's actually common, probably a small helper or a cell configuration, not a base class."
+```

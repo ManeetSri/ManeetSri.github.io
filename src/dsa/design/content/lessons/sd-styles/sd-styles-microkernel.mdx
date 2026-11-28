@@ -1,0 +1,284 @@
+## Why it matters
+
+Some products have a small, stable core and a long, growing list of things plugged into it: card types in a feed, block types in an editor, payment methods, deep-link handlers, tools in a debug menu, mini-apps inside a super-app. The microkernel style is how you let other teams add to that list without editing the core each time. You also live inside one: iOS is a plug-in host, and every widget, share extension and keyboard you ship is a plug-in. "How would other teams add a new card type?" is a common follow-up in feed and super-app interviews.
+
+## The idea
+
+A microkernel architecture has two kinds of part:
+
+- **The core system** (the kernel): the minimum the product needs to run, plus the **contract** that plug-ins implement and a **registry** that knows which plug-ins exist.
+- **Plug-ins**: independent components that add features by implementing the contract.
+
+The constraints:
+
+1. **The core depends on the contract, never on a plug-in.** It can't `import PollCard`.
+2. **Plug-ins depend on the contract, never on each other.** If two plug-ins must cooperate, they do it through the core.
+3. **Something outside both does the wiring.** In an app, that's the composition root at launch.
+
+That buys **extensibility** (a new card type is a new module plus one registration line), **isolation of change** (a bug in the poll card can't be in the text card), and **parallel work** (each team owns its plug-ins). It costs the design of the contract, which is the hardest part, because every plug-in depends on it.
+
+## A feed with plug-in cards
+
+```swift run title="A registry of card plug-ins"
+// The contract: the only thing the core and the plug-ins share
+struct FeedItem {
+    let kind: String
+    let fields: [String: String]
+}
+
+protocol CardPlugin {
+    static var kind: String { get }
+    func render(_ item: FeedItem) -> String
+}
+
+// The core: it knows the contract, never a concrete plug-in
+final class CardRegistry {
+    private var factories: [String: () -> any CardPlugin] = [:]
+    private var made: [String: any CardPlugin] = [:]
+    private let fallback: any CardPlugin
+
+    init(fallback: any CardPlugin) {
+        self.fallback = fallback
+    }
+
+    /// Register a factory, not an instance, so launch stays cheap: plug-ins are made on first use
+    func register<Plugin: CardPlugin>(_ type: Plugin.Type, make: @escaping () -> Plugin) {
+        precondition(factories[Plugin.kind] == nil, "Two plug-ins claim the kind \(Plugin.kind)")
+        factories[Plugin.kind] = make
+    }
+
+    func render(_ item: FeedItem) -> String {
+        if let plugin = made[item.kind] {
+            return plugin.render(item)
+        }
+        guard let make = factories[item.kind] else {
+            return fallback.render(item)
+        }
+        let plugin = make()
+        made[item.kind] = plugin
+        return plugin.render(item)
+    }
+}
+
+// Plug-ins, each owned by a different team
+struct TextCard: CardPlugin {
+    static let kind = "text"
+    func render(_ item: FeedItem) -> String { "Text: \(item.fields["body", default: ""])" }
+}
+
+struct PollCard: CardPlugin {
+    static let kind = "poll"
+    func render(_ item: FeedItem) -> String {
+        let options = item.fields["options", default: ""].split(separator: "|")
+        return "Poll: \(item.fields["question", default: "?"]) (\(options.count) options)"
+    }
+}
+
+struct UpdateNeededCard: CardPlugin {
+    static let kind = "fallback"
+    func render(_ item: FeedItem) -> String { "Update the app to see this \(item.kind) post" }
+}
+
+// The composition root is the one place that knows every plug-in
+let registry = CardRegistry(fallback: UpdateNeededCard())
+registry.register(TextCard.self) { TextCard() }
+registry.register(PollCard.self) { PollCard() }
+
+let feed = [
+    FeedItem(kind: "text", fields: ["body": "Shipping v2 today"]),
+    FeedItem(kind: "poll", fields: ["question": "Tabs or spaces?", "options": "Tabs|Spaces|Both"]),
+    FeedItem(kind: "live-audio", fields: ["room": "42"]),
+]
+for item in feed {
+    print(registry.render(item))
+}
+```
+
+```output
+Text: Shipping v2 today
+Poll: Tabs or spaces? (3 options)
+Update the app to see this live-audio post
+```
+
+Three decisions in that code are the ones that matter in any plug-in system:
+
+- **A fallback for unknown kinds.** The server will send kinds that old builds don't have. The core must degrade, not crash or drop the item silently.
+- **Factories, not instances.** Registering 40 plug-ins at launch should cost 40 dictionary writes, not 40 view models built before the first frame.
+- **Duplicate claims fail loudly.** Two plug-ins claiming `poll` is a wiring bug; a `precondition` in debug finds it on the first launch instead of in a bug report. In production, you might log and keep the first.
+
+A real card contract returns a view, not a string: `@MainActor func makeView(for item: FeedItem) -> AnyView`, or a `UIView` for UIKit. The shape is the same.
+
+## Watching the registry work
+
+```visual flow
+title: The core asks the registry; the registry picks a plug-in
+nodes:
+  - { id: root, label: Composition root, kind: client, at: [0, 0] }
+  - { id: core, label: Feed core, kind: service, at: [0, 2] }
+  - { id: registry, label: Card registry, kind: service, at: [2, 1] }
+  - { id: text, label: Text card, kind: view, at: [4, 0] }
+  - { id: poll, label: Poll card, kind: view, at: [4, 1] }
+  - { id: fallback, label: Update-needed card, kind: view, at: [4, 2] }
+groups:
+  - { id: kernel, label: Core system, nodes: [core, registry] }
+  - { id: plugins, label: Plug-ins, nodes: [text, poll, fallback] }
+edges:
+  - [root, registry, register]
+  - [core, registry, card for kind]
+  - [registry, text]
+  - [registry, poll]
+  - [registry, fallback]
+steps:
+  - say: At launch, the composition root registers each plug-in's factory. The feed core never imports a plug-in.
+    send: root->registry
+  - say: A `poll` item arrives. The core asks the registry for the card for that kind.
+    send: core->registry
+  - say: The registry makes the poll plug-in on first use, and it renders the item.
+    send: registry->poll
+    state: { poll: ok }
+  - say: A `live-audio` item comes from a newer server. No plug-in claims it, so the fallback asks the user to update, and the feed keeps working.
+    send: registry->fallback
+    state: { poll: null, fallback: wait }
+```
+
+## Designing the contract
+
+The contract is a public API with many implementers, so it's expensive to change. A few rules keep it healthy:
+
+- **Small and stable.** Give plug-ins what they need (the item, a way to open a URL, a way to log) through a narrow **context** the core passes in, not access to the core's internals.
+- **Version it.** When the contract must change, add a new protocol (`CardPluginV2`) or new requirements with default implementations in an extension, so existing plug-ins still compile. Deprecate before removing.
+- **Plug-ins talk through the core.** If the poll card needs the user's profile, the context provides it. Two plug-ins importing each other recreate the coupling the style exists to remove.
+- **Give each plug-in a contract test.** The core team ships one test suite that every plug-in runs: renders an empty item without crashing, handles missing fields, renders in under a frame. It's how a core team keeps 30 plug-ins honest.
+
+This is the open–closed principle at architecture scale: the core is closed for modification and open for extension. It's also a choice about [the expression problem](/design/learn/sd-solid-expression-problem) from D04: a protocol makes **adding new kinds** easy, at the cost of making **a new operation** on every kind expensive, because every plug-in must implement it.
+
+## Plug-ins on iOS: compiled in, chosen at runtime
+
+On the desktop, plug-ins are often loaded from disk at runtime. An iOS app can't do that with code it downloads: App Review Guideline 2.5.2 rules out downloading code that adds or changes features. So in-app plug-ins are **compiled in**, and "dynamic" means **selected at runtime**: by the server's item kinds, a feature flag, or the user's region.
+
+Apple's own plug-in system is different again. **App extensions** (widgets, share extensions, keyboards, notification service extensions) are plug-ins to the system, each declared against an *extension point* in its `Info.plist`, and each runs in **its own process**. That gives real isolation (a crashing widget doesn't take your app down) at the price of separate memory limits and no shared in-memory state. Your in-app plug-ins share one process: one plug-in that crashes takes the whole app with it.
+
+## Shared kernels
+
+The **shared kernel** is a related idea from domain-driven design (Eric Evans). Two teams or bounded contexts agree to share a *small* part of the model, such as `Money` or `UserID`, and to change it only together. In an app, it's the small foundation module every feature imports:
+
+```swift check title="SharedKernel: types every feature agrees on"
+/// A user's identity, shared so Checkout and Profile mean the same thing by "user"
+public struct UserID: Hashable, Sendable, Codable {
+    public let rawValue: String
+
+    public init(_ rawValue: String) {
+        self.rawValue = rawValue
+    }
+}
+
+/// An amount in minor units (pence, cents), so no feature ever adds money as Double
+public struct Money: Hashable, Sendable, Codable {
+    public let minorUnits: Int
+    public let currencyCode: String
+
+    public init(minorUnits: Int, currencyCode: String) {
+        self.minorUnits = minorUnits
+        self.currencyCode = currencyCode
+    }
+}
+```
+
+A shared kernel trades coordination for consistency: everyone agrees what `Money` is, and every change needs everyone's agreement. The failure mode is familiar: the "Common" or "Core" module that grows a networking client, three managers and a date extension, until every change rebuilds the app and every team waits for review. Keep it to value types that rarely change. The package principles from D05 ([REP, CCP and CRP](/design/learn/sd-principles-package-cohesion)) are the test: if a feature imports the kernel and uses one type in ten, the kernel is too big.
+
+## Trade-offs
+
+| | A `switch` over an enum in the core | In-app plug-in registry | App extensions (separate processes) |
+| --- | --- | --- | --- |
+| Add a new kind | Edit the core | Add a module and one registration | Add a target |
+| Who can add one | The core team | Any team | Any team, within Apple's extension points |
+| Compiler checks every kind is handled | Yes, exhaustively | No: unknown kinds need a fallback | Not applicable |
+| A broken plug-in can crash | The app | The app | Only itself |
+| Cost | Lowest | A contract to design and version | Inter-process data sharing, memory limits |
+| Best for | A few kinds, one team | Many kinds, several teams | Features the system hosts (widgets, sharing, keyboards) |
+
+The `switch` wins more often than people expect: with five card types owned by one team, exhaustive checking is worth more than extensibility. Move to a registry when other teams need to add kinds without waiting for yours.
+
+<Callout kind="interview">
+
+**Say:** "The feed core knows a `CardPlugin` protocol and a registry; each card type is a module that registers at launch. Unknown kinds from a newer server render a fallback." Then go straight to the contract: what's in the context, how it's versioned, how plug-ins are tested.
+
+**Ask:** how many kinds there will be, who builds them, and whether the server can send kinds older apps don't know.
+
+**Red flags:** downloading plug-in code at runtime; plug-ins that import each other; a contract that hands plug-ins the whole app container; no plan for unknown kinds.
+
+</Callout>
+
+<Callout kind="gotcha" title="iOS gotcha: extensions don't share your app's memory">
+
+A widget or share extension can't see your app's singletons, caches or logged-in session object, because it's a different process. Share data through an App Group container (files, a shared SwiftData or Core Data store, or `UserDefaults(suiteName:)`), share credentials through a Keychain access group, and expect the extension to run when your app isn't running at all.
+
+</Callout>
+
+## Practice
+
+The design exercise asks you to design a block plug-in system for a notes editor: the contract, the registry, unknown blocks from newer versions, and how a core team keeps other teams' blocks fast and safe.
+
+```cards
+- id: microkernel-parts
+  front: "What are the parts of a microkernel architecture?"
+  back: "A minimal core with a contract and a registry, and plug-ins that implement the contract. The core never depends on a plug-in; plug-ins never depend on each other; the composition root wires them."
+- id: plugin-decisions
+  front: "Three decisions every in-app plug-in system needs?"
+  back: "A fallback for unknown kinds, lazy factories so launch stays cheap, and loud failure when two plug-ins claim the same kind."
+- id: ios-plugins
+  front: "Why are in-app plug-ins compiled in on iOS?"
+  back: "App Review Guideline 2.5.2 rules out downloading code that adds or changes features, so plug-ins ship in the binary and are selected at runtime by data or flags."
+- id: shared-kernel
+  front: "What is a shared kernel, and its failure mode?"
+  back: "A small part of the model that several teams share and change only together. It fails by growing into a Common module that everything depends on and nobody can change."
+```
+
+```quiz
+- id: q1
+  type: mcq
+  prompt: "One team owns a settings screen with four row types that rarely change. Another team proposes a plug-in registry for the row types. What do you say?"
+  options:
+    - "Yes: plug-ins are always more extensible"
+    - "Keep an enum with a `switch`: one team, few kinds, and exhaustive checking catches a missing case at compile time"
+    - "Use app extensions so each row type runs in its own process"
+    - "Download row types from the server"
+  answer: 1
+  explain: "A registry pays off when many kinds come from several teams. Here it would add a contract and lose exhaustive checking for no gain."
+- id: q2
+  type: multi
+  prompt: "Which belong in the core of a feed's plug-in system?"
+  options:
+    - "The `CardPlugin` protocol"
+    - "The registry that maps kinds to factories"
+    - "The poll card's vote-counting logic"
+    - "The fallback for unknown kinds"
+    - "A list of every card type, imported by the feed screen"
+  answer: [0, 1, 3]
+  explain: "The core holds the contract, the registry and the fallback. Card logic belongs to its plug-in, and the core importing every card type would undo the style; only the composition root knows them all."
+- id: q3
+  type: truefalse
+  prompt: "If an in-app plug-in force-unwraps a missing field and crashes, the rest of the app keeps running because plug-ins are isolated."
+  answer: false
+  explain: "In-app plug-ins share the app's process, so a crash in one is a crash of the app. Only app extensions, which run in their own processes, are isolated like that."
+- id: q4
+  type: mcq
+  prompt: "Version 5 of your editor adds a `table` block. Notes with tables sync to phones still running version 4. What should version 4 do?"
+  options:
+    - "Fail to open the note"
+    - "Drop the table block silently and save the note without it"
+    - "Show a placeholder (\"Update to see this table\") and keep the block's data untouched when saving"
+    - "Ask the server to convert the table to text"
+  answer: 2
+  explain: "Dropping the block loses the user's data on the next save. A placeholder keeps the note usable, and preserving the raw block means version 5 still sees the table later."
+- id: q5
+  type: mcq
+  prompt: "The `SharedKernel` module now holds `Money`, `UserID`, an API client, an image cache and a `DateFormatter` extension. What's the main risk?"
+  options:
+    - "Value types like `Money` are slow to share"
+    - "Every feature depends on everything in it, so any change rebuilds and risks every feature, and every team must agree on it"
+    - "Swift can't put structs and classes in one module"
+    - "It's too small to be worth a module"
+  answer: 1
+  explain: "A shared kernel works because it's small and stable. Mixing in volatile infrastructure turns it into a module that changes often and that everyone depends on, which is the worst combination."
+```

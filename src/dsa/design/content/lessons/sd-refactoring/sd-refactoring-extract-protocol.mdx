@@ -1,0 +1,325 @@
+## Why it matters
+
+These are two of the refactorings you'll use most in legacy iOS code. **Extract protocol** opens a seam: it's how a class that talks to the network, the Keychain or StoreKit becomes something a test can replace. **Introduce parameter object** tames long parameter lists and the clumps of values that always travel together, and gives their rules a home. Both are small and mechanical when done in steps. Done carelessly, the first breeds protocols nobody needs and the second breeds structs full of optionals, so interviewers listen for *why* you'd reach for each.
+
+## Extract protocol
+
+Fowler calls this *extract interface*; in Swift the interface is a protocol. The mechanics:
+
+1. **List what the client actually uses**, not everything the class can do. A checkout screen that calls one method of a twelve-method `OrderService` needs one method. That's a role protocol, as in [interface segregation](/design/learn/sd-solid-isp).
+2. **Name it for the role**, from the client's side: `OrderPlacing`, not `OrderServiceProtocol`.
+3. **Put it with the client.** The checkout feature owns the abstraction it depends on; that's [dependency inversion](/design/learn/sd-solid-dip).
+4. **Conform the existing class**, usually with an empty extension, since it already has the methods.
+5. **Change the client to depend on the protocol**, injected through its initialiser. With many callers, give the parameter a default value first, as in the global-state lesson.
+6. **Add the second conformer** that justifies the protocol: a stub for tests, a fake for previews.
+
+```swift check title="After extracting OrderPlacing"
+import Observation
+
+struct Basket: Sendable {
+    let productIDs: [String]
+    let pence: Int
+}
+
+struct OrderConfirmation: Sendable, Equatable {
+    let orderID: String
+}
+
+// Owned by the checkout feature, and named for the role checkout needs
+protocol OrderPlacing: Sendable {
+    func place(_ basket: Basket) async throws -> OrderConfirmation
+}
+
+// The existing class, unchanged: it does much more than checkout uses
+final class OrderService: Sendable {
+    func place(_ basket: Basket) async throws -> OrderConfirmation {
+        OrderConfirmation(orderID: "A-1001")
+    }
+
+    func cancel(orderID: String) async throws {}
+    func history() async throws -> [OrderConfirmation] { [] }
+}
+
+// It already has the method, so the conformance is empty
+extension OrderService: OrderPlacing {}
+
+@MainActor @Observable
+final class CheckoutModel {
+    private(set) var confirmation: OrderConfirmation?
+    private let orders: any OrderPlacing
+
+    init(orders: any OrderPlacing) {
+        self.orders = orders
+    }
+
+    func placeOrder(_ basket: Basket) async throws {
+        confirmation = try await orders.place(basket)
+    }
+}
+
+// The second conformer, which is what makes the protocol worth having
+struct StubOrders: OrderPlacing {
+    let confirmation: OrderConfirmation
+
+    func place(_ basket: Basket) async throws -> OrderConfirmation {
+        confirmation
+    }
+}
+```
+
+### Choices Swift makes you take
+
+- **`any` or a generic?** `let orders: any OrderPlacing` is the simplest choice and right for a dependency called a few times per screen. A generic parameter, `CheckoutModel<Orders: OrderPlacing>`, avoids the existential box and dynamic dispatch, but the type parameter then spreads to everything that stores a `CheckoutModel`. You weighed this in [some vs any](/design/learn/sd-swift-design-some-any).
+- **A protocol isn't the only seam.** For one or two functions, a struct of closures is lighter and needs no conforming types: the [environment style](/design/learn/sd-functional-environment).
+
+**Isolation has to line up.** A `@MainActor` class whose *async* method satisfies a nonisolated `async` requirement is fine: the call hops to the main actor. A *synchronous* requirement is different, and Swift 6 rejects the conformance:
+
+```text title="What you'll see"
+error: conformance of 'MainThing' to protocol 'SyncThing' crosses into main actor-isolated code and can cause data races
+```
+
+Mark the protocol `@MainActor` if every caller is on the main actor, or, since Swift 6.2, declare an *isolated conformance*, `extension MainThing: @MainActor SyncThing {}`, which can only be used on the main actor.
+
+## Introduce parameter object
+
+A **long parameter list** is hard to call correctly, and a **data clump** (the same values always travelling together) is a type waiting to be named. Here's a typical signature:
+
+```swift title="Before"
+func searchHotels(city: String, checkIn: Date, checkOut: Date, adults: Int, children: Int,
+                  rooms: Int, petFriendly: Bool, freeCancellation: Bool) async throws -> [Hotel]
+```
+
+It costs you in three ways. Two `Date`s and three `Int`s next to each other can be swapped and still compile. Every new filter changes this signature and every function that passes the values along. And the rules about the group, such as "check-out is after check-in" or "at least one adult", are checked in several places, or in none.
+
+The refactoring is a **parallel change** (expand, migrate, contract), so nothing breaks along the way:
+
+1. **Create a type for each clump**, named for the concept: `Stay`, `Guests`, and `HotelSearch` around them.
+2. **Expand:** add a function taking `HotelSearch`, and make the old one build the struct and forward to it. Every caller still compiles.
+3. **Migrate** the callers one at a time.
+4. **Contract:** delete the old signature.
+5. **Move behaviour onto the new types.** Validation goes in their initialisers, so an invalid search can't be built, which is [making illegal states unrepresentable](/design/learn/sd-modelling-illegal-states) applied to arguments. Derived values (`nights`, `total`) go there too.
+
+```visual flow
+title: Parallel change for a new signature
+nodes:
+  - { id: screen, label: Search screen, kind: view, at: [0, 0] }
+  - { id: link, label: Deep link handler, kind: client, at: [0, 2] }
+  - { id: widget, label: Widget, kind: view, at: [0, 4] }
+  - { id: old, label: 8-parameter search, at: [3, 1] }
+  - { id: new, label: HotelSearch version, at: [3, 3] }
+edges:
+  - [screen, old]
+  - [link, old]
+  - [widget, old]
+  - [old, new, forwards]
+  - [screen, new]
+  - [link, new]
+  - [widget, new]
+steps:
+  - say: Before. Three callers each pass eight arguments, in the right order, they hope.
+    show: [screen, link, widget, old, screen->old, link->old, widget->old]
+  - say: "**Expand:** add a function that takes a `HotelSearch`, and make the old one build the struct and forward to it. No caller changes."
+    show: [new, old->new]
+    send: old->new
+  - say: "**Migrate** callers one at a time, each in its own small change. The old signature keeps the others working."
+    hide: [screen->old]
+    show: [screen->new]
+    send: screen->new
+  - say: The deep link handler and the widget follow, whenever their owners get to them.
+    hide: [link->old, widget->old]
+    show: [link->new, widget->new]
+  - say: "**Contract:** nothing calls the old signature, so delete it. The compiler confirms nothing still did."
+    hide: [old, old->new]
+    state: { new: ok }
+```
+
+And the new types, with their rules:
+
+```swift run
+import Foundation
+
+enum SearchError: Error {
+    case checkOutNotAfterCheckIn
+    case noAdults
+    case moreRoomsThanGuests
+}
+
+// A data clump, two dates that always travel together, now with its rule
+struct Stay {
+    let checkIn: Date
+    let checkOut: Date
+
+    init(checkIn: Date, checkOut: Date) throws(SearchError) {
+        guard checkOut > checkIn else { throw .checkOutNotAfterCheckIn }
+        self.checkIn = checkIn
+        self.checkOut = checkOut
+    }
+
+    func nights(in calendar: Calendar) -> Int {
+        calendar.dateComponents([.day], from: checkIn, to: checkOut).day ?? 0
+    }
+}
+
+struct Guests {
+    let adults: Int
+    let children: Int
+    let rooms: Int
+
+    init(adults: Int, children: Int = 0, rooms: Int = 1) throws(SearchError) {
+        guard adults >= 1 else { throw .noAdults }
+        guard rooms <= adults + children else { throw .moreRoomsThanGuests }
+        self.adults = adults
+        self.children = children
+        self.rooms = rooms
+    }
+
+    var total: Int { adults + children }
+}
+
+// Was: searchHotels(city:checkIn:checkOut:adults:children:rooms:petFriendly:freeCancellation:)
+struct HotelSearch {
+    var city: String
+    var stay: Stay
+    var guests: Guests
+    var petFriendly = false
+    var freeCancellation = false
+}
+
+let calendar: Calendar = {
+    var calendar = Calendar(identifier: .gregorian)
+    calendar.timeZone = TimeZone(identifier: "UTC")!
+    return calendar
+}()
+
+func june(_ day: Int) -> Date {
+    calendar.date(from: DateComponents(year: 2026, month: 6, day: day))!
+}
+
+do {
+    let search = HotelSearch(city: "Lisbon", stay: try Stay(checkIn: june(12), checkOut: june(15)), guests: try Guests(adults: 2, children: 1))
+    print("\(search.city): \(search.stay.nights(in: calendar)) nights, \(search.guests.total) guests")
+    _ = try Stay(checkIn: june(15), checkOut: june(12))
+} catch {
+    print("Rejected: \(error)")
+}
+
+do {
+    _ = try Guests(adults: 1, rooms: 2)
+} catch {
+    print("Rejected: \(error)")
+}
+```
+
+```output
+Lisbon: 3 nights, 3 guests
+Rejected: checkOutNotAfterCheckIn
+Rejected: moreRoomsThanGuests
+```
+
+The filters stay as plain properties with defaults, so a caller sets only what it cares about: `var search = HotelSearch(…); search.petFriendly = true`. Adding a filter now changes one struct, not every function in the chain.
+
+Apple's own frameworks use this move. `UIButton.Configuration` (iOS 15) and `UIListContentConfiguration` (iOS 14) are value-type parameter objects that replaced dozens of separate setters, and `URLRequest` gathers everything about one request into one value.
+
+<Callout kind="note">
+
+A parameter object isn't a bag for every argument. Group values that belong together as a concept (a stay, a set of guests), and leave unrelated arguments as arguments. A struct whose fields are all optional, set in different combinations by different callers, has swapped a long parameter list for a hidden one.
+
+</Callout>
+
+## Trade-offs
+
+| Technique | Callers change? | Testability | Cost | Wins when |
+| --- | --- | --- | --- | --- |
+| Extract protocol, `any` | only the initialiser | high | a protocol and a conformance | a dependency you need to swap in tests or previews |
+| Extract protocol, generic | the type gains a parameter | high | type parameters spread | hot paths, or when static types matter |
+| Struct of closures | only the initialiser | high | no conforming types | one or two functions |
+| Parameter object | yes, through a parallel change | the rules become testable | a type per concept | clumps that travel together, or have rules |
+| Default arguments | no | none gained | none | one or two rarely used options |
+
+<Callout kind="interview">
+
+**What to say:** for extract protocol, name the role ("checkout needs to *place orders*, so `OrderPlacing`, with one method") and say what the second conformer is. For a parameter object, say which values form a concept and which rules move onto it, and that you'd do it as expand, migrate, contract so the build never breaks.
+
+**What to ask:** What does the client use of this class? What will stand in for it in tests? How many callers pass these arguments, and do they always pass them together?
+
+**Red flags:** a `…Protocol` mirroring every method of a class; a protocol in a shared module that only one feature uses; a parameter object of optionals; changing a signature used in forty places in one commit.
+
+</Callout>
+
+<Callout kind="gotcha" title="Swift gotcha: protocol extension methods aren't requirements">
+
+A method that's only in a protocol *extension*, not in the protocol itself, is dispatched statically. If `OrderService` has its own `place(_:express:)` and the protocol extension adds one with the same signature, a call through `any OrderPlacing` runs the extension's version, not the class's. Anything conformers should be able to customise belongs in the protocol's requirements.
+
+</Callout>
+
+<Callout kind="gotcha" title="Swift gotcha: no default arguments in requirements">
+
+`func place(_ basket: Basket, express: Bool = false)` doesn't compile inside a protocol: requirements can't have default values. Declare the full requirement, then add a convenience overload in a protocol extension that passes the default.
+
+</Callout>
+
+## Practice
+
+The **delivery fee kata** starts from a seven-parameter legacy function, and its `Order` parameter object (with a `Speed` enum where a `Bool` used to be) is the API you implement behind characterisation tests.
+
+```cards
+- id: role-protocol
+  front: "When extracting a protocol from a big class, what goes in it?"
+  back: "Only what the client uses, named for the client's role (`OrderPlacing`), declared alongside the client. The class conforms, usually with an empty extension."
+- id: parameter-object
+  front: "What does introduce parameter object fix, and how do you do it safely?"
+  back: "Long parameter lists and data clumps. Create a type for the concept, add a function taking it while the old one forwards, migrate callers, delete the old one, then move the rules onto the type."
+- id: isolation-conformance
+  front: "Why might Swift 6 reject a `@MainActor` class's conformance to a protocol?"
+  back: "Its main-actor methods can't satisfy nonisolated synchronous requirements. Make the protocol `@MainActor`, make the requirements `async`, or (Swift 6.2) use an isolated conformance: `extension T: @MainActor P`."
+```
+
+```quiz
+- id: q1
+  type: mcq
+  prompt: "`CheckoutModel` calls one method of `PaymentsService`, which has fifteen. You want to test checkout. What do you extract?"
+  options:
+    - "`PaymentsServiceProtocol` with all fifteen methods, so any code can use it"
+    - "A `PaymentCharging` protocol with the one method checkout calls, declared beside `CheckoutModel`"
+    - "A base class `PaymentsServiceBase` that tests subclass"
+    - "Nothing: test checkout against the real service"
+  answer: 1
+  explain: "A role protocol keeps the test double one method long and keeps checkout from depending on fourteen methods it never calls. Declaring it with the client means the feature owns its abstraction. A mirror of the whole class forces every fake to implement fifteen methods."
+- id: q2
+  type: multi
+  prompt: "Which of these are good candidates for a parameter object?"
+  options:
+    - "`latitude: Double, longitude: Double`, passed together through six functions"
+    - "`startDate: Date, endDate: Date`, where the end must come after the start"
+    - "`func setTitle(_ title: String)`"
+    - "`adults: Int, children: Int, infants: Int` on every booking call"
+    - "`animated: Bool` on one method"
+  answer: [0, 1, 3]
+  explain: "Values that always travel together, especially with a rule between them, are concepts: a coordinate, a date range, a party of passengers. One argument, or one unrelated option, isn't a clump."
+- id: q3
+  type: order
+  prompt: "Put the steps of changing a widely used signature to a parameter object in order."
+  lines:
+    - "Create the new type for the clumped values"
+    - "Add a function that takes the new type"
+    - "Make the old function build the type and forward to the new one"
+    - "Move callers to the new function, one at a time"
+    - "Delete the old function"
+    - "Move the rules about the values into the new type"
+  explain: "Expand, migrate, contract: the build stays green after every step, and each caller's move is a small change its owner can make. Moving the rules last means validation lives in one place once nothing bypasses it."
+- id: q4
+  type: truefalse
+  prompt: "A protocol with one production conformer and a test stub that conforms to it is speculative generality."
+  answer: false
+  explain: "The stub is a real second conformer, used today: it's why the protocol exists. Speculative generality is a protocol with nothing on the other side of it."
+- id: q5
+  type: mcq
+  prompt: "A `@MainActor final class LocationStore` has `func lastKnown() -> Location?`. Conforming it to a plain `protocol LocationProviding { func lastKnown() -> Location? }` fails in Swift 6. Every caller is a main-actor view model. What's the simplest fix?"
+  options:
+    - "Mark the method `nonisolated` and read the stored state anyway"
+    - "Mark the protocol `@MainActor`, or use an isolated conformance, `extension LocationStore: @MainActor LocationProviding`"
+    - "Make the class `@unchecked Sendable`"
+    - "Remove `@MainActor` from the class"
+  answer: 1
+  explain: "The callers are all on the main actor, so the protocol can say so, or the conformance can be isolated (Swift 6.2 and later). A `nonisolated` method reading main-actor state, or `@unchecked Sendable`, reintroduces the data race the compiler was pointing at."
+```

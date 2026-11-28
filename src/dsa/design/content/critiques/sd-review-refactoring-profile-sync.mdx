@@ -1,0 +1,124 @@
+<Brief>
+
+A note-taking app syncs the signed-in user's profile and settings when it comes to the foreground, and the settings screen shows a spinner until the sync finishes. Users report the spinner sometimes never stops, and a few say their settings "reset themselves". The sync code is below; the transport and store behind its two protocols are thin wrappers over URLSession and Core Data, and the store replaces the saved record each time it saves.
+
+```swift check ios title="ProfileSync.swift"
+import Foundation
+
+protocol HTTPTransport {
+    func send(_ method: String, _ path: String, completion: @escaping ([String: Any]?, Error?) -> Void)
+}
+
+protocol RecordStore {
+    func save(_ record: [String: Any], entity: String, completion: @escaping (Error?) -> Void)
+}
+
+struct SyncOptions {
+    var retryPolicy: String? = nil
+    var conflictResolution = "serverWins"
+    var batchSize = 50
+    var onProgress: ((Double) -> Void)? = nil
+}
+
+final class ProfileSync {
+    private let transport: HTTPTransport
+    private let store: RecordStore
+    private let options: SyncOptions
+
+    init(transport: HTTPTransport, store: RecordStore, options: SyncOptions = SyncOptions()) {
+        self.transport = transport
+        self.store = store
+        self.options = options
+    }
+
+    func sync(userID: String, completion: @escaping (Bool) -> Void) {
+        transport.send("GET", "/users/" + userID) { profile, error in
+            guard var profile = profile, error == nil else {
+                completion(false)
+                return
+            }
+            self.transport.send("GET", "/users/" + userID + "/settings") { settings, error in
+                if let error = error as? URLError, error.code == .notConnectedToInternet {
+                    NotificationCenter.default.post(name: Notification.Name("ProfileSyncOffline"), object: nil)
+                    return
+                }
+                profile["settings"] = settings
+                self.store.save(profile, entity: "CDProfile") { error in
+                    if error == nil {
+                        NotificationCenter.default.post(name: Notification.Name("profileDidSync"), object: nil, userInfo: ["userId": userID])
+                    }
+                    completion(error == nil)
+                }
+            }
+        }
+    }
+}
+```
+
+</Brief>
+
+```workspace
+template: critique
+minutes: 25
+```
+
+```findings
+- id: never-completes
+  title: The offline path never calls completion
+  severity: high
+  lines: 36-39
+  detail: "When the settings request fails because the device is offline, `sync` posts a notification and returns without calling `completion`, so the settings screen's spinner never stops. Callback code has to call its completion on every path by hand; an `async throws` function can't forget, because every path has to return or throw."
+- id: settings-wiped
+  title: A failed settings request wipes the saved settings
+  severity: high
+  lines: 40
+  detail: "Any other failure of the second request (a timeout, a 500) leaves `settings` nil, and assigning nil to a dictionary key removes the key. The profile is saved without its settings and the sync reports success, so the store, which replaces the record, deletes the user's settings. That's the \"reset themselves\" report. Only one error case is checked; the rest are ignored."
+- id: pyramid
+  title: Nested callbacks serialise independent work and hide the thread
+  severity: medium
+  lines: 29-49
+  detail: "Three levels of callbacks run two independent GETs one after the other, offer no way to cancel a sync, and repeat error handling at each level. `completion` runs on whatever queue the store's callback uses, so a caller that updates its spinner there is touching UIKit off the main thread. With `async`/`await`, `async let` runs both requests together, `try` propagates errors, cancellation flows through the task, and the caller's actor decides where results land."
+- id: bool-result
+  title: Every outcome is squashed into a Bool
+  severity: medium
+  lines: 29
+  detail: "Callers can't tell offline from not found from a server error from a decoding problem, so the screen can only say something went wrong and can't decide whether a retry would help. Return the profile or throw a typed error, such as `SyncError.offline`."
+- id: untyped-json
+  title: "`[String: Any]` carries the JSON shape through every layer"
+  severity: medium
+  lines: 3-9
+  detail: "The transport, the sync and the store all pass untyped dictionaries. Nothing validates the response, every reader casts with `as?` and quietly gets nil when the server renames a field, and the store's schema can't be checked against anything. Decode into `Codable` structs (`Profile`, `ProfileSettings`) at the edge and pass those."
+- id: leaky-abstractions
+  title: The protocols leak URLSession and Core Data details
+  severity: medium
+  lines: 36-41
+  detail: "`HTTPTransport` exists to hide how requests travel, yet the sync checks for `URLError.notConnectedToInternet`: a test double or a different transport that reports offline its own way changes the sync's behaviour. `entity: \"CDProfile\"` leaks a Core Data entity name through `RecordStore`, so the store can't be swapped without editing its callers. Map transport errors to the app's own errors inside the transport, and give the store typed methods such as `save(_ profile: Profile)`."
+- id: stringly-typed
+  title: Methods, paths, notification names and keys are bare strings
+  severity: low
+  lines: 30-43
+  detail: "`\"GET\"`, paths built by concatenation, and two notification names in different styles (`\"ProfileSyncOffline\"` and `\"profileDidSync\"`) with a `\"userId\"` key are all retyped wherever they're used. A typo in an observer compiles and silently never fires. Use an HTTP method enum, an endpoint type, and `Notification.Name` constants, or better, return the result instead of broadcasting it."
+- id: speculative-options
+  title: "`SyncOptions` offers four settings that nothing reads"
+  severity: low
+  lines: 11-16
+  detail: "A retry policy, a conflict strategy, a batch size and a progress callback are accepted and stored, and the sync ignores all four. Callers will set them and believe they work, and readers have to check which ones are live. Delete the type, and add the one option a real need asks for when it arrives."
+```
+
+<ReferenceReview>
+
+**Most important first.** Both user reports trace to this file. The offline path **never calls completion** (lines 36–39), which is the spinner that never stops. And any other settings failure **saves a profile without settings and reports success** (line 40), which is the settings that "reset themselves": silent data loss. Fix those two first, in a small pull request of their own.
+
+**The design problems underneath** are an API built from completion handlers and untyped dictionaries, behind protocols that leak what they were meant to hide. Each makes the bugs above easy to write and hard to see: a forgotten completion is invisible, a nil in a dictionary is a deletion, and the sync knows about `URLError` and Core Data entity names.
+
+**How I'd fix it, in small steps:**
+
+1. Characterise today's behaviour with a fake transport and store that record calls: success, offline on either request, a server error on the settings request. Two of those tests describe bugs; write them as they behave now, then change their expectations in the commit that fixes each.
+2. Fix the bugs: call `completion(false)` on the offline path, and treat any settings failure as a failed sync that saves nothing.
+3. Add `Codable` `Profile` and `ProfileSettings` types, and a transport method `func get<T: Decodable>(_ endpoint: Endpoint) async throws(SyncError) -> T` that maps `URLError` to `SyncError.offline` inside the transport.
+4. Write `func sync(userID: String) async throws(SyncError) -> Profile`: two `async let` requests, a typed `store.save(profile)`, and a plain return. Keep the completion-handler method as a deprecated wrapper that calls it from a `Task`, move callers over, then delete the wrapper.
+5. Replace the notifications with the return value (the screen awaits the sync), or with `Notification.Name` constants for the observers that remain. Delete `SyncOptions`.
+
+**Tests to add:** offline on either request throws `.offline` and saves nothing; a settings failure saves nothing; success saves one merged profile; cancelling the sync's task before the requests finish saves nothing.
+
+</ReferenceReview>

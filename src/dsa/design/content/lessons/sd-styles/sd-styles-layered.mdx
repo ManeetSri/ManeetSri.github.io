@@ -1,0 +1,299 @@
+## Why it matters
+
+Layered architecture is the default shape of nearly every iOS codebase: views on top, some business logic in the middle, networking and storage at the bottom. Most of the architectures you'll meet later (MVVM, VIPER, Clean) are layered styles with extra rules. Knowing exactly what the layering constraint buys, and where it quietly costs you, is the difference between layers that help and layers that are only ceremony.
+
+## The idea: each layer has one job and calls down
+
+A layered architecture arranges components into horizontal layers. Each layer offers services to the one above it and uses the one below it. In an iOS app the usual three are:
+
+| Layer | Holds | iOS examples |
+| --- | --- | --- |
+| **Presentation** | What the user sees and does: layout, formatting, input | SwiftUI views, UIKit view controllers, view models |
+| **Domain** (business logic) | The rules of the product, in its own vocabulary | `Order`, "an order can be cancelled until it ships", use cases |
+| **Data** (infrastructure) | Getting and keeping data | API client on `URLSession`, SwiftData or Core Data stores, Keychain, repositories |
+
+The constraint: **a layer may depend on the layer below it, never on a layer above.** The data layer has no idea a view exists. That one rule gives you most of the style's value:
+
+- **Replaceability.** Swap the REST client for GraphQL, or Core Data for SwiftData, and the layers above don't change, as long as the layer's interface holds.
+- **Testability.** Test the domain without a simulator, and the presentation with a fake domain.
+- **Understandability.** A new teammate knows where formatting code goes, and where it doesn't.
+
+## Layers in Swift
+
+Here's a small orders screen, layer by layer. Each layer speaks its own language: the data layer deals in the server's records, the domain in `Order`s with rules, the presentation in rows of text.
+
+```swift run title="Three layers, wired top to bottom"
+import Foundation
+
+// MARK: Data layer: where orders come from, in the server's shape
+struct OrderRecord {
+    let id: String
+    let totalPence: Int
+    let status: String          // "placed", "shipped", "delivered", "cancelled"
+}
+
+protocol OrderSource {
+    func fetchRecords() throws -> [OrderRecord]
+}
+
+struct CannedOrderSource: OrderSource {
+    func fetchRecords() throws -> [OrderRecord] {
+        [
+            OrderRecord(id: "A12", totalPence: 1850, status: "shipped"),
+            OrderRecord(id: "A13", totalPence: 420, status: "cancelled"),
+            OrderRecord(id: "A14", totalPence: 6400, status: "placed"),
+        ]
+    }
+}
+
+// MARK: Domain layer: the app's rules, in its own words
+struct Order {
+    let id: String
+    let totalPence: Int
+    let isOpen: Bool
+}
+
+struct OrdersService {
+    let source: any OrderSource
+
+    /// Open orders, largest first. Cancelled and delivered orders aren't open.
+    func openOrders() throws -> [Order] {
+        try source.fetchRecords()
+            .map { Order(id: $0.id, totalPence: $0.totalPence, isOpen: !["cancelled", "delivered"].contains($0.status)) }
+            .filter(\.isOpen)
+            .sorted { $0.totalPence > $1.totalPence }
+    }
+}
+
+// MARK: Presentation layer: what the screen shows
+struct OrderRow {
+    let title: String
+    let detail: String
+}
+
+struct OrdersPresenter {
+    let service: OrdersService
+
+    func rows() -> [OrderRow] {
+        do {
+            return try service.openOrders().map { order in
+                OrderRow(title: "Order \(order.id)", detail: String(format: "£%d.%02d", order.totalPence / 100, order.totalPence % 100))
+            }
+        } catch {
+            return [OrderRow(title: "Couldn't load orders", detail: "Pull to try again")]
+        }
+    }
+}
+
+// The composition root wires the layers top to bottom
+let presenter = OrdersPresenter(service: OrdersService(source: CannedOrderSource()))
+for row in presenter.rows() {
+    print(row.title, "·", row.detail)
+}
+```
+
+```output
+Order A14 · £64.00
+Order A12 · £18.50
+```
+
+Notice the direction of every arrow. `OrdersPresenter` knows `OrdersService`; `OrdersService` knows `OrderSource`; nothing points up. Notice also something you might not like: the **domain imports a protocol that belongs to the data layer**. In classic layering, the business rules depend on the data layer's interface. That's the one arrow that the hexagonal and clean styles turn round, a few lessons from now.
+
+## Watching a request travel
+
+Step through a request in a layered app, then through the most common way layering breaks.
+
+```visual flow
+title: A request through the layers, and a layer skipped
+layers:
+  - { label: Presentation, rows: [0, 1] }
+  - { label: Domain, rows: [2, 3] }
+  - { label: Data, rows: 4 }
+nodes:
+  - { id: view, label: OrdersView, kind: view, at: [0, 0] }
+  - { id: vm, label: View model, kind: service, at: [2, 0] }
+  - { id: usecase, label: LoadOpenOrders, kind: service, at: [2, 2] }
+  - { id: cache, label: Disk cache, kind: store, at: [0, 4] }
+  - { id: repo, label: Repository, kind: service, at: [2, 4] }
+  - { id: api, label: API client, kind: service, at: [4, 4] }
+edges:
+  - [view, vm, onAppear]
+  - [vm, usecase, execute]
+  - [usecase, repo, orders()]
+  - [repo, cache, read, { style: data }]
+  - [repo, api, GET /orders]
+  - [vm, api, URLSession]
+steps:
+  - say: The view tells its view model it appeared. The view knows nothing about where orders come from.
+    show: [view, vm, usecase, repo, cache, api]
+    send: view->vm
+  - say: The view model asks the **domain**. `LoadOpenOrders` holds the rules, such as "cancelled orders aren't open".
+    send: vm->usecase
+  - say: The use case asks the repository for orders. It knows *what* it needs, not *where* it comes from.
+    send: usecase->repo
+  - say: The repository decides where. Cache first, then the network.
+    send: [repo->cache, repo->api]
+  - say: Answers travel back up the same way, and each layer translates. Records become orders; orders become rows.
+    send: usecase->vm
+  - say: "A **layer skip**: a rushed view model calls the API directly. The cache and the rules are bypassed, and the view model can no longer be tested without the network."
+    show: [vm->api]
+    send: vm->api
+    state: { vm: error }
+    label: { vm->api: layer skip }
+```
+
+## Closed and open layers
+
+So far every layer has been **closed**: a request must pass through it. Some architectures mark a layer **open**, meaning the layer above may skip it.
+
+- **Strict layering** (all closed) gives the strongest isolation. Changing the data layer can only affect the domain, because nothing else touches it.
+- **Relaxed layering** opens some layers. A typical iOS example is a shared `Formatting` or `Logging` layer that every layer may call directly. Opening a layer deliberately is fine. Skipping a layer by accident, as in the last step above, is how layering erodes.
+
+Write down which layers are open. If you can't say, they're all open, and you don't have a layered architecture any more.
+
+### The sinkhole
+
+The layering constraint has a cost: sometimes a layer has nothing to add. A screen that shows the user's name goes view → view model → use case → repository → API client, and the use case does nothing except call the repository. Mark Richards calls this the **architecture sinkhole**: requests that fall through layers that do no work.
+
+A few pass-through calls are normal and worth it for consistency. His rough rule: if around 20% of requests are pass-throughs, that's fine; if most are, the layers are ceremony, and you should open the middle layer for simple reads or collapse it. On iOS this is the "one use case per screen, each one line long" smell.
+
+## Layers are not tiers
+
+Two words people mix up:
+
+- A **layer** is a *logical* grouping of code. All three layers above live in one process on one iPhone.
+- A **tier** is a *physical* place code runs. A classic three-tier system is the client (the app), the application server and the database server.
+
+Your app is one tier containing several layers. The backend is another tier with its own layers. Confusing the two leads to designs where the "data layer" on the phone is expected to enforce rules that only the server tier can enforce, such as stock levels.
+
+## Technical layers vs feature slices
+
+Layered architecture partitions code **technically**. Taken literally, you get one folder or module per layer for the whole app:
+
+```text
+Presentation/   OrdersView, ProfileView, SearchView, CheckoutView …
+Domain/         OrdersService, ProfileService, SearchService …
+Data/           OrdersRepository, ProfileRepository, APIClient …
+```
+
+That reads well with three screens. With forty, every feature change touches three far-apart places, two teams edit the same module all day, and nothing stops `SearchView` from using `ProfileRepository`. The common fix is to slice by feature first and layer *inside* each slice:
+
+```text
+Orders/         OrdersView, OrdersViewModel, LoadOpenOrders, OrdersRepository
+Profile/        ProfileView, ProfileViewModel, ProfileRepository
+Shared/         APIClient, DesignSystem, Formatting
+```
+
+The layering rule still holds inside each feature; between features you add a new rule, such as "features don't import each other". That's the step from a layered app towards a modular monolith, which has its own lesson later in this module.
+
+## Making the compiler enforce it
+
+In one app target, nothing stops a view from importing the API client. Put the layers in separate Swift package targets and the compiler refuses:
+
+```swift title="Package.swift (excerpt)"
+.target(name: "OrdersUI", dependencies: ["OrdersDomain", "DesignSystem"]),
+.target(name: "OrdersDomain", dependencies: ["OrdersData"]),
+.target(name: "OrdersData", dependencies: ["Networking"]),
+```
+
+Now `import OrdersData` inside `OrdersUI` fails to build, which is exactly the point. Inside a package, the `package` access level (Swift 5.9) lets modules share types with each other without making them `public` to the app.
+
+## Trade-offs
+
+| | Strict layers | Relaxed layers | Feature slices, layered inside | No layers (logic in views) |
+| --- | --- | --- | --- | --- |
+| Isolation of change | Strongest | Good, if open layers are few | Strong within a feature | None |
+| Code per feature | Most (pass-throughs) | Less | Moderate | Least |
+| Testability | High | High | High | Low |
+| A feature change touches | Every layer | Most layers | One folder or module | One file, often a big one |
+| Works for many teams | Poorly (shared layers) | Poorly | Well | Poorly |
+| Best for | Small apps with long lives, regulated domains | Most apps | Apps with several teams | Prototypes and tiny apps |
+
+Strict layers win when the lower layers will genuinely change and the rules must be protected, as in banking. Feature slices win as soon as more than one team works in the app. Logic in views wins for a two-week prototype, and only until it isn't one.
+
+<Callout kind="interview">
+
+**Say:** the layers *and* the direction: "Presentation depends on domain, domain on data; the view model never touches `URLSession`." Then say where you'd relax it: "Simple reads can go straight to the repository; I wouldn't write a use case that only forwards a call."
+
+**Ask:** how many teams will work in the app, and which lower layers might change (a backend migration, a new database).
+
+**Red flags:** six layers of boilerplate for a settings screen; a view model building `URLRequest`s; calling the data layer "the backend"; no idea which layers are open.
+
+</Callout>
+
+<Callout kind="gotcha" title="iOS gotcha: SwiftData's @Query skips your layers on purpose">
+
+SwiftUI's `@Query` fetches SwiftData models straight into a view, and the models are `@Model` classes the view can mutate. That's a deliberate relaxed layering: it's fast to write and fine for small apps whose rules are simple. In an app with real domain rules, it puts persistence types in your presentation layer, so swapping storage or testing a rule means a simulator. Decide per feature, and say which you chose.
+
+</Callout>
+
+```cards
+- id: layered-constraint
+  front: "What is the layered style's one constraint, and what does it buy?"
+  back: "A layer depends only on layers below it. That makes lower layers replaceable, upper layers testable with fakes, and code placement predictable."
+- id: closed-open
+  front: "Closed vs open layers?"
+  back: "A closed layer must be passed through; an open one may be skipped. Open layers on purpose (a shared formatting layer) and write them down; skipping by accident erodes the style."
+- id: sinkhole
+  front: "What is the architecture sinkhole?"
+  back: "Requests that pass through layers that add nothing. A few are fine; if most requests are pass-throughs, open or collapse the layer."
+- id: layer-tier
+  front: "Layer vs tier?"
+  back: "A layer is a logical grouping of code in one process; a tier is a physical place code runs (device, app server, database)."
+```
+
+```quiz
+- id: q1
+  type: sort
+  prompt: "Which layer of an iOS app does each belong to?"
+  buckets: [Presentation, Domain, Data]
+  items:
+    - ["Formatting a price as \"£18.50\"", 0]
+    - ["\"An order can be cancelled until it ships\"", 1]
+    - [Decoding the orders JSON, 2]
+    - [Reading the token from the Keychain, 2]
+    - [Deciding whether the Cancel button is enabled, 0]
+    - [Working out a basket's delivery charge, 1]
+  explain: "Presentation shapes things for the screen, including UI state such as an enabled button; the domain holds product rules; the data layer fetches, decodes and stores. The button's *state* is presentation, but the rule it reflects belongs to the domain."
+- id: q2
+  type: mcq
+  prompt: "Your app has 30 use cases, and 26 of them do nothing but call one repository method. What's the best response?"
+  options:
+    - "Keep them all: consistency matters more than code size"
+    - "Open the domain layer for simple reads, and keep use cases where there's a real rule"
+    - "Remove the domain layer entirely and put all rules in view models"
+    - "Add a seventh layer to give the use cases more to do"
+  answer: 1
+  explain: "That's the sinkhole. Opening the layer for plain reads removes the ceremony while keeping a home for real rules. Deleting the layer throws away the rules' home too."
+- id: q3
+  type: bug
+  prompt: "This view model lives in the presentation layer. Which line breaks the layering?"
+  code: |
+    @MainActor @Observable
+    final class ProfileViewModel {
+        private let profiles: any ProfileRepository
+        var name = ""
+        init(profiles: any ProfileRepository) { self.profiles = profiles }
+        func load() async throws {
+            let (data, _) = try await URLSession.shared.data(from: URL(string: "https://api.example.com/me")!)
+            name = try JSONDecoder().decode(Profile.self, from: data).name
+        }
+    }
+  answer: 7
+  explain: "The view model goes around its own repository and talks to the network directly: a layer skip. Caching, auth and error mapping in the repository are bypassed, and the view model now needs the network to test."
+- id: q4
+  type: truefalse
+  prompt: "A three-layer iOS app (presentation, domain, data) is a three-tier system."
+  answer: false
+  explain: "All three layers run in one process on the phone, which is one tier. Tiers are physical: the device, the app server and the database server would make three."
+- id: q5
+  type: mcq
+  prompt: "Three squads will build Search, Checkout and Profile in one app. Which structure fits best?"
+  options:
+    - "Three app-wide modules: Presentation, Domain and Data"
+    - "One module per feature, each layered inside, plus shared lower modules"
+    - "One app target with folders per layer"
+    - "One module per screen, with no shared code"
+  answer: 1
+  explain: "With app-wide layers, all three squads edit the same three modules all day. Feature-first slicing keeps each squad's changes in its own module, and the layering rule still holds inside each one."
+```

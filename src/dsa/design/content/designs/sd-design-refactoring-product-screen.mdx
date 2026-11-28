@@ -1,0 +1,153 @@
+<Brief>
+
+You've joined the iOS team of a large shopping app as a senior engineer. Your first assignment is the **product page**, `ProductViewController.swift`: everyone agrees it has to change, and nobody agrees how.
+
+What you find:
+
+- **3,800 lines** of UIKit, laid out in a storyboard: one scroll view with nine sections (image gallery, title and price, size and colour picker, delivery estimate, add-to-basket bar, reviews, questions and answers, "you might also like", recently viewed).
+- The view controller fetches the product, reviews and recommendations itself, keeps about twenty stored properties of state, and is the data source and delegate for four collection views.
+- **Four squads** change it: Catalogue, Checkout, Reviews and Recommendations. 46 pull requests touched it last quarter, and it causes a merge conflict most weeks.
+- It produces **23% of the app's crashes**. The top one is an index out of range in the size picker, after a pull-to-refresh replaces the product while the picker is reloading. Crash-free sessions are 99.4%; the company target is 99.8%.
+- **No unit tests** cover it. Three UI tests do, and they fail about one run in five.
+- The app releases weekly with phased release, and the team has remote feature flags.
+
+What the business wants: the Reviews squad is redesigning its section next quarter, and Recommendations wants to build its new carousel in SwiftUI. Feature work can't stop. The page sits on the path to 40% of revenue, so **add-to-basket conversion must not drop**. You have one engineer full-time (you) plus whatever time the squads give to their own sections.
+
+Write the migration plan you'd take to the four squad leads. Spend about 35 minutes.
+
+</Brief>
+
+```workspace
+template: migration
+minutes: 35
+```
+
+<ModelAnswer section="current">
+
+**What's wrong, concretely:**
+
+- **One type with nine jobs.** Fetching, decoding, state, layout, four collection views' data sources, formatting prices and delivery dates, analytics, and navigation. Its stored properties fall into clusters that barely overlap (the gallery's images and page index; the picker's variants and selection; the reviews' pages and sort order), so the sections are separate objects living in one file.
+- **Shared mutable state without an owner.** The product, the selected variant and the loading flags are plain `var`s that any method changes. The size-picker crash is exactly that: refresh replaces `product` while the picker's data source still reads the old variants.
+- **Four teams, one file.** Every squad's change lands in the same type, so changes collide (46 PRs, weekly conflicts) and a Reviews change can break the buy box.
+- **No safety net.** Untested code nobody dares change, plus flaky UI tests that people have learned to rerun, which is worse than none.
+
+**What's good, and must survive:** it works, it converts, and its analytics feed the revenue dashboards. The plan has to preserve all three.
+
+**Baseline before touching anything:** crash share and crash-free rate for this screen, add-to-basket conversion (with its normal week-to-week noise), time to first content, PR count and conflict rate for the file.
+
+</ModelAnswer>
+
+<ModelAnswer section="target">
+
+A **thin container with one child view controller per section**, each owned by one squad.
+
+- `ProductViewController` (about 300 lines) builds the page: it owns a vertical stack of children and a `ProductPageModel`, and does nothing else.
+- **`ProductPageModel`** (`@MainActor`, `@Observable`) is the single source of truth for the shared state: the loaded product, the selected variant, the loading state. It loads through an injected `ProductRepository` protocol. Refresh replaces the product and validates the selection in one place, which removes the crash class rather than the one crash.
+- **Children:** Gallery, BuyBox (title, price, picker, delivery and the add-to-basket bar together, because they share the selected variant), Reviews, Q&A, Recommendations and RecentlyViewed. Each takes explicit inputs (the product ID, or the model) and reports outputs through closures such as `onSelectProduct`; none reaches into its parent.
+- **Recommendations** is a `UIHostingController` hosting the new SwiftUI carousel, embedded with the same containment calls as any other child.
+- **Navigation** leaves the children: outputs go to a coordinator (or a closure the container gets from it).
+
+**Why this target:** each section has its own data and lifecycle (gallery video, reviews pagination), child view controllers are UIKit's native unit for a screen region, and the move can happen one section at a time with the page shipping every week. A rewrite to SwiftUI or a full MVVM conversion would stop feature work and gamble the revenue path for months.
+
+</ModelAnswer>
+
+<ModelAnswer section="steps">
+
+Every step ships on its own and leaves the page working.
+
+1. **Agree ownership.** Map each section to a squad, write the map into CODEOWNERS, and agree the order below with the leads.
+2. **Open the smallest seam.** Extract a `ProductRepository` protocol from the fetching code, with the current code as its default implementation, injected through the initialiser with a default value. No behaviour changes; now tests can feed the page fixtures.
+3. **Build the safety net (characterisation).** Snapshot tests of the whole page for six fixture products: in stock, out of stock, many variants, no reviews, a very long title, and Dynamic Type at the largest size. Plus an analytics spy test that records the events and their order for "open the page, pick a size, add to basket". Fix or delete the three flaky UI tests, and keep one reliable add-to-basket UI test.
+4. **Fix the crash with structure.** Introduce `ProductPageModel` and route the product and the selection through it. Validate the selection on refresh, and drive the picker from a diffable snapshot.
+5. **Extract the first child: RecentlyViewed.** It's the least coupled and least risky section, so it proves the pattern (a containment helper, inputs and outputs, analytics) where a mistake costs little.
+6. **Extract Reviews and Q&A.** The Reviews squad then builds its redesign *inside* its child, behind a flag, without touching the container.
+7. **Recommendations in SwiftUI.** A `UIHostingController` child behind a remote flag, with the old and new carousels side by side for an A/B comparison of taps and conversion.
+8. **The buy box last.** It's the revenue path and the most entangled, so it goes when the pattern is proven and the tests are trusted: behind a flag, rolled out 1% → 10% → 50% → 100% with phased release, watching add-to-basket rate at each stage.
+9. **Clean up.** Delete the old code paths and flags, shrink the storyboard scene to the container, and add a file-length budget and a lint rule against network calls in view controllers so it doesn't grow back.
+
+Roughly one quarter: steps 1–5 by me, then each squad extracts its own section with me reviewing.
+
+</ModelAnswer>
+
+<ModelAnswer section="risks">
+
+- **Behaviour changes slip through.** Snapshot and characterisation tests on every PR; each extraction is a pure refactor with no visual change, and redesigns come after, in separate PRs.
+- **Broken storyboard connections.** Moving an `@IBAction` or `@IBOutlet` compiles but crashes at runtime ("not key value coding-compliant"). The snapshot tests load the real storyboard scene, and the UI test opens the page on every build.
+- **Lost or changed analytics.** The analytics spy test pins the events and their order; revenue dashboards depend on them.
+- **Revenue risk on the buy box.** A remote flag per extracted section is the kill switch; phased rollout with conversion as the guardrail. Roll back by turning the flag off, not by shipping a fix.
+- **Performance.** More view controllers and a hosting controller can cost time to first content. Measure with signposts against the baseline at each step, and load sections below the fold lazily.
+- **Migration stalls halfway** (the most common failure). Keep the order and owners visible, review progress at each squad's planning, and delete old paths as soon as a flag reaches 100% so two versions don't live forever.
+
+</ModelAnswer>
+
+<ModelAnswer section="measure">
+
+- **Crashes:** the page's share of crashes falls from 23% towards that of an average screen (under 5%); the size-picker crash is gone; crash-free sessions move towards 99.8%.
+- **Guardrail:** add-to-basket conversion stays within its normal noise at every rollout stage. If it drops, the flag goes off.
+- **Speed of change:** fewer PRs touching `ProductViewController`, merge conflicts close to zero, and the Reviews redesign ships without touching the container.
+- **Safety net:** snapshot and characterisation tests run on every PR and stay green and stable (no reruns).
+- **Performance:** time to first content no worse than the baseline at p50 and p90.
+
+Line count (3,800 down to a few hundred) is a sanity check, not a goal. Success is fewer crashes and faster change at the same conversion.
+
+</ModelAnswer>
+
+```rubric
+- id: diagnosis
+  label: Diagnosed the screen concretely, with a baseline
+  skill: requirements
+  look_for:
+    - The separate responsibilities hiding in the controller, and the state they share (or don't)
+    - The crash traced to unowned shared state, not to "bad code" in general
+    - Several squads colliding on one file as a cause of the pain
+    - Numbers to compare against later (crashes, conversion, conflicts, load time)
+- id: safety-net
+  label: Protected behaviour before changing structure
+  skill: testing
+  look_for:
+    - A seam (a protocol or injected dependency) so tests can supply fixture products
+    - Characterisation or snapshot tests across several realistic products and Dynamic Type
+    - Analytics events pinned, not only pixels
+    - The flaky UI tests fixed or removed rather than tolerated
+- id: target
+  label: A target that fits UIKit and the teams
+  skill: client
+  look_for:
+    - One child view controller per section, with explicit inputs and outputs
+    - A single owner for shared state such as the selected variant
+    - Navigation kept out of the children
+    - SwiftUI introduced as a hosted child, not a rewrite
+- id: incremental
+  label: Small, shippable steps in a sensible order
+  skill: architecture
+  look_for:
+    - Least risky section first to prove the pattern, revenue path last
+    - Pure refactors kept apart from redesigns
+    - Feature flags and phased rollout for risky extractions
+    - Old code deleted as flags reach 100%
+- id: risks
+  label: Named the risks, the rollback and the measures of success
+  skill: tradeoffs
+  look_for:
+    - Storyboard connections, analytics and performance as specific risks
+    - A kill switch per section
+    - Conversion as a guardrail metric, alongside crashes and speed of change
+    - Why not a rewrite, in terms of risk and time
+- id: people
+  label: Planned it with the squads
+  skill: communication
+  look_for:
+    - An ownership map (for example CODEOWNERS) and an agreed order
+    - Each squad extracting its own section, with review
+```
+
+<Pitfalls>
+
+- Proposing a rewrite in SwiftUI or a new architecture for the whole page: months without feature work, and the revenue path at risk on one release.
+- Extracting the buy box first because it's the biggest problem: the riskiest change is made before the pattern and the tests are proven.
+- Changing structure and design in the same pull request, so a snapshot difference can't be told apart from a bug.
+- Refactoring before any safety net, or trusting the flaky UI tests as one.
+- Forgetting analytics, which silently break revenue reporting when code moves.
+- Declaring victory on line count rather than crashes, conversion and speed of change.
+
+</Pitfalls>

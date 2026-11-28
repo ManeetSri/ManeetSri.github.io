@@ -1,0 +1,320 @@
+## Why it matters
+
+Child view controllers are UIKit's own way to split a screen. Each child owns a region: its views, its state, its loading and its lifecycle. `UINavigationController`, `UIPageViewController` and `UISplitViewController` are all built from the same containment API. As a refactoring, **extract child view controller** turns a massive screen into parts that different people can own and test, one region at a time. It's also the usual first step in bringing SwiftUI into a UIKit screen, which is why interviewers ask how you'd break up a big view controller without a rewrite.
+
+## When a region deserves its own controller
+
+The cohesion map from [Massive View Controller and god objects](/design/learn/sd-refactoring-massive-vc) shows you the clusters. A cluster is a good child when:
+
+- **it has its own data and state**: reviews, their pages and their sort order;
+- **it has its own lifecycle needs**: a video that should pause when the region disappears, location updates, a timer;
+- **it's reused** on another screen, or soon will be;
+- **another team owns it**, so a boundary in the code matches a boundary between people.
+
+It's the wrong tool when the region is a few labels with no state of their own: a custom `UIView` that the parent configures is lighter. And it's wrong inside list cells: cells are reused constantly, and a controller per cell makes containment calls on every scroll. Use content configurations there, or `UIHostingConfiguration` (iOS 16) for SwiftUI cells.
+
+## The containment calls, in order
+
+Embedding a child is three calls, and removing one is three more in mirror image. The order matters, and so does knowing which calls UIKit makes for you:
+
+```swift check ios group=containment title="Embedding and removing a child"
+import UIKit
+
+extension UIViewController {
+    /// Adds a child whose view goes into a stack view, with the containment calls in order
+    func embed(_ child: UIViewController, in stack: UIStackView) {
+        addChild(child)                          // UIKit calls child.willMove(toParent: self)
+        stack.addArrangedSubview(child.view)     // reading child.view loads it, so its viewDidLoad runs here
+        child.didMove(toParent: self)            // yours to call: containment is now complete
+    }
+
+    /// Removes a child, the calls mirrored
+    func unembed(_ child: UIViewController) {
+        child.willMove(toParent: nil)            // yours to call
+        child.view.removeFromSuperview()
+        child.removeFromParent()                 // UIKit calls child.didMove(toParent: nil)
+    }
+}
+```
+
+Step through what each call sets off:
+
+```visual sequence
+title: Embedding a child view controller
+participants:
+  - { id: parent, label: Parent }
+  - { id: uikit, label: UIKit }
+  - { id: child, label: Child }
+messages:
+  - [parent, uikit, "addChild(child)", { say: "`addChild` records the relationship: the child joins `children`, and its `parent` is set." }]
+  - [uikit, child, "willMove(toParent:)", { say: "UIKit calls `willMove(toParent:)` for you during `addChild`." }]
+  - [parent, child, "child.view", { say: "The parent reads `child.view`, which loads it." }]
+  - [child, child, viewDidLoad, { say: "So the child's `viewDidLoad` runs now, before its view is in the hierarchy." }]
+  - [parent, parent, add view and constraints, { say: "The parent adds the child's view to its own hierarchy and lays it out." }]
+  - [parent, child, "didMove(toParent: self)", { say: "`didMove(toParent:)` is yours to call: it tells the child containment is complete." }]
+  - { note: "From here, appearance calls, size changes and traits reach the child", over: [parent, child] }
+  - [uikit, child, viewWillAppear, { say: "When the parent appears (or at once, if it's already on screen), UIKit forwards the appearance calls to the child." }]
+```
+
+Containment is what makes the child a real view controller rather than a view that happens to have one attached. Because it's contained, UIKit forwards `viewWillAppear` and its siblings and size transitions to it, and it inherits its parent's traits (Dynamic Type, dark mode); its `parent` and `navigationController` are set; and it can push and present.
+
+## The refactoring, step by step
+
+Take a product page whose reviews section was built inline: a stack of review buttons, the reviews array, a loading method and a tap handler, all in `ProductViewController`. Each step below leaves the page working.
+
+1. **Pin the region's behaviour.** Snapshot the page with reviews, with none, and with the reviews request failing, and note the analytics events the section sends. That's your characterisation.
+2. **Create the child with explicit inputs.** `ReviewsViewController(productID:loader:)` takes exactly what the region needs, and never a reference to its parent.
+3. **Move the views and layout** into the child's `viewDidLoad`.
+4. **Move the state and methods of the cluster**: the reviews, the loading, the button building. The cohesion map says which.
+5. **Turn every back-reference into an output.** Where the old code called the parent's method on a tap, the child exposes `onSelectReview`, and the parent (or its coordinator) decides what a tap means.
+6. **Embed it and delete the old code**, then run the snapshots and check the analytics.
+
+Here's the result:
+
+```swift check ios group=containment title="After: the reviews region as a child"
+struct Review: Sendable, Hashable {
+    let id: String
+    let stars: Int
+    let text: String
+}
+
+protocol ReviewsLoading: Sendable {
+    func reviews(productID: String) async throws -> [Review]
+}
+
+// The region, extracted: its own views, state and loading, and explicit inputs and outputs
+final class ReviewsViewController: UIViewController {
+    var onSelectReview: ((Review) -> Void)?      // output: the parent decides what a tap means
+
+    private let productID: String                // inputs: what it needs, never its parent
+    private let loader: any ReviewsLoading
+    private let stack = UIStackView()
+
+    init(productID: String, loader: any ReviewsLoading) {
+        self.productID = productID
+        self.loader = loader
+        super.init(nibName: nil, bundle: nil)
+    }
+
+    required init?(coder: NSCoder) { nil }
+
+    override func viewDidLoad() {
+        super.viewDidLoad()
+        stack.axis = .vertical
+        stack.alignment = .leading
+        stack.translatesAutoresizingMaskIntoConstraints = false
+        view.addSubview(stack)
+        NSLayoutConstraint.activate([
+            stack.topAnchor.constraint(equalTo: view.topAnchor),
+            stack.leadingAnchor.constraint(equalTo: view.leadingAnchor),
+            stack.trailingAnchor.constraint(equalTo: view.trailingAnchor),
+            stack.bottomAnchor.constraint(equalTo: view.bottomAnchor),
+        ])
+        Task { await load() }
+    }
+
+    private func load() async {
+        do {
+            let reviews = try await loader.reviews(productID: productID)
+            for review in reviews.prefix(3) {
+                let action = UIAction(title: "\(review.stars)★  \(review.text)") { [weak self] _ in
+                    self?.onSelectReview?(review)
+                }
+                stack.addArrangedSubview(UIButton(configuration: .plain(), primaryAction: action))
+            }
+        } catch {
+            let label = UILabel()
+            label.text = "Reviews aren't available right now."
+            stack.addArrangedSubview(label)
+        }
+    }
+}
+
+// The parent builds the page from sections and wires each child's outputs
+final class ProductViewController: UIViewController {
+    private let productID: String
+    private let reviewsLoader: any ReviewsLoading
+    private let openReview: (Review) -> Void     // from the coordinator
+    private let scrollView = UIScrollView()
+    private let sections = UIStackView()
+
+    init(productID: String, reviewsLoader: any ReviewsLoading, openReview: @escaping (Review) -> Void) {
+        self.productID = productID
+        self.reviewsLoader = reviewsLoader
+        self.openReview = openReview
+        super.init(nibName: nil, bundle: nil)
+    }
+
+    required init?(coder: NSCoder) { nil }
+
+    override func viewDidLoad() {
+        super.viewDidLoad()
+        sections.axis = .vertical
+        sections.spacing = 24
+        sections.translatesAutoresizingMaskIntoConstraints = false
+        scrollView.translatesAutoresizingMaskIntoConstraints = false
+        view.addSubview(scrollView)
+        scrollView.addSubview(sections)
+        let content = scrollView.contentLayoutGuide
+        NSLayoutConstraint.activate([
+            scrollView.topAnchor.constraint(equalTo: view.topAnchor),
+            scrollView.leadingAnchor.constraint(equalTo: view.leadingAnchor),
+            scrollView.trailingAnchor.constraint(equalTo: view.trailingAnchor),
+            scrollView.bottomAnchor.constraint(equalTo: view.bottomAnchor),
+            sections.topAnchor.constraint(equalTo: content.topAnchor),
+            sections.leadingAnchor.constraint(equalTo: content.leadingAnchor, constant: 16),
+            sections.trailingAnchor.constraint(equalTo: content.trailingAnchor, constant: -16),
+            sections.bottomAnchor.constraint(equalTo: content.bottomAnchor),
+            sections.widthAnchor.constraint(equalTo: scrollView.frameLayoutGuide.widthAnchor, constant: -32),
+        ])
+
+        let reviews = ReviewsViewController(productID: productID, loader: reviewsLoader)
+        reviews.onSelectReview = openReview
+        embed(reviews, in: sections)
+    }
+}
+```
+
+Look at what the parent now knows about reviews: how to create the child and where its output goes. Nothing about loading, layout or failure. A Reviews team can redesign the region inside `ReviewsViewController` without touching the page, and test it with a stub `ReviewsLoading`.
+
+## Sizing children
+
+Most sizing trouble with children comes from one of three places:
+
+- **In a stack view**, the child's view is sized by Auto Layout from its content, so its constraints must define a height from top to bottom, as the reviews stack's do. When the reviews arrive and buttons are added, the stack grows and the page re-lays itself out.
+- **Outside Auto Layout**, a child reports the size it wants through `preferredContentSize`, and the parent responds in `preferredContentSizeDidChange(forChildContentContainer:)`.
+- **A scrolling child in a scrolling parent**, such as a table view inside the page's scroll view, fights for gestures and can't size itself to its content. Either show a fixed number of rows (as above, with a "See all" that pushes a full list), or make the whole page one collection view whose sections come from a compositional layout. You'll meet that in D17.
+
+## A SwiftUI child
+
+A `UIHostingController` is a view controller, so a SwiftUI region is embedded with the same three calls. Since iOS 16, setting `sizingOptions = .intrinsicContentSize` makes the hosting controller's view report its SwiftUI content's ideal size to Auto Layout, so it sits in a stack view like any other child:
+
+```swift check ios title="A SwiftUI region as a child"
+import SwiftUI
+import UIKit
+
+struct RecommendationsView: View {
+    let titles: [String]
+
+    var body: some View {
+        ScrollView(.horizontal) {
+            HStack {
+                ForEach(titles, id: \.self) { title in
+                    Text(title)
+                        .padding()
+                        .background(.thinMaterial, in: .rect(cornerRadius: 12))
+                }
+            }
+        }
+    }
+}
+
+// A SwiftUI region as a child view controller: embedded with exactly the same calls
+@MainActor func makeRecommendations(titles: [String]) -> UIViewController {
+    let host = UIHostingController(rootView: RecommendationsView(titles: titles))
+    host.sizingOptions = .intrinsicContentSize   // iOS 16: Auto Layout sizes it from the SwiftUI content
+    return host
+}
+```
+
+That's how a UIKit screen moves to SwiftUI without a rewrite: one extracted child at a time, each replaced by a hosting controller when its team is ready.
+
+## Trade-offs
+
+| Option | Own state and lifecycle | Effort | Reuse | Wins when |
+| --- | --- | --- | --- | --- |
+| Child view controller | yes, with forwarded appearance and traits | medium | high | an independent region with its own data or lifecycle |
+| Custom `UIView` subclass | no | low | medium | presentation only, configured by the parent |
+| Data-source or delegate object | list logic only | low | medium | the bulk of the code is table plumbing |
+| `UIHostingController` child | yes, through SwiftUI state | medium | high | new or rewritten regions, or a move to SwiftUI |
+| A section in a compositional layout | per section, inside one list | medium to high | low | the whole page is a long scrolling list |
+
+<Callout kind="interview">
+
+**What to say:** "I'd split the screen by region, using the clusters its state already forms, and extract one child at a time behind snapshot tests. Each child gets explicit inputs and reports out through closures or a delegate, never through its parent's type." Know the containment calls and their order, and what containment gives a child that `addSubview` alone doesn't.
+
+**What to ask:** Which regions change most, and who owns them? Are any reused elsewhere? Does the page scroll as one list, or as stacked sections? Is there a plan to move parts to SwiftUI?
+
+**Red flags:** adding `child.view` without `addChild`; a child that casts `parent` to a concrete type; a view controller per cell; a scroll view nested in a scroll view without a plan for sizing.
+
+</Callout>
+
+<Callout kind="gotcha" title="iOS gotcha: addSubview alone isn't containment">
+
+`view.addSubview(child.view)` without `addChild` shows the child's views and looks fine in a demo. But the child never gets `viewWillAppear` or `viewWillTransition(to:with:)`, its `navigationController` is `nil` so pushes do nothing, and presenting from it logs "Presenting view controllers on detached view controllers is discouraged". Always pair the view with the containment calls, through one helper like `embed(_:in:)`.
+
+</Callout>
+
+<Callout kind="gotcha" title="Swift gotcha: output closures and retain cycles">
+
+The parent holds its children (through `children`), and each child holds its output closures. If a closure captures the parent strongly, `child.onSelectReview = { self.show($0) }`, the two keep each other alive after the screen is dismissed. Capture `[weak self]`, or pass a closure that doesn't capture the parent at all, as `openReview` above does.
+
+</Callout>
+
+## Practice
+
+**Take apart a 3,800-line product page** is this refactoring at full scale: choose the order of the children, keep the page shipping every week, and bring in a SwiftUI section without a rewrite.
+
+```cards
+- id: containment-order
+  front: "What are the calls to embed a child view controller, in order?"
+  back: "`addChild(child)` (UIKit calls `willMove`), add `child.view` to your hierarchy with its layout, then `child.didMove(toParent: self)`. Removal mirrors it: `willMove(toParent: nil)`, remove the view, `removeFromParent()`."
+- id: child-boundaries
+  front: "How should a child view controller talk to its parent?"
+  back: "Through outputs it declares, such as a closure or a delegate protocol. It takes its inputs in its initialiser and never casts `parent` to a concrete type."
+- id: swiftui-child
+  front: "How do you bring a SwiftUI section into a UIKit screen?"
+  back: "Wrap it in a `UIHostingController`, embed it with the normal containment calls, and set `sizingOptions = .intrinsicContentSize` (iOS 16) so Auto Layout sizes it."
+```
+
+```quiz
+- id: q1
+  type: order
+  prompt: "Put the calls to embed a child view controller in order."
+  lines:
+    - "addChild(child)"
+    - "Add child.view to the parent's view hierarchy"
+    - "Activate the child view's constraints"
+    - "child.didMove(toParent: self)"
+  explain: "`addChild` comes first so the child is contained before its view appears; UIKit calls `willMove(toParent:)` inside it. The view and its layout come next, and `didMove(toParent:)` is the call you make last to say containment is complete."
+- id: q2
+  type: bug
+  prompt: "This method swaps one child for another. Click the line that's wrong."
+  code: |
+    func replace(_ old: UIViewController, with new: UIViewController) {
+        old.willMove(toParent: nil)
+        old.view.removeFromSuperview()
+        old.removeFromParent()
+        addChild(new)
+        stack.addArrangedSubview(new.view)
+        new.willMove(toParent: self)
+    }
+  answer: 7
+  explain: "After adding a child, you call `didMove(toParent: self)`. `addChild` has already called `willMove(toParent:)`, so this calls it a second time and never tells the child containment finished. The removal half is in the right order."
+- id: q3
+  type: mcq
+  prompt: "A teammate embeds a child with `view.addSubview(child.view)` only. What breaks first?"
+  options:
+    - "Nothing: the child's views are on screen, which is all containment does"
+    - "The child misses its appearance callbacks, and its `navigationController` is nil, so pushing from it does nothing"
+    - "The app crashes as soon as the view is added"
+    - "Auto Layout can no longer size the child's view"
+  answer: 1
+  explain: "Without `addChild`, UIKit doesn't know the controller is part of the hierarchy, so it forwards nothing to it and its parent-derived properties are nil. It fails quietly, which is why it survives code review."
+- id: q4
+  type: multi
+  prompt: "Which regions of a product page are good candidates for their own child view controller?"
+  options:
+    - "Reviews, which load, paginate and sort on their own"
+    - "A video gallery that must pause when it scrolls off screen"
+    - "The product title, which is a single label set from the product"
+    - "Each row of the reviews list"
+    - "Recommendations, owned by another team and moving to SwiftUI"
+  answer: [0, 1, 4]
+  explain: "Own data, own lifecycle and a separate owner are the signs. A single label is better as a plain view the parent configures, and list rows are reused cells, where a controller each would be heavy and fragile."
+- id: q5
+  type: truefalse
+  prompt: "When a review is tapped, the child should call `(parent as? ProductViewController)?.openReview(review)`."
+  answer: false
+  explain: "That couples the child to one parent type, so it can't be reused or tested alone, and the cast silently does nothing when the parent changes. Expose an output, `onSelectReview`, and let whoever embeds the child decide what it means."
+```

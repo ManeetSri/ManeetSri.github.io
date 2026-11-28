@@ -1,0 +1,233 @@
+## Why it matters
+
+Almost every app you'll build is the client half of a client–server system, and many of its hardest problems come from that: latency, flaky networks, versions of your app that are years old, and users who can tamper with anything on their own device. Mobile system design interviews spend much of their time on this boundary: what runs on the phone, what runs on the server, and what crosses between them.
+
+## The style
+
+Client–server is the oldest distributed style, and its constraints are short:
+
+- **Servers** offer a service and wait. They don't know in advance who their clients are.
+- **Clients** start every exchange. They know the server's address and its interface.
+- **Many clients, one logical server.** The server is the shared place where data meets: everyone's orders, everyone's messages.
+
+What it buys: a **single source of truth** for shared data, **central control** (fix a pricing bug once, on the server, and every client gets it), and clients that can be small. What it costs: every interaction pays for the network, and the client is useless without the server unless you design otherwise.
+
+REST, which Roy Fielding described in 2000, is client–server plus more constraints: **stateless** requests (each one carries everything the server needs, including auth), **cacheable** responses that say so, a **uniform interface** (resources and standard methods), and a **layered system** (the client can't tell whether it's talking to the server or a CDN in front of it). Each constraint buys something an app cares about. Statelessness is why your API client can retry a request on another connection; cacheability is why `URLCache` and `ETag`s work.
+
+## What's different when the client is a phone
+
+Client–server was designed for desktop terminals on office networks. On a phone, four things change the design.
+
+### 1. The network is slow, and every round trip counts
+
+On cellular, a round trip can be anywhere from about 50 ms on a strong 5G signal to well over 500 ms on a weak one, and the radio may need to wake up first. Bandwidth matters far less than the **number of round trips that depend on each other**. A screen that needs `/me`, then `/me/orders`, then `/orders/42/items` pays three round trips one after another, however fast the download.
+
+Play with it. Start at the defaults, then move the round trip to 600 ms, a bad train connection:
+
+```visual estimator
+title: Why chatty APIs hurt on mobile
+inputs:
+  - { id: rtt, label: Round trip on cellular, min: 20, max: 1000, value: 300, scale: log, unit: ms }
+  - { id: calls, label: "Calls the screen needs, each needing the last", min: 1, max: 12, step: 1, value: 4 }
+  - { id: kb, label: Response size per call, min: 1, max: 500, value: 20, scale: log, unit: KB }
+  - { id: mbps, label: Download speed, min: 0.5, max: 100, value: 5, scale: log, unit: Mbit/s }
+  - { id: hop, label: One call between servers in the data centre, min: 1, max: 50, step: 1, value: 5, unit: ms }
+outputs:
+  - { id: transfer, label: Time spent downloading, formula: calls * kb * 8 / 1000 / mbps, format: duration }
+  - { id: chained, label: The phone makes the calls one after another, formula: calls * rtt / 1000 + transfer, format: duration }
+  - { id: bff, label: One call to a backend for frontend that chains them itself, formula: rtt / 1000 + calls * hop / 1000 + transfer, format: duration }
+  - { id: saved, label: Time the user gets back, formula: chained - bff, format: duration }
+```
+
+The download is a small part of the total; the round trips are most of it. That's the case for a **backend for frontend (BFF)**: a server-side layer, owned by the app team, that does the chatty work next to the services, where a call costs milliseconds, and hands the app one response shaped for one screen. GraphQL attacks the same problem a different way, by letting the client ask for the whole tree in one request. (A brand-new connection also adds a TCP and a TLS 1.3 handshake, about two more round trips, which is why connection reuse matters too; D32 covers it.)
+
+### 2. Old clients live for years
+
+You deploy a server when you like. You *release* an app through App Review, and then users update when they feel like it. Some never do. Any response format you ship will be read by builds you can't change, so the server must stay **backwards compatible**, and the client must be **tolerant** of what it doesn't recognise.
+
+The classic crash: the server adds an enum case, and every old build that decoded that enum strictly fails to decode the whole response.
+
+```swift run title="Surviving a new enum case, and checking the supported version"
+import Foundation
+
+// Version 1.0 of the app knew two payment methods, and decoded them strictly
+enum StrictMethod: String, Decodable {
+    case card, applePay = "apple_pay"
+}
+
+// A tolerant version keeps whatever the server sends, so an old build survives a new case
+enum PaymentMethod: Decodable, Equatable {
+    case card, applePay
+    case unknown(String)
+
+    init(from decoder: any Decoder) throws {
+        let raw = try decoder.singleValueContainer().decode(String.self)
+        switch raw {
+        case "card": self = .card
+        case "apple_pay": self = .applePay
+        default: self = .unknown(raw)
+        }
+    }
+
+    var label: String {
+        switch self {
+        case .card: "card"
+        case .applePay: "Apple Pay"
+        case .unknown(let raw): "unknown (\(raw))"
+        }
+    }
+}
+
+struct Wallet<Method: Decodable>: Decodable {
+    let methods: [Method]
+}
+
+// Months later, the server starts sending a method this build has never heard of
+let json = Data(#"{ "methods": ["card", "apple_pay", "klarna"] }"#.utf8)
+
+do {
+    let wallet = try JSONDecoder().decode(Wallet<StrictMethod>.self, from: json)
+    print("Strict: decoded", wallet.methods.count, "methods")
+} catch {
+    print("Strict: the whole wallet failed to decode")
+}
+
+let wallet = try JSONDecoder().decode(Wallet<PaymentMethod>.self, from: json)
+print("Tolerant:", wallet.methods.map(\.label))
+let usable = wallet.methods.filter { if case .unknown = $0 { false } else { true } }
+print("Shown to the user:", usable.count, "of", wallet.methods.count)
+
+// The server also says which builds it still supports. Compare versions numerically, not as text.
+let minimumSupported = "2.10.0"
+for installed in ["2.9.4", "2.10.0", "2.11.1"] {
+    let tooOld = installed.compare(minimumSupported, options: .numeric) == .orderedAscending
+    print(installed, tooOld ? "→ ask to update" : "→ fine", "(as plain text: \(installed < minimumSupported ? "older" : "not older"))")
+}
+```
+
+```output
+Strict: the whole wallet failed to decode
+Tolerant: ["card", "Apple Pay", "unknown (klarna)"]
+Shown to the user: 2 of 3
+2.9.4 → ask to update (as plain text: not older)
+2.10.0 → fine (as plain text: not older)
+2.11.1 → fine (as plain text: not older)
+```
+
+Two habits fall out of this. Decode closed sets tolerantly, with an `unknown` case. And have the server tell the app the **minimum supported version**, so you can retire old builds deliberately. Compare versions with `.numeric`: as text, "2.9.4" sorts after "2.10.0".
+
+### 3. The client can't be trusted
+
+The phone belongs to the user. They can read your binary, change requests with a proxy, and replay them. So anything that must be true goes on the server:
+
+- **Prices, discounts, stock and entitlements** are decided by the server. The app *shows* a total; the server *computes* the one it charges.
+- **Validation** on the client is for the user's convenience: instant feedback that the email looks wrong. The server validates again.
+- **Secrets** don't belong in the app bundle. An API key shipped in the binary is public.
+
+This is the **trust boundary**, and it's the strongest argument for keeping business rules that involve money or other users on the server tier.
+
+### 4. Sometimes there is no server
+
+The client may be offline for minutes or days. Pure client–server says the app does nothing then. Most apps soften that with a cache (D38), and offline-first apps go further: they make the **device** the place the user's edits live first, and sync with the server later (D39). That's still client–server, but with the source of truth for *unsynced* data moved onto the phone.
+
+## Thin and thick clients
+
+Where you put logic is a dial, not a switch.
+
+- **Thin client:** the server decides almost everything, even layout. **Server-driven UI** sends a description of the screen ("a header, then a carousel of these cards") and the app renders it. Airbnb and others have written about doing this to change screens without an App Store release.
+- **Balanced:** the server owns shared data and rules; the app owns presentation, local state, caching and navigation. Most apps live here.
+- **Thick client:** the app holds real data and rules locally (a notes app, a photo editor, an offline field-service app) and syncs.
+
+## When the server needs to speak first
+
+The style says clients start every exchange, but chat messages, live scores and ride updates need the server to tell the client something. Apps bend the rule in three standard ways: **polling** (the client asks every n seconds), a long-lived connection the **client opens** and the server then writes to (WebSockets, server-sent events), and **push notifications** through APNs, which is a separate channel owned by Apple. Each keeps the core rule intact in its own way: the server never dials a phone directly. D35 and D46 go deep on these.
+
+## Trade-offs
+
+| | Thin client (server-driven UI) | Balanced client | Thick client (offline-first) |
+| --- | --- | --- | --- |
+| Ship a change without App Review | Most changes | Data and rules only | Few |
+| Works offline | Barely | Read-only, from cache | Fully |
+| Latency the user feels | Highest | Medium | Lowest |
+| Consistency across iOS, Android, web | High, one implementation | Medium | Low, rules duplicated |
+| Client complexity | Low | Medium | High: sync, conflicts, migrations |
+| Rules the user could tamper with | None | Few | Must still be re-checked on the server |
+
+Thin wins when the product changes weekly and connectivity is good (shopping, content). Thick wins when the user must keep working without a connection (field work, notes, health logging). Balanced is the right default until a requirement pushes you along the dial.
+
+<Callout kind="interview">
+
+**Say:** which side owns each piece, and why. "The server computes the total and checks stock; the app shows an estimate and the server's answer wins." Mention old versions unprompted: "Responses only ever add fields, enums decode with an unknown case, and the server sends a minimum supported version."
+
+**Ask:** how good the connectivity is, whether anything must work offline, and how fast product needs to change things without a release.
+
+**Red flags:** trusting prices or entitlements from the client; designing endpoints that mirror database tables, so one screen needs six calls; assuming every user runs the latest build.
+
+</Callout>
+
+<Callout kind="gotcha" title="iOS gotcha: you can't hot-fix a shipped build">
+
+A bug in a shipped build stays in the wild until users update, and App Review adds a delay of its own. Keep a few levers on the server side for that day: the minimum supported version, remote flags that can switch a feature off, and a way to serve a broken version differently (URLSession's default `User-Agent` includes the build number, or send the version in a header of your own). D54 covers flags properly.
+
+</Callout>
+
+```cards
+- id: client-server-constraints
+  front: "What are client–server's core constraints?"
+  back: "Servers wait and serve many clients they don't know in advance; clients start every exchange. It buys one source of truth and central control, at the cost of the network."
+- id: round-trips
+  front: "On cellular, what usually dominates a screen's load time: bandwidth or round trips?"
+  back: "Round trips that depend on each other. Collapse them with a backend for frontend or a query language like GraphQL, and reuse connections."
+- id: old-clients
+  front: "Three habits for living with old app versions?"
+  back: "Only add to responses, never change or remove; decode closed sets tolerantly with an unknown case; have the server send a minimum supported version."
+- id: trust-boundary
+  front: "What must the server decide, whatever the client says?"
+  back: "Anything that must be true: prices, stock, entitlements, permissions. Client-side validation is for user convenience only."
+```
+
+```quiz
+- id: q1
+  type: estimate
+  prompt: "A product screen needs 5 calls, each depending on the one before. The round trip is 400 ms and the downloads are tiny. Roughly how long before it can draw, in milliseconds?"
+  answer: 2000
+  unit: ms
+  within: { percent: 20 }
+  explain: "5 × 400 ms = 2,000 ms of waiting, before any download time. A backend for frontend making the same calls next to the services would cost about one round trip, 400 ms, plus a few milliseconds per internal call."
+- id: q2
+  type: mcq
+  prompt: "Version 3.2 of your app decodes `status` as a strict `String` enum. The backend team wants to add `\"on_hold\"`. What's the safest plan?"
+  options:
+    - "Add the case on the server; users will update soon enough"
+    - "Ship a client that decodes unknown statuses safely, wait until old builds are rare (or below the minimum version), then send the new value"
+    - "Send the new value only to Android"
+    - "Rename the field so old clients ignore it"
+  answer: 1
+  explain: "Old builds can't be changed, so the server has to respect what they can decode. Ship tolerance first, and use the minimum supported version to retire builds that would break. Renaming fields breaks old clients in a different way."
+- id: q3
+  type: multi
+  prompt: "Which of these must the server enforce, even if the app also checks them?"
+  options:
+    - "The discount a promo code gives"
+    - "That a username has no more than 30 characters"
+    - "Whether a user may view another user's private album"
+    - "The order the tabs appear in"
+    - "Whether the user's subscription includes offline downloads"
+  answer: [0, 1, 2, 4]
+  explain: "Anything a tampered client could abuse is enforced on the server: money, data limits, permissions and entitlements. The client may check too, for quick feedback. Tab order is presentation."
+- id: q4
+  type: mcq
+  prompt: "A field inspection app is used in basements with no signal for hours, and inspectors must keep filling in forms. Where on the dial does it belong?"
+  options:
+    - "Thin client with server-driven UI"
+    - "Balanced client with a read-only cache"
+    - "Thick client: forms, drafts and photos live on the device and sync later"
+    - "No server at all"
+  answer: 2
+  explain: "Hours offline with writes means the device must hold the source of truth for unsynced work. The server is still needed: for shared data, for validating what syncs, and for the office to see the results."
+- id: q5
+  type: truefalse
+  prompt: "Because push notifications let the server reach the phone first, an app that uses APNs is no longer a client–server system."
+  answer: false
+  explain: "APNs is a separate channel that Apple runs; your server asks APNs, and the app usually responds by calling your server as a client. The app–server relationship stays client–server."
+```
