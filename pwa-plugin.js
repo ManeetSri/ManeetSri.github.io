@@ -41,7 +41,12 @@ export const pwa = () => {
             }
 
             const projectAssets = readdirSync(join(root, 'public/assets/apps')).filter((name) => name.endsWith('.jpg')).sort();
-            const publicAssets = ['/manifest.webmanifest', '/assets/favicon.png', ...projectAssets.map((name) => `/assets/apps/${name}`)];
+            const publicAssets = [
+                '/manifest.webmanifest',
+                '/icons/favicon-phone-16.png',
+                '/icons/favicon-phone-32.png',
+                ...projectAssets.map((name) => `/assets/apps/${name}`),
+            ];
             const version = createHash('sha256').update(html).update(worker).update(JSON.stringify([...shell, CONSOLE_BASES]));
             for (const path of publicAssets) version.update(path).update(readFileSync(join(root, 'public', path.slice(1))));
 
