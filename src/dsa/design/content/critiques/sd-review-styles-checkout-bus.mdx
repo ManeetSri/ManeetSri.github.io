@@ -1,0 +1,158 @@
+<Brief>
+
+A shopping app's team wrote this design for its new checkout, got it approved, and shipped it. Since then support has seen customers charged twice, a spinner that never ends after a declined card, and orders missing from order history. Review the design and the code it produced: what's wrong, what matters most, and how you'd fix it.
+
+> **Checkout v2: design doc (approved)**
+>
+> **Team:** 4 iOS engineers, one app, weekly releases.
+>
+> **Quality priorities, in order:** (1) payment correctness: never charge twice, never show success for a failed charge; (2) debuggability: support must be able to answer "what happened to my order?"; (3) speed of delivery.
+>
+> **Architecture:** to decouple features, all communication between modules goes through `AppEventBus`, and modules never call each other. Checkout publishes `checkout.pay` with the basket. Payments listens, charges the card and publishes `payment.result`. Orders listens to `payment.result` and saves the order. Checkout listens to `payment.result` to show the outcome. New features join by subscribing.
+
+```swift check ios title="Checkout.swift"
+import Foundation
+import Observation
+
+final class AppEventBus: @unchecked Sendable {
+    static let shared = AppEventBus()
+    private var handlers: [UUID: @Sendable (String, [String: any Sendable]) -> Void] = [:]
+
+    func subscribe(_ handler: @escaping @Sendable (String, [String: any Sendable]) -> Void) {
+        handlers[UUID()] = handler
+    }
+
+    func publish(_ name: String, _ payload: [String: any Sendable] = [:]) {
+        DispatchQueue.global().async {
+            for handler in self.handlers.values {
+                handler(name, payload)
+            }
+        }
+    }
+}
+
+@MainActor @Observable
+final class CheckoutViewModel {
+    var status = "Ready"
+    let basketID: String
+    let totalPence: Int
+
+    init(basketID: String, totalPence: Int) {
+        self.basketID = basketID
+        self.totalPence = totalPence
+        AppEventBus.shared.subscribe { [self] name, payload in
+            guard name == "payment.result" else { return }
+            let succeeded = payload["success"] as? Bool ?? false
+            Task { @MainActor in self.status = succeeded ? "Order placed" : "Payment failed" }
+        }
+    }
+
+    func payTapped() {
+        status = "Paying…"
+        AppEventBus.shared.publish("checkout.pay", ["basket": basketID, "pence": totalPence])
+    }
+}
+
+final class PaymentsService: Sendable {
+    init() {
+        AppEventBus.shared.subscribe { name, payload in
+            guard name == "checkout.pay", let pence = payload["pence"] as? Int else { return }
+            Task {
+                do {
+                    try await self.charge(pence: pence)
+                    AppEventBus.shared.publish("payment.result", ["success": true, "basket": payload["basket"] ?? ""])
+                } catch {
+                    AppEventBus.shared.publish("payment.reslut", ["success": false])
+                }
+            }
+        }
+    }
+
+    func charge(pence: Int) async throws { /* POST /payments with the amount */ }
+}
+
+final class OrdersStore: @unchecked Sendable {
+    private(set) var orders: [String] = []
+    init() {
+        AppEventBus.shared.subscribe { name, payload in
+            if name == "payment.result", let basket = payload["basket"] as? String {
+                self.orders.append(basket)
+            }
+        }
+    }
+}
+```
+
+</Brief>
+
+```workspace
+template: critique
+minutes: 30
+```
+
+```findings
+- id: style-mismatch
+  title: The chosen style works against the design's own priorities
+  severity: high
+  detail: "The doc ranks payment correctness and debuggability first and second, then routes the payment, the one flow that must be correct and traceable, through fire-and-forget events. Events buy decoupling and easy extension, neither of which is on the list, and they cost exactly what is: nobody can read the flow in one place, failures don't reach the caller, and order isn't guaranteed. With four engineers in one app, direct `async` calls for checkout, with events only for side effects afterwards, fit the stated qualities."
+- id: double-charge
+  title: A second tap charges the card again
+  severity: high
+  lines: 37-39
+  detail: "Nothing stops `payTapped()` running twice: each tap publishes another `checkout.pay`, and Payments charges each one. No idempotency key reaches the payment API either, so a retry after a timeout also charges twice. This is the reported double charge."
+- id: typo-failure
+  title: Failed payments publish an event nobody listens to
+  severity: high
+  lines: 52
+  detail: "`\"payment.reslut\"` is misspelt, so on a declined card no subscriber ever hears about it and the screen stays on \"Paying…\" for ever: the endless spinner. String event names and `[String: any Sendable]` payloads give the compiler nothing to check; the same goes for `as? Int` silently dropping an event whose amount arrives as another type."
+- id: no-correlation
+  title: Every checkout screen accepts every payment result
+  severity: high
+  lines: 30-34
+  detail: "The handler ignores the basket in the payload, so a result for any basket sets this screen's status. With two checkouts alive (a pushed screen and a stale one, or a retried basket), one payment's success shows on the wrong screen, or a failure on a screen whose charge succeeded. Request and reply over events needs a correlation id; a direct call needs none."
+- id: data-race
+  title: The bus's state is read and written from several threads
+  severity: high
+  lines: 6-17
+  detail: "`subscribe` mutates `handlers` on the main thread while `publish` iterates it on a global queue, and `OrdersStore.orders` (line 66) is appended to from whichever thread delivers. `@unchecked Sendable` tells Swift 6 not to check, so these races compile and crash intermittently. A lock or an actor, or a bus that delivers on a known actor, is needed."
+- id: unordered-delivery
+  title: Delivery order is undefined, so Orders can lag behind the screen
+  severity: medium
+  lines: 14-15
+  detail: "Handlers live in a `[UUID: …]` dictionary, whose iteration order is unspecified, and run on a background queue. Checkout can show \"Order placed\" before OrdersStore has saved the order, so order history opened straight afterwards doesn't show it: the missing orders support reported."
+- id: never-unsubscribed
+  title: Subscriptions can't be removed, so screens leak and keep reacting
+  severity: medium
+  lines: 8-10
+  detail: "There's no unsubscribe. Each `CheckoutViewModel` registers a handler that captures `self` strongly, and the global bus keeps it for ever, so every checkout screen ever opened stays in memory and keeps responding to payment results."
+- id: swallowed-errors
+  title: Failures carry no reason and no order, and nothing is logged
+  severity: medium
+  lines: 51-52
+  detail: "The catch discards the error, and the failure event has no basket id or reason. Support can't answer \"what happened to my order?\", which the doc names as priority two, and the screen couldn't tell a declined card from a timeout even if the event arrived."
+- id: hidden-dependencies
+  title: A global singleton bus hides every dependency
+  severity: low
+  lines: 5
+  detail: "Every type reaches for `AppEventBus.shared`, so nothing's dependencies appear in its initialiser, tests can't use an isolated bus, and \"modules never call each other\" is only true on paper: they're all coupled through undocumented string names and payload keys."
+```
+
+<ReferenceReview>
+
+**Most important first.** Customers are being charged twice and left on endless spinners, and both trace to the same decision: **the payment flow is built from events**, when the design's own top priorities (correctness, then debuggability) call for a flow you can read, that returns errors to its caller, and that runs its steps in order. Events were the right tool for what happens *after* an order is placed, not for placing it.
+
+**Stop the bleeding this week**, in small releases:
+
+1. Disable the Pay button while a payment is in flight, and send an idempotency key (one per checkout attempt) with the charge, so the payment API rejects duplicates. That stops double charges even from retries.
+2. Fix the `payment.reslut` typo so failures reach the screen, and add a timeout to the "Paying…" state as a backstop.
+3. Make the bus thread-safe (a lock around `handlers`, delivery on the main actor), and log every payment outcome with the basket id.
+
+**Then fix the design:**
+
+4. Replace the payment events with a **mediator**: a `PlaceOrder` use case that checkout calls with `try await placeOrder(basket)`. It charges through an injected `PaymentsClient` (with the idempotency key), saves through an `OrdersRepository`, and returns the order or throws a typed error. The view model maps that to a status enum (`idle`, `paying`, `placed(Order)`, `failed(reason)`) instead of strings.
+5. Keep a bus for side effects only: after success, `PlaceOrder` publishes a typed `OrderPlaced` event for analytics, the badge and the widget. Use an injected, typed bus whose subscriptions are owned and cancelled on release, not a global with string names.
+6. Delete `checkout.pay` and `payment.result`, and update the design doc: record the decision, the priorities it serves, and the rule "commands and queries are calls; events are facts for side effects".
+
+**Tests to add:** `PlaceOrder` with fakes: success charges once and saves once; a declined card throws, saves nothing and surfaces the reason; the same idempotency key twice charges once; save failing after a successful charge is reported, not hidden. The view model's states for each outcome. For the bus: delivery by type and in order, cancellation on release, and a run under Thread Sanitizer with concurrent publishers and subscribers.
+
+</ReferenceReview>

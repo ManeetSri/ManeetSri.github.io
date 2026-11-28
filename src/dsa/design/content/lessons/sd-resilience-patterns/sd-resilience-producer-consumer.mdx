@@ -1,0 +1,307 @@
+## Why it matters
+
+Some work arrives faster than you can do it: 400 photos to back up after a holiday, thumbnails for a grid the user is flinging through, analytics events from every tap, offline edits waiting to sync. The **producer–consumer** pattern puts a queue between the code that creates work and the code that does it, so each can run at its own pace. Interviewers reach for it whenever a prompt says "upload" or "sync": the follow-up questions are always how big the queue is, how many workers drain it, and what happens when it's full.
+
+## The pattern
+
+A **producer** creates units of work and puts them on a **queue** (also called a buffer). One or more **consumers** (workers) take work off the queue and do it. Neither knows about the other; they only share the queue.
+
+<Callout kind="analogy">
+
+A restaurant kitchen. Waiters (producers) clip order tickets to a rail; cooks (consumers) take the oldest ticket when they're free. A busy table doesn't make a waiter cook, and a slow dish doesn't stop waiters taking orders. The rail is the queue, and the interesting question is what happens when it's full.
+
+</Callout>
+
+That separation buys three things:
+
+- **Different speeds.** The producer can burst (a user selects 400 photos in one tap) while consumers work at the rate the network allows.
+- **Controlled concurrency.** You choose how many consumers run at once, instead of letting the number of jobs decide.
+- **A place to put policy.** Priority, retries, persistence and cancellation all live in the queue, not scattered across callers.
+
+Here's the shape in an app: the camera roll produces, three upload workers consume.
+
+```visual flow
+title: A photo backup queue
+nodes:
+  - { id: library, label: Photo library, kind: store, at: [0, 1] }
+  - { id: queue, label: Upload queue, kind: queue, at: [2, 1] }
+  - { id: w1, label: Worker 1, kind: service, at: [4, 0] }
+  - { id: w2, label: Worker 2, kind: service, at: [4, 1] }
+  - { id: w3, label: Worker 3, kind: service, at: [4, 2] }
+edges:
+  - [library, queue, enqueue]
+  - [queue, w1, next]
+  - [queue, w2, next]
+  - [queue, w3, next]
+steps:
+  - say: "The **producer** reads pending photos from the library and adds them to the queue. It never uploads anything itself."
+    show: [library, queue]
+    send: library->queue
+    label: { queue: 4 waiting }
+  - say: "Three **consumers** each take the next photo. Three is the concurrency limit: the queue decides it, not the number of photos."
+    show: [w1, w2, w3]
+    send: [queue->w1, queue->w2, queue->w3]
+    state: { w1: active, w2: active, w3: active }
+    label: { queue: 1 waiting }
+  - say: "Photos arrive faster than three uploads finish, so the queue fills to its **capacity** of 10."
+    send: library->queue
+    state: { queue: wait }
+    label: { queue: 10 waiting · full }
+  - say: "A full queue makes the producer **wait**. That's **backpressure**: the slow end slows the fast end down, instead of the queue growing without limit."
+    state: { library: wait }
+    label: { library: paused }
+  - say: "Worker 1 finishes and takes the next photo. A slot frees up, so the producer adds exactly one more."
+    send: [queue->w1, library->queue]
+    state: { library: null, w1: ok }
+    label: { library: null }
+```
+
+## When work arrives faster than it leaves
+
+If producers add work faster than consumers finish it, the difference has to go somewhere. **Little's law** gives the steady-state picture: the average number of items in a system equals the arrival rate times the average time each spends there. If uploads arrive at 2 a second and each takes 1.5 seconds, about 3 are in flight on average. If the workers can only finish 1.5 a second, there's no steady state: the queue grows by half a photo every second, for as long as the burst lasts.
+
+A full queue has exactly four options, and choosing between them is the design decision:
+
+1. **Grow** (unbounded). Nothing is lost, but memory and the wait for new work grow with the backlog.
+2. **Make the producer wait** (backpressure). Nothing is lost and memory is bounded; the producer runs slower.
+3. **Drop**: either the new item, or the oldest one to make room for it.
+4. **Reject**: fail the call, so the caller decides (show an error, try later).
+
+This program runs one second at a time: 8 photos arrive, the workers finish 5. Watch where the other 3 go under each policy.
+
+```swift run title="WhenFull.swift"
+// Each second, 8 photos arrive and the workers finish 5. What does the queue do about the other 3?
+enum WhenFull {
+    case unbounded
+    case dropNew(capacity: Int)
+    case producerWaits(capacity: Int)
+}
+
+func simulate(_ policy: WhenFull, seconds: Int) -> String {
+    var queued = 0
+    var lost = 0       // dropped for good
+    var behind = 0     // still in the photo library, not yet read by the producer
+    var sizes: [Int] = []
+    for _ in 1...seconds {
+        var arriving = 8 + behind
+        behind = 0
+        switch policy {
+        case .unbounded:
+            break
+        case .dropNew(let capacity):
+            lost += max(0, queued + arriving - capacity)
+            arriving = min(arriving, capacity - queued)
+        case .producerWaits(let capacity):
+            behind = max(0, queued + arriving - capacity)
+            arriving = min(arriving, capacity - queued)
+        }
+        queued += arriving
+        sizes.append(queued)
+        queued -= min(queued, 5)
+    }
+    return "queue \(sizes), lost \(lost), not yet read \(behind)"
+}
+
+print("Unbounded:       ", simulate(.unbounded, seconds: 5))
+print("Drop new (10):   ", simulate(.dropNew(capacity: 10), seconds: 5))
+print("Producer waits:  ", simulate(.producerWaits(capacity: 10), seconds: 5))
+```
+
+```output
+Unbounded:        queue [8, 11, 14, 17, 20], lost 0, not yet read 0
+Drop new (10):    queue [8, 10, 10, 10, 10], lost 10, not yet read 0
+Producer waits:   queue [8, 10, 10, 10, 10], lost 0, not yet read 10
+```
+
+The unbounded queue grows by 3 every second, forever, and a photo added at the end waits behind everything before it. The other two hold memory flat. The difference is what happens to the excess: dropping loses 10 photos, while backpressure leaves them in the library, where they're perfectly safe, to be read when there's room. For a backup, that's clearly right. For a different kind of data it isn't, which is why the policy belongs to the data, not to the queue.
+
+| The work | Good policy when full | Why |
+| --- | --- | --- |
+| Photo uploads, offline edits, sent messages | Producer waits, and persist the queue | Losing any is a bug the user notices |
+| The rider's live location, a download's progress | Keep only the newest | An old value is worse than none |
+| Verbose logs, low-value analytics | Drop | Cheap to lose; must never slow the app |
+| Requests from another subsystem | Reject | Lets the caller choose: retry, degrade or tell the user |
+
+## Building one in Swift
+
+iOS gives you several queues, and they differ exactly on the questions above.
+
+| Tool | Consumers | When full | Notes |
+| --- | --- | --- | --- |
+| Serial `DispatchQueue` | 1 | Grows | FIFO; a work item can only be cancelled before it starts, and blocking work ties up a thread |
+| `OperationQueue` | `maxConcurrentOperationCount` | Grows | Priorities, dependencies and cancellation; async work needs an asynchronous `Operation` subclass |
+| `AsyncStream` | 1 (unicast) | Grows, or drops by policy | `yield` never waits; a policy of `.bufferingOldest(n)` or `.bufferingNewest(n)` drops instead |
+| Task group, sliding window | You choose | Producer waits | Structured: cancelling the parent cancels every worker |
+| `AsyncChannel` (swift-async-algorithms) | Any | Producer waits | `send` suspends until a consumer takes the element: true backpressure |
+| Background `URLSession` | The system decides | The system queues | Transfers continue while the app is suspended; you'll design with it in D52 |
+
+For in-process work with Swift concurrency, the **sliding window** in a task group is the workhorse. Start as many workers as the limit allows, then start one more each time one finishes. Pulling from an iterator makes the producer wait naturally: nothing is read until there's a free slot.
+
+```swift run title="SlidingWindow.swift"
+// Counts uploads in flight, so we can check the limit holds
+actor InFlightGauge {
+    private var current = 0
+    private(set) var peak = 0
+
+    func enter() {
+        current += 1
+        peak = max(peak, current)
+    }
+
+    func leave() {
+        current -= 1
+    }
+}
+
+func upload(_ photo: String, gauge: InFlightGauge) async -> String {
+    await gauge.enter()
+    await Task.yield() // stands in for the network
+    await gauge.leave()
+    return photo
+}
+
+// A worker pool in a task group: start `limit` uploads, then one more each time one finishes
+func uploadAll(_ photos: [String], limit: Int, gauge: InFlightGauge) async -> [String] {
+    await withTaskGroup(of: String.self) { group in
+        var pending = photos.makeIterator()
+        for _ in 0..<limit {
+            guard let photo = pending.next() else { break }
+            group.addTask { await upload(photo, gauge: gauge) }
+        }
+        var uploaded: [String] = []
+        while let done = await group.next() {
+            uploaded.append(done)
+            if let photo = pending.next() {
+                group.addTask { await upload(photo, gauge: gauge) }
+            }
+        }
+        return uploaded
+    }
+}
+
+let photos = (1...12).map { "IMG_\($0)" }
+let gauge = InFlightGauge()
+let uploaded = await uploadAll(photos, limit: 3, gauge: gauge)
+print("Uploaded \(uploaded.count) of \(photos.count)")
+print("Never more than 3 at once:", await gauge.peak <= 3)
+```
+
+```output
+Uploaded 12 of 12
+Never more than 3 at once: true
+```
+
+Notice what isn't there: no locks, no counters of free workers, no semaphore. The group's `next()` is the signal that a slot is free. Because it's structured, cancelling the task that called `uploadAll` cancels every upload in flight, and `uploadAll` can't return while one is still running.
+
+### Choosing the number of consumers
+
+Size the pool by the bottleneck, not by the amount of work.
+
+- **Network uploads:** 2–4. More rarely helps: they share one radio and the same bandwidth, and every extra upload holds its data in memory. `URLSession` also limits connections per host (`httpMaximumConnectionsPerHost`); with HTTP/1.1, requests beyond that wait inside it, holding their memory, and can time out before they're even sent.
+- **CPU work** (resizing images, parsing): about the number of cores, `ProcessInfo.processInfo.activeProcessorCount`. Beyond that they only take turns.
+- **Disk or database writes:** often 1. A single writer can't conflict with itself, which is why Core Data and SwiftData background contexts serialise their work.
+
+### When the queue must survive
+
+A queue in memory dies with the process, and iOS terminates suspended apps without warning. If losing the work is a bug (an upload, a sent message, an edit), persist the queue: each item written to disk before it's acknowledged to the user, and removed only after it succeeds. That's the **outbox** pattern, and you'll build one in D39.
+
+## Trade-offs
+
+| Option | Memory | Wait for new work | Loses work | Wins when |
+| --- | --- | --- | --- | --- |
+| Unbounded queue | Grows with the backlog | Grows with the backlog | No | Bursts are small and short, and you've checked that |
+| Bounded, producer waits | Fixed | Bounded | No | The producer can slow down safely: a file list, a database cursor |
+| Bounded, keep newest | Fixed | Small | Old items | Only the latest value matters: location, progress, typing state |
+| Bounded, drop new | Fixed | Small | New items | The data is cheap and the app must never stall for it |
+| Reject when full | Fixed | Immediate answer | No (the caller decides) | Another subsystem or the user can choose what to do |
+
+<Callout kind="interview">
+
+**Say** the three numbers out loud: queue capacity, number of workers, and the policy when full, and justify each. "Uploads go through a persistent queue with three workers; when it's busy, the producer waits, because losing a photo is unacceptable." **Ask** how big a burst can be (a holiday's photos? a year's?) and whether the work must survive the app being killed. **Red flags:** starting one task per item, an in-memory array as the only copy of user data, and "we'll add more threads" as the answer to a slow queue.
+
+</Callout>
+
+<Callout kind="gotcha" title="Swift gotcha: AsyncStream never makes the producer wait">
+
+`AsyncStream`'s `yield` returns at once, whatever the consumer is doing. With the default `.unbounded` policy, a fast producer and a slow consumer is an unbounded queue, and with `.bufferingOldest(n)` or `.bufferingNewest(n)` the excess is dropped (`yield` tells you so by returning `.dropped`). Neither is backpressure. When the producer must slow down, use a sliding window over an iterator, or `AsyncChannel` from swift-async-algorithms, whose `send` suspends until a consumer takes the element.
+
+</Callout>
+
+<Callout kind="gotcha" title="Swift gotcha: semaphores inside async code">
+
+`DispatchSemaphore(value: 3)` with `wait()` in every task looks like a concurrency limit, but `wait()` blocks the thread. Swift concurrency runs tasks on a small pool of about one thread per core, and blocked threads can't run anything else: with enough waiting tasks the pool stalls, and the task that would `signal()` never gets a thread. Limit async work by structure (a sliding window) or with an actor that suspends callers, never by blocking.
+
+</Callout>
+
+## Practice
+
+The review **"the 2 a.m. photo backup storm"** has a backup service that starts every upload at once. Find what that does to memory, to the network and to the server, then design the queue it should have used. You'll meet its other problems (retries and rate limits) later in this module.
+
+```cards
+- id: four-options
+  front: "What are the four things a full queue can do?"
+  back: "Grow (unbounded), make the producer wait (backpressure), drop an item (the new one or the oldest), or reject the work so the caller decides."
+- id: littles-law
+  front: "What does Little's law say, and why does it matter for a work queue?"
+  back: "Items in the system = arrival rate × time each spends there. If arrivals outpace what the consumers can finish, there's no steady state and an unbounded queue grows without limit."
+- id: sliding-window
+  front: "How do you cap concurrent async work at N in Swift concurrency?"
+  back: "A sliding window in a task group: add N child tasks, then add one more each time `group.next()` returns. Pulling work from an iterator means nothing is read until a slot is free."
+- id: pool-size
+  front: "How many consumers for network uploads, CPU work and database writes?"
+  back: "Uploads: 2–4 (they share one radio). CPU: about the number of cores. Writes: often 1, so the writer never conflicts with itself."
+```
+
+```quiz
+- id: q1
+  type: estimate
+  prompt: "Thumbnails are requested at 40 a second while the user scrolls, and each takes 50 ms to render. On average, how many renders are in progress at once?"
+  answer: 2
+  unit: renders
+  within: { percent: 25 }
+  explain: "Little's law: 40 a second × 0.05 s = 2 in progress on average. Two workers keep up on average, but bursts make the queue grow, so a bounded queue that drops renders for rows scrolled off screen is the usual design."
+- id: q2
+  type: sort
+  prompt: "Which policy suits each kind of work when its queue is full?"
+  buckets: [Producer waits, Keep only the newest, Drop]
+  items:
+    - [Photo uploads from the camera roll, 0]
+    - [The rider's live location sent to the driver, 1]
+    - [Messages the user sent while offline, 0]
+    - [Debug log lines while the logger is backed up, 2]
+    - [Progress updates for a download's progress bar, 1]
+  explain: "Uploads and messages must never be lost, so the producer slows down (and the queue is persisted). For location and progress, only the latest value matters. Debug logs are cheap to lose and must never stall the app."
+- id: q3
+  type: mcq
+  prompt: "A producer yields photos into `AsyncStream.makeStream(of: Photo.self, bufferingPolicy: .bufferingOldest(10))` faster than the consumer reads. Ten are buffered. What happens to the eleventh?"
+  options:
+    - "`yield` suspends the producer until the consumer reads one"
+    - "It's discarded, and `yield` returns `.dropped` with it"
+    - "The first photo is discarded to make room for it"
+    - "The stream finishes with an error"
+  answer: 1
+  explain: "`AsyncStream` never suspends the producer. `.bufferingOldest(10)` keeps the ten oldest and drops new arrivals; `.bufferingNewest(10)` would keep the eleventh and drop the first. For backpressure you need a different tool, such as a sliding window or `AsyncChannel`."
+- id: q4
+  type: bug
+  prompt: "This backs up a user's selected photos. Which line causes the trouble when they select 2,000?"
+  code: |
+    func backUp(_ photos: [Photo]) {
+        for photo in photos {
+            Task {
+                try await uploader.upload(photo)
+            }
+        }
+    }
+  answer: 3
+  explain: "One unstructured task per photo starts 2,000 uploads at once, with no limit, no way to cancel them together and no way to know when they've all finished. Feed the photos through a bounded queue or a sliding-window task group instead."
+- id: q5
+  type: multi
+  prompt: "Which of these cap a batch of async uploads at three running at once? Choose all that apply."
+  options:
+    - "A task group that adds three children, then one more each time `next()` returns"
+    - "`DispatchSemaphore(value: 3)`, calling `wait()` at the start of each task"
+    - "Setting `httpMaximumConnectionsPerHost = 3` and starting every upload at once"
+    - "An actor that hands out three permits and suspends callers until one is returned"
+  answer: [0, 3]
+  explain: "The sliding window and a permit actor both suspend work without blocking threads. A semaphore blocks threads of the small cooperative pool and can stall it. The connection limit only queues requests inside URLSession, where they all hold memory and can time out before they're sent."
+```

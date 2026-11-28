@@ -1,0 +1,428 @@
+## Why it matters
+
+"Duplicate this note", "reorder last week's shop", "start from the default session configuration", "new document from template": all of these create an object by **copying** one that already exists. That's the prototype pattern. In Swift the hard part isn't writing a `clone()` method; it's knowing whether a copy is really independent, and whether a copy should keep its identity. Get either wrong and you ship shared-state bugs or duplicate-ID crashes.
+
+## The pattern
+
+The Gang of Four: *specify the kinds of objects to create using a prototypical instance, and create new objects by copying this prototype.* The client asks an existing object to copy itself, instead of calling an initialiser. That's useful in three situations:
+
+1. **Configuration is the hard part.** A session configuration, a paragraph style or a button configuration has dozens of settings. Copying a configured one and changing two is easier than building from scratch.
+2. **The concrete type is only known at run time.** A drawing app duplicates the selection without knowing whether each item is text, an image or a shape. Each item copies itself, keeping its own type.
+3. **Presets and templates.** A registry of named prototypes ("Email, small", "Print, high quality") that users start from.
+
+## Value types: prototypes for free
+
+In Swift, a struct or enum **is** its own prototype. Assigning it makes an independent copy, so "clone and adjust" is one line:
+
+```swift check ios
+import UIKit
+
+func captionAttributes() -> [NSAttributedString.Key: Any] {
+    // Start from the system default and change a copy, never the shared default itself
+    let paragraph = NSParagraphStyle.default.mutableCopy() as! NSMutableParagraphStyle
+    paragraph.lineSpacing = 4
+    paragraph.alignment = .center
+    return [.paragraphStyle: paragraph, .font: UIFont.preferredFont(forTextStyle: .caption1)]
+}
+
+func makeUploadSession() -> URLSession {
+    // .default hands back a fresh configuration each time: a prototype to customise
+    let configuration = URLSessionConfiguration.default
+    configuration.allowsExpensiveNetworkAccess = false
+    configuration.timeoutIntervalForRequest = 30
+    configuration.httpAdditionalHeaders = ["X-Client": "ios"]
+
+    let session = URLSession(configuration: configuration)
+
+    // No effect: the session stored its own copy when it was created
+    configuration.timeoutIntervalForRequest = 5
+    return session
+}
+
+@MainActor
+func destructiveButton(title: String) -> UIButton {
+    var configuration = UIButton.Configuration.filled()
+    configuration.title = title
+    configuration.baseBackgroundColor = .systemRed
+    return UIButton(configuration: configuration)
+}
+```
+
+`UIButton.Configuration` is a struct, so `destructiveButton` changes its own copy and nothing else. The other two functions use **reference** types, which is where prototypes need care; we'll come back to them.
+
+### Copy-on-write: copies that cost nothing until they differ
+
+If every assignment copied every byte, value types would be expensive prototypes. They aren't, because Swift's collections (`Array`, `Dictionary`, `Set`, `String`, `Data`) use **copy-on-write**: a copy shares the original's storage until one of them is mutated, and only then is the storage duplicated. You can build the same behaviour into your own types with `isKnownUniquelyReferenced`:
+
+```swift run
+final class ItemStorage {
+    var items: [String]
+    init(_ items: [String]) { self.items = items }
+}
+
+// A value type with copy-on-write: copies share storage until one of them changes
+struct PackingList {
+    private var storage: ItemStorage
+
+    init(_ items: [String]) { storage = ItemStorage(items) }
+
+    var items: [String] { storage.items }
+
+    mutating func add(_ item: String) {
+        if !isKnownUniquelyReferenced(&storage) {
+            print("  copying storage before adding \(item)")
+            storage = ItemStorage(storage.items)
+        }
+        storage.items.append(item)
+    }
+}
+
+let template = PackingList(["Passport", "Charger"])
+var beach = template
+var ski = template
+print("Two copies made; no storage copied yet")
+
+beach.add("Sunscreen")
+ski.add("Gloves")
+ski.add("Goggles")
+
+print(template.items)
+print(beach.items)
+print(ski.items)
+```
+
+```output
+Two copies made; no storage copied yet
+  copying storage before adding Sunscreen
+  copying storage before adding Gloves
+["Passport", "Charger"]
+["Passport", "Charger", "Sunscreen"]
+["Passport", "Charger", "Gloves", "Goggles"]
+```
+
+```visual flow
+title: Copy-on-write, one write at a time
+nodes:
+  - { id: template, label: template, kind: client, at: [0, 0] }
+  - { id: beach, label: beach, kind: client, at: [0, 1] }
+  - { id: ski, label: ski, kind: client, at: [0, 2] }
+  - { id: shared, label: "Passport, Charger", kind: store, at: [3, 0] }
+  - { id: beachStore, label: + Sunscreen, kind: store, at: [3, 1] }
+  - { id: skiStore, label: + Gloves, kind: store, at: [3, 2] }
+edges:
+  - [template, shared, { style: data }]
+  - [beach, shared, { style: data }]
+  - [ski, shared, { style: data }]
+  - [beach, beachStore, { style: data }]
+  - [ski, skiStore, { style: data }]
+steps:
+  - say: "`var beach = template` and `var ski = template` copy the struct, but all three point at **one** storage object."
+    show: [template, beach, ski, shared, template->shared, beach->shared, ski->shared]
+    state: { shared: active }
+  - say: "`beach.add` finds the storage shared, so it copies it first, then appends. `template` is untouched."
+    hide: [beach->shared]
+    show: [beachStore, beach->beachStore]
+    state: { shared: null, beachStore: ok }
+  - say: "`ski.add(\"Gloves\")` does the same: the storage is still shared with `template`."
+    hide: [ski->shared]
+    show: [skiStore, ski->skiStore]
+    state: { skiStore: ok }
+  - say: Now `ski` holds the only reference to its storage, so `add("Goggles")` appends in place with no copy.
+    state: { skiStore: active }
+    label: { skiStore: + Goggles }
+```
+
+The output shows the important property: **two** storage copies for three writes, and none at all for the copies that were never changed. That's why a template value can be handed out freely.
+
+## Shallow copies: the class inside the struct
+
+Value semantics only go as deep as the stored properties. A struct that holds a **class** reference copies the reference, not the object, so two "independent" copies share it:
+
+```swift run
+final class AttachmentList {
+    var names: [String] = []
+}
+
+struct Draft {
+    var subject: String
+    let attachments: AttachmentList
+}
+
+let template = Draft(subject: "Weekly report", attachments: AttachmentList())
+var mine = template
+mine.subject = "Weekly report: week 12"
+mine.attachments.names.append("figures.pdf")
+
+print(template.subject)
+print(template.attachments.names)
+```
+
+```output
+Weekly report
+["figures.pdf"]
+```
+
+The subject was copied; the attachment list was shared, so attaching a file to *my* draft attached it to the template too. Note that `let attachments` didn't help: `let` stops you replacing the reference, not mutating the object behind it. You have three fixes, in order of preference:
+
+1. Make the inner type a value type (`var attachments: [Attachment]`).
+2. Keep the class for its storage, but wrap it in copy-on-write, as `PackingList` does.
+3. Deep-copy it explicitly when you copy the outer value.
+
+This is the "value types containing references" trap from [Value vs reference semantics in architecture](/design/learn/sd-swift-design-value-semantics), and it's the most common way a prototype goes wrong in Swift.
+
+## Reference types: `NSCopying`
+
+Classes don't copy on assignment, so they need an explicit copy operation. Foundation's is `NSCopying`: a class implements `copy(with zone: NSZone?) -> Any`, and callers use `copy()`. `NSMutableCopying` adds `mutableCopy()`, which returns a mutable variant. Apple's frameworks use them as prototypes in a few places worth knowing:
+
+- **`URLSessionConfiguration.default`** returns a **new** configuration on every access. Apple's documentation says it's "always safe to use the returned object as a starting point for additional customization". It's a prototype handed to you.
+- **`URLSession(configuration:)`** stores its own copy of the configuration. In `makeUploadSession()` above, setting the timeout to 5 after creating the session changes nothing. Configure first, then create the session.
+- **`NSParagraphStyle.default.mutableCopy()`** is the standard way to customise paragraph styles: copy the shared default, then change the copy.
+- **`NSArray.copy()`** is **shallow**: the new array holds the same element objects. `NSArray(array:copyItems: true)` copies one level deeper, and only if the elements conform to `NSCopying`.
+
+### Copying when the type is only known at run time
+
+The pattern's original reason, polymorphic copying, still comes up in apps with heterogeneous object graphs: canvas items, form fields, document nodes. In pure Swift you don't need `NSObject`. A `required` initialiser that copies, plus a `clone()` that returns `Self`, gives every subclass a copy of its own type:
+
+```swift run
+// A drawing app's canvas items: the canvas copies whatever is selected without knowing its class
+class CanvasItem {
+    var x: Double
+    var y: Double
+
+    init(x: Double, y: Double) {
+        self.x = x
+        self.y = y
+    }
+
+    // Every subclass must be able to copy itself, so clone() can return Self
+    required init(copying other: CanvasItem) {
+        x = other.x
+        y = other.y
+    }
+
+    func clone() -> Self {
+        Self(copying: self)
+    }
+
+    var summary: String { "item at (\(x), \(y))" }
+}
+
+final class TextBox: CanvasItem {
+    var text: String
+
+    init(text: String, x: Double, y: Double) {
+        self.text = text
+        super.init(x: x, y: y)
+    }
+
+    required init(copying other: CanvasItem) {
+        text = (other as? TextBox)?.text ?? ""
+        super.init(copying: other)
+    }
+
+    override var summary: String { "text \"\(text)\" at (\(x), \(y))" }
+}
+
+func duplicate(_ selection: [CanvasItem], offsetBy offset: Double) -> [CanvasItem] {
+    selection.map { item in
+        let copy = item.clone()
+        copy.x += offset
+        copy.y += offset
+        return copy
+    }
+}
+
+let selection: [CanvasItem] = [TextBox(text: "Hello", x: 10, y: 20), CanvasItem(x: 0, y: 0)]
+for item in duplicate(selection, offsetBy: 8) {
+    print(type(of: item), item.summary)
+}
+print(selection[0].summary)
+```
+
+```output
+TextBox text "Hello" at (18.0, 28.0)
+CanvasItem item at (8.0, 8.0)
+text "Hello" at (10.0, 20.0)
+```
+
+`duplicate` never mentions `TextBox`, yet the copy is a `TextBox`, because `Self(copying:)` dispatches on the dynamic type. `required` makes the compiler insist every subclass implements the copying initialiser, so a new item type can't silently be copied as its superclass. If you can model the items as an enum of value types instead, do: then a plain assignment copies them and the whole problem disappears.
+
+## Copy or duplicate? Identity decides
+
+Copying a value copies **everything**, including its `id`. That's right for a temporary copy you'll edit and save back. It's wrong when the user asks for a **new** thing that starts from an old one, because that new thing is a different entity:
+
+```swift run
+import Foundation
+
+struct Note: Identifiable, Equatable {
+    let id: UUID
+    var title: String
+    var body: String
+    var serverID: String?
+    var isPinned: Bool
+
+    // A copy keeps the id. A duplicate is a new entity that starts from this one's content.
+    func duplicated(newID: UUID) -> Note {
+        Note(id: newID, title: title + " copy", body: body, serverID: nil, isPinned: false)
+    }
+}
+
+let original = Note(id: UUID(uuidString: "00000000-0000-0000-0000-000000000001")!, title: "Packing", body: "Passport, charger", serverID: "n_93", isPinned: true)
+
+let copy = original
+let duplicate = original.duplicated(newID: UUID(uuidString: "00000000-0000-0000-0000-000000000002")!)
+
+print(copy.id == original.id, copy == original)
+print(duplicate.id == original.id, duplicate.title, duplicate.serverID ?? "not synced yet", duplicate.isPinned)
+```
+
+```output
+true true
+false Packing copy not synced yet false
+```
+
+A duplicate gets a new local id, loses its server id (so sync creates it instead of overwriting the original), and resets state that belongs to the original, such as being pinned. Deciding which fields carry over is a product decision; making it explicit in one `duplicated` method is the design decision. In the app, the new id would come from `UUID()`, injected here so the output is repeatable. This is the entity-versus-value distinction from [Entities, value objects and identity](/design/learn/sd-modelling-entities-values) applied to creation.
+
+<Callout kind="gotcha" title="iOS gotcha: duplicate identifiers crash diffable data sources">
+
+If "duplicate" copies the `id`, the list now holds two items with the same identifier. `NSDiffableDataSourceSnapshot` requires item identifiers to be unique and raises an exception when they aren't, and SwiftUI's `ForEach` misbehaves in quieter ways: rows that don't update, or animate as the wrong item. A duplicated entity always needs a fresh identity.
+
+</Callout>
+
+## A registry of prototypes
+
+With value types, a prototype registry is just a dictionary of named, preconfigured values. "Cloning" is reading one:
+
+```swift check
+import Foundation
+
+struct ExportSettings: Sendable {
+    var maxPixelSize: Int
+    var compressionQuality: Double
+    var includesLocation: Bool
+}
+
+enum ExportPresets {
+    static let all: [String: ExportSettings] = [
+        "Email": ExportSettings(maxPixelSize: 1600, compressionQuality: 0.7, includesLocation: false),
+        "Print": ExportSettings(maxPixelSize: 6000, compressionQuality: 0.95, includesLocation: false),
+        "Archive": ExportSettings(maxPixelSize: .max, compressionQuality: 1, includesLocation: true),
+    ]
+
+    static func settings(named name: String, includingLocation: Bool) -> ExportSettings? {
+        guard var settings = all[name] else { return nil }
+        settings.includesLocation = includingLocation
+        return settings
+    }
+}
+```
+
+`static let all` is safe to share across the app because the values are immutable and `Sendable`; nobody can change a preset by changing their copy.
+
+## Trade-offs
+
+| | Assign a value type | Custom copy-on-write | `NSCopying` / `mutableCopy()` | `required init(copying:)` + `clone()` | Rebuild from parameters (a factory) |
+| --- | --- | --- | --- | --- | --- |
+| Effort | None | A storage class and checks | A method per class | An initialiser per subclass | A factory per variant |
+| Independent copies | Yes, unless it holds class references | Yes | Only as deep as you write it | Only as deep as you write it | Yes |
+| Preserves the run-time type | Yes | Yes | Yes | Yes | No: the factory names the type |
+| Cost of a copy | Cheap until written | Cheap until written | A full copy each time | A full copy each time | A full construction |
+| Best for | Almost every model and configuration | Large values copied often | Foundation and UIKit types | Class hierarchies you can't make values | Objects whose state shouldn't be copied |
+
+<Callout kind="interview">
+
+**What to say:** "Models are value types, so templates and drafts are copies by assignment. Where a model holds a class, I either make it a value or wrap it in copy-on-write. 'Duplicate' is a separate method that mints a new id and clears server state."
+
+**What to ask:** "When the user duplicates this, what should the copy share with the original: attachments, comments, permissions, sync state?" It's a product question with an architectural answer.
+
+**Red flags:** a `clone()` on a struct; copying a model that holds a class and assuming the copy is independent; changing a `URLSessionConfiguration` after creating the session; a duplicate that keeps the original's id.
+
+</Callout>
+
+<Callout kind="gotcha" title="Swift gotcha: @NSCopying doesn't copy in init">
+
+The `@NSCopying` property attribute makes a stored property's **setter** store `copy()` of the new value. It doesn't apply in the class's own initialisers, which assign the storage directly, and in our tests with Swift 6.4 it didn't copy at all in a `final` class. Where an independent copy matters, write the copy yourself: `self.style = style.copy() as! ParagraphStyle`.
+
+</Callout>
+
+## Practice
+
+The **request builder** kata branches several requests from one shared base builder, which is the prototype idea with value types: configure once, copy, customise. Its tests check that customising one branch never changes the base.
+
+```cards
+- id: prototype-uses
+  front: "When is creating by copying better than calling an initialiser?"
+  back: "When configuration is the hard part, when the concrete type is only known at run time, or when users start from named presets or templates."
+- id: cow
+  front: "What is copy-on-write?"
+  back: "Copies share storage until one of them is mutated; the write duplicates the storage first. Swift's collections work this way, and `isKnownUniquelyReferenced` lets your own types do it."
+- id: shallow
+  front: "Why can copying a struct still share state?"
+  back: "A struct copies its stored properties. If one is a class reference, both copies point at the same object, even if the property is a `let`."
+- id: duplicate-identity
+  front: "How does duplicating an entity differ from copying it?"
+  back: "A duplicate is a new entity: it needs a new id, no server id, and reset state like pins. A copy keeps the id, which crashes diffable data sources if both end up in one list."
+```
+
+```quiz
+- id: q1
+  type: output
+  prompt: "What does this print?"
+  code: |
+    final class Tags {
+        var values: [String] = []
+    }
+
+    struct Photo {
+        var caption: String
+        let tags: Tags
+    }
+
+    let original = Photo(caption: "Beach", tags: Tags())
+    var edited = original
+    edited.caption = "Beach at dusk"
+    edited.tags.values.append("sunset")
+    print(original.caption, original.tags.values.count)
+  answer: "Beach 1"
+  explain: "`caption` is a `String`, copied with the struct. `tags` is a class reference, so both photos share one `Tags` object, and the append is visible through `original`. `let` only stops you replacing the reference."
+- id: q2
+  type: mcq
+  prompt: "This code runs at launch. What timeout do requests on `session` use?"
+  code: |
+    let configuration = URLSessionConfiguration.default
+    configuration.timeoutIntervalForRequest = 30
+    let session = URLSession(configuration: configuration)
+    configuration.timeoutIntervalForRequest = 5
+  options:
+    - "5 seconds: the session reads its configuration on every request"
+    - "30 seconds: the session stored a copy when it was created"
+    - "60 seconds: `.default` always resets to the system default"
+    - "It crashes: a configuration can't change after use"
+  answer: 1
+  explain: "`URLSession` copies its configuration at creation, so later changes to that object have no effect. To change settings, make a new session from a new configuration."
+- id: q3
+  type: multi
+  prompt: "A user taps **Duplicate** on a synced note. Which should the new note get? Choose all that apply."
+  options:
+    - "A new local id"
+    - "The original's server id, so the server knows they're related"
+    - "The original's title and body"
+    - "A sync state of 'not yet uploaded'"
+    - "The original's id, so the list can show them together"
+  answer: [0, 2, 3]
+  explain: "A duplicate is a new entity that starts from the original's content. Reusing the server id would make the first sync overwrite the original, and reusing the local id breaks every list keyed by identity."
+- id: q4
+  type: truefalse
+  prompt: "Assigning one `Array` to another copies all of its elements immediately."
+  answer: false
+  explain: "Arrays use copy-on-write: both share storage until one is mutated. That's what makes value types cheap prototypes."
+- id: q5
+  type: mcq
+  prompt: "A drawing app has a class hierarchy of canvas items and must duplicate a mixed selection, keeping each item's type. What's the most robust shape?"
+  options:
+    - "A `switch` over the selection with a case per subclass, calling each initialiser"
+    - "A `required init(copying:)` on the base class and a `clone() -> Self` that calls it"
+    - "Encode the selection with `NSKeyedArchiver` and decode it again"
+    - "Assign each item to a new variable"
+  answer: 1
+  explain: "`Self(copying:)` dispatches on the dynamic type, and `required` makes every subclass implement it, so new item types can't be copied as their superclass. A switch breaks when a subclass is added, archiving is slow and needs `NSCoding`, and assigning a class reference doesn't copy at all."

@@ -1,0 +1,275 @@
+## Why it matters
+
+Two screens show the same thing, a recipe's favourite heart in a list and on its detail page, and after a while they disagree. Somebody updated one copy and forgot the other, or a delegate and a notification fought over who changes what. **Unidirectional data flow** prevents that whole class of bug with a few rules about which way data may travel. It's the idea underneath SwiftUI itself, and behind Redux, the Elm architecture, MVI and TCA, which D28 compares in depth. Knowing the core ideas lets you apply them in a plain SwiftUI app, and explain in an interview why they work.
+
+## Four rules
+
+1. **One source of truth.** Each piece of state has exactly one owner: a store, a view model, an `@State`. Everything else reads it.
+2. **State flows down.** Views receive state and render it. They don't keep their own copies.
+3. **Actions flow up.** Views report *what happened* ("the heart was tapped"), not *what to change* ("set `isFavourite` to true").
+4. **State changes in one place.** The owner applies each action, usually with a [reducer](/design/learn/sd-functional-reducers), and runs side effects at the edge. Their results come back as more actions.
+
+Put together they form a loop: state renders a view, the user does something, an action changes the state, and the new state renders again. Apple's own framing of SwiftUI, from its 2019 talk *Data Flow Through SwiftUI*, is that a view is a function of state. UDF takes that seriously all the way down.
+
+<Callout kind="analogy">
+
+A shared spreadsheet works the same way. Nobody edits their own printout and posts it round the office: everyone looks at the one sheet, edits go to the sheet, and every screen showing it updates. Two printouts disagreeing is the bug UDF removes.
+
+</Callout>
+
+## What two-way flow gets wrong
+
+Before SwiftUI, a common UIKit setup for the favourites heart looked like this: the list cell kept an `isFavourite` flag and posted a notification when tapped; the detail view controller kept its own flag and told the list through a delegate; the network callback updated whichever controller started the request. Every arrow pointed both ways. The result was familiar:
+
+- **Copies drift.** One path forgets to update one copy, and the screens disagree.
+- **Updates loop.** A change notifies a listener, whose change notifies the first one back.
+- **Nobody can say why.** A bug report says the heart flickered; there are five places that could have done it.
+
+With one-way flow, both screens read `favourites` from one owner and both send `favouriteTapped(id)`. There's one place a heart can change, and it's a pure function you can test.
+
+## The loop, with an optimistic update
+
+Favouriting should feel instant, so the app fills the heart straight away and tells the server in the background. If the server refuses, the heart must empty again and the user should hear why. Here's that whole behaviour as state, actions, effects and a reducer:
+
+```swift run title="Favourites: one state, two screens, an optimistic update and a rollback"
+struct RecipesState: Equatable {
+    var favourites: Set<Int> = []
+    var pending: Set<Int> = []
+    var toast: String?
+}
+
+enum RecipesAction {
+    case favouriteTapped(Int)
+    case saveFinished(Int, succeeded: Bool)
+}
+
+enum RecipesEffect: Equatable {
+    case save(recipe: Int, isFavourite: Bool)
+}
+
+func reduce(_ state: inout RecipesState, _ action: RecipesAction) -> [RecipesEffect] {
+    switch action {
+    case .favouriteTapped(let id):
+        guard !state.pending.contains(id) else { return [] }   // one request per recipe at a time
+        let isFavourite = !state.favourites.contains(id)
+        if isFavourite { state.favourites.insert(id) } else { state.favourites.remove(id) }
+        state.pending.insert(id)
+        state.toast = nil
+        return [.save(recipe: id, isFavourite: isFavourite)]
+    case .saveFinished(let id, succeeded: true):
+        state.pending.remove(id)
+        return []
+    case .saveFinished(let id, succeeded: false):
+        state.pending.remove(id)
+        // Roll back the optimistic change
+        if state.favourites.contains(id) { state.favourites.remove(id) } else { state.favourites.insert(id) }
+        state.toast = "Couldn't update favourites. Check your connection."
+        return []
+    }
+}
+
+// Two screens, one state: the list row and the detail page both draw from `favourites`
+func heart(_ state: RecipesState, _ id: Int) -> String { state.favourites.contains(id) ? "♥" : "♡" }
+
+let actions: [RecipesAction] = [
+    .favouriteTapped(42),
+    .favouriteTapped(42),
+    .saveFinished(42, succeeded: false),
+    .favouriteTapped(42),
+    .saveFinished(42, succeeded: true),
+]
+
+var state = RecipesState()
+for action in actions {
+    let effects = reduce(&state, action)
+    var line = "\(action) → list \(heart(state, 42)), detail \(heart(state, 42))"
+    if state.toast != nil { line += ", toast shown" }
+    if let effect = effects.first { line += ", effect: \(effect)" }
+    print(line)
+}
+```
+
+```output
+favouriteTapped(42) → list ♥, detail ♥, effect: save(recipe: 42, isFavourite: true)
+favouriteTapped(42) → list ♥, detail ♥
+saveFinished(42, succeeded: false) → list ♡, detail ♡, toast shown
+favouriteTapped(42) → list ♥, detail ♥, effect: save(recipe: 42, isFavourite: true)
+saveFinished(42, succeeded: true) → list ♥, detail ♥
+```
+
+The list and detail can't disagree, because neither has anything of its own to disagree with. The second tap, made while the first request was still out, is refused rather than racing it. And the rollback is three lines in the one place that knows what the optimistic change was. Here's the same journey across the app's parts:
+
+```visual sequence
+title: An optimistic favourite, round the loop twice
+participants:
+  - { id: view, label: Views }
+  - { id: store, label: Store }
+  - { id: reducer, label: reduce }
+  - { id: api, label: Favourites API }
+messages:
+  - [view, store, favouriteTapped(42)]
+  - [store, reducer, "reduce(state, action)"]
+  - [reducer, store, "♥ + save effect", { reply: true }]
+  - [store, view, new state, { async: true }]
+  - [store, api, "PUT /favourites/42", { async: true }]
+  - [api, store, "503", { reply: true }]
+  - [store, reducer, "saveFinished(failed)"]
+  - [reducer, store, "♡ + toast", { reply: true }]
+  - [store, view, new state, { async: true }]
+steps:
+  - say: "The heart is tapped. The view sends an **action** saying what happened; it doesn't touch any state."
+    upTo: 0
+  - say: "The store hands the action to the reducer, which fills the heart at once and returns a `save` effect as a value."
+    upTo: 2
+  - say: "Both the list row and the detail page re-render from the one new state, so they can't disagree."
+    upTo: 3
+  - say: "The store runs the effect. The server is having a bad day and answers `503`."
+    upTo: 5
+  - say: "The failure comes back up as an action, through the same door as the tap. The reducer rolls the heart back and sets a toast."
+    upTo: 7
+  - say: "The views render again. Every change, from the user or the network, took the same path in the same direction."
+    upTo: 8
+```
+
+## SwiftUI is already halfway there
+
+You don't need a framework to work this way. A SwiftUI view reading an `@Observable` view model already has state flowing down; calling the model's methods is actions flowing up, though not written as values. The one place SwiftUI is deliberately two-way is `@Binding`: a child view can write straight into its parent's state. That's the right tool for local, simple state such as a toggle in a form. When the owner needs to apply rules to every change, derive a binding that sends an action instead:
+
+```swift check ios title="A text field that sends actions instead of writing state"
+import SwiftUI
+
+@MainActor
+@Observable
+final class SearchModel {
+    enum Action {
+        case queryChanged(String)
+        case clearTapped
+    }
+
+    private(set) var query = ""
+
+    func send(_ action: Action) {
+        switch action {
+        case .queryChanged(let text): query = String(text.prefix(100))
+        case .clearTapped: query = ""
+        }
+    }
+}
+
+struct SearchField: View {
+    let model: SearchModel
+
+    var body: some View {
+        HStack {
+            TextField("Search recipes", text: Binding(
+                get: { model.query },
+                set: { model.send(.queryChanged($0)) }
+            ))
+            Button("Clear") { model.send(.clearTapped) }
+        }
+    }
+}
+```
+
+`query` is `private(set)`, so the only way to change it is `send`. The text field still feels like an ordinary binding, but the 100-character limit lives in the model, and so would analytics, validation or a search effect.
+
+### A spectrum, not a switch
+
+How far to go is a choice per feature, and each step buys something:
+
+| Step | What it adds | What it costs |
+| --- | --- | --- |
+| `@Observable` model, views call its methods | State down, calls up; one owner | Little; methods can still write anything |
+| Model with one `send(_ action:)` | Every change is a value you can log; one switch to read | An action enum |
+| A pure reducer returning effects | Every rule testable with plain values; replayable bug reports | Effects as values, and a small store to run them |
+| A framework such as TCA | Composition, dependency control and exhaustive test tools | Its conventions, and the time to learn them |
+
+## One store, or many?
+
+Redux on the web keeps **one store for the whole app**. That gives a single place to log and replay everything, but every feature depends on one giant state type, and a change anywhere can make every screen re-check whether it changed. Most iOS apps do better with **a store per feature**, plus a few app-wide owners for things that really are shared, such as the signed-in session and settings. Features talk through those shared owners or through their parent, not by reaching into each other's state. D19 weighs global stores in detail.
+
+## Trade-offs
+
+| Approach | Consistency between screens | Debugging | Ceremony | When it wins |
+| --- | --- | --- | --- | --- |
+| Two-way: each screen keeps a copy, synced by delegates and notifications | Fragile | Hard: many writers | Low at first, high later | Small, isolated screens that share nothing |
+| One-way with an `@Observable` owner and methods | Good: one owner | Medium: any method can write | Low | Most SwiftUI features |
+| One-way with actions and a reducer | Strong | Easy: log and replay actions | Medium | Features with async results, optimistic updates or rules worth exhaustive tests |
+| One app-wide store | Strong | Easy, all in one log | High, and grows with the app | Small apps, or apps built around one framework that expects it |
+
+<Callout kind="interview">
+
+**Say** "State has one owner and flows down; views send actions up describing what happened; the owner changes state in one place and runs effects, whose results come back as actions. So two screens can't disagree, and every change is traceable." **Ask** which state is genuinely shared between features, because that decides what needs an app-level owner. **Red flags:** child views holding copies of parent state "for convenience", effects that write state directly instead of sending an action, and one global store for a large app with no plan for its performance.
+
+</Callout>
+
+<Callout kind="gotcha" title="iOS gotcha: a text field's binding must update synchronously">
+
+If `send(.queryChanged)` hops to a `Task` before changing `query`, the text field renders the old value for a frame, the cursor jumps and fast typing loses characters. Apply the change to state synchronously on the main actor inside `send`, and start any slow work (a search) as an effect afterwards.
+
+</Callout>
+
+<Callout kind="gotcha" title="Swift gotcha: effects shouldn't read state later">
+
+An effect that reads `store.state.favourites` when it runs may see a newer state than the one the reducer decided on, because other actions got in first. Put what the effect needs into its payload when the reducer creates it, as `save(recipe:isFavourite:)` does. The effect then carries out exactly the decision that was made.
+
+</Callout>
+
+## Practice
+
+The kata **typeahead search reducer** is the heart of a one-way search screen: queries go in as actions, searches come out as effects, and results come back as actions that the reducer can refuse when they're stale.
+
+```cards
+- id: udf-rules
+  front: "What are the four rules of unidirectional data flow?"
+  back: "One source of truth per piece of state; state flows down to views; actions flow up describing what happened; state changes in one place, with effects at the edge feeding results back as actions."
+- id: udf-actions
+  front: "Why should a view send `favouriteTapped(id)` rather than set `isFavourite = true`?"
+  back: "The owner decides what a tap means: toggling, refusing a duplicate, starting a save and rolling back on failure. The view only reports what happened, so the rules live in one place."
+- id: udf-binding
+  front: "How do you keep a SwiftUI text field one-way?"
+  back: "Make the state `private(set)` and give the field a derived `Binding` whose setter sends an action, applied synchronously by the owner."
+```
+
+```quiz
+- id: q1
+  type: mcq
+  prompt: "After a failed save, the list shows an empty heart but the detail page still shows a full one. What's the most likely design flaw?"
+  options:
+    - "The reducer forgot to roll back"
+    - "The detail page keeps its own copy of the favourite flag instead of reading the shared state"
+    - "The API should have retried"
+    - "SwiftUI didn't re-render the list"
+  answer: 1
+  explain: "If both screens read one source of truth, a rollback updates both or neither. A disagreement means a second copy exists somewhere, which is exactly what UDF's first rule forbids."
+- id: q2
+  type: order
+  prompt: "Put one trip round the loop in order, for a tap that triggers a network call."
+  lines:
+    - "The view sends an action describing what the user did"
+    - "The reducer updates the state and returns an effect"
+    - "The views re-render from the new state"
+    - "The store runs the effect"
+    - "The effect's result is sent back as a new action"
+  explain: "Actions go up, state changes in one place, state flows down, and effects run at the edge and report back as actions, so the network takes the same path as the user."
+- id: q3
+  type: multi
+  prompt: "Which of these break unidirectional data flow? Choose all that apply."
+  options:
+    - "A network callback that sets `model.favourites` directly"
+    - "A child view that copies `recipe.isFavourite` into its own `@State` on appear"
+    - "A view that calls `model.send(.favouriteTapped(id))`"
+    - "Two views reading the same `@Observable` model"
+    - "An effect that reads the latest `store.state` instead of its payload"
+  answer: [0, 1, 4]
+  explain: "Writing state from outside the owner, keeping a private copy, and acting on state the reducer didn't decide on all reintroduce extra paths. Sending actions and sharing one model are the pattern itself."
+- id: q4
+  type: truefalse
+  prompt: "Using `@Binding` anywhere means an app isn't unidirectional."
+  answer: false
+  explain: "A binding to simple local state, such as a toggle in a form, is fine. When the owner needs rules applied to every change, derive a binding whose setter sends an action instead."
+- id: q5
+  type: recall
+  prompt: "Why do most iOS apps prefer a store per feature over one store for the whole app?"
+  model: "Per-feature stores keep each feature's state type and rules small and independent, so features can change without touching a global type, and an update in one feature doesn't make every screen re-check its state. Genuinely shared state, like the session or settings, gets its own app-level owner."
+```

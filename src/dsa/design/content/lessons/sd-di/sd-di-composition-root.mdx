@@ -1,0 +1,493 @@
+## Why it matters
+
+If every object is *given* its dependencies, something has to do the giving. The **composition root** is that something: the one place where the app's object graph is assembled, where the concrete types are named, and where configuration decides which implementations run. Get it right and the rest of the code is plain types with honest initialisers. Get it wrong and it either sprawls into every file or turns into a global that everything reaches into, which is a service locator with extra steps. "Where are your dependencies created?" is a standard follow-up in architecture interviews, and a crisp answer about the root, its scopes and its factories is a senior signal.
+
+## One place that knows everything
+
+Mark Seemann's definition is the useful one: a composition root is a single location in the application, **as close as possible to its entry point**, where modules are composed together. Three properties follow:
+
+- **It's the only code that knows the concrete types.** `URLSession`, `LiveTripsAPI`, `KeychainTokenStore` and `BatchedAnalytics` are named here and nowhere else. Every other type depends on protocols, closures or plain values.
+- **It composes; it doesn't decide product behaviour.** No business rules, no networking, no formatting. If the root contains an `if` about trips, that `if` belongs in a type the root builds.
+- **It runs once per scope.** Once at launch for app-wide services, once per sign-in for a session, once per window for a scene. You'll meet scopes properly in the next lesson.
+
+Being close to the entry point matters because everything between the entry point and the root is code that can't be given its dependencies. Put the root deep inside a feature and the layers above it go back to reaching for globals.
+
+## Where it lives on iOS
+
+Every process your app runs has its own entry point, so every process has its own root:
+
+| Entry point | Where the root goes |
+| --- | --- |
+| A SwiftUI app | The `App` struct: create the root once, in a `@State` property or a `let`, and pass it (or what it makes) to the first scene's views |
+| A UIKit app with scenes | App-wide services in the app delegate; each window's screens in `scene(_:willConnectTo:options:)` |
+| A widget, notification service extension or share extension | A small root of its own: it's a **separate process**, so it can share your code and (through an App Group) your files, but never your app's objects |
+| App Intents | Register dependencies at launch with `AppDependencyManager.shared.add(dependency:)`; intents read them with `@Dependency` (iOS 16 and later) |
+| Unit tests, previews, UI tests | Their own roots, built from fakes, fixtures or stub servers |
+
+Here's a SwiftUI app with a root, and the same root reached from UIKit scenes:
+
+```swift check ios title="Roots for a SwiftUI app and a UIKit app"
+import SwiftUI
+import UIKit
+
+struct Trip: Identifiable, Sendable {
+    let id: String
+    let destination: String
+}
+
+protocol TripsLoading: Sendable {
+    func trips() async throws -> [Trip]
+}
+
+struct LiveTripsAPI: TripsLoading {
+    let baseURL: URL
+    let session: URLSession
+
+    func trips() async throws -> [Trip] {
+        let (data, _) = try await session.data(from: baseURL.appending(path: "trips"))
+        return try JSONDecoder().decode([String].self, from: data).map { Trip(id: $0, destination: $0) }
+    }
+}
+
+@MainActor @Observable final class TripsModel {
+    private let loader: any TripsLoading
+    private(set) var trips: [Trip] = []
+
+    init(loader: any TripsLoading) {
+        self.loader = loader
+    }
+
+    func load() async {
+        trips = (try? await loader.trips()) ?? []
+    }
+}
+
+/// The composition root: builds app-lifetime services once and makes everything else on demand
+@MainActor final class AppRoot {
+    private let trips: any TripsLoading
+
+    init(baseURL: URL) {
+        trips = LiveTripsAPI(baseURL: baseURL, session: .shared)
+    }
+
+    func makeTripsModel() -> TripsModel {
+        TripsModel(loader: trips)
+    }
+}
+
+struct TripsScreen: View {
+    @State var model: TripsModel
+
+    var body: some View {
+        List(model.trips) { Text($0.destination) }
+            .task { await model.load() }
+    }
+}
+
+// SwiftUI: the App struct is the entry point (marked @main in the app target)
+struct TravelApp: App {
+    @State private var root = AppRoot(baseURL: URL(string: "https://api.example.com")!)
+
+    var body: some Scene {
+        WindowGroup {
+            TripsScreen(model: root.makeTripsModel())
+        }
+    }
+}
+
+// UIKit: app-wide services in the app delegate, one window's screens per scene
+final class AppDelegate: UIResponder, UIApplicationDelegate {
+    let root = AppRoot(baseURL: URL(string: "https://api.example.com")!)
+}
+
+final class SceneDelegate: UIResponder, UIWindowSceneDelegate {
+    var window: UIWindow?
+
+    func scene(_ scene: UIScene, willConnectTo session: UISceneSession, options connectionOptions: UIScene.ConnectionOptions) {
+        // UIKit creates both delegates, so this is the one bridge from a framework-made object to the root
+        guard let windowScene = scene as? UIWindowScene,
+              let appDelegate = UIApplication.shared.delegate as? AppDelegate else { return }
+        let window = UIWindow(windowScene: windowScene)
+        window.rootViewController = UIHostingController(rootView: TripsScreen(model: appDelegate.root.makeTripsModel()))
+        window.makeKeyAndVisible()
+        self.window = window
+    }
+}
+```
+
+The scene delegate's `UIApplication.shared.delegate` is a lookup, and that's fine: UIKit creates both delegates, so *something* has to bridge from a framework-made object to your graph. The rule is that the bridge happens **once, at the entry point**, and everything below it is injected.
+
+## What the root does
+
+A root has four jobs, in this order:
+
+1. **Read the configuration.** Which environment, whether this is a UI-test run, the user's privacy choices, a snapshot of remote config. Decide once, here, rather than with `#if DEBUG` and `ProcessInfo` checks scattered through features.
+2. **Build the long-lived services from the leaves up.** The URL session and token store first, then the API client that needs them, then the repositories that need *it*. Each is built once and kept.
+3. **Expose factories for what's created later.** Screens, flows and sessions don't exist at launch, so the root can't build them yet. It offers methods or closures that build them with the shared services when they're needed.
+4. **Start the first screen.** Hand the first view or coordinator what it needs, and get out of the way.
+
+Here's a root that picks implementations from launch arguments, so a UI test can launch the app against fixtures, and makes a new model for every screen while keeping one API client:
+
+```swift run title="A root that reads its configuration and shares its services"
+import Foundation
+
+var apiClientsBuilt = 0
+
+struct AppConfig {
+    enum Environment {
+        case production, staging, uiTesting
+    }
+
+    var environment: Environment
+
+    /// Launch arguments are how a UI test chooses the root: XCUIApplication().launchArguments = ["-ui-testing"]
+    init(arguments: [String]) {
+        if arguments.contains("-ui-testing") {
+            environment = .uiTesting
+        } else if arguments.contains("-staging") {
+            environment = .staging
+        } else {
+            environment = .production
+        }
+    }
+}
+
+protocol TripsLoading: Sendable {
+    func trips() async -> [String]
+}
+
+final class LiveTripsAPI: TripsLoading {
+    let host: String
+
+    @MainActor init(host: String) {
+        self.host = host
+        apiClientsBuilt += 1
+    }
+
+    func trips() async -> [String] {
+        host.hasPrefix("staging") ? ["Lisbon (staging data)"] : ["Lisbon"]
+    }
+}
+
+struct FixtureTrips: TripsLoading {
+    func trips() async -> [String] { ["Fixture: Porto", "Fixture: Seville"] }
+}
+
+@MainActor final class TripsModel {
+    private let loader: any TripsLoading
+    private(set) var trips: [String] = []
+
+    init(loader: any TripsLoading) {
+        self.loader = loader
+    }
+
+    func load() async {
+        trips = await loader.trips()
+    }
+}
+
+@MainActor final class AppRoot {
+    private let trips: any TripsLoading
+
+    init(config: AppConfig) {
+        // The one switch on configuration in the whole app
+        switch config.environment {
+        case .production: trips = LiveTripsAPI(host: "api.example.com")
+        case .staging: trips = LiveTripsAPI(host: "staging.api.example.com")
+        case .uiTesting: trips = FixtureTrips()
+        }
+    }
+
+    // A factory: a new model per screen, sharing the root's one API client
+    func makeTripsModel() -> TripsModel {
+        TripsModel(loader: trips)
+    }
+}
+
+let staging = AppRoot(config: AppConfig(arguments: ["TravelApp", "-staging"]))
+let first = staging.makeTripsModel()
+let second = staging.makeTripsModel()
+await first.load()
+await second.load()
+print("API clients built:", apiClientsBuilt)
+print("each screen has its own model:", first !== second)
+print("staging trips:", first.trips)
+
+let uiTest = AppRoot(config: AppConfig(arguments: ["TravelApp", "-ui-testing"]))
+let fixtureModel = uiTest.makeTripsModel()
+await fixtureModel.load()
+print("UI-test trips:", fixtureModel.trips)
+print("API clients built:", apiClientsBuilt)
+```
+
+```output
+API clients built: 1
+each screen has its own model: true
+staging trips: ["Lisbon (staging data)"]
+UI-test trips: ["Fixture: Porto", "Fixture: Seville"]
+API clients built: 1
+```
+
+Two lifetimes appear without any framework: the root's **stored properties** live as long as the root (here, the app), and its **factory methods** make something new on every call. That's most of what a DI container's "singleton" and "transient" mean.
+
+## Pass factories, not the root
+
+Navigation code needs to create screens long after launch. The tempting shortcut is to hand the whole root to every coordinator and screen, so each can call whatever `make…` it likes. Don't: an object that holds the root can reach any service in the app, its dependencies are invisible again, and you've rebuilt a service locator. Pass each flow only the factories it uses:
+
+```visual flow
+title: The root builds services once and hands out factories
+groups:
+  - { id: appProcess, label: App process, nodes: [app, root, api, analytics, flow, screen] }
+  - { id: widgetProcess, label: Widget process, nodes: [widget, wroot, wstore] }
+nodes:
+  - { id: app, label: App struct, kind: client, at: [0, 0] }
+  - { id: root, label: AppRoot, at: [0, 1] }
+  - { id: api, label: Trips API, at: [2, 1] }
+  - { id: analytics, label: Analytics, at: [3, 2] }
+  - { id: flow, label: Trips flow, kind: view, at: [0, 3] }
+  - { id: screen, label: Trip screen, kind: view, at: [2, 3] }
+  - { id: widget, label: Widget, kind: client, at: [4, 0] }
+  - { id: wroot, label: WidgetRoot, at: [4, 1] }
+  - { id: wstore, label: Shared file, kind: store, at: [4, 2] }
+edges:
+  - [app, root, creates]
+  - [root, api, builds]
+  - [root, analytics, builds]
+  - [root, flow, factories]
+  - [flow, screen, make…]
+  - [screen, api, { style: data }]
+  - [screen, analytics, { style: data }]
+  - [widget, wroot, creates]
+  - [wroot, wstore, reads]
+steps:
+  - say: "At launch the `App` struct creates the root, once. It's the first object the app makes for itself."
+    show: [app, root]
+    send: app->root
+  - say: "The root builds the long-lived services from the leaves up and keeps them: one API client, one analytics pipeline."
+    show: [api, analytics]
+    send: [root->api, root->analytics]
+    state: { root: active }
+  - say: "It hands the trips flow **factories**, not itself. The flow can make trip screens and nothing else."
+    show: [flow]
+    send: root->flow
+    state: { root: null }
+    label: { flow: "makeTripScreen" }
+  - say: "When the user taps a trip, the flow calls the factory. A new screen model is built, wired to the shared services."
+    show: [screen]
+    send: flow->screen
+    active: [screen->api, screen->analytics]
+    state: { screen: ok }
+  - say: "The widget is another process with its own entry point, so it has its own small root. It shares files with the app through an App Group, never objects."
+    show: [widgetProcess]
+    send: [widget->wroot, wroot->wstore]
+```
+
+In code, a factory can be a method on a small struct or a closure:
+
+```swift check title="A flow that receives only the factories it needs"
+import Foundation
+
+struct Trip: Sendable, Identifiable {
+    let id: String
+}
+
+@MainActor final class TripDetailModel {
+    let tripID: String
+
+    init(tripID: String) {
+        self.tripID = tripID
+    }
+}
+
+/// Everything the trips flow can build. The root fills it in; tests fill it with fakes.
+struct TripsFlowFactories {
+    var makeDetail: @MainActor (Trip.ID) -> TripDetailModel
+}
+
+@MainActor final class TripsFlow {
+    private let factories: TripsFlowFactories
+    private(set) var stack: [TripDetailModel] = []
+
+    init(factories: TripsFlowFactories) {
+        self.factories = factories
+    }
+
+    func showTrip(_ id: Trip.ID) {
+        stack.append(factories.makeDetail(id))
+    }
+}
+```
+
+## Feature modules and the root
+
+In a modular app, a feature package can't see the app's concrete services, and shouldn't. Each feature declares what it needs and exposes one entry point; the app's root adapts its services to that shape:
+
+```swift check ios group=feature title="TripsFeature package: what it needs, and its entry point"
+import SwiftUI
+
+/// Everything the feature touches, in the feature's own words
+public struct TripsDependencies: Sendable {
+    public var loadTrips: @Sendable () async throws -> [String]
+    public var track: @Sendable (String) async -> Void
+
+    public init(loadTrips: @escaping @Sendable () async throws -> [String], track: @escaping @Sendable (String) async -> Void) {
+        self.loadTrips = loadTrips
+        self.track = track
+    }
+}
+
+public enum TripsFeature {
+    @MainActor public static func makeRoot(_ dependencies: TripsDependencies) -> some View {
+        TripsListView(dependencies: dependencies)
+    }
+}
+
+struct TripsListView: View {
+    let dependencies: TripsDependencies
+    @State private var trips: [String] = []
+
+    var body: some View {
+        List(trips, id: \.self) { Text($0) }
+            .task {
+                trips = (try? await dependencies.loadTrips()) ?? []
+                await dependencies.track("trips_viewed")
+            }
+    }
+}
+```
+
+```swift check ios group=feature title="App target: the root adapts app services to the feature"
+protocol APIClient: Sendable {
+    func get(_ path: String) async throws -> Data
+}
+
+protocol AnalyticsClient: Sendable {
+    func log(_ event: String, properties: [String: String]) async
+}
+
+@MainActor final class AppServices {
+    private let api: any APIClient
+    private let analytics: any AnalyticsClient
+
+    init(api: any APIClient, analytics: any AnalyticsClient) {
+        self.api = api
+        self.analytics = analytics
+    }
+
+    func tripsDependencies() -> TripsDependencies {
+        TripsDependencies(
+            loadTrips: { [api] in try JSONDecoder().decode([String].self, from: await api.get("/trips")) },
+            track: { [analytics] event in await analytics.log(event, properties: ["feature": "trips"]) }
+        )
+    }
+}
+```
+
+The feature compiles, tests and previews without the networking or analytics packages, which is what makes modules build fast (D61 builds on this). The cost is an adapter per feature in the root. In a big app the root grows long; that's acceptable, because it's boring code in one obvious place, and it's the pressure that leads some teams to the generated wiring you'll see later in this module.
+
+## Keeping the root honest
+
+- **Lazy where it's heavy.** A root that builds a database, an ML model and a payment SDK in `init` slows the first frame. Make heavy services `lazy var`s, or factories, and measure launch with signposts before and after.
+- **No logic.** Configuration switches belong in the root; product rules don't. "If the user is premium, use the HD image loader" is a rule: put it in a type the root builds.
+- **One root per process, plus one per scope.** A session root built at sign-in is still part of the composition: the app root creates it. It's not a second, competing place to wire things.
+- **Test the wiring.** The compiler checks that every initialiser gets its parameters, but not that the root chose the right ones. A smoke test that builds the production root and makes each top-level screen catches a missing configuration value or a wrong environment before a user does.
+
+## Trade-offs
+
+| Approach | Where wiring lives | Compiler checks the graph | Discoverability | Cost | Wins when |
+| --- | --- | --- | --- | --- | --- |
+| No root: objects create or find their dependencies | Everywhere | Partly | Poor | None up front | Prototypes |
+| Hand-written root (pure DI) | One place per process and scope | Yes | One file to read | Wiring code grows with the app | Most apps, and any team that values compile-time safety |
+| Root that passes itself around | One place, used everywhere | Yes, but hidden | Poor: any object can reach anything | Low | Never: it's a service locator |
+| Root built on a container | One place, registered | No: missing registrations fail at run time | Registrations to search | A library and its rules | Very large graphs, or teams already invested in one |
+
+<Callout kind="interview">
+
+**What to say:** "The composition root is the `App` struct, or the scene delegate in UIKit: it reads configuration, builds the long-lived services once, and passes factories to the navigation layer, which creates screens on demand. Extensions are separate processes with their own small roots. Tests and previews build their own roots from fakes." Then mention one lifetime decision, such as a session root created at sign-in.
+
+**What to ask:** "Which processes does the app have (widgets, extensions, a watch app)? What differs between environments? What's created at launch versus on demand?"
+
+**Red flags:** "every class creates what it needs"; a root object passed into every view model; configuration `#if`s spread through features; building every service at launch without thinking about the first frame.
+
+</Callout>
+
+<Callout kind="gotcha" title="iOS gotcha: extensions can't share your app's objects">
+
+A widget, an App Intent running in the background, or a notification service extension runs in its own process with its own memory, often with a much smaller memory limit than the app. It can't see the app's `AppRoot`, and a singleton defined in a shared framework gets a second, separate copy there. Give each extension a root that builds only what it uses, and share data, not objects, through an App Group container.
+
+</Callout>
+
+<Callout kind="gotcha" title="Swift gotcha: App.init can run before you expect">
+
+SwiftUI creates your `App` struct very early in launch, before the first scene connects. A root built in a property initialiser runs then, on the main thread, before anything is on screen. Keep its `init` cheap, and move heavy setup to first use or to a `.task` on the first view.
+
+</Callout>
+
+## Practice
+
+**A composition root for a reading app** is this lesson in one class: read a config, build one cache and one analytics batcher, hand out a new model per screen, and let tests swap the network or analytics while the rest stays live. **Plan: move a 200-screen app from singletons to injection** asks how you'd introduce a root into an app that has none.
+
+```cards
+- id: root-definition
+  front: "What is a composition root?"
+  back: "The single place, as close as possible to an entry point, where the object graph is assembled: the only code that names concrete types and reads configuration. Everything else receives its dependencies."
+- id: root-ios-locations
+  front: "Where does the composition root live in a SwiftUI app, a UIKit app and an extension?"
+  back: "The `App` struct; the app delegate (app-wide) plus `scene(_:willConnectTo:options:)` (per window); and a small root of its own in each extension, which is a separate process."
+- id: root-factories
+  front: "Why pass factories to navigation code instead of the root itself?"
+  back: "An object holding the root can reach every service, so its dependencies become invisible again: that's a service locator. Factories give each flow exactly what it can build."
+- id: root-lifetimes
+  front: "Which two lifetimes does a hand-written root give you for free?"
+  back: "Stored properties live as long as the root (singletons for its scope); factory methods make a new instance per call (transients)."
+```
+
+```quiz
+- id: q1
+  type: mcq
+  prompt: "A team puts its composition root inside the trips feature, because trips is the first screen. Settings and the onboarding flow, which run before trips, keep using `APIClient.shared`. What principle did they break?"
+  options:
+    - "The root must be a class, not a struct"
+    - "The root should be as close as possible to the entry point, so nothing before it has to find its own dependencies"
+    - "There must be exactly one root in the whole codebase, including extensions"
+    - "Roots must be built with a container"
+  answer: 1
+  explain: "Code that runs before the root can't be given anything, so it falls back to globals. The `App` struct or the delegates come first, so that's where the root belongs."
+- id: q2
+  type: multi
+  prompt: "Which of these belong in the composition root? Choose all that apply."
+  options:
+    - "Choosing the staging or production API host"
+    - "Building one `URLSession` with the app's configuration"
+    - "Deciding whether a basket qualifies for free delivery"
+    - "A factory that makes a checkout screen's model"
+    - "Formatting prices for display"
+    - "Using stub responses when launched with `-ui-testing`"
+  answer: [0, 1, 3, 5]
+  explain: "The root reads configuration, builds services and provides factories. Free-delivery rules and price formatting are product behaviour: they belong in types the root builds."
+- id: q3
+  type: mcq
+  prompt: "Your widget extension imports the shared `Core` framework and calls `TripStore.shared`. The app has already loaded trips into its own `TripStore.shared`. What does the widget see?"
+  options:
+    - "The app's instance, with the trips already loaded"
+    - "A separate instance in the widget's own process, with nothing loaded unless the widget loads it itself"
+    - "A crash, because singletons can't be used in extensions"
+    - "The app's instance, but read-only"
+  answer: 1
+  explain: "An extension is a separate process. Shared code means a second copy of every static, not shared memory. Data crosses processes through files in an App Group, so give the widget its own root that reads them."
+- id: q4
+  type: order
+  prompt: "Put a composition root's work in order."
+  lines:
+    - "Read the configuration: environment, launch arguments, privacy choices"
+    - "Build the leaf services: URL session, token store"
+    - "Build the services that depend on them: API client, repositories"
+    - "Create factories for screens and sessions"
+    - "Hand the first screen or coordinator what it needs"
+  explain: "Configuration decides the implementations, the graph is built from the leaves up because each object needs its dependencies to exist first, and factories cover everything created later."
+- id: q5
+  type: truefalse
+  prompt: "Passing the `AppRoot` object into every coordinator and view model, so they can call any `make…` method, is a good way to avoid long initialisers."
+  answer: false
+  explain: "That turns the root into a service locator: any object can reach any service, and nobody can tell from a signature what an object depends on. Pass each flow a small set of factories instead."
+```

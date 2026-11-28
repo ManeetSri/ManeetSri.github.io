@@ -1,2 +1,36 @@
 // Katas for D35 · Real-time communication
-export default [];
+export default [
+    {
+        id: 'sd-kata-realtime-reconnecting-socket',
+        kind: 'problem',
+        title: 'A reconnecting socket client',
+        difficulty: 'hard',
+        patterns: ['realtime', 'concurrency', 'networking'],
+        lessons: ['sd-rt-reconnection', 'sd-rt-websockets'],
+        swiftTest: 'RealtimeReconnectingSocketTests',
+        lists: [],
+        minutes: 50,
+    },
+    {
+        id: 'sd-kata-realtime-ordering-buffer',
+        kind: 'problem',
+        title: 'An ordering buffer',
+        difficulty: 'medium',
+        patterns: ['realtime', 'networking'],
+        lessons: ['sd-rt-ordering-delivery'],
+        swiftTest: 'RealtimeSequenceBufferTests',
+        lists: [],
+        minutes: 35,
+    },
+    {
+        id: 'sd-kata-realtime-typing-indicator',
+        kind: 'problem',
+        title: 'A typing indicator',
+        difficulty: 'easy',
+        patterns: ['realtime', 'state'],
+        lessons: ['sd-rt-presence-typing'],
+        swiftTest: 'RealtimeTypingIndicatorTests',
+        lists: [],
+        minutes: 25,
+    },
+];

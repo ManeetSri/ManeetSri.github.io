@@ -1,0 +1,334 @@
+## Why it matters
+
+Every object you create at launch delays the first frame, and every object you create but never use is wasted memory. Lazy initialisation, creating something the first time it's needed, is how UIKit loads view controllers' views, how Swift creates `static let` values, and how fast apps launch fast. But lazy creation only **moves** a cost, to a moment you don't choose. Knowing when to be lazy, and when to warm something up deliberately, is a design skill interviewers probe with "our app takes three seconds to launch: what would you look at?"
+
+## `lazy var`: created on first access
+
+A `lazy var` doesn't run its initialiser when the instance is created. It runs it the first time the property is read, stores the result, and returns the stored value from then on:
+
+```swift run
+final class ProfileScreen {
+    lazy var header: String = {
+        print("building header")
+        return "Hello, Maneet"
+    }()
+}
+
+let screen = ProfileScreen()
+print("screen created")
+print(screen.header)
+print(screen.header)
+```
+
+```output
+screen created
+building header
+Hello, Maneet
+Hello, Maneet
+```
+
+Three properties make `lazy var` useful beyond saving work:
+
+- **It can use `self`.** An ordinary stored property's default can't refer to the instance, because the instance doesn't exist yet. A lazy one runs later, so it can. That's why UIKit code often sets up controls lazily:
+
+```swift check ios
+import UIKit
+
+final class FeedViewController: UITableViewController {
+    // A lazy property can use self in its initialiser; the closure runs once, so it doesn't retain self
+    private lazy var refresher: UIRefreshControl = {
+        let control = UIRefreshControl()
+        control.addTarget(self, action: #selector(refresh), for: .valueChanged)
+        return control
+    }()
+
+    override func viewDidLoad() {
+        super.viewDidLoad()
+        refreshControl = refresher
+    }
+
+    @objc private func refresh() {
+        refresher.endRefreshing()
+    }
+}
+```
+
+- **The initialising closure doesn't create a retain cycle.** It's called once, immediately, and then released, so using `self` inside it is safe. A lazy property that **stores** a closure is different: `lazy var onTap: () -> Void = { self.open() }` keeps the closure, the closure keeps `self`, and `self` keeps the closure. That one needs `[weak self]`.
+- **It's per instance.** Each `ProfileScreen` builds its own header on first use.
+
+### Where `lazy var` doesn't fit
+
+`lazy var` is **not thread-safe**. Swift's documentation is explicit: if several threads read an uninitialised lazy property at once, there's no guarantee it's initialised only once. Swift 6 enforces the consequences. A `lazy var` is mutable state, so a `Sendable` class can't have one, and a lazy property on a struct mutates the struct when first read:
+
+```swift
+final class Thumbnailer: Sendable {
+    lazy var cache: [String: [UInt8]] = [:]
+}
+
+struct Report {
+    lazy var summary: String = "expensive"
+}
+
+let report = Report()
+print(report.summary)
+```
+
+```text title="What you'll see"
+error: stored property 'cache' of 'Sendable'-conforming class 'Thumbnailer' is mutable
+error: cannot use mutating getter on immutable value: 'report' is a 'let' constant
+```
+
+So `lazy var` belongs in types confined to one isolation domain: a `@MainActor` view controller or view model, an actor, or a class used from one thread. For a lazily created value shared across threads, use a `static let`, which is created exactly once, or keep the state inside an actor.
+
+## UIKit's lazy views
+
+A view controller's **view is lazy**. Creating `SettingsViewController()` doesn't build any views. The first time anything reads `view`, UIKit calls `loadView()` and then `viewDidLoad()`. That's why a tab bar controller with five tabs doesn't build five screens at launch: each tab's view is loaded the first time it's shown.
+
+It's also a classic source of surprises. Reading `view` from outside, even to set a background colour before pushing, loads it **right then**, so `viewDidLoad` runs earlier than you expected, perhaps before the properties it reads have been set. UIKit gives you three tools for this:
+
+```swift check ios
+import UIKit
+
+final class SettingsViewController: UIViewController {
+    let titleLabel = UILabel()
+
+    override func viewDidLoad() {
+        super.viewDidLoad()
+        view.addSubview(titleLabel)
+    }
+}
+
+@MainActor
+func prepareSettings(title: String) -> SettingsViewController {
+    let settings = SettingsViewController()
+    settings.title = title
+    // Touching `view` here would load it now and run viewDidLoad before the screen is shown.
+    // viewIfLoaded reads it only if it already exists.
+    settings.viewIfLoaded?.backgroundColor = .systemBackground
+    return settings
+}
+```
+
+- **`viewIfLoaded`** returns the view only if it's already loaded, without loading it.
+- **`isViewLoaded`** tells you whether it is.
+- **`loadViewIfNeeded()`** loads it deliberately, for example in a unit test that wants to inspect the view hierarchy.
+
+## Static and global values are lazy too
+
+You met this in [Singleton and Apple's shared instances](/design/learn/sd-creational-singleton): Swift initialises `static let` properties and global variables lazily, on first access, exactly once, even across threads. That makes `static let` the simplest thread-safe lazy value in the language. The one exception is top-level code in a `main.swift` file or a script, where globals are initialised in order as the code runs.
+
+## SwiftUI: when is your model created?
+
+SwiftUI views are values that are created and thrown away constantly, so *when* an initialiser runs matters more than in UIKit:
+
+- **`@State private var model = LibraryModel()`** evaluates `LibraryModel()` **every time the view's struct is initialised**, which happens whenever its parent's body runs. SwiftUI keeps only the first instance and discards the rest, but each extra one is still created. Apple's documentation for `State` says to avoid side effects and expensive work in the default value, and to defer creating such objects with the `task` modifier.
+- **`@StateObject private var model = LibraryModel()`**, the older wrapper for `ObservableObject`s, takes an **autoclosure**: the model is created lazily, once, when the view first needs it. Migrating from `@StateObject` to `@State` with `@Observable` changes when your initialiser runs, which matters if it does work.
+
+```swift check ios
+import SwiftUI
+
+@MainActor
+@Observable
+final class LibraryModel {
+    private(set) var books: [String] = []
+
+    // Cheap: SwiftUI may run this every time the view's struct is recreated
+    init() {}
+
+    func load() async {
+        books = ["Design Patterns", "Working Effectively with Legacy Code"]
+    }
+}
+
+struct LibraryView: View {
+    @State private var model = LibraryModel()
+
+    var body: some View {
+        List(model.books, id: \.self) { Text($0) }
+            .task { await model.load() }
+    }
+}
+```
+
+The rule that follows: an `@Observable` model's `init` should be cheap and free of side effects, with no network calls, no disk reads and no subscriptions. Start work in `.task`, which runs once when the view appears and is cancelled when it disappears. You'll see exactly how view and state lifetimes differ in D18.
+
+## Lazy values that need async work
+
+Some values need asynchronous work to create: remote configuration, a database opened from disk, a machine-learning model loaded from the bundle. Making them lazy has a twist. If three screens ask at the same moment, a naive implementation starts **three** loads. Store the in-flight `Task` instead, so later callers wait for the same one:
+
+```swift run
+actor RemoteConfig {
+    private var cached: [String: Bool]?
+    private var inFlight: Task<[String: Bool], any Error>?
+    private let fetch: @Sendable () async throws -> [String: Bool]
+    private(set) var fetches = 0
+
+    init(fetch: @escaping @Sendable () async throws -> [String: Bool]) {
+        self.fetch = fetch
+    }
+
+    func flags() async throws -> [String: Bool] {
+        if let cached { return cached }
+        // Someone is already loading: wait for their result instead of starting another load
+        if let inFlight { return try await inFlight.value }
+
+        fetches += 1
+        let task = Task { try await fetch() }
+        inFlight = task
+        defer { inFlight = nil }
+
+        // On failure nothing is cached, so the next call tries again
+        let value = try await task.value
+        cached = value
+        return value
+    }
+}
+
+let config = RemoteConfig(fetch: { ["newCheckout": true, "darkIcons": false] })
+
+async let home = config.flags()
+async let cart = config.flags()
+async let settings = config.flags()
+let all = try await [home, cart, settings]
+
+print(all.map { $0["newCheckout"] ?? false })
+print("fetches:", await config.fetches)
+print("later call:", try await config.flags()["darkIcons"] ?? true, "fetches:", await config.fetches)
+```
+
+```output
+[true, true, true]
+fetches: 1
+later call: false fetches: 1
+```
+
+The actor makes the check-then-start step safe: because the in-flight task is recorded before the first `await`, any caller that arrives while the load is running finds it and waits. Failures aren't cached, so a bad network moment doesn't poison the value for the rest of the session. This is the **single-flight** idea you'll study properly in D14, applied to creation.
+
+## Lazy moves the cost; warm-up chooses when
+
+Lazy creation is a bet that the first use will come at a convenient moment. Often it doesn't: the first tap on History opens the database on the main thread, mid-animation. The fix is to stay lazy at launch, then **warm up** expensive objects deliberately, on a background task, just after the first frame:
+
+```visual timeline
+title: Three ways to pay for opening the database
+unit: ms
+lanes:
+  - { id: eager, label: Eager }
+  - { id: lazy, label: Lazy }
+  - { id: warm, label: Lazy + warm-up }
+spans:
+  - { lane: eager, from: 0, to: 190, label: all launch set-up, tone: error }
+  - { lane: eager, from: 190, to: 230, label: first frame, tone: ok }
+  - { lane: lazy, from: 0, to: 40, label: first frame, tone: ok }
+  - { lane: lazy, from: 300, to: 390, label: opens DB on tap, tone: error }
+  - { lane: warm, from: 0, to: 40, label: first frame, tone: ok }
+  - { lane: warm, from: 60, to: 150, label: warms DB in background, tone: wait }
+  - { lane: warm, from: 300, to: 310, label: already open, tone: ok }
+markers:
+  - { at: 300, label: user taps History }
+steps:
+  - { at: 40, say: "Both lazy versions draw their first frame almost at once: they've created nothing they don't need yet." }
+  - { at: 150, say: "The warm-up version opens the database on a **background** task after the first frame, while the user is still reading the screen." }
+  - { at: 230, say: "The eager launch did all its set-up before drawing anything: nearly a quarter of a second of launch screen." }
+  - { at: 390, say: "Plain lazy paid the same bill later, on the main thread, when the user first tapped History. Warm-up paid it when nobody was waiting." }
+```
+
+That's the whole strategy for launch time, which D16 covers in depth: do the minimum before the first frame, defer the rest, and warm up what you know will be needed soon at a moment you choose.
+
+## Trade-offs
+
+| | Eager at launch | Lazy on first use | Lazy, then warmed up | Lazy async, single-flight |
+| --- | --- | --- | --- | --- |
+| Launch time | Slowest | Fastest | Fastest | Fast |
+| First-use latency | None | Full creation cost, wherever it lands | Usually none | One load, shared by every caller |
+| Memory | Everything, always | Only what's used | What's likely to be used | Only what's used |
+| Predictability | High: one known moment | Low: depends on the user | High | Medium |
+| Best for | Tiny, always-needed objects | Rarely used features and screens | Expensive objects most sessions need | Remote config, databases, ML models |
+
+<Callout kind="interview">
+
+**What to say** about slow launches: "First measure: the App Launch template in Instruments locally, and launch-time metrics from the field. Then move everything that isn't needed for the first frame out of `didFinishLaunching`: SDK set-up, migrations, cache warming. Make those lazy, and warm the ones most sessions need on a background task after the first frame."
+
+**What to ask:** "What does the first screen actually need?" Usually far less than what launch currently does.
+
+**Red flags:** lazy everything with no thought for where the cost lands; heavy work in an `@Observable` model's `init`; `lazy var` shared across threads; "we'll make it lazy" as the only answer to a slow first tap.
+
+</Callout>
+
+<Callout kind="gotcha" title="iOS gotcha: reading view loads it">
+
+`viewController.view.backgroundColor = .red` before the controller is shown loads its whole view hierarchy right then and runs `viewDidLoad`, possibly before you've set the properties it reads. In tests it's sometimes what you want (call `loadViewIfNeeded()` to say so); in production code, set properties and let the view load when it's displayed, or use `viewIfLoaded`.
+
+</Callout>
+
+## Practice
+
+The **singletons and hidden construction** review has a lazy view that crashes on first access and a shared cache whose initialiser does far too much the first time it's touched. Find both, and say where the cost should go instead.
+
+```cards
+- id: lazy-var-facts
+  front: "What does `lazy var` guarantee, and what doesn't it?"
+  back: "It runs its initialiser on first access, can use `self`, and stores the result. It doesn't guarantee a single initialisation across threads, so it belongs in types confined to one actor or thread."
+- id: lazy-closure-cycle
+  front: "Does `lazy var x = { … self … }()` create a retain cycle?"
+  back: "No: the closure runs once and is released. A lazy property that *stores* a closure capturing `self` does create one."
+- id: state-vs-stateobject
+  front: "When is `LibraryModel()` evaluated in `@State var model = LibraryModel()` versus `@StateObject var model = LibraryModel()`?"
+  back: "With `@State`, every time the view's struct is initialised (SwiftUI keeps only the first). With `@StateObject`, once, lazily, through an autoclosure."
+- id: lazy-moves-cost
+  front: "What does lazy initialisation do to a cost, and how do you control when it lands?"
+  back: "It moves the cost to first use rather than removing it. Warm expensive objects deliberately on a background task after the first frame."
+```
+
+```quiz
+- id: q1
+  type: output
+  prompt: "What does this print?"
+  code: |
+    final class Screen {
+        lazy var title: String = {
+            print("making title")
+            return "Orders"
+        }()
+    }
+
+    let screen = Screen()
+    print("created")
+    print(screen.title + " / " + screen.title)
+  answer: "created\nmaking title\nOrders / Orders"
+  explain: "Creating the screen doesn't run the lazy initialiser. The first read runs it once and stores the result; the second read uses the stored value."
+- id: q2
+  type: mcq
+  prompt: "A view model's `init` starts a network request. The view holds it as `@State private var model = FeedModel()`, inside a parent that re-renders often. What happens?"
+  options:
+    - "One request, because SwiftUI keeps the first model"
+    - "A request each time the view's struct is recreated, though only the first model is kept"
+    - "No request until the view appears"
+    - "It doesn't compile: `@State` can't hold a class"
+  answer: 1
+  explain: "`@State` evaluates its default value every time the view's struct is initialised, so every extra `FeedModel()` starts a request that nobody uses. Keep `init` cheap and start work in `.task`."
+- id: q3
+  type: truefalse
+  prompt: "A `lazy var` on a class is initialised exactly once, even if two threads read it for the first time together."
+  answer: false
+  explain: "Swift makes no such guarantee for `lazy var`; that's why Swift 6 won't let a `Sendable` class have one. `static let` and globals *are* initialised exactly once."
+- id: q4
+  type: mcq
+  prompt: "Opening the app's database takes about 90 ms. Most sessions use it within the first minute, but the first screen doesn't. When should it be opened?"
+  options:
+    - "In `application(_:didFinishLaunchingWithOptions:)`, before the first frame"
+    - "Lazily, on the main thread, the first time a screen queries it"
+    - "On a background task just after the first frame, with later queries waiting for it if it isn't ready"
+    - "Every time a screen needs it, then closed again"
+  answer: 2
+  explain: "Opening it before the first frame slows every launch, and opening it on first query puts 90 ms on the main thread at a moment you don't control. Warming it in the background right after launch takes it off both paths."
+- id: q5
+  type: multi
+  prompt: "Three screens call `await config.flags()` at the same moment, and the value isn't loaded yet. Which properties should a lazy async loader have? Choose all that apply."
+  options:
+    - "Only one fetch starts; the other callers wait for it"
+    - "A failed fetch is cached, so the app doesn't retry"
+    - "Once loaded, later calls return the stored value without fetching"
+    - "Each caller starts its own fetch, and the fastest wins"
+    - "The check for an in-flight load and starting a new one can't interleave between callers"
+  answer: [0, 2, 4]
+  explain: "Share one in-flight load, cache only success, and make check-then-start atomic, which an actor does as long as the in-flight task is recorded before the first `await`. Caching failures would leave the app stuck until relaunch."

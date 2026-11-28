@@ -1,4 +1,5 @@
-import { BookOpen, FileText, Github, Mail } from 'lucide-react';
+import { BookOpen, FileText, Mail } from 'lucide-react';
+import { Github } from '../BrandIcons';
 import AppIcon from './AppIcon';
 import { projects } from '../../data/projects';
 import { ICON_SIZE, iconPosition } from '../../data/workTimeline';

@@ -1,2 +1,38 @@
 // Design exercises and architecture reviews for D18 · SwiftUI architecture
-export default [];
+export default [
+    {
+        id: 'sd-design-swiftui-podcast-library',
+        kind: 'design',
+        title: 'Data flow for a podcast library with live downloads',
+        difficulty: 'hard',
+        patterns: ['ui', 'state', 'performance'],
+        lessons: ['sd-swiftui-observable', 'sd-swiftui-environment', 'sd-swiftui-composition', 'sd-swiftui-previews'],
+        minutes: 35,
+        template: 'component',
+        mock: false,
+        lists: [],
+        summary: 'Design the models, owners and view inputs for 3,000 episodes, three live downloads and a mini player, so each update re-renders only the view that shows it.',
+    },
+    {
+        id: 'sd-review-swiftui-contacts-ownership',
+        kind: 'critique',
+        title: 'Review: a contacts split view that forgets and leaks',
+        difficulty: 'medium',
+        patterns: ['ui', 'state'],
+        lessons: ['sd-swiftui-lifetimes', 'sd-swiftui-state-binding', 'sd-swiftui-legacy-observation'],
+        minutes: 25,
+        lists: [],
+        summary: 'A store nobody owns, a detail pane stuck on its first contact and a polling loop that never ends: find who should own each piece of state, and for how long.',
+    },
+    {
+        id: 'sd-review-swiftui-chat-thread-identity',
+        kind: 'critique',
+        title: 'Review: a chat thread that rebuilds itself every second',
+        difficulty: 'medium',
+        patterns: ['ui', 'performance'],
+        lessons: ['sd-swiftui-identity', 'sd-swiftui-updates', 'sd-swiftui-performance'],
+        minutes: 25,
+        lists: [],
+        summary: 'Fresh UUIDs for every row, a scroll view reset on every message and a timer that re-runs the whole thread: fix identity, then the cost of each update.',
+    },
+];

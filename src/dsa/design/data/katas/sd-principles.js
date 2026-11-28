@@ -1,2 +1,36 @@
 // Katas for D05 · More design principles
-export default [];
+export default [
+    {
+        id: 'sd-kata-principles-unread-badges',
+        kind: 'problem',
+        title: 'One unread rule, three badges',
+        difficulty: 'easy',
+        patterns: ['principles', 'ui'],
+        lessons: ['sd-principles-dry', 'sd-principles-simplicity'],
+        swiftTest: 'PrinciplesUnreadBadgesTests',
+        lists: [],
+        minutes: 20,
+    },
+    {
+        id: 'sd-kata-principles-playback-queue',
+        kind: 'problem',
+        title: 'Compose a playback queue',
+        difficulty: 'medium',
+        patterns: ['principles', 'patterns'],
+        lessons: ['sd-principles-composition', 'sd-principles-grasp-variation'],
+        swiftTest: 'PrinciplesPlaybackQueueTests',
+        lists: [],
+        minutes: 30,
+    },
+    {
+        id: 'sd-kata-principles-upload-queue',
+        kind: 'problem',
+        title: 'An upload queue workers can share',
+        difficulty: 'medium',
+        patterns: ['principles', 'concurrency'],
+        lessons: ['sd-principles-cqs', 'sd-principles-immutability', 'sd-principles-grasp-ownership'],
+        swiftTest: 'PrinciplesUploadQueueTests',
+        lists: [],
+        minutes: 30,
+    },
+];

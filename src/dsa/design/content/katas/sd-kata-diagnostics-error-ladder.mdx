@@ -1,0 +1,129 @@
+An orders screen should never see a `URLError` or a status code. Build the two rungs between them: one that turns a transport failure into what it means for orders, and one that turns that into what the screen shows and whether to try again. Then wrap a typed-throwing transport call so its failures come out already translated.
+
+`DiagErrorLadder.ordersError(for:) -> OrdersError`, `DiagErrorLadder.load(_:) async throws(OrdersError) -> T` and `DiagErrorLadder.presentation(for:attempt:) -> Presentation?`
+
+**Rung one, transport to orders.**
+
+| `TransportError` | `OrdersError` |
+| --- | --- |
+| `.notConnected` | `.offline` |
+| `.timedOut` | `.unavailable(retryAfter: nil)` |
+| `.cancelled` | `.cancelled` |
+| `.undecodable` | `.contractBroken` |
+| `.status(401, _)` | `.sessionExpired` |
+| `.status(404, _)`, `.status(410, _)` | `.notFound` |
+| `.status(code, retryAfter: r)` where `code` is 408, 429, 502, 503 or 504 | `.unavailable(retryAfter: r)` |
+| any other `.status` from 400 to 499 | `.rejected(status:)` |
+| any other `.status` from 500 to 599 | `.serverFault` |
+| any other status (below 400, or 600 and above) | `.contractBroken` |
+
+**The wrapper.** `load(_:)` runs `operation` and returns its value. If it throws a `TransportError`, `load` throws the matching `OrdersError` instead.
+
+**Rung two, orders to the screen.** `attempt` is how many attempts have failed so far, counting from 1; treat anything below 1 as 1.
+
+| `OrdersError` | `message` | `retry` | `report` |
+| --- | --- | --- | --- |
+| `.cancelled` | returns `nil`: show nothing | | |
+| `.offline` | `.offline` | `.whenOnline` | `false` |
+| `.unavailable(retryAfter)`, attempt 1 or 2 | `.busy` | `.automatically(afterSeconds:)`: `retryAfter` if the server sent it, otherwise 2 to the power of `attempt`; never more than 60 or less than 1 | `false` |
+| `.unavailable`, attempt 3 or more | `.busy` | `.button` | `false` |
+| `.sessionExpired` | `.signInAgain` | `.signIn` | `false` |
+| `.notFound` | `.notFound` | `.none` | `false` |
+| `.rejected` | `.generic` | `.none` | `true` |
+| `.serverFault` | `.generic` | `.button` | `false` |
+| `.contractBroken` | `.generic` | `.none` | `true` |
+
+## Examples
+
+| Call | Result |
+| --- | --- |
+| `ordersError(for: .status(503, retryAfter: 12))` | `.unavailable(retryAfter: 12)` |
+| `ordersError(for: .status(422, retryAfter: nil))` | `.rejected(status: 422)` |
+| `ordersError(for: .status(302, retryAfter: nil))` | `.contractBroken` |
+| `presentation(for: .unavailable(retryAfter: nil), attempt: 2)` | `.busy`, `.automatically(afterSeconds: 4)`, no report |
+| `presentation(for: .unavailable(retryAfter: 600), attempt: 1)` | `.busy`, `.automatically(afterSeconds: 60)`, no report |
+| `presentation(for: .unavailable(retryAfter: 5), attempt: 3)` | `.busy`, `.button`, no report |
+| `presentation(for: .contractBroken, attempt: 1)` | `.generic`, `.none`, report |
+| `presentation(for: .cancelled, attempt: 1)` | `nil` |
+| `try await load { () async throws(TransportError) -> Int in throw .status(404, retryAfter: nil) }` | throws `OrdersError.notFound` |
+
+## Constraints
+
+- All three are pure: no clocks, no network, no shared state.
+- `load` must declare `throws(OrdersError)`, so a caller's `catch` gets an `OrdersError` it can switch over exhaustively.
+- `report` is true only when the app itself is probably at fault: a request the server rejected, or a response the app couldn't read. Server faults are the server's own monitoring's job.
+
+<Hints>
+<Hint>
+Switch over the transport error first, and over the status code inside `.status`. Put `401`, `404` and `410` before the ranges, and test the busy statuses with a `Set` before `400...499` and `500...599`.
+</Hint>
+<Hint>
+In `load`, a `do`/`catch` around `try await operation()` gives you a `TransportError` in the `catch`, because the closure's error type is typed. Map it and `throw` the result.
+</Hint>
+<Hint>
+For the automatic delay, `1 << attempt` is 2 to the power of `attempt`. Clamp with `min(60, max(1, retryAfter ?? backoff))`.
+</Hint>
+</Hints>
+
+## Solutions
+
+<Approach title="Two exhaustive switches and a typed wrapper" time="O(1)" space="O(1)">
+
+```swift
+private static let transientStatuses: Set<Int> = [408, 429, 502, 503, 504]
+
+public static func ordersError(for error: TransportError) -> OrdersError {
+    switch error {
+    case .notConnected: return .offline
+    case .timedOut: return .unavailable(retryAfter: nil)
+    case .cancelled: return .cancelled
+    case .undecodable: return .contractBroken
+    case .status(let code, let retryAfter):
+        switch code {
+        case 401: return .sessionExpired
+        case 404, 410: return .notFound
+        case _ where transientStatuses.contains(code): return .unavailable(retryAfter: retryAfter)
+        case 400...499: return .rejected(status: code)
+        case 500...599: return .serverFault
+        default: return .contractBroken
+        }
+    }
+}
+
+public static func load<T>(_ operation: () async throws(TransportError) -> T) async throws(OrdersError) -> T {
+    do {
+        return try await operation()
+    } catch {
+        throw ordersError(for: error)
+    }
+}
+
+public static func presentation(for error: OrdersError, attempt: Int) -> Presentation? {
+    let attempt = max(1, attempt)
+    switch error {
+    case .cancelled:
+        return nil
+    case .offline:
+        return Presentation(message: .offline, retry: .whenOnline, report: false)
+    case .unavailable(let retryAfter):
+        guard attempt < 3 else { return Presentation(message: .busy, retry: .button, report: false) }
+        let backoff = 1 << min(attempt, 6)
+        let delay = min(60, max(1, retryAfter ?? backoff))
+        return Presentation(message: .busy, retry: .automatically(afterSeconds: delay), report: false)
+    case .sessionExpired:
+        return Presentation(message: .signInAgain, retry: .signIn, report: false)
+    case .notFound:
+        return Presentation(message: .notFound, retry: .none, report: false)
+    case .rejected:
+        return Presentation(message: .generic, retry: .none, report: true)
+    case .serverFault:
+        return Presentation(message: .generic, retry: .button, report: false)
+    case .contractBroken:
+        return Presentation(message: .generic, retry: .none, report: true)
+    }
+}
+```
+
+Each rung knows only the one below it. The screen can't depend on a status code, because nothing above `ordersError(for:)` ever sees one, and every `switch` is exhaustive, so a new transport or orders case won't compile until someone decides what it means. The presentation returns a **message key** rather than English text, so the words live in the String Catalog and the mapping stays testable. In a real app, the repository would also keep the transport error as the orders error's cause for logging, as the propagation lesson does; the kata leaves it out to keep the mapping in focus.
+
+</Approach>

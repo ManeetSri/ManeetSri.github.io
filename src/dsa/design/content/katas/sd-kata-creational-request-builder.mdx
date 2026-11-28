@@ -1,0 +1,125 @@
+An API client's requests are assembled in layers: one sets the base URL and an auth header, an endpoint adds a path and query items, and a feature adds a JSON body. Write the **value-type, fluent builder** they all share: each method returns a changed copy, so a configured base builder can be branched into many requests, and `build()` validates the parts once before making a `URLRequest`.
+
+`CreationalRequestBuilder.Builder(baseURL:)` with `method(_:)`, `path(_:)`, `query(_:_:)`, `header(_:_:)`, `jsonBody(_:) throws`, `timeout(_:)` and `build() throws(BuildError) -> URLRequest`
+
+- **Defaults:** method `GET`, path `"/"`, no query, no headers, no body, timeout 60 seconds.
+- **URL:** the path is added after the base URL's own path, with exactly one `/` between them, so `https://api.example.com/v2` and `https://api.example.com/v2/` both give `…/v2/orders` for `"/orders"`.
+- **Query items** appear in the order they were added. A name may repeat. A `nil` value adds nothing. Values are percent-encoded so the server reads them back exactly: spaces become `%20`, and `+`, `&`, `=` and `#` are encoded too. With no items, the URL has no `?`.
+- **Headers:** setting a header replaces any earlier value for the same name, ignoring letter case.
+- **`jsonBody(_:)`** encodes the value with a `JSONEncoder` using `.sortedKeys`, stores it as the body, and sets `Content-Type` to `application/json`.
+- **`build()`** throws `.invalidPath(path)` if the path doesn't start with `/`, then `.bodyNotAllowed(.get)` for a GET with a body. Other methods may have a body.
+- **Value semantics:** calling a method never changes the builder it's called on.
+
+## Examples
+
+| Builder | `build()` gives |
+| --- | --- |
+| `Builder(baseURL: api)` | `GET https://api.example.com/`, timeout 60 |
+| `.path("/search").query("tag", "green").query("page", nil).query("tag", "loose")` | `…/search?tag=green&tag=loose` |
+| `.path("/search").query("q", "tea + cake")` | `…/search?q=tea%20%2B%20cake` |
+| `.header("Accept", "text/plain").header("accept", "application/json")` | one `Accept` header: `application/json` |
+| `.method(.post).path("/orders").jsonBody(NewOrder(quantity: 2, name: "Tea"))` | `POST`, body `{"name":"Tea","quantity":2}`, `Content-Type: application/json` |
+| `.path("orders")` | throws `.invalidPath("orders")` |
+| `.path("/orders/7").jsonBody(order)` with the default method | throws `.bodyNotAllowed(.get)` |
+| `let base = Builder(baseURL: api).header("Authorization", "Bearer abc")`, then `base.path("/orders")` and `base.path("/profile")` | two requests to different paths, both authorised; `base` still builds `/` |
+
+## Constraints
+
+- `Builder` must stay a `struct` and `Sendable`: the tests branch from shared base builders.
+- `URLComponents` percent-encodes spaces, `&` and `=` in `queryItems`, but leaves `+` alone, and many servers decode a `+` in a query as a space. Encode values yourself and set `percentEncodedQueryItems`.
+- Since iOS 13, `URLSession` refuses to send a GET request that has a body, which is why `build()` rejects it up front instead of letting the request fail later.
+
+<Hints>
+<Hint>
+Keep the parts as plain stored properties: the method, the path, an array of `(name, value)` pairs for the query, another for the headers, the body and the timeout. Only `build()` creates a `URLRequest`.
+</Hint>
+<Hint>
+Every method has the same shape: `var copy = self`, change one property, `return copy`. A private helper, `func changing(_ change: (inout Builder) -> Void) -> Builder`, removes the repetition.
+</Hint>
+<Hint>
+For the query, encode each name and value with `addingPercentEncoding(withAllowedCharacters:)` using `CharacterSet.urlQueryAllowed.subtracting(CharacterSet(charactersIn: "+&=#"))`. For the path, trim trailing slashes from `URLComponents.percentEncodedPath` before appending your own.
+</Hint>
+</Hints>
+
+## Solutions
+
+<Approach title="A struct whose methods return changed copies, validated in build()" time="O(q + h) to build, for q query items and h headers" space="O(q + h)">
+
+```swift
+public struct Builder: Sendable {
+    private let baseURL: URL
+    private var method = Method.get
+    private var path = "/"
+    private var queryItems: [(name: String, value: String)] = []
+    private var headers: [(name: String, value: String)] = []
+    private var body: Data?
+    private var timeoutInterval: TimeInterval = 60
+
+    public init(baseURL: URL) {
+        self.baseURL = baseURL
+    }
+
+    public func method(_ method: Method) -> Builder { changing { $0.method = method } }
+    public func path(_ path: String) -> Builder { changing { $0.path = path } }
+    public func timeout(_ seconds: TimeInterval) -> Builder { changing { $0.timeoutInterval = seconds } }
+
+    public func query(_ name: String, _ value: String?) -> Builder {
+        guard let value else { return self }
+        return changing { $0.queryItems.append((name, value)) }
+    }
+
+    public func header(_ name: String, _ value: String) -> Builder {
+        changing { builder in
+            builder.headers.removeAll { $0.name.caseInsensitiveCompare(name) == .orderedSame }
+            builder.headers.append((name, value))
+        }
+    }
+
+    public func jsonBody(_ value: some Encodable) throws -> Builder {
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = .sortedKeys
+        let data = try encoder.encode(value)
+        return changing { $0.body = data }.header("Content-Type", "application/json")
+    }
+
+    public func build() throws(BuildError) -> URLRequest {
+        guard path.hasPrefix("/") else { throw .invalidPath(path) }
+        if method == .get, body != nil { throw .bodyNotAllowed(method) }
+
+        var components = URLComponents(url: baseURL, resolvingAgainstBaseURL: false) ?? URLComponents()
+        var basePath = components.percentEncodedPath
+        while basePath.hasSuffix("/") { basePath.removeLast() }
+        components.percentEncodedPath = basePath + path
+        if !queryItems.isEmpty {
+            components.percentEncodedQueryItems = queryItems.map {
+                URLQueryItem(name: Self.encode($0.name), value: Self.encode($0.value))
+            }
+        }
+
+        var request = URLRequest(url: components.url ?? baseURL)
+        request.httpMethod = method.rawValue
+        request.timeoutInterval = timeoutInterval
+        request.httpBody = body
+        for header in headers {
+            request.setValue(header.value, forHTTPHeaderField: header.name)
+        }
+        return request
+    }
+
+    private func changing(_ change: (inout Builder) -> Void) -> Builder {
+        var copy = self
+        change(&copy)
+        return copy
+    }
+
+    private static let queryValueAllowed = CharacterSet.urlQueryAllowed.subtracting(CharacterSet(charactersIn: "+&=#"))
+
+    private static func encode(_ text: String) -> String {
+        text.addingPercentEncoding(withAllowedCharacters: queryValueAllowed) ?? text
+    }
+}
+```
+
+Copying the struct on every call is cheap: the arrays inside share their storage until one copy appends, so branching ten requests from one base builder doesn't copy the base's headers ten times. Keeping headers as an ordered array, rather than a dictionary, keeps the result deterministic and makes "last one wins, whatever the case" a single `removeAll`. And because the only way to get a `URLRequest` is `build()`, a request that breaks the rules never reaches `URLSession`.
+
+</Approach>

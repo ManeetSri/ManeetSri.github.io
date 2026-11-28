@@ -1,2 +1,38 @@
 // Design exercises and architecture reviews for D16 · How an iOS app runs
-export default [];
+export default [
+    {
+        id: 'sd-design-app-runtime-flow-restoration',
+        kind: 'design',
+        title: 'Restore a multi-step insurance claim',
+        difficulty: 'hard',
+        patterns: ['state', 'persistence', 'navigation'],
+        lessons: ['sd-runtime-restoration', 'sd-runtime-multi-window', 'sd-runtime-memory-pressure'],
+        minutes: 40,
+        template: 'component',
+        mock: false,
+        lists: [],
+        summary: 'Design the component that saves and restores a five-step claim flow, so jetsam, swipe-aways and two iPad windows never lose a claim or leak bank details.',
+    },
+    {
+        id: 'sd-review-app-runtime-retain-cycles',
+        kind: 'critique',
+        title: 'Review: leaks across the profile feature’s layers',
+        difficulty: 'medium',
+        patterns: ['architecture', 'performance', 'concurrency'],
+        lessons: ['sd-runtime-ownership'],
+        minutes: 30,
+        lists: [],
+        summary: 'A shared store, a view model, a view controller and a coordinator that keep every closed profile screen alive and refreshing: find each path and fix the ownership.',
+    },
+    {
+        id: 'sd-review-app-runtime-launch-main-thread',
+        kind: 'critique',
+        title: 'Review: a slow and fragile launch path',
+        difficulty: 'medium',
+        patterns: ['performance', 'background', 'architecture'],
+        lessons: ['sd-runtime-launch', 'sd-runtime-run-loop', 'sd-runtime-sandbox'],
+        minutes: 25,
+        lists: [],
+        summary: 'An app delegate and scene delegate that wait on the network, register background tasks too late and sign users out overnight: find what blocks the first frame and what is broken.',
+    },
+];

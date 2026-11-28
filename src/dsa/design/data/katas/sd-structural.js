@@ -1,2 +1,47 @@
 // Katas for D11 · Structural patterns
-export default [];
+export default [
+    {
+        id: 'sd-kata-structural-sdk-adapter',
+        kind: 'problem',
+        title: 'Adapt a geocoding SDK',
+        difficulty: 'medium',
+        patterns: ['patterns', 'concurrency'],
+        lessons: ['sd-structural-adapter'],
+        swiftTest: 'AtlasGeocoderAdapterTests',
+        lists: [],
+        minutes: 30,
+    },
+    {
+        id: 'sd-kata-structural-caching-decorator',
+        kind: 'problem',
+        title: 'A caching decorator for an HTTP client',
+        difficulty: 'medium',
+        patterns: ['patterns', 'caching', 'networking'],
+        lessons: ['sd-structural-decorator'],
+        swiftTest: 'CachingClientDecoratorTests',
+        lists: [],
+        minutes: 30,
+    },
+    {
+        id: 'sd-kata-structural-lazy-proxy',
+        kind: 'problem',
+        title: 'A lazy-loading proxy for an on-device model',
+        difficulty: 'medium',
+        patterns: ['patterns', 'concurrency', 'performance'],
+        lessons: ['sd-structural-proxy'],
+        swiftTest: 'TranslatorVirtualProxyTests',
+        lists: [],
+        minutes: 30,
+    },
+    {
+        id: 'sd-kata-structural-menu-composite',
+        kind: 'problem',
+        title: 'Questions for a menu tree',
+        difficulty: 'easy',
+        patterns: ['patterns', 'ui'],
+        lessons: ['sd-structural-composite'],
+        swiftTest: 'MenuTreeCompositeTests',
+        lists: [],
+        minutes: 20,
+    },
+];

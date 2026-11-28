@@ -1,0 +1,90 @@
+Coordinators form a tree: a tab's coordinator starts checkout, checkout starts gift wrapping. Most coordinator bugs are lifetime bugs: a child nobody holds vanishes mid-flow, a child nobody releases leaks along with its screens, a result arrives twice, or the back swipe ends a flow without telling anyone. Write the `Coordinator` that gets all of that right, and prove it with weak references.
+
+`Coordinator.show(_:)`, `start(_:onFinish:)`, `finish(_:)` and `stack(_:didRemove:)`
+
+The `Stack` type is given: it stands in for a `UINavigationController`, holding screen names bottom first, with a root screen nothing can pop. Like UIKit, it pops without asking your code and then tells its weak `delegate` which screens were removed, whether your code or the user asked. The app makes the root coordinator that delegate. Screen names are unique on a stack.
+
+| Method | What it must do |
+| --- | --- |
+| `show(screen)` | push `screen` onto the stack and record it in `screens`. Ignored once the flow has finished. |
+| `start(child, onFinish:)` | add `child` to `children`, set its (weak) `parent`, and keep `onFinish` for when it finishes. Ignored if this flow has finished, or `child` is this flow, already has a parent, or has finished. |
+| `finish(outcome)` | once only. In order: finish every child with `.cancelled`, newest first; pop this flow's screens, and anything above them, off the stack; leave the parent's `children` and clear `parent`; call `onFinish(outcome)`, then release it. |
+| `stack(_:didRemove:)` | remove those screens from `screens` throughout this flow's subtree; then every running flow in it that had shown screens and has none left finishes with `.cancelled`, deepest first. A flow that never showed a screen (one that presents, say) is left alone. |
+
+Nothing may keep a finished flow alive: not its parent, not its own `onFinish` closure (even one that captures the flow), not the stack.
+
+## Examples
+
+| Steps (the stack starts as `home`; `basket` is the root and the stack's delegate) | Result |
+| --- | --- |
+| basket shows `basket`; starts checkout; checkout shows `address`, `payment` | stack `home, basket, address, payment`; checkout's screens `address, payment` |
+| … checkout finishes `.completed("A1B2C3")` | its `onFinish` gets `.completed("A1B2C3")` once; stack `home, basket`; basket has no children; checkout is freed |
+| … instead, the user goes back once | stack `home, basket, address`; checkout still running |
+| … then back again | checkout gets `.cancelled`; it's freed |
+| checkout has started gift wrapping, which shows `paper`; the user pops to `basket` | gift wrapping is cancelled first, then checkout |
+
+## Constraints
+
+- Everything is `@MainActor`, as UIKit coordinators are; no concurrency beyond that.
+- Hold children strongly in `children` and the parent weakly. Store each child's `onFinish` on the child.
+- Iterate over a copy when finishing in a loop: finishing a flow changes `children`, and its pops call back into the delegate while you're still working.
+
+<Hints>
+<Hint>
+Set `isFinished` at the very start of `finish`. Popping your own screens makes the stack call the root's delegate method, which walks the tree, and the walk must see that this flow is already finishing.
+</Hint>
+<Hint>
+To pop "my screens and anything above them", find the index of your first screen in `stack.screens` and call `stack.pop(toCount: index)`.
+</Hint>
+<Hint>
+A recursive `subtree()` that returns `children.flatMap { $0.subtree() } + [self]` lists descendants before ancestors, which is exactly the order to cancel them in. A private flag recording "this flow has shown a screen" separates a flow whose screens were popped from one that never had any.
+</Hint>
+</Hints>
+
+## Solutions
+
+<Approach title="Ownership down, reports up, finish once" time="O(n) per finish or pop, for n flows in the tree" space="O(n)">
+
+```swift
+public func start(_ child: Coordinator, onFinish: @escaping @MainActor (Outcome) -> Void) {
+    guard !isFinished, child !== self, child.parent == nil, !child.isFinished else { return }
+    children.append(child)
+    child.parent = self
+    child.onFinish = onFinish
+}
+
+public func finish(_ outcome: Outcome) {
+    guard !isFinished else { return }
+    isFinished = true
+    for child in children.reversed() {       // a copy: each finish edits `children`
+        child.finish(.cancelled)
+    }
+    if let first = screens.first, let index = stack.screens.firstIndex(of: first) {
+        stack.pop(toCount: index)             // takes this flow's screens, and anything above them
+    }
+    screens = []
+    parent?.children.removeAll { $0 === self }
+    parent = nil
+    let report = onFinish
+    onFinish = nil                            // drop the closure, and whatever it captured
+    report?(outcome)
+}
+
+public func stack(_ stack: Stack, didRemove removed: [String]) {
+    let tree = subtree()
+    for coordinator in tree {
+        coordinator.screens.removeAll { removed.contains($0) }
+    }
+    for coordinator in tree where !coordinator.isFinished && coordinator.hasShownScreens && coordinator.screens.isEmpty {
+        coordinator.finish(.cancelled)
+    }
+}
+
+private func subtree() -> [Coordinator] {
+    children.flatMap { $0.subtree() } + [self]
+}
+```
+
+Two details carry the lifetimes. Detaching from the parent *before* calling `onFinish` means the parent's callback sees itself without the child, so it can start the next flow cleanly. Clearing `onFinish` before calling it breaks the cycle a closure creates when it captures the child itself, which is exactly the leak a `weak` reference in the test catches. In a SwiftUI app the same rules hold, with the child stored in the parent's presentation state instead of a `children` array.
+
+</Approach>

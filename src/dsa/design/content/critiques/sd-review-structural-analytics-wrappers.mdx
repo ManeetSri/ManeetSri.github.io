@@ -1,0 +1,145 @@
+<Brief>
+
+A shopping app sends analytics to a vendor called Beacon and keeps recent events as breadcrumbs for crash reports. A colleague has wrapped it all up with the patterns from this module: an adapter, two decorators (one of them a protection proxy) and a facade. The privacy team now asks one question: does it honour the user's choice when they decline analytics? Review it as you would a pull request: what's wrong, what matters most, and how you'd fix it.
+
+```swift check ios title="Analytics.swift"
+import UIKit
+
+// The vendor's SDK, as its interface describes it (simplified)
+final class BeaconSDK: Sendable {
+    static let shared = BeaconSDK()
+    func logEvent(_ name: String, parameters: [String: Any]) {}
+    func setUserID(_ userID: String?) {}
+}
+
+protocol AnalyticsTracking {
+    func logEvent(_ name: String, parameters: [String: Any])
+}
+
+extension BeaconSDK: AnalyticsTracking {}
+
+struct SamplingTracker: AnalyticsTracking {
+    let wrapped: AnalyticsTracking
+    let rate: Double
+
+    func logEvent(_ name: String, parameters: [String: Any]) {
+        guard Double.random(in: 0..<1) < rate else { return }
+        wrapped.logEvent(name, parameters: parameters)
+    }
+}
+
+struct ConsentGate: AnalyticsTracking {
+    let wrapped: AnalyticsTracking
+
+    func logEvent(_ name: String, parameters: [String: Any]) {
+        guard UserDefaults.standard.bool(forKey: "analyticsConsent") else { return }
+        wrapped.logEvent(name, parameters: parameters)
+    }
+}
+
+// Keeps the last 50 events, to attach to crash reports
+final class CrashBreadcrumbs: AnalyticsTracking {
+    private(set) var recent: [String] = []
+
+    func logEvent(_ name: String, parameters: [String: Any]) {
+        recent = Array((recent + ["\(name) \(parameters)"]).suffix(50))
+    }
+}
+
+@MainActor
+final class Analytics {
+    static let shared = Analytics()
+
+    private let trackers: [AnalyticsTracking] = [
+        ConsentGate(wrapped: SamplingTracker(wrapped: BeaconSDK.shared, rate: 0.1)),
+        CrashBreadcrumbs(),
+    ]
+
+    func track(_ name: String, _ parameters: [String: Any] = [:]) {
+        trackers.forEach { $0.logEvent(name, parameters: parameters) }
+    }
+
+    func screenViewed(_ screen: UIViewController) {
+        track("screen_view", ["screen": String(describing: type(of: screen))])
+    }
+
+    func purchased(total: Decimal, email: String) {
+        track("purchase", ["total": total, "email": email])
+    }
+
+    func signedIn(userID: String) {
+        BeaconSDK.shared.setUserID(userID)
+    }
+
+    func signedOut() {}
+}
+```
+
+</Brief>
+
+```workspace
+template: critique
+minutes: 25
+```
+
+```findings
+- id: identify-bypasses-consent
+  title: Signing in identifies the user to the vendor without asking the gate
+  severity: high
+  lines: 65-67
+  detail: "`signedIn` calls `BeaconSDK.shared.setUserID` directly, so it never passes through `ConsentGate`. A user who declined analytics is still identified to a third party, which breaks the promise the consent screen made (and the privacy rules behind it). Every call that reaches the vendor has to go through the facade's one gate."
+- id: gate-guards-one-tracker
+  title: Consent guards one tracker, not the facade
+  severity: high
+  lines: 48-51
+  detail: The protection proxy wraps only Beacon's chain. `CrashBreadcrumbs` records every event and its parameters whatever the user chose, and any tracker added to this list later starts out ungated. The check belongs once, in front of the whole fan-out, so there is a single place it can be got wrong.
+- id: email-in-events
+  title: The purchase event sends the customer's email address
+  severity: high
+  lines: 61-63
+  detail: Personal data goes to the vendor as an event parameter, and into crash reports through the breadcrumbs. It isn't needed for analytics, it isn't covered by a typical privacy label, and it can't be recalled once sent. A typed event with no field for an email makes this impossible to write.
+- id: vendor-shaped-port
+  title: The app's interface is the vendor's interface
+  severity: medium
+  lines: 10-14
+  detail: "`AnalyticsTracking` copies Beacon's `logEvent(_:parameters:)`, and Beacon satisfies it by retroactive conformance, so the \"adapter\" translates nothing. Event names and `[String: Any]` keys are invented at every call site (one typo splits a dashboard), any value of any type can be sent, and replacing Beacon means changing the protocol and every caller. The target should be shaped by the app: typed events, adapted to Beacon's names in one place."
+- id: per-event-sampling
+  title: Sampling drops events one at a time, purchases included
+  severity: medium
+  lines: 20-23
+  detail: Each event is kept with probability 0.1 on its own, so a user's `checkout_started` can survive while their `purchase` is dropped. Funnels and conversion rates turn into noise, and nine purchases in ten never reach revenue reports. Sample per user (from a stable install id) so a user's events are kept or dropped together, exempt business-critical events, and inject the randomness so the decorator can be tested.
+- id: sign-out-keeps-identity
+  title: Signing out doesn't reset the user
+  severity: medium
+  lines: 69
+  detail: Beacon keeps the previous user id, so on a shared iPad the next person's events are attributed to the last account, and their breadcrumbs mix with it too. Sign-out should clear the identity on every tracker (through the gate) and empty the breadcrumbs.
+- id: hard-wired-singleton
+  title: The whole stack is built inside a singleton
+  severity: medium
+  lines: 46-49
+  detail: "The facade constructs its own trackers from `BeaconSDK.shared`, and the gate reads consent from `UserDefaults.standard` (line 30). Tests can't see what was sent, previews and debug builds send real events, and changing the stack means editing this file. Build the wrappers in the composition root and inject the facade and the consent source."
+- id: screen-names-from-types
+  title: Screen names come from class names
+  severity: low
+  lines: 57-59
+  detail: "`type(of:)` ties every dashboard to a UIKit class name: renaming `CheckoutViewController` silently breaks a chart, and a SwiftUI screen reports itself as a `UIHostingController` with a long generic type. Pass an explicit screen identifier, such as an enum case."
+```
+
+<ReferenceReview>
+
+**Most important first.** The answer to the privacy team is *no*. Consent is checked in the wrong place: signing in identifies the user to Beacon directly, and the breadcrumbs tracker records every event regardless. On top of that, purchases send the customer's email to a third party. Those three need fixing before anything else ships.
+
+**The design problem underneath.** Each wrapper is a reasonable pattern on its own, but the stack has no single choke point. A facade is the natural place for rules that apply to every call, and this one lets callers and its own methods go around it. The second problem is the port: `AnalyticsTracking` is Beacon's API with a new name, so it can't express "events have known names and no personal data", and it can't outlive the vendor.
+
+**How I'd fix it, in small steps:**
+
+1. Make the target the app's own: `enum AnalyticsEvent` with cases such as `.screenViewed(Screen)`, `.checkoutStarted` and `.purchased(totalPence: Int)`, and `protocol AnalyticsTracking { func track(_ event: AnalyticsEvent); func identify(_ userID: String?) }`. There is no case that carries an email.
+2. Write a real `BeaconAdapter` that maps each event to Beacon's name and parameters. It's the only file that mentions Beacon.
+3. Give the facade its trackers and a `ConsentProviding` dependency in its initialiser, and check consent once, at the top of both `track` and `identify`. The facade becomes the protection proxy for everything behind it.
+4. Rewrite the sampler to decide per user from a hash of a stable install id, with an exemption list (purchases, sign-ups), and take the sampling decision as an injected function.
+5. Make `signedOut()` call `identify(nil)` on every tracker and clear the breadcrumbs.
+6. Assemble the stack in the composition root. Previews and UI tests get a no-op tracker; debug builds can log events to the console instead of sending them.
+
+**Tests to add:** with a recording tracker and consent switched off, assert nothing is tracked or identified; with consent on, assert sign-out sends `identify(nil)`; with a seeded sampler, assert a user's events are all kept or all dropped and purchases are always kept; and a test per event that the adapter produces Beacon's expected name and parameters.
+
+</ReferenceReview>

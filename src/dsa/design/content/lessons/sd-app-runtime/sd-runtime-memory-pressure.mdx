@@ -1,0 +1,231 @@
+## Why it matters
+
+Many of the "crashes" users complain about in photo-heavy or long-running apps never appear in a crash reporter at all. They're **jetsam** terminations: iOS killing the app to reclaim memory, with no signal your code can catch. Memory also decides something subtler: whether your app is still alive in the background when the user comes back, or has to cold-launch and hope it restored their place. Interviewers ask about memory in any design with images, video, maps or long sessions, and "what's your memory budget?" is a senior question.
+
+## How memory works on an iPhone
+
+iOS manages memory in **pages**, and what matters is whether a page can be thrown away:
+
+- **Clean** pages hold data that also exists on storage: your executable's code, read-only memory-mapped files, frameworks. Under pressure iOS drops them and reads them back later. They're nearly free.
+- **Dirty** pages hold data your process created: heap objects, decoded images, caches, the backing stores of views. iOS can't drop them, because there's nowhere to reload them from.
+- **Compressed** pages are dirty pages iOS has squeezed in place when they haven't been touched for a while. iPhones don't swap app memory out to disk; they compress it.
+
+Your app's **footprint** is its dirty plus compressed memory. That's the number the limits are measured against, the number Xcode's memory gauge shows, and the number to design around.
+
+## Jetsam: how iOS reclaims memory
+
+When free memory runs low, the kernel's memory-status mechanism, known as **jetsam**, terminates processes in priority order. Suspended apps in the background go first, then background apps that are still running work, and the app on screen last. Every app you use pushes others out, which is why the app you left ten minutes ago sometimes cold-launches.
+
+Separately, **every process has its own limit**, set by iOS according to the device's RAM. Cross it and the app is terminated at once, even if the system as a whole has memory to spare. Extensions have far lower limits than apps, which is why a widget or notification service extension that decodes one large image can die where the app wouldn't.
+
+A few tools let you work with the limit instead of guessing:
+
+- `os_proc_available_memory()` (iOS 13+) returns how many bytes the app can still allocate before reaching its limit. Use it to size caches on a 4 GB phone differently from a 12 GB one.
+- The `com.apple.developer.kernel.increased-memory-limit` entitlement (iOS 15+) asks for a higher limit on devices that can offer one. It's for apps with a genuine need, such as pro photo or video editing, not a fix for a leak.
+- **MetricKit** counts the terminations you can't see: `MXAppExitMetric` reports `cumulativeMemoryResourceLimitExitCount` (the app crossed its own limit) and, for background exits, `cumulativeMemoryPressureExitCount` (iOS reclaimed memory from your suspended app). Xcode's Organizer shows the same as **Terminations**.
+
+<Callout kind="note">
+
+A jetsam termination is a `SIGKILL`: your process is removed without running another instruction. Crash reporters can't record it, `applicationWillTerminate(_:)` doesn't run, and nothing unsaved survives. That's why "save when the scene enters the background" from [the app states lesson](/design/learn/sd-runtime-app-states) isn't optional.
+
+</Callout>
+
+## Memory warnings: the hint before the axe
+
+As pressure rises, iOS warns the apps that are still running. The same event arrives four ways:
+
+- `UIApplication.didReceiveMemoryWarningNotification`, for any object that observes it;
+- `applicationDidReceiveMemoryWarning(_:)` on the app delegate;
+- `didReceiveMemoryWarning()` on every view controller;
+- `DispatchSource.makeMemoryPressureSource(eventMask: [.warning, .critical])`, which also works outside UIKit.
+
+A warning is a **hint, not a promise**. A suspended app runs no code, so it never hears one. A sudden allocation, such as decoding a 48 MP photo, can cross the per-process limit between one warning and the next. Treat warnings as a chance to shrink, and design so you rarely need them.
+
+When one arrives, release what you can **rebuild**: decoded images that aren't on screen, cached responses, precomputed layouts, the contents of off-screen tabs. Don't allocate while doing it, and don't nil out views: since iOS 6, view controllers no longer unload their views on a warning, so freeing your own caches is the whole job.
+
+## Images: the biggest line in most budgets
+
+A compressed JPEG on disk tells you nothing about its memory cost. Once decoded for display, an image occupies **width × height × bytes per pixel**, usually 4 bytes for standard colour and 8 for wide-colour, high-dynamic-range content. Play with the numbers for a photo grid:
+
+```visual estimator
+title: Decoded image memory in a photo grid
+inputs:
+  - { id: width, label: Photo width, min: 640, max: 8064, step: 64, value: 4032, unit: px }
+  - { id: height, label: Photo height, min: 480, max: 6048, step: 48, value: 3024, unit: px }
+  - { id: bpp, label: Bytes per pixel, min: 2, max: 8, step: 2, value: 4 }
+  - { id: count, label: Photos decoded at once, min: 1, max: 60, step: 1, value: 24 }
+  - { id: side, label: Thumbnail's longest side, min: 100, max: 1200, step: 20, value: 360, unit: px }
+outputs:
+  - { id: full, label: One photo at full size, formula: width * height * bpp, format: bytes }
+  - { id: fullTotal, label: The grid at full size, formula: full * count, format: bytes }
+  - { id: thumb, label: One downsampled thumbnail, formula: side * (side * height / width) * bpp, format: bytes }
+  - { id: thumbTotal, label: The grid downsampled, formula: thumb * count, format: bytes }
+  - { id: ratio, label: Memory saved by downsampling, formula: full / thumb, unit: "×" }
+```
+
+A grid of 24 phone photos decoded at full size needs over a gigabyte: enough to be killed on most iPhones. The same grid downsampled to a 120-point cell at 3× scale (360 pixels) needs about 9 MB. **Decode to the size you display**, never larger. ImageIO can do it without ever holding the full bitmap:
+
+```swift check title="Downsampling.swift"
+import Foundation
+import ImageIO
+
+// Decode straight to the size on screen, without ever holding the full bitmap
+func downsampledImage(at url: URL, maxPixelSize: Int) -> CGImage? {
+    let sourceOptions = [kCGImageSourceShouldCache: false] as CFDictionary
+    guard let source = CGImageSourceCreateWithURL(url as CFURL, sourceOptions) else { return nil }
+    let options = [
+        kCGImageSourceCreateThumbnailFromImageAlways: true,
+        kCGImageSourceShouldCacheImmediately: true,
+        kCGImageSourceCreateThumbnailWithTransform: true,
+        kCGImageSourceThumbnailMaxPixelSize: maxPixelSize,
+    ] as CFDictionary
+    return CGImageSourceCreateThumbnailAtIndex(source, 0, options)
+}
+```
+
+`maxPixelSize` is the view's size in points times the screen's scale. On iOS 15 and later, `UIImage.byPreparingThumbnail(ofSize:)` does the same from a `UIImage`, off the main thread.
+
+## Designing for memory
+
+Give memory a **budget**, as you would launch time: so many megabytes for image caches, so many for the feed's models, measured on the oldest supported device. Then make each cache know its cost and how to shrink.
+
+`NSCache` is the usual building block: it's thread-safe, evicts on its own when the system needs memory, and takes a **cost** for each entry. Give it the decoded size, not the file size. Two tiers with different jobs let you shrink the expensive one first:
+
+```swift check ios title="PhotoMemoryCache.swift"
+import UIKit
+
+// Two tiers with different jobs: thumbnails for the grid, full-size images for the viewer
+@MainActor
+final class PhotoMemoryCache {
+    private let thumbnails = NSCache<NSURL, UIImage>()
+    private let fullSize = NSCache<NSURL, UIImage>()
+    private var observers: [any NSObjectProtocol] = []
+
+    init(thumbnailBudgetMB: Int, fullSizeBudgetMB: Int) {
+        thumbnails.totalCostLimit = thumbnailBudgetMB * 1_000_000
+        fullSize.totalCostLimit = fullSizeBudgetMB * 1_000_000
+        let center = NotificationCenter.default
+        // A memory warning: drop everything that can be rebuilt
+        observers.append(center.addObserver(forName: UIApplication.didReceiveMemoryWarningNotification, object: nil, queue: .main) { [weak self] _ in
+            MainActor.assumeIsolated { self?.trim(keepThumbnails: false) }
+        })
+        // Leaving the screen: a smaller suspended app is a less likely jetsam victim
+        observers.append(center.addObserver(forName: UIApplication.didEnterBackgroundNotification, object: nil, queue: .main) { [weak self] _ in
+            MainActor.assumeIsolated { self?.trim(keepThumbnails: true) }
+        })
+    }
+
+    func thumbnail(for url: URL) -> UIImage? { thumbnails.object(forKey: url as NSURL) }
+
+    func insertThumbnail(_ image: UIImage, for url: URL) {
+        thumbnails.setObject(image, forKey: url as NSURL, cost: image.decodedByteCount)
+    }
+
+    func insertFullImage(_ image: UIImage, for url: URL) {
+        fullSize.setObject(image, forKey: url as NSURL, cost: image.decodedByteCount)
+    }
+
+    private func trim(keepThumbnails: Bool) {
+        fullSize.removeAllObjects()
+        if !keepThumbnails { thumbnails.removeAllObjects() }
+    }
+}
+
+extension UIImage {
+    // What the bitmap occupies once decoded, not the size of the file it came from
+    var decodedByteCount: Int {
+        guard let cgImage else { return 0 }
+        return cgImage.bytesPerRow * cgImage.height
+    }
+}
+```
+
+Shrinking on the way into the background is the part most apps skip. A suspended app with a 600 MB footprint is near the front of jetsam's queue; at 150 MB it's far more likely to still be there, with everything in memory, when the user returns a few minutes later. Thumbnails stay, so the grid looks right instantly on return; full-size images go, because they're cheap to decode again for the one photo the user opens.
+
+The other half of memory design is not leaking. A screen that never deinitialises keeps its images, models and observers alive for the rest of the session, and the footprint climbs until jetsam ends it. That's the next lesson.
+
+## Trade-offs
+
+| Approach | Survives pressure | Control | Cost | When it wins |
+| --- | --- | --- | --- | --- |
+| `NSCache` with costs | Evicts by itself | Limits are hints, eviction order isn't strict LRU | Low | Decoded images and other rebuildable objects |
+| A dictionary with your own LRU and byte budget | Only if you trim on warnings | Exact | You write and test it | When you need predictable eviction, or a cache shared with non-UI code |
+| Disk cache, decoded again on demand | Uses no memory | Full | Decode time and disk I/O | Large or many items: the image cache's second tier |
+| Recompute every time | Uses no memory | Full | CPU on every use | Cheap values; caching them costs more than it saves |
+
+<Callout kind="interview">
+
+**Say** a budget and how you'd keep to it: "Thumbnails are decoded at cell size, about 400 KB each, in an `NSCache` capped at 50 MB; full-size images get a second, smaller cache that's emptied on background; everything is measured on the oldest supported iPhone." **Ask** what the oldest device is and whether extensions handle the same images. **Red flags:** caching image *files* in memory as `Data` and decoding on every display, sizing caches by item count instead of bytes, and treating jetsam reports as "random crashes".
+
+</Callout>
+
+<Callout kind="gotcha" title="iOS gotcha: the Simulator has no memory limit">
+
+The Simulator runs on your Mac's memory and doesn't enforce iPhone limits, so an app using 3 GB looks healthy there. Debug → Simulate Memory Warning tests your handlers, not your footprint. Measure on a real, older device with Xcode's memory gauge, the Allocations and VM Tracker instruments, and the Memory Graph debugger.
+
+</Callout>
+
+## Practice
+
+Jetsam is the reason state restoration exists: if iOS kills your suspended app, the user should come back to exactly where they were. [The design exercise](/design/practice/sd-design-app-runtime-flow-restoration) builds that for a multi-screen flow, and has to keep a footprint-heavy part (up to 60 MB of photos) out of memory and out of restoration state.
+
+```cards
+- id: footprint
+  front: "What counts towards an app's memory footprint on iOS?"
+  back: "Its dirty and compressed memory: heap objects, decoded images, caches. Clean pages, like code and mapped files, can be dropped and reloaded, so they don't count."
+- id: two-kinds-of-kill
+  front: "What are the two ways jetsam ends an app?"
+  back: "System pressure: iOS reclaims memory from suspended and background apps, lowest priority first. Per-process limit: an app that crosses its own limit is killed at once, even with memory free elsewhere."
+- id: warnings-not-promises
+  front: "Why can't you rely on memory warnings to avoid being killed?"
+  back: "Suspended apps never receive them, and a sudden allocation can cross the limit before a warning arrives. Warnings are a chance to shrink, not a guarantee."
+- id: image-cost
+  front: "How much memory does a decoded image take?"
+  back: "Width × height × bytes per pixel (usually 4), whatever the file size. Decode to the size you display."
+```
+
+```quiz
+- id: q1
+  type: estimate
+  prompt: "A feed cell shows an image 300 points wide and 200 points tall on a 3× screen, decoded at exactly that size with 4 bytes per pixel. Roughly how many kilobytes is that?"
+  answer: 2160
+  unit: KB
+  within: { percent: 20 }
+  explain: "300 × 3 = 900 pixels wide, 200 × 3 = 600 high: 540,000 pixels × 4 bytes = 2,160,000 bytes, about 2.2 MB. The 12 MP original would be about 48 MB."
+- id: q2
+  type: mcq
+  prompt: "Users of a photo-editing app say it \"crashes\" after a few edits, but your crash reporter shows nothing. What's the most likely explanation, and where would you confirm it?"
+  options:
+    - "The crash reporter is misconfigured; reinstall it"
+    - "The app is crossing its per-process memory limit; MetricKit's memory exit counts and Xcode Organizer's Terminations will show it"
+    - "The users' phones are out of storage"
+    - "A watchdog timeout; check for main-thread hangs"
+  answer: 1
+  explain: "A jetsam kill is a `SIGKILL`, which no crash reporter can record. Exit metrics count it as a memory-limit termination. Editing full-resolution images, often with several copies at once, is the classic cause."
+- id: q3
+  type: sort
+  prompt: "Is each of these clean memory (iOS can drop and reload it) or dirty memory (it counts towards your footprint)?"
+  buckets: [Clean, Dirty]
+  items:
+    - [Your app's executable code, 0]
+    - [A decoded photo in an image view, 1]
+    - [A read-only file mapped into memory, 0]
+    - ["An array of 50,000 parsed feed items", 1]
+    - [An NSCache full of thumbnails, 1]
+  explain: "Code and mapped read-only files exist on storage, so iOS can discard and reread them. Everything your process computed or decoded is dirty: it can only be compressed or freed by you."
+- id: q4
+  type: truefalse
+  prompt: "An app always receives a memory warning before jetsam terminates it."
+  answer: false
+  explain: "Suspended apps run no code and get no warning, and a sudden large allocation can cross the per-process limit before any warning arrives."
+- id: q5
+  type: multi
+  prompt: "Your app is entering the background. Which steps make it less likely to be terminated while suspended? Choose all that apply."
+  options:
+    - "Empty the full-size image cache"
+    - "Release decoded images for off-screen screens"
+    - "Prefetch the next page of the feed so it's ready on return"
+    - "Keep the small thumbnail cache, so the grid redraws instantly on return"
+  answer: [0, 1, 3]
+  explain: "A smaller suspended footprint moves the app back in jetsam's queue. Prefetching on the way out grows it. Keeping a small, high-value cache is a reasonable trade: it costs little and makes returning feel instant."
+```

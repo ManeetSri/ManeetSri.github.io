@@ -1,0 +1,338 @@
+## Why it matters
+
+NotificationCenter broadcasts events. Apple's frameworks also let you observe **values**, and they do it three ways, one per era: KVO from Objective-C (still how AVFoundation and WebKit report state), Combine from 2019 (streams of values with operators), and Observation from 2023 (the engine under SwiftUI's `@Observable`). A real codebase has all three. You need to know what each one observes, how long a subscription lives and which thread it calls you on, and interviewers love "How does SwiftUI know when to redraw?"
+
+## KVO: watching one property of an NSObject
+
+**Key-value observing** lets you watch a property of an `NSObject` subclass. The property must be `@objc dynamic`, because KVO works by having the Objective-C runtime swap in a hidden subclass whose setter tells observers. Apple's own Objective-C classes are built for it, which is why it's still the way to watch:
+
+- `AVPlayer.timeControlStatus` and `AVPlayerItem.status`
+- `WKWebView.estimatedProgress`, `title` and `url`
+- `Progress.fractionCompleted`, including a `URLSessionTask`'s `progress`
+
+In Swift, `observe(_:options:changeHandler:)` takes a key path and returns an `NSKeyValueObservation`. The observation lasts until that object is released or you call `invalidate()`: the same token idea as the last lesson.
+
+```swift check ios title="Watching whether a player is playing"
+import AVFoundation
+
+@MainActor
+final class PlaybackStatus {
+    private(set) var isPlaying = false
+    private var observation: NSKeyValueObservation?
+
+    func watch(_ player: AVPlayer) {
+        // The handler is @Sendable and runs on whichever thread changed the property
+        observation = player.observe(\.timeControlStatus, options: [.initial, .new]) { [weak self] player, _ in
+            let playing = player.timeControlStatus == .playing
+            Task { @MainActor in
+                self?.isPlaying = playing
+            }
+        }
+    }
+}
+```
+
+`.initial` calls the handler once straight away with the current value, which saves writing the same update twice. The handler runs **synchronously on the thread that made the change**, so it copies out what it needs and hops to the main actor. In Swift 6 the handler is `@Sendable`, and touching main-actor state directly inside it gets a warning.
+
+<Callout kind="gotcha" title="iOS gotcha: UIKit isn't KVO-compliant">
+Apple's documentation says UIKit classes generally don't support KVO. Observing `view.frame` or `label.text` may appear to work and then silently miss changes. Use KVO on the classes documented for it (AVFoundation, WebKit, `Progress`), and on your own `@objc dynamic` properties.
+</Callout>
+
+## Combine: a stream of values
+
+Combine models change as a **publisher** that emits values over time, **operators** that transform them, and a **subscriber** at the end. `sink` and `assign` return an `AnyCancellable`, and the subscription lives exactly as long as it does, so you keep them in a property: `.store(in: &cancellables)`.
+
+`@Published` turns a property into a publisher (`$query`), and Foundation offers publishers for notifications, timers and KVO (`player.publisher(for: \.timeControlStatus)`). Combine's strength is the operators: a search box that waits for typing to pause, drops repeats and maps the query to results is one pipeline.
+
+```swift check title="A search model built from operators"
+import Combine
+import Foundation
+
+@MainActor
+final class SearchModel: ObservableObject {
+    @Published var query = ""
+    @Published private(set) var suggestions: [String] = []
+
+    init(lookup: @escaping @Sendable (String) -> [String]) {
+        $query
+            .debounce(for: .milliseconds(300), scheduler: DispatchQueue.main)
+            .removeDuplicates()
+            .map(lookup)
+            .receive(on: DispatchQueue.main)
+            .assign(to: &$suggestions)
+    }
+}
+```
+
+`assign(to: &$suggestions)` ties the subscription to the `@Published` property itself, so there's no cancellable to store and no reference to `self`. Its older cousin, `assign(to: \.suggestions, on: self)`, holds `self` strongly and creates a retain cycle when `self` stores the result.
+
+One timing detail catches everyone. `@Published` emits in the property's **`willSet`**: subscribers get the new value as an argument, but the property itself still holds the old one.
+
+```swift run title="@Published fires before the value is stored"
+import Combine
+
+final class Basket {
+    @Published var count = 0
+}
+
+let basket = Basket()
+let subscription = basket.$count.sink { newValue in
+    print("sink got \(newValue), property still says \(basket.count)")
+}
+basket.count = 1
+basket.count = 2
+subscription.cancel()
+basket.count = 3
+print("after cancel: nothing printed for 3")
+```
+
+```output
+sink got 0, property still says 0
+sink got 1, property still says 0
+sink got 2, property still says 1
+after cancel: nothing printed for 3
+```
+
+This is what made SwiftUI's first model work. An `ObservableObject` has an `objectWillChange` publisher that fires before any `@Published` property changes, and every view holding the object through `@StateObject`, `@ObservedObject` or `@EnvironmentObject` subscribes to it. One property changes, and **every** one of those views runs `body` again.
+
+Combine isn't deprecated, and it's still the best tool for time-based composition (debounce, throttle, `combineLatest`). But Apple's newer APIs use `async`/`await` and Observation instead, so new code uses it less. D23 covers it properly.
+
+## Observation: tracking what you read
+
+The `@Observable` macro (iOS 17) takes a different approach. It doesn't publish anything. Instead, every read of a stored property inside a **tracking scope** is recorded, and a change to that property invalidates only the scopes that read it. SwiftUI runs every `body` in such a scope:
+
+```visual flow
+title: Who re-runs body when playback progress changes?
+nodes:
+  - { id: model, label: Episode model, kind: store, at: [0, 1] }
+  - { id: row, label: "Row: reads title", kind: view, at: [2, 0], w: 2 }
+  - { id: bar, label: "Player bar: reads progress", kind: view, at: [2, 2], w: 2 }
+edges:
+  - [model, row, title]
+  - [model, bar, progress]
+steps:
+  - say: "Two views read one model: the row shows the **title**, the player bar shows **progress**."
+  - say: "With `ObservableObject`, both views subscribe to the whole object. Progress changes, `objectWillChange` fires, and **both** bodies run again."
+    send: [model->row, model->bar]
+    state: { row: active, bar: active }
+    label: { model->row: objectWillChange, model->bar: objectWillChange, row: body runs, bar: body runs }
+  - say: "With `@Observable`, SwiftUI recorded which properties each `body` read the last time it ran."
+    state: { row: null, bar: null }
+    label: { model->row: title, model->bar: progress, row: null, bar: null }
+  - say: "Now a progress change invalidates only the player bar. The row is left alone, four times a second."
+    send: model->bar
+    state: { bar: active }
+    label: { bar: body runs }
+  - say: "Renaming the episode invalidates only the row."
+    send: model->row
+    state: { bar: null, row: active }
+    label: { bar: null, row: body runs }
+```
+
+The primitive underneath is `withObservationTracking(_:onChange:)`. It runs the first closure, records what it read, and calls `onChange` **once**, when one of those properties is about to change. After that it's done: to keep observing, you run it again, which is what SwiftUI does each time it re-runs `body`.
+
+```swift run title="withObservationTracking fires once, for what was read"
+import Observation
+
+@Observable
+final class Profile {
+    var name = "Ada"
+    var bio = "Engineer"
+}
+
+@MainActor
+func render(_ profile: Profile) {
+    withObservationTracking {
+        print("render: \(profile.name)")
+    } onChange: {
+        print("onChange: name is about to change")
+    }
+}
+
+let profile = Profile()
+render(profile)
+profile.bio = "Mathematician"
+profile.name = "Grace"
+profile.name = "Hopper"
+print("name is now \(profile.name)")
+```
+
+```output
+render: Ada
+onChange: name is about to change
+name is now Hopper
+```
+
+Changing `bio` did nothing, because `render` never read it. The first `name` change fired `onChange`; the second didn't, because nothing registered again.
+
+Observation now reaches beyond SwiftUI:
+
+- **UIKit** tracks `@Observable` reads in update methods such as `layoutSubviews()`, and re-runs them when those properties change. iOS 18 needed the `UIObservationTrackingEnabled` Info.plist key; iOS 26 turns it on by default and adds `updateProperties()`, a method on views and view controllers meant for exactly this.
+- **`Observations`** (iOS 26, Swift 6.2) is an async sequence of a value: `for await progress in Observations({ episode.progress })`. It yields after changes rather than before, groups changes made together into one value, and needs no re-registering.
+
+```swift check ios title="One @Observable model, read by SwiftUI and UIKit"
+import Observation
+import SwiftUI
+import UIKit
+
+@MainActor
+@Observable
+final class EpisodeModel {
+    var title = "Episode 12"
+    var progress = 0.0
+}
+
+struct EpisodeRow: View {
+    let episode: EpisodeModel
+
+    var body: some View {
+        Text(episode.title)
+    }
+}
+
+@available(iOS 26, *)
+final class ProgressBarView: UIView {
+    let episode: EpisodeModel
+    private let bar = UIProgressView()
+
+    init(episode: EpisodeModel) {
+        self.episode = episode
+        super.init(frame: .zero)
+        addSubview(bar)
+    }
+
+    required init?(coder: NSCoder) { nil }
+
+    // UIKit records the read of episode.progress and calls this again when it changes
+    override func updateProperties() {
+        super.updateProperties()
+        bar.progress = Float(episode.progress)
+    }
+}
+
+@available(iOS 26, *)
+@MainActor
+func logProgress(of episode: EpisodeModel) async {
+    for await progress in Observations({ episode.progress }) {
+        print("Progress \(progress)")
+    }
+}
+```
+
+`EpisodeRow` doesn't need a property wrapper to observe: reading `episode.title` in `body` is enough. A view that *owns* the model keeps it in `@State`; one that needs bindings to it uses `@Bindable`. D18 goes through SwiftUI's data flow in full.
+
+## Keep each flavour at the edge
+
+A codebase that mixes all three works best when each one stays where it's needed, and the rest of the app sees one model:
+
+- **KVO at the framework boundary.** Only the type that wraps `AVPlayer` or `WKWebView` observes it, and it turns what it sees into plain properties. `PlaybackStatus` above is that adapter (D11's pattern): the rest of the app never sees a key path.
+- **Combine where time matters.** Debouncing a search field or combining three inputs is Combine's home ground. Its output can land in an `@Observable` model's property, so views don't need to know a pipeline exists.
+- **Observation for what views read.** Screens observe `@Observable` models, and nothing else.
+
+The opposite, a view model that exposes `AnyPublisher`s, KVO tokens and a NotificationCenter name all at once, forces every caller to learn three lifetimes and three threading rules. Converting at the edge pays for itself the first time you write a test: an `@Observable` model can be checked by setting a property and reading another, with no subscriptions to manage.
+
+## Trade-offs
+
+| | KVO | Combine | Observation |
+| --- | --- | --- | --- |
+| What you watch | One `@objc dynamic` property of an `NSObject` | Any publisher's stream of values | Any stored property of an `@Observable` class that you read |
+| Granularity | One property per observation | Whatever the publisher emits; `ObservableObject` is the whole object | Exactly the properties read |
+| Lifetime | `NSKeyValueObservation` | `AnyCancellable` | One change per tracking scope; `Observations` for as long as its loop runs |
+| Thread | The thread that changed it | The thread that sent it, unless you `receive(on:)` | `onChange`: the thread that changed it |
+| Timing | After the change (`.prior` adds before) | `@Published`: before (`willSet`) | `onChange`: before; `Observations`: after |
+| Needs | iOS 2, `NSObject` | iOS 13 | iOS 17 (`Observations`: iOS 26) |
+| Wins when | An Apple class only reports changes through KVO | Composing values over time: debounce, combine, throttle | View state in SwiftUI, and UIKit on iOS 26 |
+
+<Callout kind="interview">
+**"How does SwiftUI know to redraw?"** With `ObservableObject`, the view subscribes to `objectWillChange`, so any `@Published` change re-runs its `body`. With `@Observable`, SwiftUI runs `body` inside observation tracking, so only properties it actually read can invalidate it. That's why migrating a busy model to `@Observable` often cuts work without changing a view.
+
+**Ask:** What's the oldest iOS version we support? It decides between `ObservableObject` and `@Observable`, and whether UIKit tracking is on by default.
+
+**Red flags:** saying Combine is deprecated; `assign(to:on: self)`; touching UI from a sink without `receive(on:)`; KVO on UIKit view properties.
+</Callout>
+
+<Callout kind="gotcha" title="Swift gotcha: a sink is not a main-actor promise">
+A `sink` closure written inside a `@MainActor` class is treated by the compiler as main-actor code, but Combine calls it on whatever thread the publisher emits from. A notification or URLSession publisher can emit in the background. Put `.receive(on: DispatchQueue.main)` before any sink that touches the main actor's state.
+</Callout>
+
+<Callout kind="gotcha" title="iOS gotcha: the forgotten cancellable">
+`let _ = publisher.sink { … }` cancels the subscription immediately, because nothing keeps the `AnyCancellable`. The same goes for an `NSKeyValueObservation` kept in a local variable: it stops observing when the function returns.
+</Callout>
+
+## Practice
+
+**Observers that cancel themselves** has you build the token mechanics that `AnyCancellable` and `NSKeyValueObservation` share: release cancels, cancelling twice is harmless, and nothing keeps anything else alive.
+
+```cards
+- id: three-observers
+  front: "What does each of KVO, Combine and Observation observe?"
+  back: "KVO: one `@objc dynamic` property of an NSObject. Combine: a publisher's stream of values. Observation: the stored properties of an `@Observable` class that a tracking scope actually read."
+- id: published-willset
+  front: "When a `@Published` property changes, what does a subscriber see if it reads the property?"
+  back: "The old value. `@Published` emits in `willSet`, so the new value is only in the closure's argument."
+- id: observation-granularity
+  front: "Why can `@Observable` re-run fewer SwiftUI bodies than `ObservableObject`?"
+  back: "SwiftUI tracks which properties each `body` read, and only those invalidate it. `ObservableObject` invalidates every observing view on any `@Published` change."
+- id: tracking-one-shot
+  front: "How many times does `withObservationTracking`'s `onChange` run?"
+  back: "Once, immediately before the first change to something it tracked. To keep observing you register again (or use iOS 26's `Observations`)."
+```
+
+```quiz
+- id: q1
+  type: mcq
+  prompt: "An `@Observable` episode model is read by a row (which shows `title`) and a player bar (which shows `progress`). `progress` changes four times a second. What does SwiftUI re-run?"
+  options:
+    - "Both bodies, four times a second"
+    - "Only the player bar's body"
+    - "Neither: views must use `@ObservedObject` to update"
+    - "The parent view's body, which rebuilds both"
+  answer: 1
+  explain: "Observation records the properties each `body` read. The row never read `progress`, so only the player bar is invalidated. With `ObservableObject`, both would re-run."
+- id: q2
+  type: output
+  prompt: "What does this print?"
+  code: |
+    import Combine
+
+    final class Thermostat {
+        @Published var target = 20
+    }
+
+    let thermostat = Thermostat()
+    let token = thermostat.$target.sink { value in
+        print(value, thermostat.target)
+    }
+    thermostat.target = 22
+    token.cancel()
+    thermostat.target = 18
+  answer: |
+    20 20
+    22 20
+  explain: "A `@Published` subscriber gets the current value when it subscribes, then each new value in `willSet`, while the property still holds the old one. After `cancel()`, nothing more arrives."
+- id: q3
+  type: match
+  prompt: "Match each observer to what keeps it alive."
+  pairs:
+    - [KVO's observe, An NSKeyValueObservation you keep]
+    - [A Combine sink, An AnyCancellable you keep]
+    - [withObservationTracking, "Nothing: it fires once, then you register again"]
+    - [A NotificationCenter block observer, A token you pass to removeObserver]
+  explain: "Every observer API has a lifetime story. Know it, and you know how each one leaks or stops early."
+- id: q4
+  type: sort
+  prompt: "Which tool would you reach for?"
+  buckets: [KVO, Combine, Observation]
+  items:
+    - ["AVPlayer's timeControlStatus", 0]
+    - ["Wait for typing to pause, then search", 1]
+    - [A SwiftUI screen's view model on iOS 17 and later, 2]
+    - [A WKWebView's estimatedProgress, 0]
+    - [A UIKit view that updates in updateProperties on iOS 26, 2]
+  explain: "Apple's Objective-C classes report through KVO; Combine's operators shine for timing and combining streams; Observation is the model layer for SwiftUI, and for UIKit from iOS 26."
+- id: q5
+  type: truefalse
+  prompt: "`withObservationTracking` calls `onChange` after every change to a tracked property, until you cancel it."
+  answer: false
+  explain: "It calls `onChange` once, before the first change, and then stops tracking. SwiftUI re-registers each time it re-runs `body`; iOS 26's `Observations` sequence does the re-registering for you."
+```

@@ -1,0 +1,218 @@
+## Why it matters
+
+A chat message arrives, a goal is scored, a driver turns the corner: the data changed on the server, and the person holding the phone wants to see it without pulling to refresh. How the app finds out is one of the first decisions in any chat, feed, ride-hailing or live-sports design, and interviewers ask "how does the client learn about new messages?" in almost every one. Choose badly and you pay in battery, in servers, or in a screen that's quietly out of date.
+
+## Who speaks first
+
+HTTP has one rule: the client asks and the server answers. That's **pull**. The app decides when to look, and between looks it knows nothing.
+
+**Push** means the server sends something the moment it changes. On a phone there's a catch, as you saw in [the client–server style](/design/learn/sd-styles-client-server): a server can't open a connection to an iPhone. The phone has no public address, sits behind a carrier's NAT, and may be asleep. So every push rides on a connection that somebody on the device opened first:
+
+- **your app's own connection**, opened while it's running (a WebSocket, a server-sent event stream, an MQTT session), or
+- **Apple's connection**, the one the system keeps open to the Apple Push Notification service (APNs) on behalf of every app.
+
+That split matters more than any protocol detail. Your own connection exists only while your app runs; Apple's exists all the time but carries small, best-effort notifications, not your data stream.
+
+## The options
+
+From the simplest to the most involved:
+
+| Technique | How it works | Direction | Typical delay | When the app is suspended |
+| --- | --- | --- | --- | --- |
+| Short polling | Ask every *n* seconds | Client asks | Up to *n* seconds | Stops |
+| Long polling | Ask, and the server holds the request until something changes | Client asks, server answers when ready | About one round trip | Stops |
+| Server-Sent Events (SSE) | One long HTTP response the server keeps writing events into | Server to client | Milliseconds | Stops |
+| WebSocket | A two-way channel upgraded from an HTTP request | Both ways | Milliseconds | Stops |
+| MQTT | A publish–subscribe session with a broker | Both ways, through topics | Milliseconds | Stops; the broker can hold messages |
+| APNs | Apple delivers a notification to the device | Server to device, via Apple | Usually seconds; no guarantee | Delivered, and can wake the app |
+| WebRTC | Peers exchange audio, video and data, mostly over UDP | Peer to peer | Tens of milliseconds | Only during a call (CallKit) |
+
+The rest of this module takes each row in turn. This lesson is about choosing between them.
+
+<Callout kind="analogy">
+
+Polling is checking your letterbox every hour. Long polling is waiting at the letterbox until the post comes. A WebSocket is a phone call you keep open. APNs is the doorbell: it tells you something arrived, but you still go and get the parcel.
+
+</Callout>
+
+## Four questions that pick the strategy
+
+### 1. How fresh must it be?
+
+Give every piece of data a **freshness budget**: how stale can it be before someone notices or is harmed?
+
+- **Under a second:** a multiplayer game, a voice call, a collaborative cursor.
+- **A second or two:** chat messages, a driver's position, a live score.
+- **Tens of seconds to minutes:** an inbox count, an order status, a feed's "new posts" pill.
+- **Whenever the screen opens:** a weather forecast, a profile, settings.
+
+Below a few seconds, polling stops making sense: you'd have to poll so often that most requests return nothing. Above a minute, a persistent connection is waste: you're paying to keep a channel open for traffic that hardly ever comes.
+
+### 2. Which way does the data go, and how often?
+
+One-way, server to client (scores, prices, notifications, a streaming AI answer) fits SSE or long polling. Both directions at a high rate (chat with typing indicators, a game, a shared whiteboard) fits a WebSocket. Rare changes fit polling or push. Count the rate: an order that changes state four times in an hour doesn't need a socket.
+
+### 3. Is the app on screen?
+
+This is the mobile question that backend designs skip. When the user leaves your app, iOS suspends it a few seconds later, and a suspended app runs no code: it can't read a socket, answer a heartbeat or poll. Every technique in the table except APNs stops. So a real-time design always has **two modes**:
+
+- **Foreground:** your own connection, as live as the product needs.
+- **Background:** APNs, either a visible notification or a silent push that may wake the app briefly, plus a catch-up fetch when the user comes back.
+
+You'll meet the push side in D46 and background execution in D52. Here, the point is that "keep a WebSocket open so the user gets messages" is never the whole answer on iOS.
+
+### 4. How many people get each update?
+
+**Fan-out** is the number of devices one change must reach. A one-to-one chat message reaches one or two devices. A goal in a cup final reaches millions within seconds. A presence change ("Ana is online") reaches everyone who can see Ana. High fan-out pushes the design towards cheap reads (a CDN-cached file that many clients poll) or towards a server built to hold millions of connections; low fan-out with low latency fits sockets.
+
+Two costs sit behind all four questions. A persistent connection holds memory on a server for every user who's merely looking, and it makes deploys and load balancing harder because connections are long-lived. And on the phone, every request or heartbeat wakes the cellular radio, which stays powered for several seconds afterwards (the last lesson in this module puts numbers on it).
+
+## Most apps mix them
+
+Real apps rarely pick one row. The common shape for chat, ride tracking or live sport is a hybrid:
+
+```visual flow
+title: The usual hybrid for a live feature
+layers:
+  - { label: iPhone, rows: [0, 0] }
+  - { label: Backend, rows: [2, 2] }
+nodes:
+  - { id: app, label: App, kind: client, at: [0, 0] }
+  - { id: db, label: Local store, kind: store, at: [2, 0] }
+  - { id: api, label: HTTP API, kind: service, at: [0, 2] }
+  - { id: gateway, label: Live gateway, kind: service, at: [2, 2] }
+  - { id: apns, label: APNs, kind: external, at: [4, 1] }
+edges:
+  - [app, api, catch up]
+  - [app, gateway, socket, { style: async }]
+  - [app, db, save, { style: data }]
+  - [gateway, apns, notify, { style: async }]
+  - [apns, app, push, { style: async }]
+steps:
+  - say: "The user opens the app. It shows what's in the **local store** at once, then asks the HTTP API for everything that changed since its last cursor."
+    show: [app, db, api]
+    send: app->api
+  - say: "With the screen up to date, it opens **one socket** to the live gateway and subscribes to what's on screen. New events arrive in milliseconds."
+    show: [gateway]
+    send: gateway->app
+    state: { gateway: active }
+  - say: "Each event is saved locally before it's shown, so the store stays the source of truth whether data came by socket or by fetch."
+    send: app->db
+  - say: "The user leaves. iOS suspends the app and the socket dies with it; the gateway notices when heartbeats stop."
+    state: { app: wait, gateway: null }
+    label: { app: suspended }
+  - say: "Now a new message goes through **APNs** instead. Apple delivers a notification, which can also wake the app briefly to prefetch."
+    show: [apns]
+    send: [gateway->apns, apns->app]
+  - say: "When the user taps it, the app is back to step one: catch up over HTTP, then reopen the socket."
+    state: { app: null }
+    label: { app: null }
+    send: app->api
+```
+
+Three rules make the hybrid work:
+
+- **The socket is an accelerator, not the source of truth.** Anything it carries can also be fetched over HTTP with a cursor, so a missed event costs latency, never data.
+- **One connection per app, not per screen.** Screens subscribe to topics on a shared connection; opening a socket for every view controller multiplies servers and battery.
+- **Push says "something happened", the API says what.** A notification payload is small (4 KB) and best-effort; the app fetches the real data when it runs.
+
+### Matching common features
+
+| Feature | Freshness | Strategy |
+| --- | --- | --- |
+| One-to-one chat | 1–2 s | WebSocket in the foreground, APNs alerts in the background, fetch since cursor on open |
+| Order or delivery status | Tens of seconds | Poll every 15–30 s while the tracking screen is visible, push for milestones, a Live Activity for the lock screen |
+| Live score for millions | A few seconds | SSE or WebSocket from an edge tier, or poll a CDN-cached JSON every few seconds; Live Activity pushes in the background |
+| Social feed | Minutes | Pull on open and on pull-to-refresh; optionally a "new posts" hint over an existing connection |
+| Shared document | Under a second | WebSocket carrying operations, with a snapshot fetch on reconnect |
+| Video call | Under 200 ms | WebRTC for media, a WebSocket for signalling, VoIP push and CallKit to ring |
+
+## Trade-offs
+
+| | Short polling | Long polling | SSE | WebSocket | APNs |
+| --- | --- | --- | --- | --- | --- |
+| Latency | Interval-bound | Low | Low | Lowest | Seconds, best-effort |
+| Client complexity | Lowest | Low | Medium (no built-in client on iOS) | Medium–high | Medium (tokens, permissions) |
+| Server cost per idle user | None between polls | One held request | One open stream | One open socket | None for you |
+| Works through proxies and CDNs | Yes, and cacheable | Usually | Usually, if buffering is off | Usually, on 443 | n/a |
+| Battery while idle | Radio wake per poll | Radio wake per cycle | Heartbeats | Heartbeats | Shared system connection |
+| Works when suspended | No | No | No | No | Yes |
+
+Short polling wins when freshness is measured in tens of seconds and the data is cacheable. Long polling wins when you need low latency but can't run persistent connections. SSE wins for one-way streams over plain HTTP. WebSockets win for frequent two-way traffic. APNs is the only thing that reaches a suspended app, and it's a doorbell, not a pipe.
+
+<Callout kind="interview">
+
+**Say** the freshness budget and both modes out loud: "Messages should appear within a couple of seconds while the chat is open, so I'll use one WebSocket in the foreground. In the background the socket is gone, so the server sends an APNs alert, and on open the app fetches everything after its last cursor." **Ask** how fresh the data must be, how many users receive each update, and whether the backend already has a real-time tier. **Red flags:** "keep the socket open in the background", a socket per screen, treating push notifications as a reliable data channel, and choosing WebSockets for something that changes twice an hour.
+
+</Callout>
+
+<Callout kind="gotcha" title="iOS gotcha: the socket that works on your desk">
+
+In the Simulator or on a phone attached to Xcode, the debugger keeps your app running when it's in the background, so a socket can look as if it survives. On a real device, untethered, the app is suspended within seconds and the connection dies. Test background behaviour on a device with the debugger detached, and design as though every connection ends the moment the user leaves.
+
+</Callout>
+
+## Practice
+
+The design exercise **"Live score updates for 5 million fans"** asks all four questions at once: a two-second freshness budget, one-way traffic, a background mode for fans who aren't in the app, and fan-out to millions for a single goal. Decide the foreground and background strategy first; the rest of the design follows from it.
+
+```cards
+- id: who-opens
+  front: "Why can't a server push to an iPhone directly?"
+  back: "The phone has no reachable address and may be asleep. Every push rides on a connection the device opened: your app's own socket while it runs, or the system's connection to APNs."
+- id: two-modes
+  front: "What are the two modes of every real-time design on iOS?"
+  back: "Foreground: your own connection (socket, SSE, polling) as live as the product needs. Background: APNs, plus a catch-up fetch when the app runs again."
+- id: freshness-budget
+  front: "What is a freshness budget?"
+  back: "How stale a piece of data can be before it matters: sub-second for calls, seconds for chat, minutes for feeds. It decides between polling, a persistent connection and push."
+- id: socket-accelerator
+  front: "Why should a socket be an accelerator rather than the source of truth?"
+  back: "Connections drop and events get missed. If everything can also be fetched over HTTP with a cursor, a missed event costs latency, never data."
+```
+
+```quiz
+- id: q1
+  type: sort
+  prompt: "Pick the main foreground strategy for each feature."
+  buckets: [Poll, Persistent connection, Pull on open]
+  items:
+    - ["A food order's status, which changes every few minutes", 0]
+    - [A chat with typing indicators, 1]
+    - [A collaborative whiteboard, 1]
+    - [A weather forecast, 2]
+    - ["A user's settings screen", 2]
+    - [A parcel tracking page refreshed while it's on screen, 0]
+  explain: "Chat and whiteboards need two-way traffic within a second, which a WebSocket gives. Order and parcel status change rarely, so a 15–30 s poll while visible is cheap and simple. Forecasts and settings only need fetching when the screen opens."
+- id: q2
+  type: mcq
+  prompt: "A product manager wants new chat messages to appear 'instantly, even when the app is closed'. What do you propose?"
+  options:
+    - "Keep the WebSocket open in the background with a background task"
+    - "Poll every 5 seconds from BGAppRefreshTask"
+    - "A WebSocket while the app is in the foreground, APNs notifications while it isn't, and a fetch since the last cursor when it opens"
+    - "Silent pushes for every message, so the app can update its database in the background"
+  answer: 2
+  explain: "A suspended app runs no code, so its socket and any timer stop. BGAppRefreshTask runs when iOS chooses, often hours apart. Silent pushes are throttled and not guaranteed. Visible notifications reach the user; the catch-up fetch fills in the data."
+- id: q3
+  type: estimate
+  prompt: "1 million people keep an order-tracking screen open, and each phone polls every 10 seconds. Roughly how many requests a second reach the server?"
+  answer: 100000
+  unit: requests a second
+  explain: "1,000,000 ÷ 10 s = 100,000 requests a second, nearly all answering 'no change'. Conditional requests (304) make each one cheap, and a CDN can absorb them if the response is shared."
+- id: q4
+  type: truefalse
+  prompt: "Opening a separate WebSocket for each screen that needs live data is a good way to keep features independent."
+  answer: false
+  explain: "Each socket is another TLS handshake, another set of heartbeats waking the radio, and another connection the server must hold. Share one connection and let screens subscribe to topics on it."
+- id: q5
+  type: mcq
+  prompt: "Which question most changes a real-time design for mobile compared with the web?"
+  options:
+    - "Whether the server uses JSON or protobuf"
+    - "What happens when the app is suspended"
+    - "Which load balancer the backend uses"
+    - "Whether the client is written in Swift"
+  answer: 1
+  explain: "A browser tab can often keep its connection while in the background; an iOS app is suspended within seconds and loses it. Every mobile real-time design needs a background mode built on APNs and a catch-up path."
+```

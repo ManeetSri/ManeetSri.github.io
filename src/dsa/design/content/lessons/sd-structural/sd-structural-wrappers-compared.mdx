@@ -1,0 +1,259 @@
+## Why it matters
+
+Adapters, decorators, proxies and facades all look the same in code: a type that holds another and forwards calls to it. What differs is the *intent*, and the intent is what tells a reviewer what the wrapper is allowed to do. Naming the right one in a design discussion is a quick signal that you understand composition rather than having memorised four definitions, and "what's the difference between a decorator and a proxy?" is a standard interview question.
+
+## One shape, four intents
+
+| | Adapter | Decorator | Proxy | Facade |
+| --- | --- | --- | --- | --- |
+| Interface it offers | a **different** one: the one your code expects | the **same** as what it wraps | the **same** as its subject | a **new, simpler** one |
+| What it wraps | one adaptee | one component (often another decorator) | one subject | several objects |
+| Why it exists | to make something fit | to add behaviour | to control access: when, where, who | to make a subsystem easy to use |
+| Who creates what it wraps | someone else, who hands it over | someone else, who hands it over | often the proxy itself | usually the facade |
+| iOS example | a Beacon SDK adapter behind `AnalyticsTracking` | `LoggingHTTPClient` | a lazily loaded translation model | `NSPersistentContainer` |
+
+## Three questions that tell them apart
+
+When you meet a wrapper in a code review, or want to name your own, ask in this order:
+
+1. **Does the interface change?** If callers see the same protocol as the wrapped object, it's a decorator or a proxy. If they see a different one, it's an adapter or a facade.
+2. **Same interface: is it adding behaviour, or controlling access?** Logging, timing, caching a given object's answers: decorator. Deciding *whether* the call reaches the subject, *when* the subject is created, or *where* it lives: proxy.
+3. **Different interface: one object made to fit, or many made simple?** One existing object reshaped to an interface you already have: adapter. A new interface designed for a task, coordinating several objects: facade.
+
+<Callout kind="tip">
+
+A quick test for the second question: could the wrapper ever decide **not** to call the wrapped object, or create it itself? Then it's a proxy. A decorator always forwards (except a cache returning what it already has, which is where the two blur).
+
+</Callout>
+
+## All four in one feature
+
+Analytics is a good place to see them together, because a real analytics setup needs all four jobs. The screen calls a **facade**. Behind it, a **protection proxy** drops events until the user consents. A **decorator** echoes events to the console in debug builds. An **adapter** turns the app's events into the vendor's.
+
+```swift run
+// The vendor's SDK: the adaptee
+final class BeaconClient {
+    func logEvent(_ name: String, parameters: [String: String]) {
+        let pairs = parameters.sorted { $0.key < $1.key }.map { "\($0.key)=\($0.value)" }
+        print("    Beacon: \(name) \(pairs.joined(separator: " "))")
+    }
+}
+
+enum AnalyticsEvent {
+    case screenViewed(String)
+    case purchased(totalPence: Int)
+}
+
+protocol AnalyticsTracking {
+    func track(_ event: AnalyticsEvent)
+}
+
+// Adapter: makes Beacon's interface fit ours
+struct BeaconAdapter: AnalyticsTracking {
+    let client: BeaconClient
+
+    func track(_ event: AnalyticsEvent) {
+        switch event {
+        case .screenViewed(let screen):
+            client.logEvent("screen_view", parameters: ["screen": screen])
+        case .purchased(let totalPence):
+            client.logEvent("purchase", parameters: ["value_pence": String(totalPence)])
+        }
+    }
+}
+
+// Decorator: the same interface, plus a job (echoing events in debug builds)
+struct DebugEcho: AnalyticsTracking {
+    let wrapped: any AnalyticsTracking
+
+    func track(_ event: AnalyticsEvent) {
+        print("  debug: \(event)")
+        wrapped.track(event)
+    }
+}
+
+// Proxy: the same interface, controlling access to what's behind it
+final class ConsentGate: AnalyticsTracking {
+    private let wrapped: any AnalyticsTracking
+    var hasConsent = false
+
+    init(wrapping wrapped: any AnalyticsTracking) {
+        self.wrapped = wrapped
+    }
+
+    func track(_ event: AnalyticsEvent) {
+        guard hasConsent else {
+            print("  gate: no consent, dropped")
+            return
+        }
+        wrapped.track(event)
+    }
+}
+
+// Facade: a new, simpler interface for the rest of the app
+final class Analytics {
+    private let gate: ConsentGate
+
+    init(sending tracker: any AnalyticsTracking) {
+        gate = ConsentGate(wrapping: tracker)
+    }
+
+    func consentChanged(to granted: Bool) { gate.hasConsent = granted }
+    func screen(_ name: String) { gate.track(.screenViewed(name)) }
+    func purchase(totalPence: Int) { gate.track(.purchased(totalPence: totalPence)) }
+}
+
+let analytics = Analytics(sending: DebugEcho(wrapped: BeaconAdapter(client: BeaconClient())))
+print("Before the user answers:")
+analytics.screen("Basket")
+analytics.consentChanged(to: true)
+print("After they agree:")
+analytics.screen("Basket")
+analytics.purchase(totalPence: 2499)
+```
+
+```output
+Before the user answers:
+  gate: no consent, dropped
+After they agree:
+  debug: screenViewed("Basket")
+    Beacon: screen_view screen=Basket
+  debug: purchased(totalPence: 2499)
+    Beacon: purchase value_pence=2499
+```
+
+Notice where each decision lives. The facade creates the gate itself, so every call the app can make passes through it: there's no way round consent. The decorator and the adapter are handed in from outside, so a debug build can include `DebugEcho` and a release build can leave it out without touching the facade.
+
+```visual flow
+title: One event, four wrappers
+nodes:
+  - { id: screen, label: Basket screen, kind: view, at: [0, 0] }
+  - { id: facade, label: Analytics facade, kind: service, at: [2, 0] }
+  - { id: gate, label: Consent proxy, kind: service, at: [4, 0] }
+  - { id: echo, label: Debug decorator, kind: service, at: [4, 2] }
+  - { id: adapter, label: Beacon adapter, kind: service, at: [2, 2] }
+  - { id: sdk, label: Beacon SDK, kind: external, at: [0, 2] }
+edges:
+  - [screen, facade, "screen(\"Basket\")"]
+  - [facade, gate, track(event)]
+  - [gate, echo, track(event)]
+  - [echo, adapter, track(event)]
+  - [adapter, sdk, logEvent]
+steps:
+  - say: The screen calls the **facade** with a task-shaped method. It knows nothing about events, consent or vendors.
+    show: [screen, facade]
+    send: screen->facade
+  - say: The facade builds a typed event and passes it to the **proxy** it created, so nothing can bypass it.
+    show: [gate]
+    send: facade->gate
+  - say: The user hasn't consented, so the proxy drops the event. Nothing behind it runs.
+    state: { gate: error }
+    label: { gate: dropped }
+  - say: Once the user agrees, the same call goes through. The **decorator** echoes it and forwards it unchanged.
+    show: [echo]
+    state: { gate: ok }
+    label: { gate: null }
+    send: gate->echo
+  - say: The **adapter** translates the event into Beacon's name and parameters. It's the only code that imports the SDK.
+    show: [adapter, sdk]
+    send: [echo->adapter, adapter->sdk]
+```
+
+## Where the lines blur
+
+The definitions are crisp; real code isn't always. Three common cases:
+
+- **Caching.** The original catalogue lists a caching proxy; this module built a caching decorator. Both are defensible. If the wrapper is handed an object and remembers its answers, it reads as a decorator. If it owns its subject, or decides when to reach it at all (think of a cache in front of a remote service it creates), it reads as a proxy.
+- **A facade over one object.** A facade with a single object behind it, which also renames its methods, is doing an adapter's job. That's fine: the name should say what matters most to readers.
+- **"Adapter" in architecture.** In ports and adapters (hexagonal) architecture, which you'll meet in D30, every implementation of a boundary protocol is called an adapter, including your own database code. It's the same idea of fitting a detail to an interface the core owns, used at the scale of a whole app.
+
+When the label is genuinely arguable, don't spend a review arguing it. Argue the responsibilities, because those are what the names are for.
+
+## What the names promise
+
+Names are worth getting right because each one is a promise about behaviour, and reviewers rely on it:
+
+- An **adapter** translates. It shouldn't add policy, such as retries or consent rules, that callers can't see.
+- A **decorator** keeps the contract. It mustn't swallow errors or change the meaning of a call.
+- A **proxy** may refuse, delay or create. Callers should expect "not yet" or "not allowed".
+- A **facade** coordinates. It shouldn't hold business rules or state that other code depends on.
+
+A type called `AnalyticsDecorator` that silently drops events breaks the first thing a reader assumes about it. Call it a gate or a proxy, and the drop becomes the obvious thing to look for.
+
+## Trade-offs: what every wrapper costs
+
+| Cost | Why | Keeping it small |
+| --- | --- | --- |
+| Indirection | each layer is one more file to open while debugging | keep each wrapper to one job and a few lines |
+| Identity | the wrapper is a different object from what it wraps | never compare with `===` or downcast through a protocol |
+| Order | stacked wrappers behave differently in different orders | assemble the stack in one place, the composition root, and comment the order |
+| Speed | calls through `any Protocol` are dynamically dispatched | negligible next to I/O; measure before worrying in hot loops |
+| The wrong abstraction | a wrapper around something used once adds nothing | wrap when there's a second implementation, a cross-cutting job or a boundary to protect |
+
+<Callout kind="interview">
+
+**What to say about decorator versus proxy:** "Same interface and the same shape. A decorator adds behaviour to an object it's given, and always forwards. A proxy controls access to its subject: it may create it lazily, live in front of something remote, or refuse the call." Then give an example of each from an app you know: logging around a client, a lazily loaded model.
+
+**What to ask:** when someone proposes "a wrapper", ask what it's *for*: making something fit, adding a job, controlling access, or simplifying. The answer decides what it may do.
+
+**Red flags:** using the four names interchangeably; a "decorator" that changes behaviour; a facade that callers can bypass for the one rule it exists to enforce.
+
+</Callout>
+
+## Practice
+
+The architecture review for this module is an analytics stack very like the one above, written by a colleague who used all four patterns and still sends data for users who said no. Use the three questions, and what each name promises, to find out why.
+
+```cards
+- id: wrappers-interface-question
+  front: "Which two wrappers keep the wrapped object's interface, and which two change it?"
+  back: "Decorators and proxies keep it. Adapters change one object's interface to fit yours; facades offer a new, simpler interface over several objects."
+- id: wrappers-proxy-test
+  front: "What's a quick test for whether a same-interface wrapper is a proxy?"
+  back: "Whether it can decide not to call the wrapped object, or creates it itself. Proxies control access; decorators always forward."
+- id: wrappers-promises
+  front: "What does each wrapper's name promise a reviewer?"
+  back: "Adapter: it only translates. Decorator: it keeps the contract. Proxy: it may refuse, delay or create. Facade: it coordinates, without rules or state of its own."
+```
+
+```quiz
+- id: q1
+  type: sort
+  prompt: "Which pattern is each of these?"
+  buckets: [Adapter, Decorator, Proxy, Facade]
+  items:
+    - ["Makes a vendor's `PSResult` callback API fit the app's `PaymentProcessing` protocol", 0]
+    - ["Times every call to `HTTPClient` and forwards it unchanged", 1]
+    - ["Creates the Core ML model only when the first prediction is requested", 2]
+    - ["`NSPersistentContainer`", 3]
+    - ["Adds an `X-Request-ID` header to every request and forwards it", 1]
+    - ["Throws `.requiresPro` before an export unless the user has subscribed", 2]
+    - ["`PhotoUploader.upload(_:caption:)`, over a compressor, an API and storage", 3]
+    - ["`extension URLSession: HTTPClient`", 0]
+  explain: "Interface changes for one object: adapter. Same interface, added job: decorator. Same interface, controlled access or lifetime: proxy. A new simple interface over several objects: facade."
+- id: q2
+  type: mcq
+  prompt: "A wrapper conforms to `ImageLoading`, holds the real loader, and returns a placeholder without calling it when the device is in Low Power Mode. What is it, and why?"
+  options:
+    - "A decorator, because it has the same interface as the loader"
+    - "A proxy, because it decides whether the call reaches its subject at all"
+    - "An adapter, because it changes what the loader returns"
+    - "A facade, because it hides the loader"
+  answer: 1
+  explain: "Keeping the interface narrows it to decorator or proxy. Refusing to forward under a condition is controlling access, which is a proxy's job. Naming it so tells readers to expect the placeholder."
+- id: q3
+  type: truefalse
+  prompt: "In the analytics example, the facade creates its consent gate itself, rather than being handed one, so that no call can reach the trackers without passing the gate."
+  answer: true
+  explain: "Ownership is the point. A facade that's handed an already-assembled stack can be handed one without a gate. By creating the gate around whatever tracker it receives, the facade makes the consent rule impossible to leave out."
+- id: q4
+  type: mcq
+  prompt: "A pull request adds `RetryingAnalyticsAdapter`, which maps events to the vendor's format and also retries failed uploads three times. What's the best review comment?"
+  options:
+    - "Rename it to `RetryingAnalyticsFacade`"
+    - "Split it: keep the adapter to translation, and add retries as a decorator, so each job can be tested and reordered on its own"
+    - "Retries should never be added to analytics"
+    - "It's fine: adapters are allowed to do anything the vendor needs"
+  answer: 1
+  explain: "An adapter promises to translate. Hiding a policy like retrying inside it means readers won't look for it there, and it can't be turned off or tested alone. A separate decorator keeps each job visible."
+```

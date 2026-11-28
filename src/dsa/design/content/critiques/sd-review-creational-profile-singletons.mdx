@@ -1,0 +1,142 @@
+<Brief>
+
+This is the profile screen of a social app, written during a rush to adopt Swift 6: the compiler complained about the singletons, so they were annotated until it stopped. QA reports that the screen sometimes crashes on a fresh install, that it stutters when it opens, and that after logging out and in as someone else, the old user's avatar and name can appear. Review it as you would a pull request: what's wrong, what matters most, and how you'd fix it.
+
+```swift check ios title="ProfileViewController.swift"
+import UIKit
+
+struct User: Codable, Sendable {
+    let id: String
+    var name: String
+    var avatarURL: URL
+}
+
+final class SessionManager {
+    nonisolated(unsafe) static var shared = SessionManager()
+    var user: User?
+
+    func logOut() {
+        UserDefaults.standard.removeObject(forKey: "token")
+        SessionManager.shared = SessionManager()
+    }
+}
+
+final class AvatarCache: @unchecked Sendable {
+    static let shared = AvatarCache()
+    private var images: [String: UIImage] = [:]
+
+    private init() {
+        let folder = FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask)[0]
+        let files = (try? FileManager.default.contentsOfDirectory(at: folder, includingPropertiesForKeys: nil)) ?? []
+        for file in files {
+            images[file.lastPathComponent] = UIImage(contentsOfFile: file.path)
+        }
+    }
+
+    func image(for url: URL) -> UIImage? { images[url.lastPathComponent] }
+    func store(_ image: UIImage, for url: URL) { images[url.lastPathComponent] = image }
+}
+
+final class ProfileAPI: Sendable {
+    func fetchProfile() async throws -> User {
+        let session = URLSession(configuration: .default)
+        var request = URLRequest(url: URL(string: "https://api.example.com/me")!)
+        let token = UserDefaults.standard.string(forKey: "token") ?? ""
+        request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
+        let (data, _) = try await session.data(for: request)
+        return try JSONDecoder().decode(User.self, from: data)
+    }
+}
+
+final class ProfileViewController: UIViewController {
+    private let session = SessionManager.shared
+    private lazy var avatarView = UIImageView(image: AvatarCache.shared.image(for: session.user!.avatarURL))
+    private let nameLabel = UILabel()
+
+    override func viewDidLoad() {
+        super.viewDidLoad()
+        view.addSubview(avatarView)
+        view.addSubview(nameLabel)
+        nameLabel.text = session.user?.name
+        Task {
+            let user = try await ProfileAPI().fetchProfile()
+            session.user = user
+            nameLabel.text = user.name
+        }
+    }
+
+    @objc func logOutTapped() {
+        session.logOut()
+        navigationController?.popToRootViewController(animated: true)
+    }
+}
+```
+
+</Brief>
+
+```workspace
+template: critique
+minutes: 30
+```
+
+```findings
+- id: force-unwrap-in-lazy
+  title: The lazy avatar view crashes whenever there's no user yet
+  severity: high
+  lines: 48
+  detail: "`session.user!` runs the first time `avatarView` is read, which is in `viewDidLoad`. On a fresh install, or straight after logging out, `user` is still `nil` because the profile hasn't loaded, so opening the screen crashes. Lazy construction hides the crash far from its cause: nothing at line 53 looks dangerous."
+- id: replaced-global-session
+  title: Logging out swaps a mutable global, and live screens keep the old user
+  severity: high
+  lines: 10-16
+  detail: "`nonisolated(unsafe) static var shared` switches off Swift 6's checking for a global that `logOut()` reassigns, so any background reader races with the swap. Worse, `ProfileViewController` copied the old instance into `session` at init (line 47): after logout it, and every other live screen, still holds the previous user. An in-flight fetch then writes the old user's profile into that orphaned session (line 58)."
+- id: hidden-dependencies
+  title: Every dependency is reached or constructed inside the screen
+  severity: high
+  lines: 47-57
+  detail: "The screen reaches `SessionManager.shared` and `AvatarCache.shared` and constructs `ProfileAPI()` inline, and the API reads `UserDefaults.standard` for its token. Nothing is injected, so no unit test or SwiftUI preview can show this screen without the real disk, network and defaults, and the logged-out state that crashes can't be reproduced in a test."
+- id: cache-init-on-main-thread
+  title: The avatar cache scans the whole Caches folder on first use, on the main thread
+  severity: medium
+  lines: 23-29
+  detail: "`AvatarCache.shared` is created lazily on first access, which happens in `viewDidLoad`. Its initialiser lists the Caches directory and opens every file as a `UIImage`, synchronously, to show one avatar. The stutter grows with the size of the cache, and every image stays in memory for the life of the process."
+- id: unchecked-sendable-cache
+  title: "@unchecked Sendable on a cache with an unprotected dictionary"
+  severity: medium
+  lines: 19-32
+  detail: "`@unchecked Sendable` tells the compiler the class is safe to share across threads, but `images` has no lock or actor around it. The first time someone calls `store` from a download task while the main thread reads `image(for:)`, it's a data race on a dictionary: corrupted state or a crash, and the compiler won't warn."
+- id: session-per-request
+  title: A new URLSession for every request
+  severity: medium
+  lines: 37
+  detail: "Each call makes a session with its own connections, so no connection is ever reused: every profile fetch pays for a new connection and TLS handshake. Sessions are meant to be created once per configuration and shared, and this one also can't be replaced in tests."
+- id: logout-leaves-data
+  title: Logging out leaves the previous user's data in other singletons
+  severity: medium
+  lines: 13-16
+  detail: "`logOut()` resets the session and the token, but `AvatarCache.shared` keeps the previous user's images in memory and on disk. On a shared device the next user can see them, which is the reported bug. A singleton's lifetime is the process, so per-user state in one has to be reset by hand, in every one, every time."
+- id: errors-dropped
+  title: A failed profile fetch is silently ignored
+  severity: low
+  lines: 56-60
+  detail: "The `Task`'s errors are thrown away (Swift warns that the throwing task is unused), so an expired token or a network failure leaves a stale or empty name with no error state and no retry. The task also isn't cancelled when the screen goes away."
+```
+
+<ReferenceReview>
+
+**Most important first.** Two bugs users can see. Opening the screen **crashes** whenever the profile isn't loaded yet, because the lazy `avatarView` force-unwraps `session.user` at line 48. And logging out leaves the **previous user's data** visible: `logOut()` replaces a mutable global that live screens have already copied, and the avatar cache is never cleared.
+
+**The design problem underneath** is global access and hidden construction. The screen reaches three singletons and builds a fourth object inline; the singletons were made to compile under Swift 6 by switching the checks off (`nonisolated(unsafe)`, `@unchecked Sendable`) rather than by making them safe. Lazy creation then moves real work, a directory scan and a force unwrap, to the moment the screen opens.
+
+**How I'd fix it, in small steps:**
+
+1. **Stop the crash today.** Make `avatarView` a plain `let` and set its image once the user is known, with a placeholder until then.
+2. **Introduce seams without changing call sites.** Extract small protocols for what the screen uses (`ProfileLoading`, `AvatarImages`, a `TokenStore`) and give the screen, or better a new `@MainActor` `ProfileModel`, initialiser parameters that default to today's instances.
+3. **Write tests against those seams:** logged out (no crash, placeholder shown), loaded, and fetch failed (an error state instead of a stale name).
+4. **Make the shared objects safe for real.** Turn `AvatarCache` into an actor that loads one image on demand, off the main thread, with no directory scan in `init`. Give `ProfileAPI` one injected `URLSession` and read the token from the Keychain through `TokenStore`.
+5. **Create them at the composition root and remove the defaults.** The scene delegate builds one session, one cache and one API client and passes them in. Delete `SessionManager.shared`.
+6. **Give per-user state a per-user lifetime.** On sign-in, the root builds a signed-in object graph (session, caches, user-scoped API client); on sign-out it throws the whole graph away and clears the user's cache directory. Nothing can keep the old user, because nothing global holds them.
+
+**Tests to add:** the model's states with a stub `ProfileLoading` (loading, loaded, failed, logged out); a spy `AvatarImages` showing logout clears it; the API client sending the token from an injected `TokenStore`; and the composition root building a fresh graph after sign-out.
+
+</ReferenceReview>

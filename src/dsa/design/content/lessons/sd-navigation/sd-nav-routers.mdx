@@ -1,0 +1,360 @@
+## Why it matters
+
+An app with coordinators or navigation models still needs a shared language for *where*. Without one, every entry point invents its own: the scene delegate matches URL strings, the notification handler reads dictionary keys, a widget builds its own URL, and a button in the basket calls three methods on two tabs. They drift apart, and the same destination ends up reachable in four slightly different ways. A **route** is a typed name for a destination; a **router** is the one place that turns routes into navigation. "Design deep linking for this app" is a common interview question, and a strong answer is mostly this lesson.
+
+## A route names a destination
+
+A route is a value that says *where* the user should end up, with the ids that destination needs, and nothing about *how* it's shown:
+
+```swift check title="AppRoute.swift"
+enum AppRoute: Hashable, Codable, Sendable {
+    case home
+    case category(slug: String)
+    case product(id: Int)
+    case search(query: String)
+    case basket
+    case orders
+    case order(id: String)
+    case settings
+}
+```
+
+The rules for a good route type follow from what it's used for:
+
+- **Ids, not objects.** `.product(id: 42)`, never the product. A route arrives from a link or a notification before any data is loaded, and it's saved for restoration long after the data has changed.
+- **`Hashable`, `Codable`, `Sendable`.** Routes go into navigation paths, get saved, and cross from notification delegates to the main actor.
+- **No UI types.** Nothing in a route mentions a view controller, a sheet or a tab. `.order(id:)` doesn't say "push it on the Account tab"; that's the router's decision, and it may differ on iPad or while the user is signed out.
+- **Every way of navigating uses it.** A button in the basket that opens an order doesn't call methods on the Account tab; it asks the router for `.order(id:)`. Then a link, a notification, a widget and a button can't disagree about what "show order 42" means.
+
+## What a router does
+
+A router takes raw input from anywhere and ends with something on screen. Its work splits into four steps, and keeping them apart is what makes it testable: the first three are pure functions.
+
+```visual flow
+title: One way in, whatever the entry point
+nodes:
+  - { id: link, label: Link, kind: external, at: [0, 0] }
+  - { id: push, label: Notification, kind: external, at: [0, 1] }
+  - { id: parse, label: Parse, kind: service, at: [2, 0.5] }
+  - { id: route, label: AppRoute, kind: client, at: [4, 0.5] }
+  - { id: gate, label: Check, kind: service, at: [4, 2] }
+  - { id: plan, label: Plan, kind: service, at: [2, 2] }
+  - { id: ui, label: UI, kind: view, at: [0, 2] }
+edges:
+  - [link, parse, URL]
+  - [push, parse, payload]
+  - [parse, route, typed]
+  - [route, gate]
+  - [gate, plan, allowed]
+  - [plan, ui, commands]
+steps:
+  - say: "A link arrives as a URL, a notification as a dictionary. Both go to the same **parser**."
+    show: [link, push, parse]
+    send: [link->parse, push->parse]
+  - say: "The parser turns raw input into a typed `AppRoute`, or rejects it. From here on, nothing in the app handles strings."
+    show: [route]
+    send: parse->route
+    state: { route: ok }
+  - say: "In-app buttons skip parsing: they create `AppRoute.order(id:)` directly. Every way of navigating meets at the route."
+    active: [route]
+  - say: "The **check** asks what the route needs: a signed-in user, a feature that's switched on, a minimum app version. An order link while signed out is held, and sign-in is shown first."
+    show: [gate]
+    send: route->gate
+    label: { gate: "sign-in?" }
+  - say: "The **plan** combines the route with what's on screen now. Is a sheet up? Which tab? The result is a list of commands: dismiss, select Account, set the stack to orders and order."
+    show: [plan]
+    send: gate->plan
+  - say: "Only the last step touches UIKit or SwiftUI. Everything before it runs in a unit test in milliseconds."
+    show: [ui]
+    send: plan->ui
+    state: { ui: ok }
+```
+
+Here's a small router with all three pure steps, run over some links a real app receives:
+
+```swift run title="Parse, check and plan"
+import Foundation
+
+enum Tab: String {
+    case home, search, basket, account
+}
+
+/// Where to go, by id. Nothing about how it's shown.
+enum AppRoute: Equatable {
+    case product(id: Int)
+    case search(query: String)
+    case basket
+    case order(id: String)
+}
+
+/// What the UI layer should do: the only part that touches UIKit or SwiftUI
+struct Plan: CustomStringConvertible {
+    var dismissPresented = false
+    var signInFirst = false
+    var tab: Tab
+    var screens: [String] = []
+
+    var description: String {
+        var steps: [String] = []
+        if dismissPresented { steps.append("dismiss") }
+        if signInFirst { steps.append("sign in") }
+        steps.append("\(tab.rawValue): [\(screens.joined(separator: ", "))]")
+        return steps.joined(separator: " → ")
+    }
+}
+
+struct Router {
+    static let scheme = "shop"
+    static let host = "shop.example.com"
+
+    /// 1. Parse: a custom-scheme URL and a universal link mean the same route
+    func route(for url: URL) -> AppRoute? {
+        var segments = url.pathComponents.filter { $0 != "/" }
+        switch url.scheme?.lowercased() {
+        case Self.scheme:
+            // shop://product/42 puts "product" in the host, not the path
+            if let host = url.host() { segments.insert(host, at: 0) }
+        case "https" where url.host()?.lowercased() == Self.host:
+            break
+        default:
+            return nil   // someone else's link
+        }
+        let query = URLComponents(url: url, resolvingAgainstBaseURL: false)?.queryItems
+        switch (segments.first, segments.count) {
+        case ("product", 2):
+            guard let id = Int(segments[1]), id > 0 else { return nil }   // links are untrusted input
+            return .product(id: id)
+        case ("search", 1):
+            guard let text = query?.first(where: { $0.name == "q" })?.value, !text.isEmpty else { return nil }
+            return .search(query: text)
+        case ("basket", 1):
+            return .basket
+        case ("orders", 2):
+            return .order(id: segments[1])
+        default:
+            return nil
+        }
+    }
+
+    /// 2 and 3. Check what the route needs, then plan it against what's on screen now
+    func plan(for route: AppRoute, isSignedIn: Bool, isPresenting: Bool) -> Plan {
+        var plan: Plan
+        switch route {
+        case .product(let id):
+            plan = Plan(tab: .home, screens: ["product \(id)"])
+        case .search(let query):
+            plan = Plan(tab: .search, screens: ["results for \"\(query)\""])
+        case .basket:
+            plan = Plan(tab: .basket)
+        case .order(let id):
+            plan = Plan(tab: .account, screens: ["orders", "order \(id)"])
+            plan.signInFirst = !isSignedIn
+        }
+        plan.dismissPresented = isPresenting   // never push behind a sheet
+        return plan
+    }
+}
+
+let router = Router()
+// The user is signed out, with a sheet open, when each link arrives
+let links = [
+    "shop://product/42",
+    "https://shop.example.com/search?q=trail%20shoes",
+    "https://shop.example.com/orders/A1B2C3",
+    "shop://product/abc",
+    "https://phish.example.net/basket",
+]
+for link in links {
+    guard let url = URL(string: link), let route = router.route(for: url) else {
+        print("\(link)\n  → rejected")
+        continue
+    }
+    let plan = router.plan(for: route, isSignedIn: false, isPresenting: true)
+    print("\(link)\n  → \(route)\n  → \(plan)")
+}
+```
+
+```output
+shop://product/42
+  → product(id: 42)
+  → dismiss → home: [product 42]
+https://shop.example.com/search?q=trail%20shoes
+  → search(query: "trail shoes")
+  → dismiss → search: [results for "trail shoes"]
+https://shop.example.com/orders/A1B2C3
+  → order(id: "A1B2C3")
+  → dismiss → sign in → account: [orders, order A1B2C3]
+shop://product/abc
+  → rejected
+https://phish.example.net/basket
+  → rejected
+```
+
+Each step earns its place:
+
+- **Parse** is the only code that sees strings. It accepts both URL forms, rejects other hosts and malformed ids, and decodes the query. A grammar of route patterns, as in [Interpreter: mini DSLs and route grammars](/design/learn/sd-behavioural-interpreter), scales this up to dozens of routes; the output is the same typed route.
+- **Check** turns "this needs sign-in" into data (`signInFirst`) instead of a scattered `if`. The executor holds the route as **pending**, presents sign-in, and replays the route when sign-in succeeds, or drops it if the user cancels.
+- **Plan** is where the app's navigation rules live: which tab owns orders, that a sheet must be dismissed before pushing, which screens sit underneath a deep-linked one so Back makes sense.
+- **Perform**, not shown, is a coordinator applying the plan to UIKit containers, or a model assigning its tab and paths in SwiftUI. It's the only part that needs a simulator to test.
+
+### A design decision hiding in the plan
+
+Where should a product link open: on the Home tab, or on whichever tab the user is in? Both are defensible.
+
+| | Always its own tab | The current tab |
+| --- | --- | --- |
+| The user's place in other tabs | kept | kept |
+| What Back does | goes to the tab's root or a category | returns to whatever they were doing |
+| Predictable for support and analytics | yes: one place per route | depends on history |
+| Fits | links from outside the app | links inside the app (a product mentioned in an order, a share sheet) |
+
+Many apps use both: links from outside go to a canonical tab, links from inside push onto the current stack. Whatever you choose, it lives in one function, `plan`, not in each entry point.
+
+## Routes travel both ways
+
+If the app can turn URLs into routes, it should turn routes into URLs too. Sharing a product, advertising a screen for Handoff, indexing it in Spotlight and building a widget's tap target all need a URL for a route. Write `url(for:)` next to the parser and test the round trip: for every route, `route(for: url(for: route)) == route`. That one property test catches most drift between what the app produces and what it accepts.
+
+The same drift exists between the app and its website. Universal links only reach the app for paths listed in the site's `apple-app-site-association` file, which you'll write in the deep links lesson later in this module. A route the app parses but the file doesn't list never arrives; a path the file lists but the app can't parse opens the app on nothing. Generate one from the other, or test them against each other.
+
+## Routes in a modular app
+
+When features live in separate modules, who defines `AppRoute`? Each answer moves the coupling somewhere.
+
+**One central enum** in a small shared module. Every feature can name every destination, `switch` statements are exhaustive, and adding a route touches the shared module, which every feature depends on.
+
+**Nested feature enums**, assembled by the app:
+
+```swift check title="Feature routes, nested in the app's"
+// In the Catalogue module
+enum CatalogueRoute: Hashable, Codable, Sendable {
+    case category(slug: String)
+    case product(id: Int)
+}
+
+// In the Account module
+enum AccountRoute: Hashable, Codable, Sendable {
+    case orders
+    case order(id: String)
+    case settings
+}
+
+// In the app module, which depends on every feature
+enum ShopRoute: Hashable, Codable, Sendable {
+    case catalogue(CatalogueRoute)
+    case account(AccountRoute)
+    case basket
+}
+
+/// Each feature parses its own URLs; the app asks them in turn
+struct LinkParser: Sendable {
+    let parse: @Sendable (_ segments: [String]) -> ShopRoute?
+}
+
+let catalogueLinks = LinkParser { segments in
+    switch (segments.first, segments.count) {
+    case ("product", 2): Int(segments[1]).map { .catalogue(.product(id: $0)) }
+    case ("category", 2): .catalogue(.category(slug: segments[1]))
+    default: nil
+    }
+}
+```
+
+Each feature owns its routes and its URL formats, and the app module is the only place that knows them all. The catch is **cross-feature navigation**: the Account feature can't create `.catalogue(.product(id:))` to show a product from an order, because it doesn't depend on Catalogue. It reports an output instead ("the user tapped a product"), and the app turns that into a route. That's usually a feature, not a bug: it keeps features independent.
+
+**Registration by string**: features register handlers for URL prefixes at launch, and navigate by building URLs. Nothing depends on anything, and nothing is checked by the compiler: a typo in a path is a link that does nothing, found by a user.
+
+## Trade-offs
+
+| | Strings matched in each entry point | One central route enum | Nested feature enums | Registered URL handlers |
+| --- | --- | --- | --- | --- |
+| Compiler checks | none | exhaustive switches | exhaustive within each feature | none |
+| Coupling | every entry point knows every format | every feature depends on the route module | the app depends on every feature | none at compile time |
+| Cross-feature navigation | ad hoc | direct | through outputs and the app | build a URL |
+| Testing | UI tests | parse, check and plan as unit tests | per feature, plus the app's composition | per handler, plus integration tests |
+| Wins for | nothing past a prototype | one-module or small apps | modular apps with a few teams | large apps with many independent teams |
+
+<Callout kind="interview">
+
+**What to say:** "Every destination is an `AppRoute` case holding ids. Links, notifications, widgets and buttons all produce routes. One router parses raw input, checks what a route needs (sign-in, flags), plans it against the current UI, and hands a plan to the coordinator or navigation model that performs it. Parse, check and plan are pure and unit-tested, including a round trip with URL generation."
+
+**What to ask:** how many link formats exist today, and do old ones from past campaigns still need to work? Which routes need sign-in? Is the app modular, and do teams own features?
+
+**Red flags:** URL strings matched in the scene delegate; navigation performed while parsing; a route that carries a model object or a view controller; a route that's valid in-app but has no URL, so it can't be shared or restored.
+
+</Callout>
+
+<Callout kind="gotcha" title="iOS gotcha: a custom scheme's first segment is the host">
+
+For `shop://product/42`, `url.host()` is `"product"` and `url.path()` is `"/42"`: the part after `//` is parsed as a host. For `shop:///product/42` (three slashes) the host is empty and the path is `/product/42`. A parser that only reads `pathComponents` silently fails on the first form, which is the one marketing will use. Normalise both forms, and universal links, into one list of segments before matching, as the router above does. Remember too that hosts are case-insensitive while paths usually aren't.
+
+</Callout>
+
+## Practice
+
+[Parse every entry point into a route](/design/practice/sd-kata-navigation-route-parsing) is this lesson's parser, done properly: custom-scheme URLs, universal links on two hosts and notification payloads, all into one typed route, with every kind of bad input rejected and a URL generator that round-trips. [Review: screens that push each other](/design/practice/sd-review-navigation-pushy-screens) shows what an app looks like without a router.
+
+```cards
+- id: route-definition
+  front: "What makes a good route type?"
+  back: "An enum of destinations holding ids, not objects; Hashable, Codable and Sendable; no UI types. Every way of navigating (links, notifications, buttons) produces one."
+- id: router-steps
+  front: "What are a router's four steps?"
+  back: "Parse raw input into a route, check what it needs (sign-in, flags, versions), plan it against the current UI, and perform the plan. The first three are pure functions."
+- id: round-trip
+  front: "Why generate URLs from routes as well as parse them?"
+  back: "Sharing, Handoff, Spotlight and widgets need URLs, and a round-trip test (route → URL → route) catches drift between what the app produces and what it accepts."
+- id: modular-routes
+  front: "How do nested feature route enums handle navigation from one feature to another?"
+  back: "A feature can't name another feature's routes, so it reports an output, and the app module, which knows every feature, turns it into a route."
+```
+
+```quiz
+- id: q1
+  type: mcq
+  prompt: "Your parser reads `url.pathComponents` and matches `[\"product\", id]`. Universal links work, but `shop://product/42` from a marketing email opens the app on Home. Why?"
+  options:
+    - "Custom schemes are not delivered to `onOpenURL`"
+    - "`product` is the URL's host, so the path is only `/42`"
+    - "The id must be percent-encoded"
+    - "iOS strips the path from custom-scheme URLs"
+  answer: 1
+  explain: "In `shop://product/42` the part after `//` is parsed as the host. Prepend the host to the segments for your custom scheme (or use three slashes), and normalise both URL forms before matching."
+- id: q2
+  type: sort
+  prompt: "Which step of the router does each belong to?"
+  buckets: [Parse, Check, Plan, Perform]
+  items:
+    - ["Reject `/product/abc` because the id isn't a number", 0]
+    - ["Hold an order link until the user has signed in", 1]
+    - ["Dismiss the open sheet before switching tabs", 2]
+    - ["Call `setViewControllers` on the Account tab's navigation controller", 3]
+    - ["Ignore links whose host isn't the shop's domain", 0]
+    - ["Put the order list underneath the order, so Back makes sense", 2]
+  explain: "Parsing turns raw input into a valid route; the check decides whether it can run now; the plan decides what the UI should do given what's on screen; performing is the only step that touches UIKit or SwiftUI."
+- id: q3
+  type: multi
+  prompt: "Which belong in an `AppRoute` case? Choose all that apply."
+  options:
+    - "`order(id: String)`"
+    - "`orderScreen(OrderViewController)`"
+    - "`search(query: String)`"
+    - "`product(Product)`, with the loaded product"
+    - "`category(slug: String)`"
+  answer: [0, 2, 4]
+  explain: "Routes name destinations with the ids or parameters they need. View controllers tie routes to one UI, and loaded models go stale, can't be built from a link, and can't be saved for restoration."
+- id: q4
+  type: truefalse
+  prompt: "With nested feature route enums, the Account feature can navigate to a product by creating `ShopRoute.catalogue(.product(id:))` itself."
+  answer: false
+  explain: "The Account module doesn't depend on Catalogue or on the app module, so it can't name those routes. It reports an output (the user tapped a product), and the app, which knows every feature, turns it into a route."
+- id: q5
+  type: mcq
+  prompt: "Which test best protects the app from links it shares but can't open?"
+  options:
+    - "A UI test that taps every share button"
+    - "A property test that, for every route, parses `url(for: route)` and gets the same route back"
+    - "A snapshot test of the share sheet"
+    - "Checking the `apple-app-site-association` file is valid JSON"
+  answer: 1
+  explain: "The round trip covers every route the app can produce, and fails as soon as the generator and the parser disagree. A separate check against the site's association file covers the website side."
+```

@@ -1,0 +1,376 @@
+## Why it matters
+
+An error that starts as a timeout in `URLSession` and ends as a banner on screen crosses four or five layers on the way. At each one, something can go wrong: the useful detail is thrown away, the error is swallowed, it's logged three times, or a low-level type leaks into the UI. [Error modelling and typed throws](/design/learn/sd-swift-design-errors) established the rule, translate at every boundary. This lesson is about doing it well in a real app: what each layer adds, what it keeps, where the error is logged, and the places errors quietly disappear. Interviewers probe it with "walk me through what happens when this request fails".
+
+## Three moves at a boundary
+
+When an error reaches a layer, that layer has three choices.
+
+- **Pass it through.** The layer adds nothing a caller could use. A logging decorator or a thin facade should rethrow exactly what it received.
+- **Wrap it.** Keep the original error as a **cause**, and add the context only this layer knows: which endpoint, which request id, which attempt. Infrastructure usually wraps, because its callers may want the detail.
+- **Translate it.** Replace it with an error in the receiving layer's vocabulary, the one its callers switch on, and keep the original only for diagnostics. Feature boundaries translate, because their callers should never branch on `URLError` codes.
+
+The mistake is to do the second without the third, or the third without the first part of the second. A repository that rethrows `APIError` leaks transport detail into view models. A repository that throws `.unavailable` and drops the cause leaves the person reading the log with "unavailable" and nothing else.
+
+## Carrying the cause
+
+Swift has no built-in error chain like Java's `getCause()` or Go's `%w`, but you can design one in a few lines. Give each layer's error a `cause`, and keep the **kind** that callers switch on separate from the **diagnostics** that logs read:
+
+```swift run
+import Foundation
+
+/// An error that can say what it is in one line, and what caused it
+protocol ChainedError: Error {
+    var summary: String { get }
+    var cause: (any Error)? { get }
+}
+
+// Infrastructure wraps: the kind, plus the context only this layer knows
+struct APIError: ChainedError {
+    enum Kind: Equatable {
+        case transport
+        case status(Int)
+        case decoding
+    }
+    let kind: Kind
+    let endpoint: String
+    let requestID: String?
+    let cause: (any Error)?
+
+    var summary: String { "APIError.\(kind) \(endpoint) request=\(requestID ?? "none")" }
+}
+
+// The feature translates into what its callers branch on, and keeps the cause for diagnostics
+struct OrdersError: ChainedError {
+    enum Kind: Equatable {
+        case offline
+        case notFound
+        case unavailable
+        case broken
+    }
+    let kind: Kind
+    let cause: (any Error)?
+
+    var summary: String { "OrdersError.\(kind)" }
+}
+
+/// One line for the log: the error, then each cause beneath it
+func describeChain(_ error: any Error) -> String {
+    var parts: [String] = []
+    var next: (any Error)? = error
+    while let current = next {
+        switch current {
+        case let chained as ChainedError:
+            parts.append(chained.summary)
+            next = chained.cause
+        case let url as URLError:
+            parts.append("URLError \(url.code.rawValue)")
+            next = nil
+        default:
+            parts.append(String(describing: type(of: current)))
+            next = nil
+        }
+    }
+    return parts.joined(separator: " <- ")
+}
+
+func fetchOrder(id: Int) throws(APIError) -> String {
+    // The transport timed out; the client wraps it with what it knows
+    throw APIError(kind: .transport, endpoint: "/orders/\(id)", requestID: "r-7f3a", cause: URLError(.timedOut))
+}
+
+func order(id: Int) throws(OrdersError) -> String {
+    do {
+        return try fetchOrder(id: id)
+    } catch {
+        let kind: OrdersError.Kind = switch error.kind {
+        case .transport: .unavailable
+        case .status(404): .notFound
+        case .status: .unavailable
+        case .decoding: .broken
+        }
+        throw OrdersError(kind: kind, cause: error)
+    }
+}
+
+// The view model handles it: one log line with the whole chain, one decision for the screen
+do throws(OrdersError) {
+    _ = try order(id: 42)
+} catch {
+    print("log: \(describeChain(error))")
+    switch error.kind {
+    case .offline, .unavailable: print("screen: Couldn't load your order. [Try again]")
+    case .notFound: print("screen: This order no longer exists.")
+    case .broken: print("screen: Something went wrong on our side. [Contact support]")
+    }
+}
+```
+
+```output
+log: OrdersError.unavailable <- APIError.transport /orders/42 request=r-7f3a <- URLError -1001
+screen: Couldn't load your order. [Try again]
+```
+
+A few choices in this design are worth defending in a review:
+
+- **Callers switch on `kind`, never on `cause`.** The cause is `any Error`, deliberately unswitchable, so nobody can couple the UI to a transport detail by accident. If a caller needs a distinction, it becomes a `Kind` case.
+- **`Kind` is `Equatable`; the error isn't.** Tests compare `error.kind == .notFound` without caring about the cause.
+- **The request id travels.** Most backends return one in a header (`X-Request-ID` or similar). With it in the log line, a support engineer can find the matching server log in seconds. That's the single most useful piece of context an app can attach.
+- **Context is chosen, not dumped.** The endpoint path is useful; a full URL with query parameters may contain search terms or tokens. The structured-logging lesson returns to what's safe to keep.
+
+A simpler alternative is to log the original error at the moment you translate it, and throw a clean domain error with no cause. It works, but it splits one failure across two log lines, at two levels, written by two layers that don't know how it ended. Carrying the cause lets the layer that *handles* the error log it once, with the full story.
+
+## Log once, where it's handled
+
+The most common propagation smell is **log and rethrow** at every layer:
+
+```swift
+} catch {
+    logger.error("fetch failed: \(error)")   // in the client
+    throw error
+}
+// …the repository logs and rethrows, the use case logs and rethrows, the view model logs it again
+```
+
+One timeout becomes four `error` lines. Error counts are inflated fourfold, the lines disagree about severity because no layer knows how it ended, and the one line that matters, what the user saw, is the hardest to find. Worse, a failure the repository *recovered from* (it served the cache) still left an `error` line from the client.
+
+The rule that fixes it: **attach context where you have it; log where you decide.** The layer that handles the error, by retrying, falling back, or showing something, is the only one that knows the outcome, so it writes the one line, at the right level, with the chain. Step through it:
+
+```visual sequence
+title: One failure, logged once
+participants:
+  - { id: vm, label: View model }
+  - { id: repo, label: Orders repository }
+  - { id: client, label: API client }
+  - { id: log, label: Logger }
+messages:
+  - [vm, repo, "order(id: 42)", { say: "The screen asks the repository for order 42." }]
+  - [repo, client, "GET /orders/42", { say: "The repository asks the API client, which owns the transport." }]
+  - [client, client, "timed out (-1001)", { say: "After its timeout, `URLSession` throws `URLError(.timedOut)`." }]
+  - { note: "wrap: endpoint, request id, cause", over: client }
+  - [client, repo, APIError.transport, { reply: true, say: "The client **wraps**: `APIError.transport`, with the endpoint, the request id and the `URLError` as its cause. It logs nothing: it doesn't know how this ends." }]
+  - { note: "translate: .unavailable, keep the cause", over: repo }
+  - [repo, vm, OrdersError.unavailable, { reply: true, say: "The repository **translates** into its callers' vocabulary, `.unavailable`, and keeps the API error as the cause." }]
+  - [vm, log, "error: the chain, once", { say: "The view model **handles** it, so it logs: one `error` line with the whole chain, at a level that matches the outcome." }]
+  - [vm, vm, "banner + Try again", { say: "And it decides what the user sees. Had the repository served a cache instead, it would have logged at `info`, and the user would have seen the cache." }]
+```
+
+There are two sensible exceptions. A layer that **recovers** logs its recovery at `info` or `debug` ("served cached orders after timeout"), because nobody above it will see the error. And code at a **process or module boundary**, such as an extension or an SDK you ship, logs what crosses it, because the receiving side may not have your logger.
+
+## Where errors disappear
+
+Propagation fails silently more often than it fails loudly. These are the places to look in any code review:
+
+- **`try?`** turns every failure into `nil`. It's right when absence is a complete answer (`try? FileManager.default.removeItem(at: tempURL)` on cleanup) and wrong almost everywhere else.
+- **An empty `catch {}`,** or one that only `print`s. In a release build, `print` goes nowhere anyone can read.
+- **Defaulting with `?? []`** after a failed load. The screen shows "No orders yet", which is a lie, and the empty state's analytics count a failure as an engaged empty user.
+- **Callbacks that drop the error:** `completion(nil)` on failure, so the caller can't tell "nothing" from "broken".
+- **Combine's `replaceError(with:)`** and `catch { _ in Empty() }`, which end the error's journey without anyone recording it.
+- **An unstructured `Task` that throws.** `Task { try await save(note) }` stores the error in the task, and if nobody awaits its `value`, the error is discarded. For years compilers accepted this silently; recent ones (Swift 6.4, for one) warn that the unused task "may accidentally ignore errors", which is a warning worth treating as an error.
+
+<Callout kind="gotcha" title="Swift gotcha: a throwing Task you never await loses its error">
+
+`Task { try await uploader.send(draft) }` compiles, at most with a warning, and when `send` throws, nothing happens: the error lives in a task nobody reads. Writing `_ = Task { … }` silences the warning without fixing anything. Fire-and-forget work must handle its own errors inside the task: `Task { do { try await uploader.send(draft) } catch { report(error) } }`. Or make the task non-throwing by design, so the type, `Task<Void, Never>`, shows that someone dealt with failure.
+
+</Callout>
+
+## Errors in long-lived streams
+
+In an `AsyncSequence` or a Combine publisher, a thrown error **ends the stream**. That's right for a one-shot request, and usually wrong for something meant to run for the life of a screen: live prices, a chat connection, location updates. One dropped socket shouldn't silently stop every future update.
+
+Two designs keep the stream alive:
+
+1. **Failures as elements.** The element type is an enum, such as `.update(Quote)` and `.interrupted(QuotesError)`, or a `Result`. The stream never throws; the screen shows a "Reconnecting" badge on `.interrupted` and clears it on the next `.update`.
+2. **Restart inside the producer.** The producer catches the error, waits with backoff (as in [retry with exponential backoff and jitter](/design/learn/sd-resilience-retry-backoff)), reconnects and carries on, and only ends the stream with an error when it gives up for good.
+
+Most live features use both: the producer retries, and emits a value so the screen can say what's happening while it does.
+
+## Crossing into Objective-C and crash reporters
+
+Your Swift errors cross a language boundary more often than you'd think: whenever they reach an Objective-C API, and whenever you hand one to a crash-reporting SDK's "record error" call. There, a Swift error becomes an `NSError`, and the bridging chooses a **domain** and **code** for you. The domain is the type's fully qualified name, such as `Notes.SyncError`. The code is the raw value for an `Int`-backed enum, and otherwise the case's **position** in the declaration:
+
+```swift run
+import Foundation
+
+// Version 1 of the app
+enum SyncError: Error {
+    case offline
+    case conflict
+    case quotaExceeded
+}
+
+// Version 2 adds a case at the top
+enum SyncErrorV2: Error {
+    case unauthorised
+    case offline
+    case conflict
+    case quotaExceeded
+}
+
+// What an Objective-C API, or a crash reporter's recordError, receives
+print("v1 quotaExceeded code:", (SyncError.quotaExceeded as NSError).code)
+print("v2 quotaExceeded code:", (SyncErrorV2.quotaExceeded as NSError).code)
+
+// Stable codes and a domain you choose
+enum StableSyncError: Int, Error, CustomNSError {
+    case offline = 100
+    case conflict = 200
+    case quotaExceeded = 300
+    case unauthorised = 400
+
+    static var errorDomain: String { "com.example.notes.sync" }
+    var errorUserInfo: [String: Any] { ["layer": "sync"] }
+}
+
+let stable = StableSyncError.quotaExceeded as NSError
+print(stable.domain, stable.code, stable.userInfo["layer"] ?? "none")
+```
+
+```output
+v1 quotaExceeded code: 2
+v2 quotaExceeded code: 3
+com.example.notes.sync 300 sync
+```
+
+Crash-reporting services typically group non-fatal errors by domain and code. Insert a case, and last week's "quota exceeded" issue silently becomes a new issue with a different code; move the type into a Swift package, and the module name in the domain changes too, so every grouped issue starts again from zero. For any error you report, give it explicit raw values and a `CustomNSError` domain, and treat both as a public contract, like an API's error codes.
+
+## Testing the mappings
+
+Each translation is a pure function from one layer's error to the next, which makes it the easiest code in the app to test thoroughly. A table of cases covers it:
+
+```swift check
+import Testing
+
+enum TransportFailure: Error, Equatable, Sendable {
+    case notConnected
+    case timedOut
+    case status(Int)
+}
+
+enum OrdersFailure: Error, Equatable, Sendable {
+    case offline
+    case unavailable
+    case notFound
+    case sessionExpired
+}
+
+func ordersFailure(for transport: TransportFailure) -> OrdersFailure {
+    switch transport {
+    case .notConnected: .offline
+    case .timedOut: .unavailable
+    case .status(401): .sessionExpired
+    case .status(404), .status(410): .notFound
+    case .status: .unavailable
+    }
+}
+
+@Test("Each transport failure becomes one orders failure", arguments: [
+    (TransportFailure.notConnected, OrdersFailure.offline),
+    (.timedOut, .unavailable),
+    (.status(401), .sessionExpired),
+    (.status(404), .notFound),
+    (.status(410), .notFound),
+    (.status(503), .unavailable),
+])
+func mapping(transport: TransportFailure, expected: OrdersFailure) {
+    #expect(ordersFailure(for: transport) == expected)
+}
+```
+
+When a new status code appears in production, the fix starts as a new row in this table.
+
+## Trade-offs
+
+| Approach | Detail available when handled | Coupling | Log noise | When it wins |
+| --- | --- | --- | --- | --- |
+| Translate and carry the cause | Full chain, one line | Low: callers switch on the kind only | Low: logged once | Most apps, most layers |
+| Translate and log at translation, no cause | Split across lines and layers | Low | Medium: two lines per failure | Small apps, or where errors cross a process boundary |
+| Pass low-level errors up unchanged | Full, but in the wrong place | High: the UI switches on `URLError` | Depends | Thin decorators and facades only |
+| Log and rethrow at every layer | Repeated four times | Medium | High, and severities disagree | Never on purpose |
+
+<Callout kind="interview">
+
+**Say:** "The API client wraps transport errors with the endpoint and request id; the repository translates into feature errors callers switch on, keeping the original as a cause; and the view model, which knows the outcome, logs once with the whole chain and decides what the user sees. Errors we report have stable codes."
+
+**Ask:** what does the backend return to correlate requests? Should a failure in this stream end it, or should the screen show it and carry on?
+
+**Red flags:** `URLError` handled in a view; `try?` or `?? []` hiding failed loads behind empty states; log-and-rethrow at every layer; and a fire-and-forget `Task` whose error nobody reads.
+
+</Callout>
+
+## Practice
+
+The **error ladder** kata builds this pipeline in miniature: transport errors become an orders error through a typed-throwing wrapper, and the orders error becomes a message key and a retry decision. Its tests are a table of mappings like the one above.
+
+```cards
+- id: three-moves
+  front: "What are the three things a layer can do with an error from below?"
+  back: "Pass it through (adds nothing), wrap it (keep it as a cause and add this layer's context), or translate it (into the vocabulary its callers switch on, keeping the original for diagnostics)."
+- id: log-once
+  front: "Which layer should log an error?"
+  back: "The one that handles it, because only it knows the outcome. Lower layers attach context to the error; a layer that recovers logs the recovery at info."
+- id: lost-task-error
+  front: "What happens to the error in `Task { try await save() }` if nobody awaits the task?"
+  back: "It's stored in the task and discarded. Recent compilers warn about the unused task, older ones don't; either way, handle errors inside fire-and-forget tasks."
+- id: nserror-codes
+  front: "Why give reported Swift errors raw values and a CustomNSError domain?"
+  back: "Bridged NSError codes default to the case's position and the domain to the module-qualified type name, so adding a case or moving the type regroups every reported issue."
+```
+
+```quiz
+- id: q1
+  type: mcq
+  prompt: "A repository catches `APIError.transport` and throws `OrdersError.unavailable`. Support says the logs show \"unavailable\" and nothing else. What's the best fix?"
+  options:
+    - "Have the view model switch on `URLError` codes instead"
+    - "Keep the `APIError` as the `OrdersError`'s cause, and log the whole chain where the error is handled"
+    - "Log the error in the API client, the repository and the view model"
+    - "Make `OrdersError` a typealias for `APIError`"
+  answer: 1
+  explain: "Translating is right, but the cause and its context (endpoint, request id) must survive for diagnostics. Logging at every layer adds noise without adding the outcome; switching on `URLError` in the UI couples it to the transport."
+- id: q2
+  type: bug
+  prompt: "The orders screen sometimes says \"You haven't placed any orders\" to people with dozens. Which line causes it?"
+  code: |
+    @MainActor
+    final class OrdersModel {
+        private let repository: OrdersRepository
+        private(set) var orders: [Order] = []
+        private(set) var isEmpty = false
+
+        init(repository: OrdersRepository) { self.repository = repository }
+
+        func load() async {
+            orders = (try? await repository.orders()) ?? []
+            isEmpty = orders.isEmpty
+        }
+    }
+  answer: 10
+  explain: "`try?` with `?? []` turns every failure into an empty list, so a timeout shows the empty state. Catch the error and show a failure state with a retry; keep the empty state for a successful, empty answer."
+- id: q3
+  type: multi
+  prompt: "Which of these lose an error without anyone recording it? Choose all that apply."
+  options:
+    - "`Task { try await sync() }` that nobody awaits"
+    - "`publisher.replaceError(with: [])`"
+    - "`do { try await sync() } catch { logger.error(\"\\(error)\"); throw error }`"
+    - "`catch { print(error) }` in a release build"
+    - "`try? FileManager.default.removeItem(at: tempFile)` while cleaning up"
+  answer: [0, 1, 3]
+  explain: "The unawaited task, `replaceError` and a `print` nobody can read all make the error vanish. Logging and rethrowing records it (perhaps too often). Ignoring a failed cleanup of a temporary file is a deliberate, harmless use of `try?`."
+- id: q4
+  type: truefalse
+  prompt: "Adding a case to the top of a Swift enum without raw values changes the NSError code of every case below it."
+  answer: true
+  explain: "Without raw values, the bridged code is the case's position in the declaration. Give reported errors explicit raw values so codes stay stable across releases."
+- id: q5
+  type: mcq
+  prompt: "A live-prices screen reads an `AsyncThrowingStream<Quote, any Error>`. When the socket drops once, prices stop updating for good. What's the better design?"
+  options:
+    - "Wrap the `for try await` loop in `try?`"
+    - "Make the stream's elements an enum with `.update(Quote)` and `.interrupted(QuotesError)`, and have the producer reconnect with backoff"
+    - "Show an alert and ask the user to reopen the screen"
+    - "Restart the app's networking layer"
+  answer: 1
+  explain: "A thrown error ends a stream. For long-lived feeds, report failures as elements so the screen can say \"Reconnecting\", and let the producer retry; end the stream only when it gives up."
+```

@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState } from 'react';
 import { AnimatePresence, motion, useDragControls } from 'framer-motion';
-import { ArrowRight, Check, FileText, Github, Linkedin, Mail, MessageSquareHeart, Newspaper, Star, X } from 'lucide-react';
+import { ArrowRight, Check, FileText, Mail, MessageSquareHeart, Newspaper, Star, X } from 'lucide-react';
+import { Github, Linkedin } from './BrandIcons';
 import { useLocation, useNavigate } from 'react-router-dom';
 import { FIELD_LIMITS, FormCooldownError, submitNetlifyForm } from '../utils/netlifyForm';
 import { track } from '../analytics';

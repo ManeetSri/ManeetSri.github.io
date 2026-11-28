@@ -1,2 +1,36 @@
 // Katas for D07 · Functional design for apps
-export default [];
+export default [
+    {
+        id: 'sd-kata-functional-typeahead-search',
+        kind: 'problem',
+        title: 'Typeahead search reducer',
+        difficulty: 'medium',
+        patterns: ['state', 'architecture'],
+        lessons: ['sd-functional-reducers', 'sd-functional-immutable-data', 'sd-functional-unidirectional'],
+        swiftTest: 'TypeaheadSearchTests',
+        lists: [],
+        minutes: 30,
+    },
+    {
+        id: 'sd-kata-functional-code-sign-in',
+        kind: 'problem',
+        title: 'One-time code sign-in machine',
+        difficulty: 'easy',
+        patterns: ['state', 'auth'],
+        lessons: ['sd-functional-state-machines'],
+        swiftTest: 'OneTimeCodeSignInTests',
+        lists: [],
+        minutes: 25,
+    },
+    {
+        id: 'sd-kata-functional-likes-outbox',
+        kind: 'problem',
+        title: 'Queued likes outbox',
+        difficulty: 'medium',
+        patterns: ['architecture', 'offline', 'testing'],
+        lessons: ['sd-functional-core-shell', 'sd-functional-environment', 'sd-functional-seams'],
+        swiftTest: 'QueuedLikesOutboxTests',
+        lists: [],
+        minutes: 35,
+    },
+];

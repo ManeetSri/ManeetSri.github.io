@@ -1,0 +1,134 @@
+<Brief>
+
+This cell shows a product in a shop's category, search and wishlist screens. It was written for the category screen and copied into the other two. Support reports products showing the wrong photo, full-price items with a "Save 20%" badge, sold-out items saying "Only 0 left", and the cart badge only updating on one screen. Review it as you would a pull request: what's wrong, what matters most, and how you'd fix it.
+
+```swift check ios title="ProductCell.swift"
+import UIKit
+
+struct Product: Sendable {
+    let id: String
+    let name: String
+    let price: Decimal
+    let wasPrice: Decimal?
+    let stock: Int
+    let imageURL: URL
+}
+
+@MainActor final class CartService {
+    static let shared = CartService()
+    var quantities: [String: Int] = [:]
+}
+
+final class ProductListViewController: UIViewController {
+    func refreshCartBadge() {}
+}
+
+final class ProductCell: UICollectionViewCell {
+    private let imageView = UIImageView()
+    private let nameLabel = UILabel()
+    private let priceLabel = UILabel()
+    private let badgeLabel = UILabel()
+    private let addButton = UIButton(type: .system)
+    private var product: Product?
+
+    override init(frame: CGRect) {
+        super.init(frame: frame)
+        [imageView, nameLabel, priceLabel, badgeLabel, addButton].forEach { contentView.addSubview($0) }
+        addButton.addTarget(self, action: #selector(addTapped), for: .touchUpInside) // constraints omitted
+    }
+
+    required init?(coder: NSCoder) { nil }
+
+    func configure(with product: Product) {
+        self.product = product
+        nameLabel.text = product.name
+        let formatter = NumberFormatter()
+        formatter.numberStyle = .currency
+        formatter.currencyCode = "GBP"
+        priceLabel.text = formatter.string(from: product.price as NSDecimalNumber)
+        if let was = product.wasPrice, was > product.price {
+            let saving = (was - product.price) / was * 100
+            badgeLabel.text = "Save \(NSDecimalNumber(decimal: saving).intValue)%"
+        } else if product.stock < 5 {
+            badgeLabel.text = "Only \(product.stock) left"
+        }
+        let inCart = CartService.shared.quantities[product.id, default: 0]
+        addButton.isEnabled = product.stock > inCart && inCart < 10
+        URLSession.shared.dataTask(with: product.imageURL) { data, _, _ in
+            guard let data, let image = UIImage(data: data) else { return }
+            DispatchQueue.main.async { self.imageView.image = image }
+        }.resume()
+    }
+
+    @objc private func addTapped() {
+        guard let product else { return }
+        CartService.shared.quantities[product.id, default: 0] += 1
+        var responder: UIResponder? = self
+        while let next = responder?.next {
+            if let list = next as? ProductListViewController {
+                list.refreshCartBadge()
+                break
+            }
+            responder = next
+        }
+    }
+}
+```
+
+</Brief>
+
+```workspace
+template: critique
+minutes: 25
+```
+
+```findings
+- id: image-race
+  title: Image loads are never cancelled or checked, so reused cells show the wrong photo
+  severity: high
+  lines: 52-55
+  detail: "Each `configure` starts a download that captures the cell, not the product. When the user scrolls, the cell is reused for another product, and whichever response arrives last wins: a product shows another product's photo until it's reused again. It also downloads again on every configure (no cache), and `UIImage(data:)` leaves the full-size decode to the main thread at first draw. Load by product ID outside the cell and reconfigure the item when the image arrives, or at least cancel on reuse and check before setting."
+- id: rules-in-cell
+  title: Pricing, stock and cart rules are decided inside the cell
+  severity: high
+  lines: 44-51
+  detail: "The discount percentage, the low-stock threshold and the 10-per-product limit are business and presentation decisions made in a view. None can be tested without creating a cell, and the copies on the search and wishlist screens will drift. The threshold also produces \"Only 0 left\" for sold-out products, because `stock < 5` includes zero. Compute a `ProductRowState` in a pure mapper over domain rules, and test it."
+- id: cart-from-cell
+  title: The cell changes the global cart itself
+  severity: high
+  lines: 58-60
+  detail: "Tapping Add mutates `CartService.shared` directly from a view: no validation, no server call, nothing the screen can observe or a test can replace. Because `isEnabled` was computed from the singleton at configure time (line 50), the button stays enabled after the tenth add until the cell happens to be reconfigured. The cell should report intent through an `onAdd` closure; the screen's view model applies the cart rules and the row is reconfigured from the new state."
+- id: stale-badge
+  title: The badge is never cleared
+  severity: medium
+  lines: 44-49
+  detail: "Only the discount and low-stock branches set `badgeLabel.text`, so a cell reused from a discounted product keeps \"Save 20%\" on a full-price one. Configuration must set or clear everything for every item; making the badge an optional in the row state forces that."
+- id: responder-walk
+  title: Walks the responder chain to find one concrete view controller
+  severity: medium
+  lines: 61-68
+  detail: "The loop looks for a `ProductListViewController`. On the search and wishlist screens there isn't one, so the cart badge silently never updates there, and the dependency is invisible to the compiler. A closure set by each screen's cell registration says who handles the tap; the responder chain is for focus-dependent commands, not for finding a parent."
+- id: formatter-per-configure
+  title: A NumberFormatter for every configure
+  severity: low
+  lines: 40-43
+  detail: "Creating a `NumberFormatter` is expensive, and this does it for every cell that scrolls in. The formatting decision belongs in the mapper too, using a cached format style such as `.currency(code: \"GBP\")` with an injected locale, so tests are deterministic."
+```
+
+<ReferenceReview>
+
+**Most important first.** Users can see three of these today. **Wrong photos** come from downloads that write to whatever product the cell shows when they finish. **Wrong badges** come from a configuration that never clears the badge, plus a threshold that counts zero as "low stock". And **the cart badge** only updates on the category screen, because the cell hunts for that one view controller.
+
+**The design problem underneath** is that the cell makes decisions and performs side effects. It prices, applies stock and cart rules, downloads images and changes the cart. That's why copying it to two more screens copied every bug, and why none of it has tests.
+
+**How I'd fix it, in small steps:**
+
+1. Extract a pure `ProductRowMapper` that turns a `Product` and the cart quantity into a `ProductRowState` (`title`, `price`, optional `badge`, `canAdd`), using domain `Pricing` and `CartRules`. Write tests first that pin today's behaviour, then fix the sold-out case on purpose ("Sold out", not "Only 0 left").
+2. Change the cell to `render(_ state: ProductRowState)`, setting every view property from the state, with the badge hidden when it's `nil`. Inject the locale into the mapper and drop the formatter.
+3. Replace `addTapped`'s body with an `onAdd` closure. Each screen's cell registration sets it to call its view model, which applies the cart rules, updates the cart through a service the screen owns, and reconfigures the row. Delete the responder-chain loop.
+4. Move image loading to the screen (or a shared image pipeline): a cache and in-flight requests keyed by product ID, thumbnails decoded with `byPreparingThumbnail(ofSize:)`, and `reconfigureItems` when one arrives. If that's too big for one pull request, first cancel the cell's task in `prepareForReuse()` and check for cancellation before setting the image.
+5. Delete the cell's stored `product`: once the closure captures the product ID, the cell has no model of its own to go stale.
+
+**Tests to add:** mapper tests for each badge (discount rounding, sold out, low stock, none), and for `canAdd` at the stock and 10-item limits. A view-model test that adding the tenth item disables the row. An image-loading test with a stub loader that finishes requests out of order and asserts each product ID ends up with its own image. Once the cell only renders state, a few snapshot tests cover its layout.
+
+</ReferenceReview>

@@ -1,0 +1,199 @@
+## Why it matters
+
+Whenever data goes through a series of transformations, you're looking at pipes and filters: an image download that's decoded, downsampled and cached; search text that's normalised and tokenised; a video export; a log line on its way to a server. "Design an image loader" is a classic mobile interview question, and the strongest answers describe it as a pipeline, with a clear reason for each stage and its order.
+
+## The idea
+
+A **filter** takes input, transforms it and produces output. A **pipe** carries one filter's output to the next filter's input. The constraints:
+
+- **Filters are independent.** A filter knows nothing about the filters before or after it, and shares no state with them.
+- **Filters agree only on the data at each pipe.** If decode produces a `CGImage`, whatever follows must accept a `CGImage`.
+- **Data flows one way.** Nothing reaches back up the pipeline.
+
+What that buys: filters can be **reused** (the same downsample filter for avatars and photos), **reordered** or swapped, **tested alone** with plain inputs, and **run concurrently**, each working on a different item. Unix pipes, `cat log | grep error | sort | uniq -c`, are the most famous example.
+
+## Filters in Swift
+
+Here's a pipeline that turns a recipe title into search terms. Each filter is an ordinary function; the `Pipeline` type only joins them, and the type checker makes sure each pipe's two ends agree.
+
+```swift run title="A search-terms pipeline"
+import Foundation
+
+/// A pipeline is filters joined end to end. Each filter sees only its input and returns its output.
+struct Pipeline<Input, Output> {
+    let run: (Input) -> Output
+
+    func then<Next>(_ filter: @escaping (Output) -> Next) -> Pipeline<Input, Next> {
+        Pipeline<Input, Next> { input in filter(run(input)) }
+    }
+}
+
+// Filters for turning a recipe title into search terms
+let fold: (String) -> String = { $0.folding(options: [.caseInsensitive, .diacriticInsensitive], locale: nil) }
+let tokenise: (String) -> [String] = { $0.split { !$0.isLetter && !$0.isNumber }.map(String.init) }
+let stopWords: Set<String> = ["a", "and", "of", "the", "with"]
+let dropStopWords: ([String]) -> [String] = { $0.filter { !stopWords.contains($0) } }
+let dropRepeats: ([String]) -> [String] = { words in
+    var seen = Set<String>()
+    return words.filter { seen.insert($0).inserted }
+}
+
+let searchTerms = Pipeline<String, String> { $0 }
+    .then(fold)
+    .then(tokenise)
+    .then(dropStopWords)
+    .then(dropRepeats)
+
+print(searchTerms.run("The Crème Brûlée of CRÈME brûlée"))
+
+// The same filters in another order: stop words are dropped before folding, so "The" survives
+let wrongOrder = Pipeline<String, [String]> { tokenise($0) }
+    .then(dropStopWords)
+    .then { $0.map(fold) }
+    .then(dropRepeats)
+
+print(wrongOrder.run("The Crème Brûlée of CRÈME brûlée"))
+```
+
+```output
+["creme", "brulee"]
+["the", "creme", "brulee"]
+```
+
+The second pipeline shows the catch in "filters are independent": they are, but the **order** is part of the design. `dropStopWords` assumes lower-case input, an assumption about its upstream that no type expresses. Write such assumptions down, or encode them in a type (a `FoldedText` wrapper that only `fold` can make) so the compiler checks them.
+
+You already use this style every day. Combine operator chains (`map`, `filter`, `removeDuplicates`) and `AsyncSequence` chains are pipes and filters for values that arrive over time. Core Image's `CIFilter` chains are pipes and filters for pixels, and Core Image goes a step further: nothing runs until you render, and then it can combine the chain's kernels into fewer GPU passes.
+
+## Streaming: the stages overlap
+
+Pipelines come in two flavours:
+
+- **Batch sequential:** each stage processes *all* the items, then hands the whole batch on. Simple, but nothing comes out until everything is done.
+- **Streaming:** each item moves on as soon as a stage finishes it, so the stages work at the same time on different items.
+
+Step through three photos going through a streaming pipeline:
+
+```visual timeline
+title: Three photos through a streaming image pipeline
+unit: ms
+lanes:
+  - { id: download, label: Download }
+  - { id: decode, label: Decode }
+  - { id: resize, label: Downsample }
+spans:
+  - { lane: download, from: 0, to: 200, label: photo 1, tone: wait }
+  - { lane: download, from: 200, to: 400, label: photo 2, tone: wait }
+  - { lane: download, from: 400, to: 600, label: photo 3, tone: wait }
+  - { lane: decode, from: 200, to: 300, label: photo 1, tone: active }
+  - { lane: decode, from: 400, to: 500, label: photo 2, tone: active }
+  - { lane: decode, from: 600, to: 700, label: photo 3, tone: active }
+  - { lane: resize, from: 300, to: 400, label: photo 1, tone: ok }
+  - { lane: resize, from: 500, to: 600, label: photo 2, tone: ok }
+  - { lane: resize, from: 700, to: 800, label: photo 3, tone: ok }
+markers:
+  - { at: 400, label: first photo on screen }
+steps:
+  - { at: 0, say: "Photo 1 starts downloading. Each stage is a filter, joined to the next by a pipe: a small buffer." }
+  - { at: 250, say: "Photo 1 moves on to decode while photo 2 downloads. The stages work at the same time." }
+  - { at: 400, say: "Photo 1 is on screen at 400 ms. A batch pipeline that downloaded all three first would show nothing until 1,200 ms." }
+  - { at: 800, say: "All done at 800 ms. Download is the slowest filter, so it sets the pace: one photo every 200 ms. A faster decode wouldn't help; a second download at once would." }
+```
+
+Two lessons from that timeline carry into every pipeline design:
+
+1. **The slowest filter sets the throughput.** Find it before optimising anything else.
+2. **Pipes need limits.** If download outpaces decode, decoded images pile up in the pipe. A bounded buffer that makes the producer wait is called **backpressure**; without it, a fast stage can use all your memory. You'll meet it again in D14 and D23.
+
+## Where it doesn't fit
+
+Pipes and filters suit data that flows one way through steps. It fits badly when:
+
+- **Steps need to talk back.** An interactive flow where step three asks step one for more is a conversation, not a pipeline.
+- **Data is huge and copied at every pipe.** Copying a 48 MB bitmap between five filters is expensive; real image pipelines pass references or fuse stages.
+- **Errors must be handled with context.** A filter only knows its input, so "photo 3 failed to decode" needs the error, or a result type, to travel down the pipe with the item's identity.
+
+## Trade-offs
+
+| | Pipes and filters | One big function | Layered service |
+| --- | --- | --- | --- |
+| Reuse a step elsewhere | Easy | Copy and paste | Moderate |
+| Reorder or add a step | Edit the chain | Edit the function | Edit a layer |
+| Test a step | Plain input, plain output | Only the whole | With fakes |
+| Concurrency | Natural: stages overlap | Manual | Manual |
+| Overhead | Hand-offs, and copies if you're careless | None | Calls between layers |
+| Fits | One-way transformations of data | Tiny, fixed transformations | Request and response flows |
+
+Choose a pipeline when the steps are genuinely separate transformations that may change or be reused; a single function is fine for two steps that will always run together.
+
+<Callout kind="interview">
+
+**Say:** the stages and why each is where it is. "Memory cache, then disk cache, then download; decode and downsample to the view's size off the main thread; then store the *downsampled* image in memory." Say which stage is the bottleneck and how many items may wait in each pipe.
+
+**Ask:** what sizes of image the views need, how many are on screen at once, and whether cancelled cells should stop their downloads.
+
+**Red flags:** decoding full-size images on the main thread; caching full-resolution bitmaps for 60-point thumbnails; no cancellation when a cell scrolls away.
+
+</Callout>
+
+<Callout kind="gotcha" title="iOS gotcha: decode and downsample before the main thread sees it">
+
+`UIImage(data:)` defers decoding until the image is first drawn, which is on the main thread, mid-scroll. A 12-megapixel photo decodes to about 48 MB (width × height × 4 bytes) however small the view. Downsample off the main thread instead: `preparingThumbnail(of:)` (iOS 15) or ImageIO's `CGImageSourceCreateThumbnailAtIndex` with `kCGImageSourceThumbnailMaxPixelSize`, which never decodes the full image at all.
+
+</Callout>
+
+```cards
+- id: pf-constraints
+  front: "What are the constraints of pipes and filters?"
+  back: "Filters are independent and share no state, agree only on the data at each pipe, and data flows one way. That makes filters reusable, reorderable, testable alone and able to run concurrently."
+- id: pf-throughput
+  front: "In a streaming pipeline, what sets the throughput?"
+  back: "The slowest filter. Speeding up any other stage doesn't help; parallelise or speed up the bottleneck."
+- id: backpressure
+  front: "What is backpressure?"
+  back: "A bounded pipe that makes a fast producer wait for a slow consumer, so items don't pile up and exhaust memory."
+```
+
+```quiz
+- id: q1
+  type: order
+  prompt: "Put an image loader's stages in a sensible order for showing a thumbnail in a list cell."
+  lines:
+    - "Look in the memory cache for the thumbnail"
+    - "Look in the disk cache for the downloaded file"
+    - "Download the file and store it on disk"
+    - "Decode and downsample to the cell's pixel size, off the main thread"
+    - "Store the thumbnail in the memory cache and show it"
+  explain: "Cheapest checks first, network last. Downsampling before the memory cache means the cache holds small bitmaps instead of 48 MB ones."
+- id: q2
+  type: estimate
+  prompt: "A 4032 × 3024 photo is decoded into a bitmap with 4 bytes per pixel. Roughly how many megabytes is that?"
+  answer: 49
+  unit: MB
+  within: { percent: 15 }
+  explain: "4032 × 3024 ≈ 12.2 million pixels × 4 bytes ≈ 48.8 MB, for one image, whatever size the view is. That's why you downsample before you keep anything."
+- id: q3
+  type: mcq
+  prompt: "Download takes 200 ms per photo, decode 100 ms and downsample 100 ms, in a streaming pipeline. Which change speeds up a grid of 100 photos the most?"
+  options:
+    - "Make decode twice as fast"
+    - "Make downsample twice as fast"
+    - "Run two downloads at a time"
+    - "Merge decode and downsample into one filter"
+  answer: 2
+  explain: "Download is the bottleneck, so it sets the pace at one photo per 200 ms. Two downloads at a time halve that; changes to the other stages leave the pace where it is."
+- id: q4
+  type: truefalse
+  prompt: "Because filters are independent, you can always reorder them without changing the result."
+  answer: false
+  explain: "Filters don't share state, but each may assume things about its input. Dropping stop words before folding case lets \"The\" through. The order is part of the design."
+- id: q5
+  type: mcq
+  prompt: "Which of these is the poorest fit for pipes and filters?"
+  options:
+    - "Turning a recording into a transcript: decode audio, detect speech, recognise words, add punctuation"
+    - "A multi-step sign-up flow where step 3's answer can send the user back to change step 1"
+    - "Preparing log lines: redact, add context, batch, compress"
+    - "Exporting a video: decode, apply filters, encode"
+  answer: 1
+  explain: "Sign-up is a conversation with branches that go backwards. The others are one-way transformations, which is exactly what pipelines are for."
+```

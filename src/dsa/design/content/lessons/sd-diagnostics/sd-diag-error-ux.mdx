@@ -1,0 +1,298 @@
+## Why it matters
+
+Users don't see error types; they see what the app does when something fails. The same timeout can be a quiet "Updated 5 min ago" label, a red row with "Tap to retry", or an alert that blocks the whole screen, and only one of those is right for any given moment. Error UX is where the taxonomy, the retry policy and the view state finally meet a person. In a design interview, "and what does the user see?" is the follow-up to almost every failure you mention.
+
+## Put the error where the failure is
+
+The first decision is **placement**: show the error on the smallest surface that covers what actually failed, and block the user only when they must decide something.
+
+| Placement | Use it when | Example |
+| --- | --- | --- |
+| Next to a field | Input is invalid and the user can fix it in place | "Use at least 8 characters" under the password field |
+| On the item | One item in a list failed; the rest are fine | A chat bubble with a red badge and "Not delivered. Tap to retry" |
+| A banner or status line | The screen's content is still useful, but something about it is off | "Offline · showing posts from 9:40" above the feed |
+| A full-screen state | There's nothing to show at all | `ContentUnavailableView` with "Couldn't load your orders" and **Try Again** |
+| An alert | The user must decide before anything else can happen, usually because money, data or an irreversible action is involved | "Payment declined. Use another card?" |
+
+[View-state enums](/design/learn/sd-state-view-state) separated *what's on screen* from *what's happening*, which is exactly what makes the middle rows possible: a failed refresh sets a banner while the loaded content stays put. Alerts sit at the bottom of the table for a reason. Each one interrupts, demands a tap and covers the content the user came for. An app that shows an alert for every failed request trains people to dismiss alerts without reading them, including the one that matters.
+
+## Say what happened and what to do
+
+A good error message answers two questions in plain words: **what happened**, in the user's terms, and **what they can do now**. It also reassures them about their work when it's safe.
+
+| Instead of | Write | Why |
+| --- | --- | --- |
+| "Error -1009" | "You're offline. Your changes are saved on this iPhone." | Says what happened and that nothing was lost |
+| "Request failed" | "Couldn't load your orders. Check your connection and try again." | Names the thing, and gives an action |
+| "Invalid input" | "Enter a date in the past" | Says exactly how to fix it, next to the field |
+| "Something went wrong" (for everything) | "Something went wrong on our side. If it keeps happening, contact support with code 7F3A." | Honest about whose fault it is, and gives support a way in |
+| "You entered an invalid card" | "This card was declined. Try another card or contact your bank." | Doesn't blame the user for the bank's decision |
+
+The last-but-one row is the right message for the "report a bug" kind from [the taxonomy](/design/learn/sd-diag-error-taxonomy): you can't tell the user how to fix your bug, but you can be honest and give them a **support reference**. A short code derived from the request id or an event id lets support find the exact logs in seconds, which turns "it doesn't work" emails into diagnosable reports.
+
+### Where the words come from
+
+The words belong to the presentation layer. The domain error says *what happened* (`.declined`); a small presentation type decides *what to say and offer*, localised with String Catalogs. Keeping this mapping in one type per feature means every screen says the same thing about the same failure, and it's testable without a view.
+
+Foundation's `LocalizedError` protocol (`errorDescription`, `failureReason`, `recoverySuggestion`) is the system's version of the same idea, and SwiftUI's `alert(isPresented:error:actions:message:)` reads it. Conform a **presentation** type to it, not your domain errors, so the domain stays free of UI strings.
+
+<Callout kind="gotcha" title="iOS gotcha: localizedDescription of your own errors reads like a crash">
+
+A Swift error that doesn't conform to `LocalizedError` has a `localizedDescription` of "The operation couldn't be completed. (Notes.SyncError error 2.)". Even `URLError` only has a friendly description when `URLSession` created it with its user info. `Text(error.localizedDescription)` is fine in a debug menu and wrong in a product: map errors to your own messages.
+
+</Callout>
+
+## Retry: who presses the button?
+
+The retry policy from [retry with exponential backoff and jitter](/design/learn/sd-resilience-retry-backoff) decides *when* to try again. The UX decides *who* starts it and what the user sees meanwhile. There are five patterns, and most apps need several:
+
+1. **Manual retry.** A **Try Again** button in the failed state. Disable it while the retry runs, and show progress in place so the button doesn't flicker. Right for a full-screen failure the user is looking at.
+2. **Automatic, then visible.** Retry silently a couple of times; if that doesn't work, say so and offer a manual retry: "Couldn't refresh. Retrying in 10 s · Retry now". The user is never stuck watching a spinner that will never finish.
+3. **Wait for the network.** When the phone is offline, a retry button can only fail. Say "Waiting for network", watch connectivity (`NWPathMonitor`, or `waitsForConnectivity` on the session), and resume on your own when it returns.
+4. **Queue it.** For writes the user expects to happen eventually, such as a sent message, a like or a saved note, accept the action at once, show it as pending ("Will send when you're online"), and deliver it from an outbox. Let them cancel a pending item.
+5. **Optimistic, with honest rollback.** The like turns red immediately; if the request finally fails, turn it back *and say so* ("Couldn't like this post"). A silent revert looks like a bug, and users tap again and again.
+
+### When you don't know whether it worked
+
+The hardest case is the one most designs forget: a **timeout after the request was sent**. The server may have received it, acted, and lost only the response. For a search, who cares? Retry. For a payment, a booking or a sent message, "Try again" could charge the card twice.
+
+That outcome needs its own state and its own words, "We're checking whether your payment went through", and its own recovery: ask the server what happened, or resend with the same **idempotency key** so the server can recognise a repeat. Step through a chat message's states:
+
+```visual states
+title: Sending one chat message
+states:
+  - { id: draft, label: Draft, at: [0, 0] }
+  - { id: sending, label: Sending, at: [1, 0] }
+  - { id: sent, label: Sent, at: [2, 0] }
+  - { id: failed, label: Not delivered, at: [0, 1] }
+  - { id: waiting, label: Waiting, at: [1, 1] }
+  - { id: unknown, label: Checking, at: [2, 1] }
+initial: draft
+final: [sent]
+transitions:
+  - [draft, sending, send]
+  - [sending, sent, accepted]
+  - [sending, waiting, offline]
+  - [waiting, sending, online]
+  - [sending, unknown, timedOut]
+  - [unknown, sent, foundOnServer]
+  - [unknown, sending, notOnServer]
+  - [sending, failed, gaveUp]
+  - [failed, sending, tapRetry]
+intro: "The user has typed a message. Every state below needs its own look, and only one of them needs the user's help."
+events:
+  - { event: send, say: "They tap **Send**. The bubble appears at once, dimmed: the message is accepted locally and has an idempotency key." }
+  - { event: offline, say: "The phone has no connection. A retry button would only fail, so the bubble says *Waiting for network* and the app watches connectivity." }
+  - { event: online, say: "The connection is back, so the outbox resends on its own. The user did nothing." }
+  - { event: timedOut, say: "This time the request went out, but no answer came back. Did the server get it? **Checking**, not *Failed*: offering Retry here could send it twice." }
+  - { event: notOnServer, say: "The app asks the server about that key; nothing arrived. Resending with the **same key** is safe either way." }
+  - { event: gaveUp, say: "The server keeps answering `503`, and the retry budget runs out. Now, and only now, the bubble turns red: *Not delivered. Tap to retry*." }
+  - { event: tapRetry, say: "The user taps it. That's the one state that needed them." }
+  - { event: accepted, say: "Delivered. Only one of the six states ever involved the user." }
+```
+
+## One problem, one message
+
+Failures cluster. When the network drops, ten requests fail within a second, and a design that reports each one shows ten banners, or worse, ten alerts in a row. A few rules keep it calm:
+
+- **Coalesce by cause.** Ten requests failing because the phone is offline is one fact: show one "You're offline" banner, owned by something app-wide that watches connectivity, rather than one per screen.
+- **Background work stays in the background.** A silent refresh the user didn't start shouldn't produce an alert. Show staleness ("Updated 2 h ago") instead, and surface the failure only if the user acts on that content.
+- **Don't stack alerts.** If something must block, present one at a time from a single owner, and drop or merge the ones that arrive while it's visible.
+- **Cancellation shows nothing.** It's not a failure. The user left.
+
+## Errors everyone can perceive
+
+An error that's only a red border or a banner sliding in at the top is invisible to some users.
+
+- **Don't rely on colour.** Pair red with an icon and words, so the message survives colour blindness and Smart Invert.
+- **Announce it.** A banner that appears doesn't move VoiceOver's focus, so a blind user never hears it. Post an announcement when it appears: `AccessibilityNotification.Announcement(text).post()` in SwiftUI (iOS 17), or `UIAccessibility.post(notification: .announcement, argument: text)` in UIKit.
+- **Move focus for form errors.** After a failed submit, move focus to the first invalid field with `@AccessibilityFocusState` (or `@FocusState` for the keyboard).
+- **Use the error haptic sparingly.** `.sensoryFeedback(.error, trigger:)` gives the system's error haptic. It's a strong signal, so save it for failures of something the user just did.
+- **Let it grow.** Messages must wrap under Dynamic Type; a fixed-height banner truncates "You're offline. Your changes are saved" to "You're offl…".
+
+Here's a banner that follows these rules, fed by a presentation type that maps a domain error to words and one action:
+
+```swift check ios title="ThreadView.swift"
+import SwiftUI
+
+enum SendError: Error, Equatable {
+    case offline
+    case rejected
+    case outcomeUnknown
+}
+
+/// What the screen says about a failure, and the one action it offers
+struct FailureNotice: Equatable {
+    enum Action: Equatable {
+        case retry
+        case checkStatus
+        case none
+    }
+    let text: String
+    let action: Action
+
+    init(_ error: SendError) {
+        switch error {
+        case .offline:
+            text = String(localized: "You're offline. Your message will send when you're back online.")
+            action = .none
+        case .rejected:
+            text = String(localized: "This message couldn't be sent.")
+            action = .retry
+        case .outcomeUnknown:
+            text = String(localized: "We're not sure this message was sent.")
+            action = .checkStatus
+        }
+    }
+}
+
+@MainActor @Observable
+final class ThreadModel {
+    private(set) var notice: FailureNotice?
+    private(set) var failures = 0
+
+    func sendFailed(_ error: SendError) {
+        notice = FailureNotice(error)
+        failures += 1
+    }
+
+    func performNoticeAction() async {
+        notice = nil
+        // …retry the send, or ask the server about the message's idempotency key
+    }
+}
+
+struct NoticeBanner: View {
+    let notice: FailureNotice
+    let onAction: () -> Void
+
+    var body: some View {
+        HStack(alignment: .firstTextBaseline) {
+            Image(systemName: "exclamationmark.triangle.fill")
+                .accessibilityHidden(true)
+            Text(notice.text)                      // wraps under Dynamic Type
+            Spacer()
+            switch notice.action {
+            case .retry: Button("Try Again", action: onAction)
+            case .checkStatus: Button("Check", action: onAction)
+            case .none: EmptyView()                // offline: no button that can only fail
+            }
+        }
+        .padding()
+        .background(.yellow.opacity(0.2), in: .rect(cornerRadius: 12))
+        .accessibilityElement(children: .combine)
+    }
+}
+
+struct ThreadView: View {
+    @State var model: ThreadModel
+
+    var body: some View {
+        VStack {
+            if let notice = model.notice {
+                NoticeBanner(notice: notice) {
+                    Task { await model.performNoticeAction() }
+                }
+            }
+            Spacer()
+        }
+        .sensoryFeedback(.error, trigger: model.failures)
+        .onChange(of: model.notice) { _, notice in
+            if let notice {
+                AccessibilityNotification.Announcement(notice.text).post()
+            }
+        }
+    }
+}
+```
+
+`FailureNotice` is the piece worth copying: one place per feature that decides the words and the single action for each failure. Its tests are three lines each, and a copywriter can review every message in one file.
+
+## Trade-offs
+
+| Pattern | Interrupts | User effort | Risk | When it wins |
+| --- | --- | --- | --- | --- |
+| Silent automatic retry | No | None | Hides a lasting problem if it never surfaces | Transient failures of reads, with a visible fallback after a few attempts |
+| Banner with cached content | No | None, or one tap | Stale data mistaken for fresh: show its age | Feeds, dashboards, anything with a cache |
+| Full-screen failed state | Replaces the screen | One tap | None, if there's truly nothing to show | First loads with no cache |
+| Queued with pending state | No | None | Users assume it's done: show "pending" clearly | Messages, likes, notes, any write that can wait |
+| Alert | Yes | A decision | Alert fatigue if overused | Money, irreversible actions, choices only the user can make |
+
+<Callout kind="interview">
+
+**Say:** "I place each error on the smallest surface that covers it: a field, a row, a banner over cached content, a full-screen state when there's nothing to show, and alerts only for decisions. Messages say what happened and what to do. Writes go through an outbox with pending states, and a timeout after sending is 'checking', never 'try again', because the server may already have acted."
+
+**Ask:** what can the user do about this failure? Is the write safe to repeat? What should the screen show while we don't know?
+
+**Red flags:** one generic alert for every error; `error.localizedDescription` on screen; a retry button while offline; a silent rollback of an optimistic update; and "Try again" on a payment that timed out.
+
+</Callout>
+
+## Practice
+
+The **error ladder** kata turns each domain error into a message key and a retry decision: automatic with a delay, a button, wait for the network, sign in, or nothing. The **account screen review** shows the opposite: one alert for everything, including cancellation.
+
+```cards
+- id: placement
+  front: "How do you decide where an error appears?"
+  back: "On the smallest surface that covers what failed (a field, a row, a banner, a full-screen state) and as an alert only when the user must decide something before continuing."
+- id: message-anatomy
+  front: "What two questions must an error message answer?"
+  back: "What happened, in the user's terms, and what they can do now. Reassure them about their work when it's safe, and give a support code for errors only you can fix."
+- id: ambiguous-outcome
+  front: "A payment request times out after it was sent. Why not show Try Again?"
+  back: "The server may have charged the card and lost only the response. Show a 'checking' state, ask the server, or resend with the same idempotency key."
+- id: offline-retry
+  front: "Why is a Try Again button wrong while the phone is offline?"
+  back: "It can only fail. Say you're waiting for the network, watch connectivity, and resume automatically when it returns."
+```
+
+```quiz
+- id: q1
+  type: sort
+  prompt: "Where should each failure appear?"
+  buckets: [Next to a field, On the item, Banner over content, Full-screen state, Alert]
+  items:
+    - [The email address has no @, 0]
+    - [One photo in an album of 50 failed to upload, 1]
+    - [A background refresh of the feed timed out; yesterday's posts are on screen, 2]
+    - [The first-ever load of the inbox failed and nothing is cached, 3]
+    - ["The card was declined at checkout; the user must choose another payment method", 4]
+  explain: "Fix-in-place problems go by the field, single-item failures on the item, stale-but-useful content gets a banner, an empty screen gets a full-screen state, and alerts are for decisions that block progress."
+- id: q2
+  type: mcq
+  prompt: "A booking request times out after the app sent it. What should the screen do?"
+  options:
+    - "Show \"Booking failed. Try again\""
+    - "Show a 'checking' state, ask the server about the booking's idempotency key, and resend with the same key only if it never arrived"
+    - "Retry automatically with a new request until it succeeds"
+    - "Assume it worked and show the confirmation"
+  answer: 1
+  explain: "The outcome is unknown: the server may have booked it. A new request could double-book, and assuming success could lie. Checking, then resending with the same key, is safe either way."
+- id: q3
+  type: multi
+  prompt: "The phone goes offline and eight requests on the home screen fail within a second. Which responses are good? Choose all that apply."
+  options:
+    - "One app-wide \"You're offline\" banner"
+    - "An alert per failed request"
+    - "Keep showing cached content with its age"
+    - "A Try Again button on each card"
+    - "Resume loading automatically when connectivity returns"
+  answer: [0, 2, 4]
+  explain: "Eight failures with one cause are one message. Cached content with its age keeps the screen useful, and resuming on reconnection needs no taps. Per-request alerts and buttons that can only fail while offline are noise."
+- id: q4
+  type: truefalse
+  prompt: "A banner that slides in with an error message is announced by VoiceOver automatically."
+  answer: false
+  explain: "New content doesn't move VoiceOver's focus. Post an announcement (`AccessibilityNotification.Announcement`, or `UIAccessibility.post(notification: .announcement, …)`) so the message is heard."
+- id: q5
+  type: mcq
+  prompt: "Tapping Like turns the heart red at once. The request then fails for good. What should happen?"
+  options:
+    - "Keep the heart red; the server will catch up eventually"
+    - "Turn it back silently"
+    - "Turn it back and say \"Couldn't like this post\", with a way to try again"
+    - "Show an alert and block the feed until dismissed"
+  answer: 2
+  explain: "An optimistic update that fails must roll back honestly. A silent revert looks like a bug and invites repeated taps; keeping it red lies; an alert is far too heavy for a like."
+```

@@ -1,0 +1,96 @@
+A large feature is built from small ones: each child has its own state, actions and reducer, and the parent holds the children and routes their actions to them. Write the operators that do the routing, so a trip planner can be assembled from a packing list that's always there, a stop editor presented as a sheet, and one row feature per stop.
+
+`UnidirectionalFeatureScope.Reducer`: `combine(_:)`, `scope(state:action:child:)`, `ifLet(_:action:child:)` and `forEach(_:action:child:)`, plus `Runtime.send(_:)`
+
+A `Reducer<State, Action>` applies an action and returns **follow-up actions**: the actions to send next, such as a child's delegate action telling its parent it's done. An `ActionCase<Parent, Child>` is how a parent action wraps a child action, like an enum case with an associated value: `extract` takes the child action out (or returns `nil`), and `embed` wraps one up.
+
+- **`Runtime.send(action)`** reduces the action, then each follow-up, first in first out, until none are left. Every action reduced goes into `log`, in order.
+- **`combine(reducers…)`** runs every reducer on the same state and action, in order. Their follow-ups are concatenated in the same order.
+- **`scope(state:action:child:)`** makes a parent reducer from a child. For an action that `action.extract` recognises, it runs the child on `state[keyPath: …]` and returns the child's follow-ups, embedded. Every other action is ignored: no change, no follow-ups.
+- **`parent.ifLet(path, action:child:)`** is for an optional child, such as a sheet. When the action is the child's and the child state isn't `nil`, the child runs first, then the parent; when the child state is `nil`, only the parent runs. The parent always runs, and the child's follow-ups come before the parent's.
+- **`parent.forEach(path, action:child:)`** is for an array of `Identifiable` children, with child actions carried as `(id:, action:)`. The child runs on the element with that id, then the parent runs. An id that isn't in the array is ignored by the child. Follow-ups are embedded with the same id.
+
+## Examples
+
+The trip's reducer is `combine(scope(state: \.packing, …, child: packing), tripCore.ifLet(\.editor, …, child: editor).forEach(\.stops, …, child: stop))`.
+
+| Starting state | Sent | Log | Afterwards |
+| --- | --- | --- | --- |
+| packing holds 3 of 3 items | `packing(add("d"))` | `packing(add("d"))`, `packing(full)` | banner "Your bag is full" |
+| editor open with `"  Porto "` | `editor(saveTapped)` | `editor(saveTapped)`, `editor(delegate(save("Porto")))` | editor closed, a stop named "Porto"; the parent saw the trimmed draft |
+| no editor | `editor(saveTapped)` | `editor(saveTapped)` | nothing: the sheet has gone |
+| stops 1, 2, 3 | `stops(id: 2, visitedToggled)` | that action | only stop 2 visited |
+| stops 1, 2, 3 | `stops(id: 1, removeTapped)` | it, then `stops(id: 1, delegate(remove))` | stops 2 and 3 |
+
+## Constraints
+
+- Everything is synchronous and pure: no effects beyond follow-up actions.
+- Children never know about their parent. They talk upwards only through delegate actions, which the parent's own reducer matches on.
+- Address collection elements by id, never by index. After a removal, index 0 is a different stop; id 1 is still the stop that was removed, so a late action for it changes nothing.
+
+<Hints>
+<Hint>
+`scope` is three lines: extract the child action or return `[]`; run `child.reduce(&state[keyPath: path], childAction)`; map the result through `action.embed`. Writable key paths give you `inout` access to the slice.
+</Hint>
+<Hint>
+For `ifLet`, copy the optional child state out with `if var childState = state[keyPath: path]`, run the child on the copy, and write it back before running `self.reduce` on the parent.
+</Hint>
+<Hint>
+For `forEach`, find the index with `firstIndex(where: { $0.id == id })` and run the child on `state[keyPath: path][index]`. Embed follow-ups with `{ action.embed((id, $0)) }`.
+</Hint>
+</Hints>
+
+## Solutions
+
+<Approach title="Each operator returns a new parent reducer; children run before parents" time="O(1) per action for scope and ifLet, O(n) for forEach over n elements" space="O(1) beyond the follow-ups">
+
+```swift
+public static func scope<ChildState, ChildAction>(
+    state path: WritableKeyPath<State, ChildState>,
+    action: UnidirectionalFeatureScope.ActionCase<Action, ChildAction>,
+    child: UnidirectionalFeatureScope.Reducer<ChildState, ChildAction>
+) -> Self {
+    Self { state, parentAction in
+        guard let childAction = action.extract(parentAction) else { return [] }
+        return child.reduce(&state[keyPath: path], childAction).map(action.embed)
+    }
+}
+
+public func ifLet<ChildState, ChildAction>(
+    _ path: WritableKeyPath<State, ChildState?>,
+    action: UnidirectionalFeatureScope.ActionCase<Action, ChildAction>,
+    child: UnidirectionalFeatureScope.Reducer<ChildState, ChildAction>
+) -> Self {
+    Self { state, parentAction in
+        var followUps: [Action] = []
+        if let childAction = action.extract(parentAction), var childState = state[keyPath: path] {
+            followUps = child.reduce(&childState, childAction).map(action.embed)
+            state[keyPath: path] = childState
+        }
+        return followUps + reduce(&state, parentAction)
+    }
+}
+
+public func forEach<Element: Identifiable, ChildAction>(
+    _ path: WritableKeyPath<State, [Element]>,
+    action: UnidirectionalFeatureScope.ActionCase<Action, (id: Element.ID, action: ChildAction)>,
+    child: UnidirectionalFeatureScope.Reducer<Element, ChildAction>
+) -> Self {
+    Self { state, parentAction in
+        var followUps: [Action] = []
+        if let (id, childAction) = action.extract(parentAction),
+           let index = state[keyPath: path].firstIndex(where: { $0.id == id }) {
+            followUps = child.reduce(&state[keyPath: path][index], childAction).map { action.embed((id, $0)) }
+        }
+        return followUps + reduce(&state, parentAction)
+    }
+}
+```
+
+`combine` is `reducers.flatMap { $0.reduce(&state, action) }`, and the runtime is a `while` loop over a queue.
+
+These are TCA's `Scope`, `ifLet` and `forEach` with the library stripped away: a key path for the state, a case path (here `ActionCase`) for the action, and a child reducer. The order is the part worth remembering. `ifLet` and `forEach` run the child first because the parent often *removes* the child in response to the child's own action: a sheet closes on "save", a row disappears on "delete". If the parent ran first, the child would get its last action with its state already gone. TCA reports exactly that as a runtime warning.
+
+`forEach` here searches an array, so routing is O(n). TCA uses `IdentifiedArray`, which keeps a dictionary from id to index alongside the elements and makes the lookup O(1).
+
+</Approach>

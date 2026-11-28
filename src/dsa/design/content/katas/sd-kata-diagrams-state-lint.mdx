@@ -1,0 +1,124 @@
+A state diagram in a pull request is only reviewed as carefully as the reviewer's patience allows. The checks a careful reviewer makes are mechanical, though: can every state be reached, can every state be left, does each event have one clear destination? Write those checks, plus a renderer that turns the diagram into Mermaid text, so a state machine can be linted and drawn the way code is.
+
+`StateDiagramLint.problems(in:) -> Set<Problem>` and `StateDiagramLint.mermaid(_:) -> String`
+
+A `Diagram` has `states` (declared, in order), an `initial` state, `finals` (in order) and `transitions`, each `from --event [condition]--> to` with an optional guard `condition`.
+
+`problems(in:)` reports:
+
+- `.unknownState(name)` for every name used by `initial`, `finals` or a transition's `from` or `to` that isn't in `states`.
+- `.unreachable(state)` for a declared state that no path of transitions reaches from `initial`. The initial state itself is always reached.
+- `.deadEnd(state)` for a declared state that isn't final and has **no transition to a different state**. A state whose only transitions loop back to itself is a dead end too: the machine is stuck there.
+- `.leavesFinal(state)` for a final state that has any transition out of it.
+- `.ambiguous(state:event:)` when two or more transitions leave `state` on the same `event` and their guards don't tell them apart: at least one has no guard, or two have the same guard.
+
+`mermaid(_:)` returns `stateDiagram-v2` text, lines joined with `\n` and no trailing newline:
+
+- the first line is `stateDiagram-v2`;
+- then `    [*] --> <initial>` (four spaces of indentation on every line after the first);
+- then each transition in order, `    <from> --> <to> : <event>`, followed by ` [<condition>]` when it has a guard;
+- then each final state in order, `    <final> --> [*]`.
+
+## Examples
+
+| Diagram | `problems(in:)` |
+| --- | --- |
+| `draft → published` on `publish`, and `trash → archived` on `archive`; initial `draft`; finals `published`, `archived` | `unreachable("trash")`, `unreachable("archived")` |
+| `queued → downloading`, `downloading → downloading` on `progress`, `downloading → failed`, `downloading → done`; final `done` | `deadEnd("failed")` |
+| One state `playing` with only `playing → playing` on `tick` | `deadEnd("playing")` |
+| `failed → queued` on `retry [attempts < 3]` and `failed → idle` on `retry [attempts = 3]` | nothing: the guards differ |
+| `queued → idle` on `cancel` and `queued → failed` on `cancel [offline]` | `ambiguous(state: "queued", event: "cancel")` |
+| `editing → saved` on `save`, `saved → editing` on `edit`; final `saved` | `leavesFinal("saved")` |
+
+For a diagram with initial `idle`, final `loaded`, and transitions `idle → loading` on `load` and `loading → loaded` on `done [ok]`, `mermaid` returns:
+
+```text
+stateDiagram-v2
+    [*] --> idle
+    idle --> loading : load
+    loading --> loaded : done [ok]
+    loaded --> [*]
+```
+
+## Constraints
+
+- State names, events and guards are non-empty strings with no newlines; compare them exactly.
+- A diagram may have no transitions and no final states.
+- Report each problem once: the result is a set.
+- Undeclared names get `unknownState` only; the other checks are about declared states.
+
+<Hints>
+<Hint>
+Group the transitions by the state they leave with `Dictionary(grouping: diagram.transitions, by: \.from)`. Most of the checks read from that one dictionary.
+</Hint>
+<Hint>
+Reachability is a graph search. Start a set and a work list with `initial`, and keep adding the `to` of every transition leaving a state you've reached, until the list is empty. It's the graph search from DSA; breadth-first or depth-first both work.
+</Hint>
+<Hint>
+For ambiguity, group each state's transitions again by `event`. With more than one transition on an event, collect their `condition`s: it's ambiguous if one is `nil`, or if a set of them is smaller than the list.
+</Hint>
+</Hints>
+
+## Solutions
+
+<Approach title="Group by source state, walk from the initial state, then count" time="O(S + T)" space="O(S + T)">
+
+```swift
+public static func problems(in diagram: Diagram) -> Set<Problem> {
+    let declared = Set(diagram.states)
+    let finals = Set(diagram.finals)
+    var problems = Set<Problem>()
+
+    let named = [diagram.initial] + diagram.finals + diagram.transitions.flatMap { [$0.from, $0.to] }
+    for name in named where !declared.contains(name) {
+        problems.insert(.unknownState(name))
+    }
+
+    let exits = Dictionary(grouping: diagram.transitions, by: \.from)
+    var reached: Set<String> = [diagram.initial]
+    var queue = [diagram.initial]
+    while let state = queue.popLast() {
+        for transition in exits[state] ?? [] where reached.insert(transition.to).inserted {
+            queue.append(transition.to)
+        }
+    }
+
+    for state in diagram.states {
+        let leaving = exits[state] ?? []
+        if !reached.contains(state) { problems.insert(.unreachable(state)) }
+        if finals.contains(state) {
+            if !leaving.isEmpty { problems.insert(.leavesFinal(state)) }
+        } else if !leaving.contains(where: { $0.to != state }) {
+            problems.insert(.deadEnd(state))
+        }
+    }
+
+    for (state, leaving) in exits {
+        for (event, sameEvent) in Dictionary(grouping: leaving, by: \.event) where sameEvent.count > 1 {
+            let conditions = sameEvent.map(\.condition)
+            if conditions.contains(nil) || Set(conditions).count < conditions.count {
+                problems.insert(.ambiguous(state: state, event: event))
+            }
+        }
+    }
+    return problems
+}
+
+public static func mermaid(_ diagram: Diagram) -> String {
+    var lines = ["stateDiagram-v2", "    [*] --> \(diagram.initial)"]
+    for transition in diagram.transitions {
+        let condition = transition.condition.map { " [\($0)]" } ?? ""
+        lines.append("    \(transition.from) --> \(transition.to) : \(transition.event)\(condition)")
+    }
+    for final in diagram.finals {
+        lines.append("    \(final) --> [*]")
+    }
+    return lines.joined(separator: "\n")
+}
+```
+
+The walk pops from the end of the list, so it's depth-first rather than breadth-first; for reachability the order doesn't matter, only that every reached state is expanded once, which `insert(_:).inserted` guarantees. Each transition is looked at a constant number of times, so the whole check is linear in states plus transitions.
+
+The rules are a design choice worth noticing. Treating a self-loop-only state as a dead end catches the download that can report progress forever but never finish. Requiring distinct guards catches the classic copy-paste bug where two arrows share an event and the machine's behaviour depends on which one the code happens to check first. Run checks like these in CI over the state machines your app declares, and a diagram in a design doc stops being a picture that drifts from the code.
+
+</Approach>

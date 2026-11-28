@@ -1,0 +1,273 @@
+## Why it matters
+
+UIKit builds big screens out of smaller view controllers. `UINavigationController`, `UITabBarController`, `UISplitViewController` and `UIPageViewController` are all containers, and your own containers are how one screen stops being a 2,000-line view controller: a header, a list and a filter panel, each its own controller with its own lifecycle. Containment has a short contract of four calls. Skip one and things fail quietly: pushes that do nothing, callbacks that arrive twice or never, children that are never freed. Interviewers use it to separate people who compose screens from people who stack views.
+
+## Two hierarchies that must match
+
+Every on-screen view controller sits in two trees at once:
+
+- **The view hierarchy**: views inside views, which decides what's drawn and where touches go.
+- **The view controller hierarchy**: parents and their `children`, which decides who is told about appearance, traits and size changes, and who answers questions like "which navigation controller am I in?"
+
+Containment keeps the two in step. When a parent adds a child view controller *and* puts the child's view inside its own, UIKit treats the child as part of the screen:
+
+- **Appearance:** when the parent appears or disappears, so do its children, with all the callbacks from [the view controller lifecycle](/design/learn/sd-uikit-vc-lifecycle).
+- **Traits and size:** trait changes (dark mode, Dynamic Type, size classes) and `viewWillTransition(to:with:)` on rotation or iPad resizing reach the child.
+- **Safe area:** the child's safe area is computed from where its view sits, and the parent can add `additionalSafeAreaInsets` to it.
+- **Lookups:** `navigationController`, `tabBarController` and `splitViewController` walk up `parent`. So does presentation: a child's `present(_:animated:)` finds the right controller to present from.
+- **The responder chain:** a child's view's next responder is the child, and the child's next responder is its view's superview, inside the parent. Key commands and menu actions flow through it.
+
+If you add only the view (`view.addSubview(child.view)`) none of that happens. The child's `parent` is `nil`, so `navigationController?.pushViewController` silently does nothing, and presenting logs "Presenting view controllers on detached view controllers is discouraged". It never hears about rotation, so it lays out for the old size. If nothing else holds the child controller, ARC frees it at the end of the method, while its view lives on, orphaned.
+
+## The four calls
+
+Adding a child is four steps, and removing one is three. Two of the callbacks are sent for you, which is why people forget the other two:
+
+```visual sequence
+title: Adding and removing a child view controller
+participants:
+  - { id: parent, label: Parent }
+  - { id: child, label: Child }
+  - { id: views, label: View hierarchy }
+messages:
+  - [parent, parent, "addChild(child)"]
+  - [parent, child, "willMove(toParent: parent)", { say: "`addChild` sends the child `willMove(toParent:)` for you." }]
+  - [parent, views, "addSubview(child.view)"]
+  - [parent, views, "activate constraints", { say: "The **parent** decides where the child's view goes and how big it is." }]
+  - [parent, child, "didMove(toParent: parent)", { say: "You send `didMove(toParent:)` yourself, once the view is in place. Now the child is part of the screen." }]
+  - { note: "Appearance, traits and size changes now reach the child.", over: [parent, child] }
+  - [parent, child, "willMove(toParent: nil)", { say: "Removing starts with `willMove(toParent: nil)`, which you send yourself." }]
+  - [parent, views, "child.view.removeFromSuperview()"]
+  - [parent, child, "removeFromParent()"]
+  - [child, child, "didMove(toParent: nil)", { say: "`removeFromParent()` sends `didMove(toParent: nil)` for you. The parent no longer holds the child, so it can be freed." }]
+steps:
+  - { upTo: 1, say: "Adding starts with `addChild`, which also sends `willMove(toParent:)`." }
+  - { upTo: 3, say: "Then the child's view goes into the parent's hierarchy, with constraints." }
+  - { upTo: 5, say: "`didMove(toParent:)` completes it: you have to send this one." }
+  - { upTo: 7, say: "Removing mirrors it: `willMove(toParent: nil)` first, then take the view out." }
+  - { upTo: 9, say: "`removeFromParent()` ends the relationship and sends the last callback." }
+```
+
+Write it once, as a pair of helpers, and nobody on the team writes it by hand again:
+
+```swift check ios title="Containment helpers" group=containment
+import UIKit
+
+extension UIViewController {
+    /// Adds `child`, with its view pinned to the edges of `container` (the root view by default)
+    func embed(_ child: UIViewController, in container: UIView? = nil) {
+        let container: UIView = container ?? view
+        addChild(child)
+        child.view.translatesAutoresizingMaskIntoConstraints = false
+        container.addSubview(child.view)
+        NSLayoutConstraint.activate([
+            child.view.topAnchor.constraint(equalTo: container.topAnchor),
+            child.view.bottomAnchor.constraint(equalTo: container.bottomAnchor),
+            child.view.leadingAnchor.constraint(equalTo: container.leadingAnchor),
+            child.view.trailingAnchor.constraint(equalTo: container.trailingAnchor),
+        ])
+        child.didMove(toParent: self)
+    }
+
+    /// Removes this view controller from its parent, in the order UIKit expects
+    func unembed() {
+        guard parent != nil else { return }
+        willMove(toParent: nil)
+        view.removeFromSuperview()
+        removeFromParent()
+    }
+}
+```
+
+The `container` parameter matters more than it looks. A screen often has placeholder views laid out in advance (a header area, a content area), and each child goes into its slot. The parent owns the layout of the slots; the child owns everything inside.
+
+## Swapping children
+
+The most useful custom container in most apps is tiny: it shows one child at a time and swaps it when the state changes. Loading, content, empty and error each become a small, focused view controller, and the screen that owns the state only decides which one to show.
+
+```swift check ios title="StateContainerViewController.swift" group=containment
+final class StateContainerViewController: UIViewController {
+    private(set) var current: UIViewController?
+
+    func show(_ next: UIViewController, animated: Bool = true) {
+        guard let previous = current, animated else {
+            current?.unembed()
+            embed(next)
+            current = next
+            return
+        }
+        previous.willMove(toParent: nil)
+        addChild(next)
+        next.view.frame = previous.view.frame
+        next.view.autoresizingMask = [.flexibleWidth, .flexibleHeight]
+        // Adds next's view, removes previous's, and runs both appearance transitions
+        transition(from: previous, to: next, duration: 0.25, options: .transitionCrossDissolve, animations: nil) { _ in
+            previous.removeFromParent()
+            next.didMove(toParent: self)
+        }
+        current = next
+    }
+}
+```
+
+`transition(from:to:duration:options:animations:completion:)` needs both controllers to be children of the same parent when it's called, and it moves the views for you. You still make the containment calls around it, in the same order as before.
+
+### Taking control of appearance
+
+By default a container forwards appearance automatically: its children appear when it does. That's wrong for a container that shows only some children at a time, such as a carousel of pages where only the visible one should start its video. Override `shouldAutomaticallyForwardAppearanceMethods` to return `false`, then call `child.beginAppearanceTransition(true, animated:)` and `child.endAppearanceTransition()` yourself as each child scrolls in and out. Calls must balance: a begin without an end logs "Unbalanced calls to begin/end appearance transitions", and the child's appearance state no longer matches what's on screen.
+
+## Designing a good child
+
+Containment gives you separate objects. Keeping them separate is a design choice:
+
+- **A child doesn't know its parent's type.** `(parent as? SearchViewController)?.reload()` welds the child to one screen and crashes or silently does nothing anywhere else. The child defines what it can report (a closure or a delegate protocol it owns) and the parent wires it up.
+- **Data goes down through the child's API**, a method like `show(_ results: [Result])` or a shared view model, never by the child reaching up.
+- **The parent owns the child's frame.** A child that needs a size says so through `preferredContentSize`; the parent hears about it in `preferredContentSizeDidChange(forChildContentContainer:)` and updates its constraints.
+- **System appearance follows the child when the parent says so.** The status bar style, home indicator and deferred edge gestures come from the parent unless it returns a child from `childForStatusBarStyle`, `childForHomeIndicatorAutoHidden` or `childForScreenEdgesDeferringSystemGestures`.
+
+```swift check ios title="A filter panel that reports up through a closure" group=containment
+struct Filters: Equatable, Sendable {
+    var inStockOnly = false
+    var maxPrice: Decimal?
+}
+
+final class FilterPanelViewController: UIViewController {
+    var onChange: ((Filters) -> Void)?
+    private var filters = Filters()
+
+    @objc private func stockToggled(_ toggle: UISwitch) {
+        filters.inStockOnly = toggle.isOn
+        onChange?(filters)
+    }
+}
+
+final class SearchViewController: UIViewController {
+    private let panel = FilterPanelViewController()
+    private let results = StateContainerViewController()
+    private let panelSlot = UIView()
+    private let resultsSlot = UIView()
+
+    override func viewDidLoad() {
+        super.viewDidLoad()
+        // Layout of the two slots omitted: the parent owns it
+        [panelSlot, resultsSlot].forEach { view.addSubview($0) }
+        embed(panel, in: panelSlot)
+        embed(results, in: resultsSlot)
+        panel.onChange = { [weak self] filters in
+            self?.search(with: filters)
+        }
+    }
+
+    private func search(with filters: Filters) {}
+}
+```
+
+The filter panel can now go on the search screen, a category screen and an iPad sidebar without changing a line, and its tests only need a closure.
+
+### Child view controller or plain view?
+
+Not every piece of a screen should be a view controller. Make it a child when it has a lifecycle of its own: it loads its own data, starts and stops work as it appears, presents or pushes, hosts SwiftUI, or is a screen in its own right elsewhere. Make it a `UIView` subclass when it only displays what it's given and reports touches: a rating control, a price label, a card. A view is lighter and can't get containment wrong.
+
+## Trade-offs
+
+| Approach | Lifecycle of its own | Reuse | Testability | Cost |
+| --- | --- | --- | --- | --- |
+| One view controller with many views | Shared, one big set of callbacks | Copy and paste | Hard: everything needs the whole screen | Lowest to start, grows fastest |
+| Child view controllers | Yes: appearance, traits, size per child | High: drop into any container | Good: test each child alone | Containment calls, more types |
+| Custom `UIView` subclasses | No | High for display | Good for rendering, nothing to test in logic | Lightest |
+| SwiftUI children in `UIHostingController` | Yes (it's a view controller) | High, across UIKit and SwiftUI | Good, with previews | Containment plus sizing |
+
+Start with views for display-only pieces and promote a piece to a child view controller when it gains a lifecycle. A screen with three independent data sources and two of them reused elsewhere is a container with three children. A form with twelve labels is one view controller with good views.
+
+<Callout kind="interview">
+
+**What to say:** "Each section is a child view controller added with `addChild`, its view placed in a slot, then `didMove(toParent:)`. The parent owns layout and wiring; children report up through closures and never cast their parent." Mention the state container for loading, content and error: it shows you design for states, not just the happy path.
+
+**What to ask:** which parts load their own data or appear elsewhere in the app? Does any part show and hide while the screen stays up (that's where appearance forwarding matters)?
+
+**Red flags:** `view.addSubview(child.view)` without `addChild`; removing a child's view but not the child, so `children` grows every swap; `parent as!` in a child; building a container when a `UIStackView` of views would do.
+
+</Callout>
+
+<Callout kind="gotcha" title="iOS gotcha: a hosting controller is a view controller">
+
+`UIHostingController` is a full view controller. Adding its `view` without `addChild` and `didMove(toParent:)` gives you a SwiftUI view whose controller gets no appearance or size-transition callbacks from its parent, and often no controller at all once the local variable goes out of scope. Contain it like any other child; you'll see the details later in this module, in the lesson on interop.
+
+</Callout>
+
+<Callout kind="gotcha" title="iOS gotcha: don't manage a system container's children">
+
+The view controllers in a navigation stack are the navigation controller's children. Change them through `pushViewController`, `setViewControllers(_:animated:)` and friends, never `addChild` on a `UINavigationController` or `UITabBarController`. And a controller can only have one parent: move it with the full remove and add sequence, never by adding it somewhere new.
+
+</Callout>
+
+## Practice
+
+The [dashboard container review](/design/practice/sd-review-uikit-dashboard-containment) is a real-looking container that gets the contract wrong in four different ways: a missing call, a child that's removed but never released, a parent forwarding callbacks UIKit already sends, and a child that casts its parent. Each has a consequence you can name.
+
+```cards
+- id: containment-order
+  front: "What are the calls to add a child view controller, in order?"
+  back: "`addChild(child)` (which sends `willMove(toParent:)`), add `child.view` and its constraints, then `child.didMove(toParent: self)`."
+- id: removal-order
+  front: "What are the calls to remove a child view controller, in order?"
+  back: "`child.willMove(toParent: nil)`, `child.view.removeFromSuperview()`, then `child.removeFromParent()` (which sends `didMove(toParent: nil)`)."
+- id: no-containment-cost
+  front: "What breaks if you add a child's view without `addChild`?"
+  back: "Its `parent` is nil, so `navigationController` is nil and pushes do nothing; it gets no appearance or size-transition callbacks; presenting from it is detached; and nothing may keep the controller alive."
+- id: child-talks-up
+  front: "How should a child view controller tell its parent something happened?"
+  back: "Through an API the child owns, such as a closure or a delegate protocol, wired up by the parent. Never by casting `parent` to a concrete type."
+```
+
+```quiz
+- id: q1
+  type: order
+  prompt: "Put the steps for adding a child view controller in order."
+  lines:
+    - "addChild(child)"
+    - "container.addSubview(child.view)"
+    - "Activate the child view's constraints"
+    - "child.didMove(toParent: self)"
+  explain: "The relationship comes first (and `addChild` sends `willMove(toParent:)`), then the view goes into place, and `didMove(toParent:)` marks the move as finished."
+- id: q2
+  type: mcq
+  prompt: "A filter panel is added to a search screen with `view.addSubview(panel.view)`. Tapping \"More filters\" calls `navigationController?.pushViewController(...)` in the panel, and nothing happens. Why?"
+  options:
+    - "Push needs to run on the main actor"
+    - "The panel was never added as a child, so its `parent` and `navigationController` are nil"
+    - "Child view controllers can't push; only the root view controller can"
+    - "The panel's view needs `translatesAutoresizingMaskIntoConstraints = false`"
+  answer: 1
+  explain: "`navigationController` walks up `parent`. Without `addChild`, the panel is detached, the optional chain is nil, and the push silently does nothing. Contained children can push: they find the navigation controller through their parent."
+- id: q3
+  type: truefalse
+  prompt: "`addChild(_:)` sends the child `willMove(toParent:)` for you, and `removeFromParent()` sends it `didMove(toParent: nil)` for you."
+  answer: true
+  explain: "Which is exactly why the other two, `didMove(toParent:)` after adding and `willMove(toParent: nil)` before removing, are yours to send, and the ones people forget."
+- id: q4
+  type: multi
+  prompt: "Which of these does UIKit pass to a properly contained child automatically?"
+  options:
+    - "Appearance callbacks when the parent appears and disappears"
+    - "Trait changes such as dark mode and Dynamic Type"
+    - "Size transitions through `viewWillTransition(to:with:)`"
+    - "Control of the status bar style"
+    - "The parent's model data"
+  answer: [0, 1, 2]
+  explain: "Appearance, traits and size changes flow down by default. The status bar style follows a child only if the parent returns it from `childForStatusBarStyle`, and data goes down only through the API you design."
+- id: q5
+  type: mcq
+  prompt: "Which of these pieces of a product page is the best candidate for a child view controller rather than a `UIView` subclass?"
+  options:
+    - "A star-rating display that shows a number from 0 to 5"
+    - "A price label that shows a sale price and a struck-through old price"
+    - "A reviews section that loads reviews itself, pages through them, and pushes a full review screen"
+    - "A rounded card background"
+  answer: 2
+  explain: "The reviews section has a lifecycle of its own: it loads data, can stop work when it disappears, and navigates. The others only display what they're given, so views are lighter and can't get containment wrong."
+- id: q6
+  type: recall
+  prompt: "A teammate's child view controller ends a long task by calling `(parent as! OrdersViewController).reload()`. What would you suggest in review, and why?"
+  model: "The force cast welds the child to one parent and crashes if it's ever embedded elsewhere, and the child now knows about its container. Give the child an `onFinish` closure (or a delegate protocol the child defines), have the parent set it when embedding the child, and let the parent decide to reload. The child becomes reusable and testable with a closure."
+```

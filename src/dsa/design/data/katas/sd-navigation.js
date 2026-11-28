@@ -1,2 +1,36 @@
 // Katas for D20 · Navigation & routing
-export default [];
+export default [
+    {
+        id: 'sd-kata-navigation-route-parsing',
+        kind: 'problem',
+        title: 'Parse every entry point into a route',
+        difficulty: 'medium',
+        patterns: ['navigation', 'security', 'push'],
+        lessons: ['sd-nav-routers', 'sd-nav-deep-links', 'sd-nav-entry-points'],
+        swiftTest: 'NavigationRouteParserTests',
+        lists: [],
+        minutes: 35,
+    },
+    {
+        id: 'sd-kata-navigation-path-reducer',
+        kind: 'problem',
+        title: 'A navigation reducer for a tabbed app',
+        difficulty: 'medium',
+        patterns: ['navigation', 'state'],
+        lessons: ['sd-nav-stack', 'sd-nav-state-driven', 'sd-nav-restoration'],
+        swiftTest: 'NavigationPathReducerTests',
+        lists: [],
+        minutes: 35,
+    },
+    {
+        id: 'sd-kata-navigation-coordinator-tree',
+        kind: 'problem',
+        title: 'A coordinator tree that lets go',
+        difficulty: 'hard',
+        patterns: ['navigation', 'patterns', 'architecture'],
+        lessons: ['sd-nav-coordinators-uikit', 'sd-nav-coordinators-swiftui'],
+        swiftTest: 'NavigationCoordinatorTreeTests',
+        lists: [],
+        minutes: 45,
+    },
+];

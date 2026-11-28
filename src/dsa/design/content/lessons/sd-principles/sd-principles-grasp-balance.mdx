@@ -1,0 +1,356 @@
+## Why it matters
+
+Expert, creator and controller propose an owner for each responsibility. Sometimes the proposal is bad: the type with the data is the wrong place for the behaviour. Low coupling and high cohesion are how you judge a proposal, and pure fabrication is what you do when no real-world concept fits. Most of an iOS app's infrastructure (repositories, API clients, caches, coordinators) consists of pure fabrications, and naming them well, and knowing when not to add one, is a senior skill.
+
+## Low coupling and high cohesion, used as judges
+
+You met coupling and cohesion in [What coupling and cohesion are](/design/learn/sd-coupling-basics). In GRASP they work differently from the other patterns. They don't tell you where to put anything; they're the **tests you run on every candidate**. Larman calls them *evaluative* patterns.
+
+Before giving a responsibility to a type, ask:
+
+- **Coupling:** what does this type now have to know about? Does it pick up a new import (SwiftData, URLSession, UIKit, a third-party SDK) or knowledge of another feature?
+- **Cohesion:** does the new responsibility belong with what the type already does? Can you still describe the type in one sentence without "and"?
+
+A good assignment adds no new dependency and fits the sentence. A bad one does neither, even when another pattern recommended it.
+
+## The case: who saves the order?
+
+Information expert gives a clear answer: `Order` has all the data, so `Order` should save itself. Now run the two tests:
+
+- **Coupling.** `Order` would import SwiftData for local storage and URLSession to sync. Every test of a cancellation rule would need a database or a network stub. The widget extension that shows order status would link the persistence and networking code too.
+- **Cohesion.** `Order` would mix business rules (what can be cancelled, how totals work) with storage formats, sync retries and error mapping. Those change for different reasons, at the request of different people.
+
+Both tests fail. Step through what happens, and the way out:
+
+```visual flow
+title: Who saves the order?
+groups:
+  - { id: domain, label: Domain, nodes: [order] }
+  - { id: fabrications, label: Fabrications, nodes: [store, sync] }
+nodes:
+  - { id: swiftdata, label: SwiftData, kind: db, at: [0, 0] }
+  - { id: urlsession, label: URLSession, kind: external, at: [4, 0] }
+  - { id: store, label: OrderStore, kind: store, at: [0, 1.6] }
+  - { id: sync, label: OrderSync, at: [4, 1.6] }
+  - { id: order, label: Order, at: [2, 3] }
+edges:
+  - [order, swiftdata, saves]
+  - [order, urlsession, uploads]
+  - [store, swiftdata]
+  - [sync, urlsession]
+  - [store, order, stores]
+  - [sync, order, sends]
+steps:
+  - say: "`Order` holds the rules: what can be cancelled, how the total is worked out. Expert says it has the data, so it should save itself."
+    show: [order]
+  - say: "**Coupling fails.** `Order` now depends on SwiftData and URLSession, and so does every test and extension that uses it."
+    send: [order->swiftdata, order->urlsession]
+    state: { order: error }
+  - say: "**Cohesion fails too.** Rules, storage formats and sync retries change for different reasons, and now share one type."
+    label: { order: "rules + storage + sync" }
+  - say: "**Pure fabrication:** invent `OrderStore` and `OrderSync`. No shop has an order store; it exists to keep `Order` small and independent."
+    hide: [order->swiftdata, order->urlsession]
+    show: [store, sync]
+    send: [store->swiftdata, sync->urlsession]
+    state: { order: null }
+    label: { order: null }
+  - say: "Dependencies now point **at** `Order`, and it points at nothing. Test rules with plain values; change storage without touching them."
+    send: [store->order, sync->order]
+    state: { order: ok }
+```
+
+## Pure fabrication
+
+> Assign a highly cohesive set of responsibilities to an artificial type that doesn't represent a concept in the problem domain, to support high cohesion, low coupling and reuse.
+
+*Fabrication* because you made it up; *pure* because it doesn't come from the domain. A shop has carts, orders and products. It doesn't have an `OrderStore`. You invent one so that `Order` can stay a cohesive, dependency-free value.
+
+```swift run title="Order keeps the rules; a fabrication keeps the storage"
+import Foundation
+
+// Domain: the rules, and nothing about storage
+struct Order: Codable, Equatable {
+    enum Status: String, Codable {
+        case placed, shipped, cancelled
+    }
+
+    let id: String
+    private(set) var status: Status
+
+    init(id: String, status: Status = .placed) {
+        self.id = id
+        self.status = status
+    }
+
+    var canBeCancelled: Bool { status == .placed }
+
+    mutating func cancel() throws(OrderError) {
+        guard canBeCancelled else { throw .cannotCancel(status.rawValue) }
+        status = .cancelled
+    }
+}
+
+enum OrderError: Error {
+    case cannotCancel(String)
+    case notFound(String)
+}
+
+// Pure fabrication: it exists to keep Order cohesive and uncoupled
+protocol OrderStore {
+    func load(id: String) throws -> Order?
+    func save(_ order: Order) throws
+}
+
+final class InMemoryOrderStore: OrderStore {
+    private var rows: [String: Data] = [:]
+    private let encoder = JSONEncoder()
+
+    init() {
+        encoder.outputFormatting = .sortedKeys
+    }
+
+    func load(id: String) throws -> Order? {
+        guard let data = rows[id] else { return nil }
+        return try JSONDecoder().decode(Order.self, from: data)
+    }
+
+    func save(_ order: Order) throws {
+        rows[order.id] = try encoder.encode(order)
+    }
+
+    func storedJSON(id: String) -> String {
+        String(decoding: rows[id] ?? Data(), as: UTF8.self)
+    }
+}
+
+// The use case's controller coordinates the rule and the storage
+struct CancelOrder {
+    let store: any OrderStore
+
+    func run(id: String) throws -> Order {
+        guard var order = try store.load(id: id) else { throw OrderError.notFound(id) }
+        try order.cancel()
+        try store.save(order)
+        return order
+    }
+}
+
+let store = InMemoryOrderStore()
+try store.save(Order(id: "A1"))
+try store.save(Order(id: "B2", status: .shipped))
+
+let cancelOrder = CancelOrder(store: store)
+for id in ["A1", "B2", "C3"] {
+    do {
+        let order = try cancelOrder.run(id: id)
+        print("\(id): \(order.status)")
+    } catch {
+        print("\(id): \(error)")
+    }
+}
+print("A1 is stored as \(store.storedJSON(id: "A1"))")
+```
+
+```output
+A1: cancelled
+B2: cannotCancel("shipped")
+C3: notFound("C3")
+A1 is stored as {"id":"A1","status":"cancelled"}
+```
+
+Three types, three jobs. `Order` decides whether cancelling is allowed. `InMemoryOrderStore` decides how orders become bytes; a SwiftData or file-backed store would replace it without `Order` changing. `CancelOrder` is the use case's controller from [GRASP: information expert, creator and controller](/design/learn/sd-principles-grasp-ownership): it coordinates, and owns neither rules nor storage.
+
+Fabrications are everywhere in iOS code once you look: `URLSession`, `JSONDecoder`, `NSCache`, `UNUserNotificationCenter`, and in your own app, API clients, image caches, Keychain wrappers, coordinators and analytics trackers. A view model is a fabrication too: a type invented to hold presentation logic so neither the view nor the domain has to.
+
+## When fabrication goes wrong
+
+Fabrications are a tool for technical responsibilities. They go wrong in three recognisable ways.
+
+### The anaemic domain model
+
+Martin Fowler's name (2003) for a codebase where every rule has moved into services and the domain types are bags of properties: `OrderService.canCancel(order)`, `OrderService.cancel(order)`, `OrderService.total(order)`. It looks organised, but the rules are scattered across services that all reach into the same data. The fix is the split above: fabrications take storage, transport and caching; **rules stay with their experts**.
+
+### The Manager
+
+`ProfileManager`, `DataHelper` and `AppUtils` are names that admit the type has no single job. Here's a typical one:
+
+```swift check ios title="ProfileManager: one name, several types"
+import UIKit
+
+struct Profile: Codable {
+    let id: String
+    var givenName: String
+    var familyName: String
+}
+
+@MainActor
+final class ProfileManager {
+    private let session: URLSession
+    private var profile: Profile?
+    private let avatarCache = NSCache<NSURL, UIImage>()
+    private let nameFormatter = PersonNameComponentsFormatter()
+    private let track: (String) -> Void
+
+    init(session: URLSession = .shared, track: @escaping (String) -> Void) {
+        self.session = session
+        self.track = track
+    }
+
+    func loadProfile() async throws -> Profile {
+        let (data, _) = try await session.data(from: URL(string: "https://api.example.com/me")!)
+        let loaded = try JSONDecoder().decode(Profile.self, from: data)
+        profile = loaded
+        track("profile_loaded")
+        return loaded
+    }
+
+    func avatar(at url: URL) async throws -> UIImage? {
+        if let cached = avatarCache.object(forKey: url as NSURL) { return cached }
+        let (data, _) = try await session.data(from: url)
+        let image = UIImage(data: data)
+        if let image { avatarCache.setObject(image, forKey: url as NSURL) }
+        return image
+    }
+
+    func displayName() -> String {
+        guard let profile else { return "" }
+        var components = PersonNameComponents()
+        components.givenName = profile.givenName
+        components.familyName = profile.familyName
+        return nameFormatter.string(from: components)
+    }
+
+    func signOut() {
+        profile = nil
+        avatarCache.removeAllObjects()
+        track("signed_out")
+    }
+}
+```
+
+A quick way to see low cohesion is a rough version of **LCOM** ("lack of cohesion of methods", from Chidamber and Kemerer's 1994 metrics): list the stored properties, then mark which ones each method uses.
+
+| Method | `session` | `profile` | `avatarCache` | `nameFormatter` | `track` |
+| --- | --- | --- | --- | --- | --- |
+| `loadProfile()` | ✓ | ✓ | | | ✓ |
+| `avatar(at:)` | ✓ | | ✓ | | |
+| `displayName()` | | ✓ | | ✓ | |
+| `signOut()` | | ✓ | ✓ | | ✓ |
+
+Islands show up. `avatar(at:)` and `avatarCache` form one; `displayName()` uses only the profile's own data and a formatter; `signOut()` touches everything because it's really a system event. Each island suggests an owner:
+
+- **`ProfileRepository`** (fabrication): `session`, `loadProfile()`, and holding the last profile.
+- **`AvatarCache`** (fabrication): the cache and `avatar(at:)`. It's reusable by any screen that shows avatars.
+- **`Profile.displayName`** (expert): the profile has the name parts. Using `PersonNameComponents` with `.formatted()` respects the user's locale.
+- **`SessionController.signOut()`** (controller): the sign-out event tells the repository and the cache to clear, and records the analytics.
+
+### Fabrication for its own sake
+
+A repository wrapping a service wrapping an API client, each forwarding the same call, is indirection with no job. Every fabrication should own something: a technology it hides, a policy it applies, or state it keeps. If you can't say what it hides, inline it. [When SOLID hurts: over-abstraction and indirection](/design/learn/sd-solid-limits) covers this failure in general.
+
+## Trade-offs
+
+Where should "save the order" go?
+
+| Option | The domain type's coupling | Cohesion | Testing the rules | Wins when |
+| --- | --- | --- | --- | --- |
+| On `Order` itself (expert) | High: SwiftData, sync | Low: rules plus storage | Needs a database | A prototype, or a SwiftData `@Model` app small enough that the model *is* the domain |
+| An `OrderStore` or repository (fabrication) | None | High on both sides | Plain values | Most apps: storage or sync might change, or several features share orders |
+| In the screen's view model | None, but the view model's grows | Low: presentation plus storage | Needs the view model | Never, beyond a one-screen app |
+| An `extension Order` in the persistence module that maps to and from records | None: the dependency points from persistence to domain | High | Plain values | Mapping code that belongs with the database but reads best as `Order(record)` |
+
+The last row is a Swift-specific tool. An extension declared in your persistence module can add `init(_ record: OrderRecord)` to `Order` without `Order`'s own module ever importing SwiftData.
+
+<Callout kind="interview">
+
+**What to say:** name fabrications by what they hide. "`OrderStore` hides SwiftData and the sync queue; `Order` is a plain value that holds the cancellation and pricing rules." It shows you know why the type exists, not only that you've seen the pattern.
+
+**What to ask:** "Will a widget, watch app or share extension need the domain types?" If so, keeping them free of persistence and networking is worth more, because extensions pay for every framework they link.
+
+**Red flags interviewers listen for:** `Manager` and `Helper` types; every rule in a service while models are bags of properties; and layers of fabrications that only forward calls.
+
+</Callout>
+
+<Callout kind="gotcha" title="Swift gotcha: extensions organise code, they don't decouple it">
+
+Splitting a 2,000-line type into `ProfileManager+Avatar.swift` and `ProfileManager+Analytics.swift` makes files shorter, but it's still one type. Its dependencies are the union of all its extensions, and every extension can touch the others' internal state. Only separate types, or a module boundary, actually separate responsibilities.
+
+</Callout>
+
+## Practice
+
+The review [The generic list screen](/design/practice/sd-review-principles-generic-list) includes a data manager that mixes fetching, caching and formatting for every screen that uses it. Look for the islands.
+
+```cards
+- id: evaluative
+  front: "How are low coupling and high cohesion used in GRASP?"
+  back: "As tests on every candidate assignment: does it add a dependency, and does it fit what the type already does? They can overrule information expert."
+- id: pure-fabrication
+  front: "What is a pure fabrication?"
+  back: "A type that doesn't represent a domain concept, invented to keep coupling low and cohesion high, such as a repository, API client, cache or coordinator."
+- id: anaemic
+  front: "What is an anaemic domain model?"
+  back: "Domain types that are only bags of properties, with every rule in services. Fabrications should take technical work, such as storage and transport, while rules stay with their experts."
+- id: lcom
+  front: "How can you spot low cohesion in a type quickly?"
+  back: "Mark which stored properties each method uses. Islands of methods using separate properties are separate types sharing one name."
+```
+
+```quiz
+- id: q1
+  type: sort
+  prompt: "In a shopping app, which are domain concepts and which are pure fabrications?"
+  buckets: [Domain concept, Pure fabrication]
+  items:
+    - ["`Cart`", 0]
+    - ["`ImageCache`", 1]
+    - ["`Order`", 0]
+    - ["`OrderRepository`", 1]
+    - ["`CheckoutCoordinator`", 1]
+    - ["`Voucher`", 0]
+  explain: "Carts, orders and vouchers exist in the business itself. Caches, repositories and coordinators exist only to keep the software's responsibilities cohesive and decoupled."
+- id: q2
+  type: mcq
+  prompt: "The API's JSON field names differ from your domain's names and change often. Who should turn a response into an `Order`?"
+  options:
+    - "`Order` itself, with custom `CodingKeys` that follow every API change"
+    - "A response type in the networking module, mapped to `Order` by a function there"
+    - "The order list's view model, since it's the first to receive the data"
+    - "A global `JSONHelper` with a static decode method for every type"
+  answer: 1
+  explain: "The wire format changes for different reasons from the domain rules, so cohesion says split them, and coupling says the domain shouldn't know the API's field names. Simple apps with a stable API can decode straight into domain types."
+- id: q3
+  type: multi
+  prompt: "Which are signs of low cohesion? Choose all that apply."
+  options:
+    - "The type's name ends in Manager or Helper"
+    - "Its methods fall into groups that use different stored properties"
+    - "Every method uses most of the stored properties"
+    - "Describing it takes several \"and\"s"
+  answer: [0, 1, 3]
+  explain: "Vague names, islands of methods and properties, and descriptions joined with \"and\" all point to several jobs in one type. Methods that all use the same state are a sign of high cohesion."
+- id: q4
+  type: truefalse
+  prompt: "Moving a large type's methods into extensions in separate files reduces its coupling."
+  answer: false
+  explain: "It's still one type: its dependencies are the union of every extension's, and all of them share its internal state. Separate types or modules reduce coupling; files only organise."
+- id: q5
+  type: bug
+  prompt: "Which line makes this domain type harder to test and to reuse in a widget?"
+  code: |
+    import Foundation
+    import SwiftData
+
+    struct Subscription {
+        let renewsOn: Date
+        let isCancelled: Bool
+        var isActive: Bool { !isCancelled && renewsOn > .now }
+        func save(in context: ModelContext) throws { }
+    }
+  answer: 8
+  explain: "Saving through a `ModelContext` couples the subscription's rules to SwiftData, so tests need a container and every target using the type links persistence. A store, a pure fabrication, should own saving."
+- id: q6
+  type: recall
+  prompt: "Information expert says `Order` should save itself because it has the data. Explain why GRASP overrules it here, and what you'd do instead."
+  model: "Low coupling and high cohesion overrule it: saving would make `Order` depend on SwiftData and networking, and mix business rules with storage concerns that change for other reasons. Invent a pure fabrication, an `OrderStore` or repository, that knows how to persist orders, and keep `Order` a plain value with its rules."
+```

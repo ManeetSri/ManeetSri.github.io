@@ -19,6 +19,8 @@ const KINDS = {
     cdn: { accent: '#7FD1C7', radius: 8, stripe: 'top' },
     external: { accent: '#A3A5AE', radius: 8, dash: '5 4' },
     actor: { accent: '#F2F0EB', pill: true },
+    // A concept rather than a part of the system (a fact, a derived value, a step): no kind tag
+    plain: { accent: '#C8C6C0', radius: 8, untagged: true },
 };
 const DASH = { sync: undefined, async: '6 4', data: '1.5 4' };
 // Parts a step hasn't shown yet stay as faint outlines, so the layout never jumps
@@ -65,7 +67,7 @@ const FlowNode = ({ node, rect, tone, active, visible, label, fade }) => {
     return (
         <g opacity={visible ? 1 : GHOST} className={fade}>
             <NodeShape rect={rect} style={style} paint={paint} />
-            <text x={rect.x + (style.stripe === 'left' ? 12 : 9)} y={rect.y + 13 + lift} fontSize="8.5" fontFamily="var(--font-mono)" letterSpacing="0.6" fill={style.accent} fillOpacity="0.85">{node.kind.toUpperCase()}</text>
+            {!style.untagged && <text x={rect.x + (style.stripe === 'left' ? 12 : 9)} y={rect.y + 13 + lift} fontSize="8.5" fontFamily="var(--font-mono)" letterSpacing="0.6" fill={style.accent} fillOpacity="0.85">{node.kind.toUpperCase()}</text>}
             {lines.map((line, index) => (
                 <text
                     key={index}

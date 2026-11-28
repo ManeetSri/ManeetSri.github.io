@@ -1,5 +1,6 @@
 import { useState } from 'react';
-import { Check, Copy, ExternalLink, Github, Globe } from 'lucide-react';
+import { Check, Copy, ExternalLink, Globe } from 'lucide-react';
+import { Github } from '../components/BrandIcons';
 import AppIcon from '../components/device/AppIcon';
 import { track } from '../analytics';
 

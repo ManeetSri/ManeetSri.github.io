@@ -1,0 +1,332 @@
+## Why it matters
+
+Almost every iOS app of any age is a mix. New screens are written in SwiftUI while the navigation, the older screens and a few hard-won components stay in UIKit, and that can last for years. The boundary between the two is where the subtle bugs live: a SwiftUI view whose `onAppear` never fires, a text view whose cursor jumps on every keystroke, two copies of the same state that slowly disagree. Interviewers ask "how would you adopt SwiftUI in a large UIKit app?" because a good answer shows you understand both frameworks' ownership rules, not only their syntax.
+
+## Two directions, four tools
+
+| Direction | Tool | What it is | Use it for |
+| --- | --- | --- | --- |
+| SwiftUI in UIKit | `UIHostingController` | A view controller whose view is a SwiftUI hierarchy | Whole screens, and sections embedded as child view controllers |
+| SwiftUI in UIKit | `UIHostingConfiguration` (iOS 16) | A content configuration for collection and table view cells | SwiftUI rows inside UIKit lists |
+| UIKit in SwiftUI | `UIViewRepresentable` | A SwiftUI view that creates and updates a `UIView` | Wrapping a view: a text view with features SwiftUI lacks, a map, a chart library |
+| UIKit in SwiftUI | `UIViewControllerRepresentable` | The same, for a view controller | System pickers, the camera, a legacy UIKit screen |
+
+iOS 18 added two smaller bridges worth knowing: `UIGestureRecognizerRepresentable`, which brings a UIKit gesture recognizer into SwiftUI, and `UIView.animate(_:changes:completion:)` taking a SwiftUI `Animation`, so UIKit and SwiftUI views can move with the same spring.
+
+## SwiftUI inside UIKit
+
+### UIHostingController is a view controller
+
+Everything from [View controller containment](/design/learn/sd-uikit-containment) applies: embed a hosting controller as a child, with `addChild`, its view in place, then `didMove(toParent:)`. Without that, the parent forwards no appearance or size-transition callbacks to it, so its SwiftUI content's appearance events don't follow the screen's, and if the controller was a local variable, nothing keeps it alive.
+
+Two properties make an embedded hosting controller behave like a well-mannered UIKit view:
+
+- **`sizingOptions = .intrinsicContentSize`** (iOS 16) keeps the hosting controller's view's intrinsic content size in step with the SwiftUI content's ideal size, so Auto Layout can size it without a fixed height, and it resizes when the content changes. `.preferredContentSize` does the same for `preferredContentSize`, for popovers and custom containers.
+- **`safeAreaRegions`** (iOS 16.4) decides which safe-area insets the SwiftUI content respects. A summary bar pinned above the home indicator by your own constraints shouldn't add the inset a second time: set it to `[]`.
+
+```swift check ios title="BasketViewController.swift" group=interop
+import SwiftUI
+import UIKit
+
+@Observable
+final class CartModel {
+    var itemCount = 0
+    var total: Decimal = 0
+}
+
+struct CartSummary: View {
+    let cart: CartModel
+    var onCheckout: () -> Void = {}
+
+    var body: some View {
+        HStack {
+            Text("\(cart.itemCount) items")
+            Spacer()
+            Text(cart.total, format: .currency(code: "GBP"))
+                .bold()
+            Button("Checkout", action: onCheckout)
+                .buttonStyle(.borderedProminent)
+        }
+        .padding()
+    }
+}
+
+final class BasketViewController: UIViewController {
+    private let cart: CartModel
+    private lazy var summary = UIHostingController(rootView: CartSummary(cart: cart) { [weak self] in
+        self?.showCheckout()
+    })
+
+    init(cart: CartModel) {
+        self.cart = cart
+        super.init(nibName: nil, bundle: nil)
+    }
+
+    required init?(coder: NSCoder) { nil }
+
+    override func viewDidLoad() {
+        super.viewDidLoad()
+        view.backgroundColor = .systemBackground
+        summary.sizingOptions = .intrinsicContentSize // Auto Layout gets SwiftUI's ideal height
+        summary.safeAreaRegions = []                 // our constraint already avoids the home indicator
+        addChild(summary)
+        summary.view.translatesAutoresizingMaskIntoConstraints = false
+        view.addSubview(summary.view)
+        NSLayoutConstraint.activate([
+            summary.view.leadingAnchor.constraint(equalTo: view.leadingAnchor),
+            summary.view.trailingAnchor.constraint(equalTo: view.trailingAnchor),
+            summary.view.bottomAnchor.constraint(equalTo: view.safeAreaLayoutGuide.bottomAnchor),
+        ])
+        summary.didMove(toParent: self)
+        observeCart()
+    }
+
+    // The UIKit side reads the same model; this reruns whenever itemCount changes
+    private func observeCart() {
+        withObservationTracking {
+            title = cart.itemCount == 0 ? "Basket" : "Basket (\(cart.itemCount))"
+        } onChange: { [weak self] in
+            Task { @MainActor in self?.observeCart() }
+        }
+    }
+
+    private func showCheckout() {}
+}
+```
+
+Notice what the SwiftUI view receives: the **model**, and a **closure** for the one thing it can't decide on its own. It never pushes a screen itself; the UIKit side owns navigation and decides what "checkout" means.
+
+### Passing data in
+
+There are two ways to get new data into a hosted view, and one of them scales:
+
+- **Reassign `rootView`** with new values. It works (SwiftUI diffs the new view value against the old one and keeps state where identity matches), but now the UIKit screen holds the data and must remember to push every change, which is two copies of the state by another name.
+- **Share an `@Observable` model.** The SwiftUI view reads it and updates itself; UIKit code that also needs it observes the same object. One source of truth, no syncing code.
+
+On the UIKit side, `withObservationTracking` (iOS 17) reports the next change to anything read inside its first closure, which is why `observeCart()` re-registers itself each time. From iOS 26, UIKit does this for you: `@Observable` properties read in `updateProperties()`, `layoutSubviews()` and the other update methods are tracked automatically and the method reruns when they change. On iOS 18 the same automatic tracking can be switched on with the `UIObservationTrackingEnabled` key in Info.plist, for the update methods that exist there.
+
+### SwiftUI rows in UIKit lists
+
+For a cell, a hosting controller is far too heavy: one view controller per visible row, each needing containment. `UIHostingConfiguration` is a content configuration, like `UIListContentConfiguration`, that renders SwiftUI inside an ordinary cell, with self-sizing, the cell's background and separators, and no view controller at all:
+
+```swift check ios title="A SwiftUI row in a UIKit list" group=interop
+struct OrderRow: View {
+    let title: String
+    let status: String
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 4) {
+            Text(title).font(.headline)
+            Text(status).font(.subheadline).foregroundStyle(.secondary)
+        }
+    }
+}
+
+struct OrderSummary: Identifiable, Sendable {
+    let id: String
+    let title: String
+    let status: String
+}
+
+@MainActor
+func makeOrderRegistration(lookup: @escaping (OrderSummary.ID) -> OrderSummary?) -> UICollectionView.CellRegistration<UICollectionViewListCell, OrderSummary.ID> {
+    UICollectionView.CellRegistration { cell, _, id in
+        guard let order = lookup(id) else { return }
+        cell.contentConfiguration = UIHostingConfiguration {
+            OrderRow(title: order.title, status: order.status)
+        }
+        .margins(.horizontal, 16)
+    }
+}
+```
+
+This is often the best first step in adopting SwiftUI: new row designs are SwiftUI views with previews, while the list, its diffable data source, prefetching and navigation stay exactly as they were.
+
+## UIKit inside SwiftUI
+
+A representable is a SwiftUI view, a value that's created and thrown away constantly, that manages a UIKit object that must persist. SwiftUI resolves that mismatch with a fixed lifecycle:
+
+```visual sequence
+title: The lifecycle of a UIViewRepresentable
+participants:
+  - { id: swiftui, label: SwiftUI }
+  - { id: rep, label: NotesEditor }
+  - { id: coordinator, label: Coordinator }
+  - { id: view, label: UITextView }
+messages:
+  - [swiftui, rep, "makeCoordinator()", { say: "First, once: the **coordinator** is a long-lived object that can be a delegate or a target." }]
+  - [swiftui, rep, "makeUIView(context:)", { say: "Once: create and configure the UIKit view, and wire up the coordinator." }]
+  - [rep, view, create and configure]
+  - [swiftui, rep, "updateUIView(_:context:)", { say: "Straight after creation, and again **whenever an input it reads changes**." }]
+  - [rep, view, set text if different]
+  - [view, coordinator, textViewDidChange, { say: "The user types. UIKit tells the delegate, which is the coordinator." }]
+  - [coordinator, swiftui, write the binding, { say: "The coordinator writes through the binding: the source of truth now holds the new text." }]
+  - [swiftui, rep, "updateUIView(_:context:)", { say: "The state changed, so SwiftUI updates the representable again." }]
+  - { note: "The view already shows this text: nothing to do.", over: [rep, view] }
+  - [swiftui, rep, "dismantleUIView(_:coordinator:)", { say: "When the view leaves the hierarchy: tear down delegates, observers and timers." }]
+```
+
+```swift check ios title="NotesEditor.swift" group=interop
+struct NotesEditor: UIViewRepresentable {
+    @Binding var text: String
+
+    func makeCoordinator() -> Coordinator {
+        Coordinator(text: $text)
+    }
+
+    // Once: build and configure
+    func makeUIView(context: Context) -> UITextView {
+        let textView = UITextView()
+        textView.font = .preferredFont(forTextStyle: .body)
+        textView.adjustsFontForContentSizeCategory = true
+        textView.delegate = context.coordinator
+        return textView
+    }
+
+    // Often: push only what changed
+    func updateUIView(_ textView: UITextView, context: Context) {
+        context.coordinator.text = $text
+        if textView.text != text {
+            textView.text = text // unconditional, this would move the cursor on every keystroke
+        }
+    }
+
+    static func dismantleUIView(_ textView: UITextView, coordinator: Coordinator) {
+        textView.delegate = nil
+    }
+
+    final class Coordinator: NSObject, UITextViewDelegate {
+        var text: Binding<String>
+
+        init(text: Binding<String>) {
+            self.text = text
+        }
+
+        func textViewDidChange(_ textView: UITextView) {
+            text.wrappedValue = textView.text
+        }
+    }
+}
+```
+
+The rules that keep a representable well behaved:
+
+- **`makeUIView` creates; `updateUIView` updates.** Never create views in `updateUIView`; it runs far more often than you'd guess.
+- **Make `updateUIView` idempotent and cheap.** Compare before setting, as `NotesEditor` does with the text. Setting a text view's text resets its selection, so the unguarded version moves the cursor to the end on every keystroke.
+- **Refresh the coordinator's copy of the representable's inputs** in `updateUIView` (`context.coordinator.text = $text`). The representable is a new value each time; a coordinator holding the first one's binding or closures can end up writing to stale ones.
+- **Don't write SwiftUI state synchronously inside `updateUIView`.** SwiftUI is in the middle of an update, and you'll see the runtime warning "Modifying state during view update, this will cause undefined behavior." State changes belong in coordinator callbacks, which come later.
+- **Use the context.** `context.environment` has the colour scheme, Dynamic Type size and your own environment values; `context.transaction.animation` tells you whether the change should animate.
+- **Size it deliberately.** A representable's size comes from the UIKit view's intrinsic content size by default. Since iOS 16, implement `sizeThatFits(_:uiView:context:)` to answer SwiftUI's size proposals yourself, which is how you make a wrapped view wrap text to the width it's offered.
+
+`UIViewControllerRepresentable` follows the same pattern with `makeUIViewController` and `updateUIViewController`, and is how SwiftUI presents things like a UIKit document picker or an existing UIKit screen you haven't migrated.
+
+## One owner for each thing
+
+Most interop bugs are ownership bugs. Decide, for each concern, which side owns it:
+
+- **State: one source of truth.** An `@Observable` model (or a store) that both sides read. Avoid UIKit holding values that it copies into `rootView`, *and* SwiftUI holding `@State` copies of the same values.
+- **The environment doesn't cross on its own.** A hosted SwiftUI view gets the system environment from UIKit's traits (colour scheme, Dynamic Type, size classes), but not your app's environment values: a theme, a router, a feature-flag client. Inject them on the root view: `UIHostingController(rootView: CartSummary(cart: cart).environment(\.theme, theme))`. To share a custom value in both directions, iOS 17's `UITraitBridgedEnvironmentKey` bridges a custom UIKit trait and a SwiftUI environment key.
+- **Navigation: one owner per flow.** Pushing a `UIHostingController` onto a `UINavigationController` is fine; the UIKit side owns the stack, and the SwiftUI screen reports intent through closures, as `CartSummary` does with `onCheckout`. Putting a `NavigationStack` inside that hosting controller gives you two navigation bars and two back stacks that don't know about each other. Move navigation to SwiftUI a whole flow at a time, which you'll plan in D20 and D31.
+
+## Trade-offs
+
+| Tool | Cost per instance | Lifecycle | Sizing | Best for |
+| --- | --- | --- | --- | --- |
+| `UIHostingController` as a pushed or presented screen | One view controller | Full: appearance, traits, navigation items | Fills the screen | New screens in an app whose navigation is UIKit |
+| `UIHostingController` as an embedded child | One view controller, plus containment | Full, if contained | `sizingOptions`, `safeAreaRegions` | A SwiftUI section of a UIKit screen |
+| `UIHostingConfiguration` | Light: no view controller | The cell's | Self-sizing with the cell | SwiftUI rows in UIKit lists |
+| `UIViewRepresentable` / `UIViewControllerRepresentable` | One UIKit object, plus a coordinator | Make, update, dismantle | Intrinsic size or `sizeThatFits` | UIKit components SwiftUI can't replace yet |
+
+Adopting SwiftUI usually goes leaf first: rows through `UIHostingConfiguration`, then whole new screens as hosting controllers pushed by the existing UIKit navigation, then whole flows once their screens are SwiftUI. Representables go the other way, wrapping the few UIKit components (a rich text editor, a camera preview) that SwiftUI still can't match.
+
+<Callout kind="interview">
+
+**What to say:** "Leaf first. New rows with `UIHostingConfiguration`, new screens as `UIHostingController`s pushed by the existing coordinators, sharing `@Observable` models so there's one source of truth. Hosting controllers are view controllers, so they're contained properly and sized with `sizingOptions`. UIKit components that SwiftUI lacks become representables with a coordinator and an idempotent `updateUIView`. Navigation stays in UIKit until a whole flow has moved."
+
+**What to ask:** what's the deployment target (it decides `UIHostingConfiguration`, `sizingOptions` and observation tracking)? Who owns navigation today? Is there shared state (a cart, a session) that both sides need?
+
+**Red flags:** a hosting controller per cell; `rootView` reassigned on every change from a UIKit copy of the state; a `NavigationStack` inside a UIKit navigation controller; an `updateUIView` that rebuilds the view or sets every property unconditionally.
+
+</Callout>
+
+<Callout kind="gotcha" title="iOS gotcha: a hosting controller's size doesn't follow its content by default">
+
+Without `sizingOptions`, an embedded `UIHostingController`'s view doesn't tell Auto Layout when its SwiftUI content's ideal size changes, so it keeps the height it was first laid out with: text gets clipped when Dynamic Type grows, and a section that gains a row overlaps what's below it. Set `sizingOptions = .intrinsicContentSize` (iOS 16) for views sized by Auto Layout, or `.preferredContentSize` for popovers and custom containers.
+
+</Callout>
+
+## Practice
+
+The [dashboard container review](/design/practice/sd-review-uikit-dashboard-containment) embeds a SwiftUI chart the way many first attempts do: a hosting controller in a local variable, its view added straight to the hierarchy. List what that costs, and write the six lines that fix it.
+
+```cards
+- id: four-interop-tools
+  front: "Which tool for each direction of UIKit–SwiftUI interop?"
+  back: "SwiftUI in UIKit: `UIHostingController` (screens and embedded sections) and `UIHostingConfiguration` (cells). UIKit in SwiftUI: `UIViewRepresentable` and `UIViewControllerRepresentable`."
+- id: representable-lifecycle
+  front: "What's the lifecycle of a `UIViewRepresentable`?"
+  back: "`makeCoordinator`, then `makeUIView` once, then `updateUIView` straight away and whenever an input changes, then `dismantleUIView` when it's removed. Create in make, update idempotently in update."
+- id: hosting-sizing
+  front: "How do you make an embedded `UIHostingController` size itself with Auto Layout?"
+  back: "Contain it as a child and set `sizingOptions = .intrinsicContentSize` (iOS 16), so its intrinsic size follows the SwiftUI content. Adjust `safeAreaRegions` if your constraints already handle the safe area."
+- id: interop-one-owner
+  front: "What should have exactly one owner across the UIKit–SwiftUI boundary?"
+  back: "Each piece of state (share an `@Observable` model), and navigation for each flow (one stack, with SwiftUI views reporting intent through closures)."
+```
+
+```quiz
+- id: q1
+  type: match
+  prompt: "Match each job to the right interop tool."
+  pairs:
+    - ["A new SwiftUI settings screen pushed by an existing UIKit coordinator", "`UIHostingController`"]
+    - ["SwiftUI rows inside an existing `UICollectionView` list", "`UIHostingConfiguration`"]
+    - ["A `UITextView` with custom text attributes inside a SwiftUI form", "`UIViewRepresentable`"]
+    - ["Presenting a UIKit document picker from a SwiftUI view", "`UIViewControllerRepresentable`"]
+  explain: "Hosting controllers are for screens and sections, hosting configurations for cells, and the representables bring UIKit views and view controllers into SwiftUI."
+- id: q2
+  type: order
+  prompt: "Put a `UIViewRepresentable`'s callbacks in the order SwiftUI calls them, for a view that's shown, edited once and then removed."
+  lines:
+    - "makeCoordinator()"
+    - "makeUIView(context:)"
+    - "updateUIView(_:context:), straight after creation"
+    - "updateUIView(_:context:), after a binding it reads changes"
+    - "dismantleUIView(_:coordinator:)"
+  explain: "The coordinator exists before the view so the view can be wired to it. Update runs immediately after make and on every relevant change; dismantle runs once, when SwiftUI removes the view."
+- id: q3
+  type: mcq
+  prompt: "A wrapped `UITextView` moves the cursor to the end after every character the user types. What's the most likely cause?"
+  options:
+    - "The coordinator isn't the text view's delegate"
+    - "`updateUIView` sets `textView.text` every time, even when it already matches"
+    - "`makeUIView` is called on every keystroke"
+    - "The binding is written from a background thread"
+  answer: 1
+  explain: "Typing writes the binding, which triggers `updateUIView`, which sets the text again and resets the selection. Compare first: only set the text when it differs."
+- id: q4
+  type: mcq
+  prompt: "Your UIKit app has a large diffable collection view of orders. Design wants the rows redesigned, and the team wants to start using SwiftUI. What's the best first step?"
+  options:
+    - "Rewrite the whole screen in SwiftUI with `List`"
+    - "Embed a `UIHostingController` in each cell"
+    - "Render the new rows with `UIHostingConfiguration` and keep the collection view, data source and navigation"
+    - "Wrap the collection view in a `UIViewRepresentable` inside a new SwiftUI screen"
+  answer: 2
+  explain: "The rows change, so only the rows move to SwiftUI: they get previews and the new design, while the tested list machinery stays. A hosting controller per cell is heavy and needs containment; a full rewrite risks everything at once."
+- id: q5
+  type: multi
+  prompt: "A hosting controller is created as a local variable in `viewDidLoad`, and only its `view` is added as a subview. What goes wrong?"
+  options:
+    - "Nothing keeps the hosting controller alive after `viewDidLoad` returns"
+    - "The parent doesn't forward appearance and size-transition callbacks to it"
+    - "There's no reference left to update its `rootView` later"
+    - "SwiftUI views can only be shown in a `UIWindow` of their own"
+  answer: [0, 1, 2]
+  explain: "Without containment the controller isn't a child, so the parent forwards nothing to it, and as a local it's freed when the method returns. Hosted SwiftUI views live happily inside UIKit hierarchies when they're contained."
+- id: q6
+  type: truefalse
+  prompt: "A SwiftUI view in a `UIHostingController` automatically gets the custom environment values (say, a `\\.theme`) of the SwiftUI views elsewhere in the app."
+  answer: false
+  explain: "The hosted view starts a new SwiftUI hierarchy. It inherits the system's values from UIKit's traits (colour scheme, Dynamic Type), but your own values must be injected on the root view with `.environment`, or bridged through a custom trait with `UITraitBridgedEnvironmentKey`."
+```

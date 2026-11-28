@@ -1,0 +1,203 @@
+<Brief>
+
+You're on the iOS team of a home-insurance app. Its most important flow is **Make a claim**, five steps long: what happened, when and where, photos of the damage, how to pay you (bank details), then review and submit.
+
+The flow has a problem. People leave it constantly: to take photos with the Camera app, to dig a receipt out of Mail, to look up their bank details in their banking app. On older iPhones the suspended app is often killed for memory while they're away, and they come back to the home screen with the claim gone. 18% of started claims are abandoned, and "the app lost my claim" is the top support complaint.
+
+What the product team wants:
+
+- **Come back to exactly where you were**, with everything you entered, after any interruption iOS causes.
+- **Never lose a claim in progress**, even if the user closes the app on purpose. But don't ambush them with it: someone who swiped the app away should be *offered* their draft, not dropped into step 4.
+- **iPad:** loss adjusters and some customers open two claims side by side in separate windows. Each window must come back to its own claim and step.
+- **Bank details are sensitive.** They must never appear anywhere they don't need to be.
+
+What you know: about 400,000 monthly users and 30,000 claims started a month. The average claim takes 12 minutes, with 3 switches to other apps, and has 6 photos of about 3 MB each (20 at most). The app is UIKit with some SwiftUI screens, its minimum is iOS 17, and each step has its own view model, coordinated per window.
+
+Design the **component that saves and restores this flow**: its API, what it stores where and when, and how it restores. Spend about 40 minutes, writing in the sections on the right as if explaining it to a colleague.
+
+</Brief>
+
+```workspace
+template: component
+minutes: 40
+```
+
+<ModelAnswer section="requirements">
+
+**Callers:** the claim flow's coordinator (one per window) and the five step view models; the scene delegate's restoration hooks.
+
+**The split that drives everything:** *where the user is* (claim id, step) is UI state; *what they entered* (answers, photos) is user data. They have different lifetimes, so they live in different places.
+
+- **Must:** after a system termination (jetsam, crash, update, reboot), relaunch into the same claim and step with every answer and photo. After a deliberate swipe-away, keep the draft and *offer* it at the start of the flow. Each iPad window restores its own claim. Survive an app update that changes the draft format.
+- **Must not:** block typing or scrolling to save; lose a photo once it's been picked; put bank details in restoration state, logs or the app switcher snapshot.
+- **Constraints:** UI is main-actor; photos are large (up to 60 MB a claim), so they're files referenced by id; storage goes in Application Support, never Caches; the app can be launched in the background while locked, which must never corrupt or reset a draft.
+- **Out of scope for now:** syncing drafts across devices through the server (see trade-offs).
+
+</ModelAnswer>
+
+<ModelAnswer section="api">
+
+```swift
+struct ClaimDraft: Codable, Sendable, Identifiable {
+    static let currentVersion = 3
+    let id: UUID
+    var version: Int
+    var step: ClaimStep
+    var answers: ClaimAnswers        // no bank details: those live in the Keychain
+    var photoIDs: [UUID]
+    var updatedAt: Date
+}
+
+enum ClaimStep: String, Codable, Sendable { case incident, details, photos, payout, review }
+
+protocol ClaimDraftStore: Sendable {                 // app-wide, an actor in production
+    func draft(id: UUID) async throws -> ClaimDraft?
+    func save(_ draft: ClaimDraft) async throws      // debounced by the caller, atomic here
+    func addPhoto(_ jpeg: Data, to draft: UUID) async throws -> UUID
+    func unfinishedDrafts() async throws -> [ClaimDraft]
+    func delete(_ draft: UUID) async throws
+}
+
+struct ClaimPointer: Codable, Sendable {             // per window: kept with the scene session
+    var draftID: UUID
+    var step: ClaimStep
+}
+
+enum RestorePlan: Equatable, Sendable {
+    case resume(draftID: UUID, step: ClaimStep)
+    case offer([UUID])                                // unfinished drafts, newest first
+    case startFresh
+}
+
+enum ClaimRestorer {                                   // pure: easy to test
+    static func plan(pointer: ClaimPointer?, drafts: [ClaimDraft]) -> RestorePlan
+}
+```
+
+Usage: the scene delegate returns the coordinator's current `ClaimPointer` from `stateRestorationActivity(for:)`; on connection it reads the pointer back, loads the drafts, asks `ClaimRestorer.plan` what to do, and the coordinator rebuilds the stack.
+
+</ModelAnswer>
+
+<ModelAnswer section="internals">
+
+**Storage layout.** `Application Support/ClaimDrafts/<draft id>/draft.json` plus `photos/<photo id>.jpg`. Files rather than a database: a handful of drafts, each rewritten whole. Bank details go to the Keychain under the draft id, so the JSON never contains them.
+
+**Writing.** Each step's view model edits the in-memory draft (the source of truth while the flow is on screen) and asks for a save. Saves are **debounced** by about half a second and coalesced, so typing doesn't write on every keystroke. Three things force an immediate save: changing step, the scene going to the background (inside a `beginBackgroundTask`), and adding a photo. Photo bytes are written the moment they're picked, before the thumbnail is shown, and only the id goes in the draft.
+
+**The pointer.** The coordinator always knows its `ClaimPointer`. The scene delegate hands it to UIKit in `stateRestorationActivity(for:)` (SwiftUI screens would use `@SceneStorage`). It's tiny and contains no answers.
+
+**Restoring.** On scene connection, in `scene(_:restoreInteractionStateWith:)` so it also works when the device was locked at connection:
+
+1. Read the pointer, if any.
+2. Load the unfinished drafts (off the main actor; the screen shows its frame meanwhile).
+3. `ClaimRestorer.plan`: a pointer to a draft that exists and is current means **resume**, but clamp `.payout` back to `.photos`; no pointer and unfinished drafts means **offer**; otherwise **start fresh**.
+4. The coordinator pushes every step up to the restored one, so Back works as if the user had never left.
+
+**Cleanup.** Delete the draft and its Keychain item after a successful submit. Prune drafts untouched for 30 days at idle time. `didDiscardSceneSessions` deletes nothing: closing a window discards the pointer, never the user's data.
+
+</ModelAnswer>
+
+<ModelAnswer section="concurrency">
+
+- **The store is an actor**, shared by every window. It serialises writes, and a newer save for the same draft supersedes a queued older one, so two saves can't interleave or land out of order.
+- **View models are `@MainActor`** and send the actor a `Sendable` value copy of the draft, so nothing mutable crosses actors.
+- **Two windows, two drafts:** each window's coordinator owns its own `draftID`, so they touch different files. **The same draft in two windows** is prevented: opening a draft that already has a window brings that window forward (its scene's `activationConditions` match the draft id) instead of creating a second editor.
+- **Suspension:** the background flush runs inside a background task and finishes before the app is suspended, so no write is ever cut off halfway.
+- **Locked background launches:** nothing in this component runs until a scene connects, so a BGTask launch at 3 a.m. never touches drafts.
+
+</ModelAnswer>
+
+<ModelAnswer section="failure">
+
+- **Killed mid-write:** atomic writes (temporary file, then rename) leave the old version or the new one, never half of each.
+- **Unknown or old version:** migrate the versions we know; for anything else, move the file aside rather than delete it, start fresh, tell the user we couldn't restore, and log it.
+- **The draft is gone, or was submitted from another device:** the pointer dangles, so fall back to `offer` or `startFresh`, never crash.
+- **Protected data unavailable:** a read failure means "not now", never "doesn't exist". We don't overwrite or delete anything on a failed read.
+- **Disk full when adding a photo:** fail on the photos step with a clear message, not at submit time.
+- **Sensitive step:** never restore straight into payout. Blur the payout screen in `sceneWillResignActive(_:)` so the app switcher snapshot doesn't show bank details.
+- **Interrupted for days:** a draft older than, say, 7 days is offered, not resumed, since the user has probably forgotten where they were.
+
+</ModelAnswer>
+
+<ModelAnswer section="testing">
+
+- **`ClaimRestorer.plan` is a pure function**, so table-driven unit tests cover it: no pointer and no drafts, no pointer with a draft, a valid pointer, a pointer to a missing draft, a pointer to `.payout`, an old version.
+- **The store** runs against a temporary directory: save and load round trips, a simulated crash mid-write (the old file survives), migrations from v1 and v2 fixtures checked into the test bundle.
+- **Debouncing** with an injected clock (`TestClock`): edits within half a second produce one save; going to the background saves at once.
+- **On a device:** the system-kill path (go home, stop the app from Xcode, relaunch: it should resume) and the force-quit path (swipe it away: it should offer). On iPad, two windows on two claims, killed and relaunched.
+- **UI tests** seed a draft through a launch argument, relaunch, and assert the step and answers on screen.
+
+</ModelAnswer>
+
+<ModelAnswer section="tradeoffs">
+
+- **Scene restoration alone** (`NSUserActivity` or `@SceneStorage` with the answers in it): simplest, but it dies with a swipe-away, is meant for small values, and would put user data in a store that isn't meant for it. Rejected: the answers are user data.
+- **Core Data or SwiftData for drafts:** worth it if drafts become a list users browse and search, or sync. For a few drafts rewritten whole, JSON files are simpler to migrate and test.
+- **Auto-resume after a swipe-away:** fewer taps, but it ignores what the user has told us. Offering respects intent and still recovers the abandoned claims.
+- **Server-side drafts:** survive a lost phone and continue on the iPad, but need an API, an offline queue, conflict rules and a privacy review for photos of people's homes. A good next step once local restoration is in place, and the local store would become its cache.
+- **Debounce length:** a longer delay means fewer writes but a bigger window of loss; the flush on background closes most of that window, since foreground kills are rare (they're crashes).
+
+</ModelAnswer>
+
+```rubric
+- id: split
+  label: Separated where the user was from what they entered
+  skill: client
+  look_for:
+    - The claim id and step stored as small per-window restoration state (an NSUserActivity, scene session userInfo or @SceneStorage)
+    - Answers and photos in the app's own store, not in restoration state
+    - The restoration state points at data rather than containing it
+- id: persistence
+  label: Saved user data early and safely
+  skill: data
+  look_for:
+    - Continuous, debounced saves rather than one save at the end
+    - An immediate flush when the scene goes to the background, inside a background task
+    - Atomic writes, in Application Support rather than Caches
+    - Photos written to files as soon as they're picked, referenced by id
+- id: intent
+  label: Matched the restore to why the app ended
+  skill: requirements
+  look_for:
+    - Resume after a system termination
+    - Offer the draft, rather than jump into it, after a deliberate swipe-away
+    - Closing a window discards the pointer but never deletes the draft
+- id: validation
+  label: Treated restored state as untrusted input
+  skill: offline
+  look_for:
+    - A version on the stored data, with migration or a safe fallback
+    - Handling a missing, submitted or corrupt draft without crashing
+    - A failed read treated as unavailable, never as missing
+- id: windows
+  label: Handled several windows
+  skill: architecture
+  look_for:
+    - One pointer per scene session, so each window restores its own claim
+    - A single shared store (an actor or equivalent) that serialises writes
+    - A policy for the same draft opened in two windows
+- id: sensitive
+  label: Kept bank details out of places they don't belong
+  skill: security
+  look_for:
+    - Bank details never in restoration state, logs or the draft JSON
+    - Never restoring straight into the payout step
+    - Hiding sensitive content before the app switcher snapshot
+- id: testing
+  label: Designed it to be testable
+  skill: testing
+  look_for:
+    - The restore decision as a pure function with table-driven tests
+    - An injected clock for the debounce, and a temporary directory for the store
+    - Manual checks of both the system-kill and the swipe-away paths
+```
+
+<Pitfalls>
+
+- Saving the claim in `applicationWillTerminate(_:)`, which doesn't run when a suspended app is killed.
+- Putting the whole claim, photos included, into `@SceneStorage` or the restoration activity.
+- Restoring the step but not the navigation stack under it, so Back leaves the flow.
+- Treating "can't read the draft" as "there's no draft" and starting over on a locked background launch.
+- One app-wide "current claim", so two iPad windows fight over the same draft.
+
+</Pitfalls>

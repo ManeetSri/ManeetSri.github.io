@@ -1,0 +1,120 @@
+An ordinary unit test checks what you remembered to check. An **exhaustive** test store checks everything the feature did: every state change after every action, and every action its effects sent back, so a test passes only when it has described the feature's behaviour completely. That's what TCA's `TestStore` does. Write a small one, and record each thing a test failed to account for as a `Failure` the tests can inspect.
+
+`UnidirectionalExhaustiveTestStore.TestStore`: `send(_:assert:)`, `receive(_:assert:)`, `finish()`, `failures` and `runningEffects`
+
+The reducer returns an `Effect`: `.none`, `.send(action)` (an action the feature sends itself), `.run(operation)` (async work on the main actor that may finish with an action) or `.merge(effects)`.
+
+- **`send(action, assert: update)`**. If actions the feature sent are waiting and the test hasn't received them, record `.receivedActionsNotHandled(before: action, pending:)` and discard them. Then work out the **expected** state: a copy of the state before this step, changed by `update` (no closure means "nothing changes"). Reduce the action for real; if the new state isn't the expected one, record `.stateMismatch(after:expected:actual:)`. Keep the actual state either way, then perform the effect.
+- **Effects.** `.send(a)` puts `a` in the queue of received actions at once. `.run` starts a task; when it finishes with an action, that action joins the queue. `.merge` performs each in order. Received actions aren't reduced until the test receives them.
+- **`receive(expected, assert: update)`**. Wait, a bounded number of `Task.yield()`s, until an action is queued or no effects are running. If none arrived, record `.noActionReceived(expected:)`. If the first queued action isn't `expected`, remove it, record `.unexpectedAction(expected:received:)` and change nothing. Otherwise reduce it and check the state exactly as `send` does, and perform its effect.
+- **`finish()`**. Wait the same way for running effects. If any are still running, record `.effectsStillRunning(count)` and cancel them. Then, if received actions are waiting, record `.unreceivedActions(actions)`.
+
+## Examples
+
+A plant-care feature: `waterTapped` adds a watering, sets `isSyncing` and runs an effect that answers `syncFinished(waterings:)`.
+
+| Test | Failures |
+| --- | --- |
+| send `waterTapped` asserting `waterings = 1`, `isSyncing = true`; receive `syncFinished(waterings: 1)` asserting the banner and `isSyncing = false`; finish | none |
+| send `waterTapped` asserting only `waterings = 1` | `.stateMismatch` with expected `isSyncing` false and actual true |
+| send `waterTapped` (asserted fully), then send `peeked` | `.receivedActionsNotHandled(before: .peeked, pending: [.syncFinished(waterings: 1)])` |
+| send `remindMeTapped`, which waits 60 s on a test clock; receive `reminderFired` before advancing the clock | `.noActionReceived(expected: .reminderFired)` |
+| send `remindMeTapped`; finish | `.effectsStillRunning(1)`, and the effect is cancelled |
+| send `bannerDismissed`, which returns `.send(.bannerCleared)`; finish | `.unreceivedActions([.bannerCleared])` |
+
+## Constraints
+
+- The store and its tests are `@MainActor`, and `.run` operations are `@MainActor` too, so waiting with `Task.yield()` lets them run in a predictable order.
+- Never wait in real time, and never wait forever: an effect sleeping on an unadvanced `TestClock` must make `receive` and `finish` give up, not hang.
+- `State` and `Action` are `Equatable`, which is how the store compares what the test expected with what happened.
+
+<Hints>
+<Hint>
+Write one private `apply(action, update)` used by both `send` and `receive`: copy the state into `expected`, run `update?(&expected)`, reduce the real state, compare, then perform the effect.
+</Hint>
+<Hint>
+Track running effects in a dictionary of tasks keyed by a token. The task appends its action to the received queue and removes its own token when it finishes. Check `Task.isCancelled` before appending, so effects cancelled by `finish` can't sneak an action in.
+</Hint>
+<Hint>
+A bounded wait is a loop: `for _ in 0..<1_000 where !condition() { await Task.yield() }`. Each yield lets the main actor run the effect tasks waiting for it.
+</Hint>
+</Hints>
+
+## Solutions
+
+<Approach title="Expected state from the test's closure, actual state from the reducer, and a queue for everything in between" time="O(size of State) per step, for the comparison" space="O(q + r) for q queued actions and r running effects">
+
+```swift
+public func send(_ action: Action, assert update: ((inout State) -> Void)? = nil) async {
+    if !received.isEmpty {
+        failures.append(.receivedActionsNotHandled(before: action, pending: received))
+        received.removeAll()
+    }
+    apply(action, update)
+}
+
+public func receive(_ expected: Action, assert update: ((inout State) -> Void)? = nil) async {
+    await waitUntil { !self.received.isEmpty || self.running.isEmpty }
+    guard !received.isEmpty else {
+        failures.append(.noActionReceived(expected: expected))
+        return
+    }
+    let action = received.removeFirst()
+    guard action == expected else {
+        failures.append(.unexpectedAction(expected: expected, received: action))
+        return
+    }
+    apply(action, update)
+}
+
+public func finish() async {
+    await waitUntil { self.running.isEmpty }
+    if !running.isEmpty {
+        failures.append(.effectsStillRunning(running.count))
+        running.values.forEach { $0.cancel() }
+        running.removeAll()
+    }
+    if !received.isEmpty {
+        failures.append(.unreceivedActions(received))
+        received.removeAll()
+    }
+}
+
+private func apply(_ action: Action, _ update: ((inout State) -> Void)?) {
+    var expected = state
+    update?(&expected)
+    let effect = reducer(&state, action)
+    if state != expected {
+        failures.append(.stateMismatch(after: action, expected: expected, actual: state))
+    }
+    perform(effect)
+}
+
+private func perform(_ effect: Effect<Action>) {
+    switch effect {
+    case .none:
+        break
+    case .send(let action):
+        received.append(action)
+    case .run(let operation):
+        nextToken += 1
+        let token = nextToken
+        running[token] = Task { [weak self] in
+            let action = await operation()
+            guard let self, !Task.isCancelled else { return }
+            if let action { self.received.append(action) }
+            self.running[token] = nil
+        }
+    case .merge(let effects):
+        effects.forEach(perform)
+    }
+}
+```
+
+The trick that makes the test readable is the closure: the test describes the *change* (`$0.isSyncing = true`), not the whole state, and the store applies it to a copy of the last state it knows. So a test of a 40-field feature mentions only the fields an action touched, yet a change to any other field still fails it.
+
+Exhaustiveness turns forgotten behaviour into failures: an analytics action nobody asserted, a timer still ticking after the screen closed, a state change a refactor introduced. That's the strength and the cost. It's ideal for a leaf feature, and noisy for an integration test of a whole tab, which is why TCA also lets you turn it off for a store (`store.exhaustivity = .off`) and assert only what you care about.
+
+TCA's real `TestStore` differs in one way: it reduces received actions as they arrive and remembers the state after each, rather than holding them until you call `receive`. The assertions you write are the same.
+
+</Approach>

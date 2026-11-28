@@ -1,0 +1,463 @@
+## Why it matters
+
+In SwiftUI every presentation is driven by state: a path for pushes, an optional for a sheet, another for an alert. Once you accept that, you can go one step further and treat a whole window's navigation as **one value**: which tab, what's pushed on each, what's presented, and what's inside the presentation. That value can be built from a deep link, saved for restoration, checked in a unit test and changed by a pure function. [Coupling between state and navigation](/design/learn/sd-state-navigation-coupling) showed the basics: one optional destination enum, ids rather than copies, pruning when data changes. This lesson designs the whole tree, including sheets inside sheets and alerts, and the places where SwiftUI can't show what your state describes.
+
+## Presentations are optionals
+
+Every SwiftUI presentation has a form that takes state, and the state says both *whether* and *what*:
+
+| Presentation | Driven by | Dismissed by setting |
+| --- | --- | --- |
+| Push | an element of the path, or `navigationDestination(item:)` | the path shorter, or the item `nil` |
+| Sheet | `.sheet(item:)` | the item `nil` |
+| Full-screen cover | `.fullScreenCover(item:)` | the item `nil` |
+| Alert, confirmation dialog | `isPresented` plus `presenting:` data | the data `nil` |
+| Popover, inspector | `.popover(item:)`, `.inspector(isPresented:)` | `nil`, `false` |
+
+The `Bool` forms (`.sheet(isPresented:)`) exist too, but a `Bool` says *whether* without saying *what*, so the sheet's content has to find its data somewhere else. Prefer the `item:` forms with an enum, so that "a sheet is showing" and "this is what it shows" are the same value.
+
+### Alerts are state too
+
+Alerts are usually the last thing left as imperative code: a closure that runs `showAlert = true` and a message stored somewhere else. Make the alert's content data, and its buttons send actions rather than run closures, and you can test "removing the last item asks for confirmation" without a UI:
+
+```swift check ios title="An alert described by data"
+import SwiftUI
+
+enum BasketAction: Equatable, Sendable {
+    case remove(itemID: Int)
+    case keep
+}
+
+/// What the alert says and what each button does, as plain data
+struct AlertState: Equatable, Sendable {
+    struct Choice: Equatable, Sendable {
+        enum Role: Sendable { case cancel, destructive }
+        let title: String
+        let role: Role?
+        let action: BasketAction
+    }
+
+    let title: String
+    let message: String
+    let choices: [Choice]
+}
+
+@MainActor @Observable
+final class BasketModel {
+    var alert: AlertState?
+    private(set) var itemIDs = [3, 8]
+
+    func removeTapped(itemID: Int) {
+        guard itemIDs.count == 1 else { return send(.remove(itemID: itemID)) }
+        // The rule under test: removing the last item asks first
+        alert = AlertState(
+            title: "Empty your basket?",
+            message: "This is the last item in your basket.",
+            choices: [
+                .init(title: "Remove", role: .destructive, action: .remove(itemID: itemID)),
+                .init(title: "Keep it", role: .cancel, action: .keep),
+            ]
+        )
+    }
+
+    func send(_ action: BasketAction) {
+        alert = nil
+        if case .remove(let id) = action { itemIDs.removeAll { $0 == id } }
+    }
+}
+
+struct BasketList: View {
+    @State private var model = BasketModel()
+
+    var body: some View {
+        List(model.itemIDs, id: \.self) { id in
+            Button("Remove item \(id)") { model.removeTapped(itemID: id) }
+        }
+        .alert(
+            model.alert?.title ?? "",
+            isPresented: Binding(get: { model.alert != nil }, set: { if !$0 { model.alert = nil } }),
+            presenting: model.alert
+        ) { alert in
+            ForEach(alert.choices, id: \.title) { choice in
+                Button(choice.title, role: choice.role.map { $0 == .destructive ? .destructive : .cancel }) {
+                    model.send(choice.action)
+                }
+            }
+        } message: { alert in
+            Text(alert.message)
+        }
+    }
+}
+```
+
+A test now reads `model.removeTapped(itemID: 3)` then `#expect(model.alert?.choices.map(\.title) == ["Remove", "Keep it"])`. The Composable Architecture's `AlertState` is the same idea, generalised; you'll meet it in D28.
+
+## One destination at a time
+
+A screen can show one presentation at a time: one sheet, or one alert, or one cover. If you model each as its own optional, nothing stops two from being set at once, and SwiftUI then shows one and ignores the other, with a console warning if you're lucky. A single optional `Destination` enum makes the impossible combinations unrepresentable, and its transitions become a small state machine you can reason about. Here's the basket screen's:
+
+```visual states
+title: The basket screen's destination
+states:
+  - { id: none, label: Nothing shown, at: [0, 1] }
+  - { id: quantity, label: Quantity sheet, at: [1, 0] }
+  - { id: remove, label: Remove alert, at: [1, 2] }
+  - { id: signIn, label: Sign-in sheet, at: [2, 1] }
+  - { id: checkout, label: Checkout cover, at: [3, 1] }
+initial: none
+transitions:
+  - [none, quantity, editQuantity]
+  - [quantity, none, save]
+  - [none, remove, removeLast]
+  - [remove, none, confirm]
+  - [remove, none, cancel]
+  - [none, checkout, checkOut, signed in]
+  - [none, signIn, checkOut, signed out]
+  - [signIn, checkout, signedIn]
+  - [signIn, none, cancel]
+  - [checkout, none, finish]
+events:
+  - { event: editQuantity, say: "`editQuantity`: the quantity sheet is the one destination. Nothing else can be presented while it's up." }
+  - save
+  - { event: removeLast, say: "`removeLast`: removing the last item asks first. The alert *replaces* the empty destination; it isn't stacked on a sheet." }
+  - cancel
+  - { event: checkOut, guard: signed out, say: "`checkOut` while signed out goes to sign-in instead. The guard is a rule in the model, not an `if` in a button." }
+  - { event: signedIn, say: "`signedIn`: the sheet is replaced by the checkout cover in one state change, so SwiftUI dismisses one and presents the other." }
+  - finish
+```
+
+Moving from the sign-in sheet straight to the checkout cover is one assignment, `destination = .checkout`, and SwiftUI handles the dismiss-then-present for you. Doing the same with two booleans means setting one false and the other true in the right order, and hoping the animation has finished.
+
+## Navigation as a tree of values
+
+Destinations nest. The checkout cover has its own stack of steps, and its own alert when a card is declined. Model that as state *inside* the destination's case, and the whole window becomes one value: a tree whose shape is the shape of the UI.
+
+```swift run title="A window's navigation as one value"
+enum Tab: String {
+    case shop, basket, account
+}
+
+enum CheckoutStep: String {
+    case address, delivery, payment
+}
+
+/// The checkout sheet's own navigation: steps pushed above the address step, and an optional alert
+struct CheckoutNavigation: Equatable {
+    var steps: [CheckoutStep] = []
+    var alert: String?
+}
+
+/// At most one sheet, and each case carries the state of what it shows
+enum Sheet: Equatable {
+    case editQuantity(itemID: Int)
+    case checkout(CheckoutNavigation)
+}
+
+/// The whole window's navigation, as one value
+struct AppNavigation: Equatable, CustomStringConvertible {
+    var tab = Tab.shop
+    var sheet: Sheet?
+
+    var description: String {
+        var text = tab.rawValue
+        switch sheet {
+        case nil: break
+        case .editQuantity(let id): text += ", sheet: quantity of \(id)"
+        case .checkout(let checkout):
+            let steps = [CheckoutStep.address] + checkout.steps
+            text += ", sheet: checkout [\(steps.map(\.rawValue).joined(separator: ", "))]"
+            if let alert = checkout.alert { text += ", alert: \(alert)" }
+        }
+        return text
+    }
+}
+
+enum CheckoutAction {
+    case next(CheckoutStep)
+    case back
+    case declined(String)
+}
+
+enum Action {
+    case select(Tab)
+    case present(Sheet)
+    case dismiss
+    case checkout(CheckoutAction)
+}
+
+func reduce(_ navigation: inout AppNavigation, _ action: Action) {
+    switch action {
+    case .select(let tab):
+        navigation.tab = tab
+    case .present(let sheet):
+        guard navigation.sheet == nil else { return }   // one sheet at a time
+        navigation.sheet = sheet
+    case .dismiss:
+        navigation.sheet = nil                          // and everything inside it, at once
+    case .checkout(let action):
+        // A late action from a checkout that's no longer showing changes nothing
+        guard case .checkout(var checkout) = navigation.sheet else { return }
+        switch action {
+        case .next(let step): checkout.steps.append(step)
+        case .back: _ = checkout.steps.popLast()
+        case .declined(let reason): checkout.alert = reason
+        }
+        navigation.sheet = .checkout(checkout)
+    }
+}
+
+var navigation = AppNavigation()
+let actions: [(String, Action)] = [
+    ("select basket", .select(.basket)),
+    ("present checkout", .present(.checkout(CheckoutNavigation()))),
+    ("next delivery", .checkout(.next(.delivery))),
+    ("present quantity", .present(.editQuantity(itemID: 3))),
+    ("next payment", .checkout(.next(.payment))),
+    ("card declined", .checkout(.declined("card declined"))),
+    ("dismiss", .dismiss),
+    ("late next", .checkout(.next(.payment))),
+]
+for (label, action) in actions {
+    reduce(&navigation, action)
+    print("\(label):", navigation)
+}
+
+// A deep link to the payment step builds the nested value directly: no taps to replay
+let link = AppNavigation(tab: .basket, sheet: .checkout(CheckoutNavigation(steps: [.delivery, .payment])))
+print("deep link:", link)
+```
+
+```output
+select basket: basket
+present checkout: basket, sheet: checkout [address]
+next delivery: basket, sheet: checkout [address, delivery]
+present quantity: basket, sheet: checkout [address, delivery]
+next payment: basket, sheet: checkout [address, delivery, payment]
+card declined: basket, sheet: checkout [address, delivery, payment], alert: card declined
+dismiss: basket
+late next: basket
+deep link: basket, sheet: checkout [address, delivery, payment]
+```
+
+Every line of that output is a property you'd otherwise test by tapping through a simulator:
+
+- **A second sheet is refused** while checkout is up, instead of SwiftUI quietly dropping it.
+- **Dismissing removes the whole subtree.** The checkout's steps and its alert go with the sheet; there's nothing to reset by hand.
+- **Late actions are harmless.** A network response that tries to advance a checkout the user already closed finds no checkout case and changes nothing. With separate flags, it would push a payment screen onto nothing, or bring the sheet back.
+- **A deep link is a value.** Building the payment step directly is one initialiser, with no sequence of taps to replay and no animations to wait for.
+
+## Trees and stacks
+
+That example mixes two shapes of navigation state, and the difference matters as apps grow:
+
+- **Tree-based:** optionals and enums nested inside each other, as `Sheet.checkout(CheckoutNavigation)` is. The type says exactly what can be presented from where. A checkout step can rely on the checkout's state existing, because it's literally inside it. The cost: every possible route through the app must be a path through the type, and deep links must build the nested value.
+- **Stack-based:** an array of routes, as a `NavigationStack` path is. Any screen can follow any other, in any order, any number of times: product → reviews → reviewer's profile → another product. Deep links are arrays. The cost: a screen can't know what's below it, so it can't rely on its parent's state.
+
+Use trees for flows whose shape is fixed (checkout, onboarding, a settings section) and stacks for open-ended browsing (catalogue, feed, profiles). Most apps are stacks per tab, with trees for the presentations launched from them. The Composable Architecture names the two styles exactly this way and builds tools for both, which you'll see in D28.
+
+## Rendering the tree
+
+Drawing that value in SwiftUI takes two techniques that aren't obvious.
+
+**Identity is which sheet, not its contents.** `.sheet(item:)` dismisses and presents again whenever the item's `id` changes. If `Sheet`'s id were the whole value, every step through checkout would change it, and the sheet would close and reopen on each tap. The id must name the *case*.
+
+**Bindings into an enum case are written by hand.** The checkout's stack needs a `Binding<CheckoutNavigation>`, but the state lives inside `Sheet.checkout`. SwiftUI has no built-in way to bind to an associated value, so you write a binding that reads the case and writes it back, but only while that case is still the one showing:
+
+```swift check ios title="Drawing nested navigation state"
+import SwiftUI
+
+enum CheckoutStep: String, Hashable {
+    case address, delivery, payment
+}
+
+struct CheckoutNavigation: Equatable {
+    var steps: [CheckoutStep] = []   // pushed above the address step, which is the stack's root
+    var alert: String?
+}
+
+enum Sheet: Equatable, Identifiable {
+    case editQuantity(itemID: Int)
+    case checkout(CheckoutNavigation)
+
+    // Identity is *which* sheet, never its contents: an id that changed as the user moved
+    // through checkout would make SwiftUI dismiss the sheet and present it again
+    var id: String {
+        switch self {
+        case .editQuantity(let itemID): "quantity-\(itemID)"
+        case .checkout: "checkout"
+        }
+    }
+}
+
+@MainActor @Observable
+final class BasketNavigation {
+    var path: [Int] = []
+    var sheet: Sheet?
+
+    /// A binding into the checkout case, for the sheet's own stack and alert
+    var checkout: Binding<CheckoutNavigation> {
+        Binding(
+            get: {
+                if case .checkout(let checkout) = self.sheet { checkout } else { CheckoutNavigation() }
+            },
+            set: { newValue in
+                // Write back only while checkout is still the sheet: a late write must not resurrect it
+                if case .checkout = self.sheet { self.sheet = .checkout(newValue) }
+            }
+        )
+    }
+}
+
+struct BasketScreen: View {
+    @State private var navigation = BasketNavigation()
+
+    var body: some View {
+        NavigationStack(path: $navigation.path) {
+            List {
+                Button("Edit quantity") { navigation.sheet = .editQuantity(itemID: 3) }
+                Button("Check out") { navigation.sheet = .checkout(CheckoutNavigation()) }
+            }
+            .navigationDestination(for: Int.self) { id in Text("Item \(id)") }
+        }
+        .sheet(item: $navigation.sheet) { sheet in
+            switch sheet {
+            case .editQuantity(let itemID):
+                Text("Quantity of item \(itemID)")
+            case .checkout:
+                CheckoutFlow(navigation: navigation.checkout)
+            }
+        }
+    }
+}
+
+struct CheckoutFlow: View {
+    @Binding var navigation: CheckoutNavigation
+
+    var body: some View {
+        NavigationStack(path: $navigation.steps) {
+            Button("Continue to delivery") { navigation.steps.append(.delivery) }
+                .navigationDestination(for: CheckoutStep.self) { step in
+                    Button("Pay") { navigation.alert = "Card declined" }
+                        .navigationTitle(step.rawValue.capitalized)
+                }
+                .navigationTitle("Address")
+        }
+        // The alert belongs to the sheet's content: the basket screen is busy presenting the sheet
+        .alert(
+            navigation.alert ?? "",
+            isPresented: Binding(get: { navigation.alert != nil }, set: { if !$0 { navigation.alert = nil } })
+        ) {
+            Button("OK", role: .cancel) {}
+        }
+    }
+}
+```
+
+Two placement rules are visible there. The checkout's stack lives *inside* the sheet, because each presentation gets its own stack. And the declined-card alert is attached to the sheet's content, not the basket screen, for the same reason as in UIKit: a view that's presenting a sheet can't present an alert as well.
+
+## Dismissing: the environment or the owner
+
+Inside a presented or pushed view, `@Environment(\.dismiss)` closes it: it dismisses the sheet, or pops the screen from its stack. It's convenient for a leaf screen's Cancel button, and it hides the decision from whoever owns the state. Your model still believes the sheet is up until SwiftUI writes `nil` back through the binding.
+
+When the dismissal *is* the logic (closing checkout after an order is placed, popping after a save, a deep link replacing what's showing), let the owner set the state, so the rule is in the model and the test can see it. A reasonable split: `dismiss` for "the user backed out", owner-driven state changes for "the app decided".
+
+## Trade-offs
+
+| | `@State` in each view | A model per feature | One value for the window |
+| --- | --- | --- | --- |
+| Logic can navigate | no | within the feature | anywhere |
+| Deep links and restoration | per view, by hand | per feature | build or decode one value |
+| Impossible combinations | easy to create | prevented within the feature | prevented everywhere, by the types |
+| Testing | UI tests | the feature's navigation in unit tests | every navigation rule in unit tests |
+| Cost | none | a model per feature | every change goes through one type; bindings into enum cases |
+| Wins for | screens whose navigation is pure UI | most apps | apps with many entry points and strict flows |
+
+<Callout kind="interview">
+
+**What to say:** "Navigation is a value: a tab, a typed path per tab, and one optional destination per screen, whose cases carry the presented flow's own state. Changes go through functions on the model, so deep links build a value, late async results can't resurrect a closed flow, and the rules are unit-tested." Mention trees for fixed flows and stacks for browsing.
+
+**What to ask:** which flows have a fixed shape, and which are open-ended? Must the app restore into the middle of a presented flow, or only to its start? Who decides when a flow closes?
+
+**Red flags:** a boolean per sheet; alert messages stored apart from the flag that shows them; a sheet `id` derived from mutable content; async completions that set presentation state without checking it's still current.
+
+</Callout>
+
+<Callout kind="gotcha" title="iOS gotcha: one presentation per view, wherever it's declared">
+
+Two `.sheet` modifiers on the same view, or a `.sheet` and an `.alert` both driven at once, compete: SwiftUI presents one, and the other is ignored with a log message such as "Currently, only presenting a single sheet is supported". Declaring the second sheet on a different child view doesn't help if both try to present from the same screen at the same time. One destination enum per presenting screen, and nested presentations declared inside the presented content, avoid the race entirely.
+
+</Callout>
+
+## Practice
+
+[A navigation reducer for a tabbed app](/design/practice/sd-kata-navigation-path-reducer) is this lesson as a kata: a value holding the selected tab, a path per tab and one sheet, and a pure function applying push, pop, pop to root, replace, tab selection, presentation and deep links to it, with the rules that keep it showable (one sheet at a time, no pushes hidden behind a sheet, sign-in gating with a pending link).
+
+```cards
+- id: item-not-bool
+  front: "Why prefer `.sheet(item:)` with an enum over `.sheet(isPresented:)`?"
+  back: "The item says both whether a sheet is showing and what it shows, in one value. A Bool says only whether, so the content has to find its data elsewhere, and two Bools can both be true."
+- id: alert-as-data
+  front: "What does it take to unit-test an alert?"
+  back: "Make its content data (title, message, choices) and have each button send an action rather than run a closure. Tests then assert on the model's alert state and send actions directly."
+- id: tree-vs-stack
+  front: "When is tree-based navigation state better than a stack?"
+  back: "For flows with a fixed shape (checkout, onboarding): nested optionals make each step's context exist by construction. Open-ended browsing suits stacks, where any screen can follow any other."
+- id: sheet-identity
+  front: "Why must a sheet enum's `id` name the case, not its contents?"
+  back: "`.sheet(item:)` re-presents whenever the id changes. If the id changed with the nested state, every step inside the sheet would close and reopen it."
+```
+
+```quiz
+- id: q1
+  type: mcq
+  prompt: "A payment request finishes after the user has already closed checkout, and its completion sets `checkoutPath.append(.confirmation)`. With separate optionals for the sheet and the checkout path, what goes wrong, and what fixes it?"
+  options:
+    - "Nothing: SwiftUI ignores changes to hidden state"
+    - "The stale path survives and may push or reappear later; keeping the path inside the sheet's enum case means the late action finds no checkout and changes nothing"
+    - "The app crashes; use a weak reference to the path"
+    - "The sheet reopens; add a delay before dismissing"
+  answer: 1
+  explain: "Separate pieces of state can disagree: the sheet is gone but its path lives on. Nesting the checkout's state inside `Sheet.checkout` ties its lifetime to the sheet, so a late action has nothing to change."
+- id: q2
+  type: bug
+  prompt: "The checkout sheet closes and reopens every time the user moves to the next step. Which line is the cause?"
+  code: |
+    enum Sheet: Hashable, Identifiable {
+        case editQuantity(itemID: Int)
+        case checkout(CheckoutNavigation)
+
+        var id: Self { self }
+    }
+
+    struct CheckoutNavigation: Hashable {
+        var steps: [CheckoutStep] = []
+    }
+  answer: 5
+  explain: "The id is the whole value, so appending a step changes the id, and `.sheet(item:)` treats it as a different sheet: dismiss, then present. The id should name the case: `\"checkout\"`."
+- id: q3
+  type: sort
+  prompt: "Tree-based or stack-based navigation state?"
+  buckets: [Tree, Stack]
+  items:
+    - ["A three-step checkout: address, delivery, payment", 0]
+    - ["Browsing products, reviews and reviewers' profiles in any order", 1]
+    - ["Onboarding with a fixed sequence and one optional step", 0]
+    - ["A social feed where any post can lead to any profile", 1]
+    - ["A settings section with fixed sub-screens", 0]
+  explain: "Fixed shapes suit nested optionals: each step's context exists by construction. Open-ended browsing suits an array, where any screen can follow any other."
+- id: q4
+  type: truefalse
+  prompt: "Calling `dismiss()` from `@Environment(\\.dismiss)` inside a sheet immediately sets the owner's sheet state to `nil` before anything else runs."
+  answer: false
+  explain: "SwiftUI dismisses the sheet and writes `nil` back through the binding as part of that update. The decision isn't visible to the model in advance, which is why app-driven dismissals belong in the owner."
+- id: q5
+  type: multi
+  prompt: "The basket screen uses one optional `Destination` enum. Which of these does that rule out? Choose all that apply."
+  options:
+    - "The quantity sheet and the remove alert showing at the same time"
+    - "Moving from the sign-in sheet to the checkout cover in one state change"
+    - "Two different sheets requested by two async completions racing each other, both being set"
+    - "A unit test checking which destination a tap leads to"
+  answer: [0, 2]
+  explain: "One optional can hold one destination, so simultaneous presentations can't be represented. It makes switching destinations a single assignment, and tests are easier, not harder."
+```

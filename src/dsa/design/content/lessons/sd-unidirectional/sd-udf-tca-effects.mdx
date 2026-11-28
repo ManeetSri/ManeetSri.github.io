@@ -1,0 +1,314 @@
+## Why it matters
+
+A feature is only as testable as its least controlled dependency. A reducer that returns effects is pure, but the effect itself calls the network, sleeps on a clock, makes a UUID or reads the date, and if those are the real ones, your tests are slow and flaky and your previews hit production. TCA answers with two things that work together: an `Effect` type with cancellation built in, and a dependency system that makes every outside call a swappable value with a test version that fails loudly when you forget to override it. This is the part of TCA that pays for the rest, and the part interviewers probe when they ask how you test a debounced search or a timer.
+
+## Effects in TCA
+
+Every reducer case returns an `Effect<Action>`. The ones you'll use:
+
+| Effect | Use it for |
+| --- | --- |
+| `.none` | Nothing to do: most cases |
+| `.run { send in … }` | Async work. `send` delivers actions back to the store; optional `catch: { error, send in … }` handles errors |
+| `.send(action)` | An action straight away, typically a delegate action to a parent |
+| `.merge(a, b)` | Several effects at once |
+| `.cancellable(id:cancelInFlight:)` | Mark an effect so it can be cancelled by id; `cancelInFlight: true` cancels the previous one first |
+| `.cancel(id:)` | Cancel whatever is running under an id |
+
+Version 1.25 deprecated a few older pieces in preparation for 2.0: the scheduler-based `Effect.debounce`, `Effect.throttle` and `Effect.animation` (sleep on a clock, or pass an animation to `send`, inside `.run` instead) and, behind an opt-in package trait, `.concatenate` and `.map` (sequence work with `await` inside one `.run` instead). Code written in the style below is current.
+
+Here's a book search: debounced, cancellable and failure-aware.
+
+```swift
+@Reducer
+struct BookSearch {
+    @ObservableState
+    struct State: Equatable {
+        var query = ""
+        var results: [Book] = []
+        var isSearching = false
+        var errorMessage: String?
+    }
+
+    enum Action {
+        case queryChanged(String)
+        case searchResponse(Result<[Book], any Error>)
+        case clearButtonTapped
+    }
+
+    enum CancelID { case search }
+
+    @Dependency(\.bookClient) var bookClient
+    @Dependency(\.continuousClock) var clock
+
+    var body: some ReducerOf<Self> {
+        Reduce { state, action in
+            switch action {
+            case let .queryChanged(query):
+                state.query = query
+                state.errorMessage = nil
+                guard query.count >= 2 else {
+                    state.results = []
+                    state.isSearching = false
+                    return .cancel(id: CancelID.search)
+                }
+                state.isSearching = true
+                return .run { send in
+                    try await clock.sleep(for: .milliseconds(300))
+                    let books = try await bookClient.search(query)
+                    await send(.searchResponse(.success(books)))
+                } catch: { error, send in
+                    await send(.searchResponse(.failure(error)))
+                }
+                .cancellable(id: CancelID.search, cancelInFlight: true)
+
+            case let .searchResponse(.success(books)):
+                state.isSearching = false
+                state.results = books
+                return .none
+
+            case .searchResponse(.failure):
+                state.isSearching = false
+                state.errorMessage = "Couldn't search. Check your connection."
+                return .none
+
+            case .clearButtonTapped:
+                state = State()
+                return .cancel(id: CancelID.search)
+            }
+        }
+    }
+}
+```
+
+What each detail buys:
+
+- **The debounce is a sleep.** Each keystroke returns a new effect with the same id and `cancelInFlight: true`, which cancels the previous one while it's still sleeping. Only a query that stays unchanged for 300 ms reaches the network.
+- **Short queries cancel.** Deleting back to one character cancels a pending search, so results for "du" can't appear under a query of "d".
+- **The query is captured by value.** The effect searches for exactly what the reducer saw, whatever the state becomes meanwhile.
+- **Cancellation is quiet.** When a cancelled `clock.sleep` throws `CancellationError`, TCA doesn't call the `catch` handler, and `send` from a cancelled effect does nothing. A stale search can't report an error, either.
+- **Both outside calls are dependencies.** `clock` and `bookClient` are declared with `@Dependency`, so a test can replace them. That's the second half of this lesson.
+
+Watch the debounce work as the user types "du", "dun", "dune":
+
+```visual timeline
+title: A debounced search, with cancelInFlight
+unit: ms
+lanes:
+  - { id: e1, label: "Effect for du" }
+  - { id: e2, label: "Effect for dun" }
+  - { id: e3, label: "Effect for dune" }
+  - { id: api, label: Books API }
+spans:
+  - { lane: e1, from: 0, to: 120, label: sleeping, tone: wait }
+  - { lane: e1, from: 120, to: 150, label: cancelled, tone: error }
+  - { lane: e2, from: 120, to: 260, label: sleeping, tone: wait }
+  - { lane: e2, from: 260, to: 290, label: cancelled, tone: error }
+  - { lane: e3, from: 260, to: 560, label: sleep 300 ms, tone: wait }
+  - { lane: e3, from: 560, to: 790, label: awaiting results, tone: active }
+  - { lane: api, from: 560, to: 790, label: "GET ?q=dune", tone: active }
+  - { lane: e3, from: 790, to: 830, label: sent, tone: ok }
+markers:
+  - { at: 0, label: "du" }
+  - { at: 120, label: "dun" }
+  - { at: 260, label: "dune" }
+steps:
+  - { at: 0, say: "The user types \"du\". The reducer returns a search effect with id `search`, which starts by sleeping 300 ms." }
+  - { at: 125, say: "\"dun\" arrives 120 ms later. Its effect has the same id and `cancelInFlight: true`, so the first effect is **cancelled while still asleep**: no request was ever made." }
+  - { at: 265, say: "\"dune\" cancels the second effect the same way. Fast typing costs nothing but a few cancelled sleeps." }
+  - { at: 560, say: "Nothing new for 300 ms, so the third effect wakes and calls the API. This is the only request." }
+  - { at: 830, say: "The results arrive and are sent back as `searchResponse(.success)`. Nothing for an older query can arrive, because those effects no longer exist." }
+```
+
+## Effect lifetimes
+
+An effect lives until it finishes or is cancelled. Three tools decide when that is:
+
+- **Ids**, as above, for work that a later action supersedes or stops.
+- **Presentation.** When a child feature presented with `ifLet` (a sheet, a pushed screen) is dismissed, TCA cancels every effect the child started. You'll see this in navigation; it's why a child's timer can't outlive its sheet.
+- **The view's lifetime**, for work that should run exactly while a screen is visible, such as observing a stream:
+
+```swift
+// In the reducer
+case .task:
+    return .run { send in
+        for await count in bookClient.finishedCountUpdates() {
+            await send(.finishedCountChanged(count))
+        }
+    }
+
+// In the view
+.task { await store.send(.task).finish() }
+```
+
+`store.send` returns a `StoreTask` for the effects the action started, and `finish()` waits for them. Awaiting it inside SwiftUI's `.task` ties the effect to the view: when the view disappears, SwiftUI cancels its task, and TCA cancels the effect. This is the `.task(id:)` subscription idea from [The Elm architecture](/design/learn/sd-udf-elm), routed through the reducer so the stream's values are actions you can test.
+
+## Dependencies
+
+Look at what effects typically touch: `URLSession`, `Date()`, `UUID()`, `ContinuousClock`, `UserDefaults`, notification permissions, analytics. Call any of them directly and three things go wrong. Tests depend on the network and on real time. Assertions about ids and timestamps can't be written. Previews make real requests. [Dependencies as closures and structs](/design/learn/sd-functional-environment) showed the fix as a struct of closures passed in by hand; TCA uses Point-Free's **swift-dependencies** library to do the passing for you ([Dependencies as values, swift-dependencies style](/design/learn/sd-di-dependency-values) covers the library on its own).
+
+### Using a dependency
+
+A reducer declares what it needs with `@Dependency` and a key path. Common ones are built in: `\.continuousClock`, `\.uuid`, `\.date`, `\.openURL`, `\.dismiss`, `\.calendar`, `\.locale`. In the app they're the real thing; in tests and previews you replace them.
+
+### Writing your own
+
+A dependency is usually a struct of `@Sendable` closures, with a live, a test and a preview value:
+
+```swift
+@DependencyClient
+struct BookClient {
+    var search: @Sendable (_ query: String) async throws -> [Book]
+    var finishedCountUpdates: @Sendable () -> AsyncStream<Int> = { .finished }
+}
+
+extension BookClient: DependencyKey {
+    static let liveValue = BookClient(
+        search: { query in
+            var components = URLComponents(string: "https://api.example.com/search")!
+            components.queryItems = [URLQueryItem(name: "q", value: query)]
+            let (data, _) = try await URLSession.shared.data(from: components.url!)
+            return try JSONDecoder().decode([Book].self, from: data)
+        },
+        finishedCountUpdates: { /* observe the local database */ .finished }
+    )
+
+    static let testValue = BookClient()
+
+    static let previewValue = BookClient(
+        search: { _ in [.dune, .emma] },
+        finishedCountUpdates: { AsyncStream { $0.yield(3) } }
+    )
+}
+
+extension DependencyValues {
+    var bookClient: BookClient {
+        get { self[BookClient.self] }
+        set { self[BookClient.self] = newValue }
+    }
+}
+```
+
+`@DependencyClient` generates an initialiser in which every endpoint you don't pass is **unimplemented**: calling it fails the current test with a message naming the endpoint (and an endpoint that returns a value gets a default, like `{ .finished }` here, so it has something to return). That's why `testValue` is simply `BookClient()`. A test must override exactly what the feature is supposed to use, and if a refactor makes the feature call something new, the test fails and tells you.
+
+### Overriding
+
+Tests override dependencies when they create the store, and previews do the same:
+
+```swift
+let store = TestStore(initialState: BookSearch.State()) {
+    BookSearch()
+} withDependencies: {
+    $0.continuousClock = ImmediateClock()
+    $0.bookClient.search = { _ in [.dune] }
+}
+```
+
+`ImmediateClock` makes every sleep return at once; `TestClock` from swift-clocks lets the test advance time step by step. You'll use both in [TCA: exhaustive tests with TestStore](/design/learn/sd-udf-tca-testing). A parent can also override a dependency for one child with the `.dependency(\.bookClient, .mock)` reducer operator, for a demo mode, say.
+
+### How it works, briefly
+
+Dependencies are resolved from a task-local context. The store sets up that context when it runs a reducer, and effects inherit it, so everything a reducer and its effects touch sees the same overrides. Anything outside that context, such as a helper object created in a view or a singleton made at launch, reads the default instead. That's the price of not passing dependencies by hand.
+
+## Trade-offs
+
+| | Singletons called directly | Protocols injected through initialisers | Structs of closures, passed by hand | `@Dependency` (swift-dependencies) |
+| --- | --- | --- | --- | --- |
+| Visible in the type's API | No | Yes | Yes | No: declared inside the reducer |
+| Wiring | None | Every layer passes them down | Every layer passes them down | None: resolved from context |
+| Overriding in a test | Hard, global | A mock class per protocol | A closure per endpoint | A closure per endpoint, in `withDependencies` |
+| A forgotten override | Hits the real thing | Doesn't compile | Doesn't compile | Fails the test as unimplemented |
+| Previews | Hit the real thing | A preview implementation | A preview value | `previewValue`, or the live one if you didn't write it |
+| Wins when | Never, for effects | Small apps; teams that prefer explicit wiring | Small apps without a library | TCA apps, and apps with many dependencies and deep trees |
+
+<Callout kind="interview">
+
+**Say** "Effects are returned, never run in the reducer. A search effect sleeps 300 ms on an injected clock and is cancellable with cancel-in-flight, so typing cancels it and only the last query hits the API. Every outside call (API, clock, UUID, date) is a dependency with a live value, a preview value and an unimplemented test value, so a test must override what the feature uses." **Ask** which effects must outlive the screen, since presentation cancels a child's effects. **Red flags:** `Task.sleep` or `Date()` called directly in an effect, `Effect.debounce` in new code, and long-running effects started with no id and no view lifetime.
+
+</Callout>
+
+<Callout kind="gotcha" title="iOS gotcha: a .task effect that never finishes">
+
+Write `.task { store.send(.task) }` without `await … .finish()` and the closure returns immediately: SwiftUI has nothing to cancel when the view disappears, so the observation keeps running and sending actions to a feature nobody is looking at. Always await `finish()` for effects meant to live as long as the view.
+
+</Callout>
+
+<Callout kind="gotcha" title="iOS gotcha: previews quietly use the live value">
+
+A dependency with no `previewValue` falls back to its `liveValue` in Xcode previews, so a preview of the search screen makes real network calls (and fails offline). Give every client that touches the network, the disk or system permissions a `previewValue`, or override it in the preview's store with `withDependencies`.
+
+</Callout>
+
+## Practice
+
+- **[Effects the store runs, cancellable by id](/design/practice/sd-kata-unidirectional-cancellable-effects)**: build the machinery behind `.cancellable(id:cancelInFlight:)` and `.cancel(id:)`, with an injected test clock and the same debounced search.
+- **[Review: one reducer for the whole app](/design/practice/sd-review-unidirectional-app-reducer)**: a store whose reducer starts its own tasks and reaches for `Date()`, `UUID()` and singletons. Say which effects and dependencies you'd introduce.
+
+```cards
+- id: effect-kinds
+  front: "Which TCA effects do most features use?"
+  back: "`.none`, `.run { send in … }` (with an optional `catch:`), `.send`, `.merge`, plus `.cancellable(id:cancelInFlight:)` and `.cancel(id:)` for cancellation."
+- id: tca-debounce
+  front: "How do you debounce in TCA since 1.25?"
+  back: "Sleep on the injected clock at the start of a `.run` and mark it `.cancellable(id:, cancelInFlight: true)`. `Effect.debounce` is deprecated."
+- id: unimplemented
+  front: "Why is a `@DependencyClient`'s test value unimplemented?"
+  back: "So a test fails, naming the endpoint, whenever the feature calls something the test didn't override. Tests state exactly what the feature uses, and new calls can't sneak in."
+- id: task-finish
+  front: "How do you tie a long-running TCA effect to a view's lifetime?"
+  back: "`.task { await store.send(.task).finish() }`. When the view disappears SwiftUI cancels the task, and TCA cancels the effect it's awaiting."
+```
+
+```quiz
+- id: q1
+  type: mcq
+  prompt: "The search effect sleeps 300 ms and is `.cancellable(id: CancelID.search, cancelInFlight: true)`. A user types `swift` at a steady 150 ms per letter, from the second letter on. How many requests reach the API?"
+  options:
+    - "Four: one per query of two letters or more"
+    - "One: each new letter cancels the previous effect while it's still sleeping"
+    - "Two: the first and the last"
+    - "None, because the debounce never ends"
+  answer: 1
+  explain: "Every letter arrives within 300 ms of the one before, so each new effect cancels the sleeping one. Only `swift` stays unchanged for 300 ms and reaches the network."
+- id: q2
+  type: multi
+  prompt: "Which of these, written inside a `.run` effect, make the feature hard to test? Choose all that apply."
+  options:
+    - "`try await Task.sleep(for: .seconds(1))`"
+    - "`let id = UUID()`"
+    - "`try await clock.sleep(for: .seconds(1))` with `@Dependency(\\.continuousClock) var clock`"
+    - "`URLSession.shared.data(from: url)`"
+    - "`await send(.finished(Date.now))`"
+  answer: [0, 1, 3, 4]
+  explain: "Real sleeps, real UUIDs, the real network and the real date are all uncontrolled: tests become slow, flaky or impossible to assert on. The injected clock can be an `ImmediateClock` or a `TestClock` in tests."
+- id: q3
+  type: sort
+  prompt: "Which effect fits each job?"
+  buckets: [".none", ".run", ".send", ".cancel(id:)"]
+  items:
+    - [A toggle that only changes state, 0]
+    - [Load the next page of results, 1]
+    - [Tell the parent the form was saved, 2]
+    - [Stop the countdown when the user taps Pause, 3]
+    - [Observe a stream of database changes while the screen is visible, 1]
+  explain: "Most cases return `.none`. Async work is `.run`, a synchronous delegate message is `.send`, and stopping long-running work is a cancel by its id."
+- id: q4
+  type: truefalse
+  prompt: "If a search effect is cancelled after the API has answered but before it calls `send`, the stale results still reach the reducer."
+  answer: false
+  explain: "TCA's `send` does nothing once the effect has been cancelled, and a cancellation error doesn't reach the `catch:` handler, so a superseded search can't deliver results or an error."
+- id: q5
+  type: mcq
+  prompt: "A test of `BookSearch` overrides only `continuousClock`. What happens when it sends `queryChanged(\"dune\")`?"
+  options:
+    - "The real API is called"
+    - "The search endpoint is unimplemented in the test value, so the test fails and names `BookClient.search`"
+    - "The search returns an empty array"
+    - "The test hangs waiting for the network"
+  answer: 1
+  explain: "With `testValue = BookClient()`, every endpoint the test didn't override reports a failure when called. The test has to say what the API returns, which is what makes it deterministic."
+- id: q6
+  type: recall
+  prompt: "Why does TCA resolve dependencies from a task-local context rather than passing them through initialisers, and what does that cost?"
+  model: "It saves threading every dependency through every layer: a reducer declares `@Dependency`, the store sets up the context, and child reducers and effects inherit the same overrides. The cost is that dependencies don't appear in a type's API, and code outside that context (a helper made in a view, a singleton) silently gets the default value."
+```

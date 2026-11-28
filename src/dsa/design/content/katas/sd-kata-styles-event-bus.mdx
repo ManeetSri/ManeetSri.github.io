@@ -1,0 +1,119 @@
+Build the in-process event bus an app uses for side effects: checkout publishes `OrderPlaced`, and analytics, the orders badge and the widget refresh each react without checkout knowing they exist. The interesting part isn't routing events; it's behaving well when handlers fail, cancel each other, or publish from inside a delivery.
+
+`InAppEventBus.Bus`, with `subscribe(to:_:) -> Subscription`, `publish(_:) -> Delivery` and `subscriberCount(for:) -> Int`
+
+- **Routing by type.** `subscribe(to: OrderPlaced.self) { event in … }` calls the handler with every `OrderPlaced` published afterwards, and with nothing else. Publishing a value through `any InAppEventBus.Event` still reaches the subscribers of its concrete type.
+- **Synchronous, in order.** `publish` calls every current subscriber to that type, in the order they subscribed, before it returns.
+- **Subscriptions are owned.** `subscribe` returns a `Subscription`. Calling `cancel()` stops delivery at once, and cancelling twice is harmless. Releasing the last reference to a subscription cancels it, as with Combine's `AnyCancellable`. The `Subscription` class is written for you: create one with the closure that removes the subscriber.
+- **Failures are contained.** A handler that throws doesn't stop the handlers after it. `publish` returns a `Delivery` counting the handlers it called (`delivered`) and how many of them threw (`failures`).
+- **Re-entrancy is safe.** A handler may publish, subscribe or cancel while a delivery is running, without deadlocking:
+  - a subscriber **cancelled** by an earlier handler isn't called for the current event;
+  - a subscriber **added** during a delivery receives the next event, not the current one;
+  - an event published **from inside** a handler is delivered completely before the outer delivery carries on.
+- **Thread-safe.** Any task or thread may subscribe, cancel or publish at the same time.
+
+## Examples
+
+| Subscribers to `OrderPlaced`, in order | `publish(OrderPlaced(id: "A12"))` calls | `Delivery` |
+| --- | --- | --- |
+| analytics, badge, receipts | analytics, badge, receipts | `(delivered: 3, failures: 0)` |
+| analytics, a handler that throws, receipts | analytics, receipts | `(delivered: 3, failures: 1)` |
+| none | nothing | `(delivered: 0, failures: 0)` |
+| first (which cancels third), second, third | first, second | `(delivered: 2, failures: 0)` |
+| A on `Outer` (publishes `Inner`), B on `Outer`, C on `Inner`; publish `Outer()` | A, C, B | `(delivered: 2, failures: 0)` |
+
+## Constraints
+
+- Use only Foundation, Swift Concurrency and the standard library's `Synchronization` module (`Mutex` is available on macOS 15 and iOS 18).
+- Never hold a lock while calling a handler: `Mutex` isn't re-entrant, so a handler that publishes would deadlock or crash.
+- A subscription that outlives its bus must not keep the bus alive.
+- Up to a few hundred subscribers per type; delivery may be O(subscribers).
+
+<Hints>
+<Hint>
+Key the subscribers by `ObjectIdentifier(E.self)`. Store each handler type-erased, as `@Sendable (any Event) throws -> Void`, which casts back with `event as? E` before calling the original.
+</Hint>
+<Hint>
+Keep all mutable state in one struct inside a `Mutex`. In `publish`, copy the handler list while holding the lock, release it, then call each handler. That's what makes re-entrant calls safe.
+</Hint>
+<Hint>
+A snapshot alone would still call a subscriber that an earlier handler just cancelled. Give every subscriber an id, keep a set of live ids, and check it, under the lock, just before each call. Give the subscription a closure that captures the bus `[weak self]` and removes that id.
+</Hint>
+</Hints>
+
+## Solutions
+
+<Approach title="Snapshot under a lock, deliver outside it, check liveness per call" time="O(n) per publish" space="O(n)">
+
+```swift
+public final class Bus: Sendable {
+    private struct Subscriber: Sendable {
+        let id: UInt64
+        let handle: @Sendable (any Event) throws -> Void
+    }
+
+    private struct State {
+        var nextID: UInt64 = 0
+        var subscribers: [ObjectIdentifier: [Subscriber]] = [:]
+        var live: Set<UInt64> = []
+    }
+
+    private let state = Mutex(State())
+
+    public init() {}
+
+    public func subscribe<E: Event>(to type: E.Type, _ handler: @escaping @Sendable (E) throws -> Void) -> Subscription {
+        let key = ObjectIdentifier(type)
+        let id = state.withLock { state in
+            state.nextID += 1
+            let subscriber = Subscriber(id: state.nextID) { event in
+                if let event = event as? E { try handler(event) }
+            }
+            state.subscribers[key, default: []].append(subscriber)
+            state.live.insert(subscriber.id)
+            return subscriber.id
+        }
+        return Subscription { [weak self] in
+            self?.remove(id, from: key)
+        }
+    }
+
+    @discardableResult
+    public func publish<E: Event>(_ event: E) -> Delivery {
+        let key = ObjectIdentifier(E.self)
+        let snapshot = state.withLock { $0.subscribers[key] ?? [] }
+        var delivered = 0
+        var failures = 0
+        for subscriber in snapshot {
+            guard state.withLock({ $0.live.contains(subscriber.id) }) else { continue }
+            delivered += 1
+            do {
+                try subscriber.handle(event)
+            } catch {
+                failures += 1
+            }
+        }
+        return Delivery(delivered: delivered, failures: failures)
+    }
+
+    public func subscriberCount<E: Event>(for type: E.Type) -> Int {
+        state.withLock { $0.subscribers[ObjectIdentifier(type)]?.count ?? 0 }
+    }
+
+    private func remove(_ id: UInt64, from key: ObjectIdentifier) {
+        state.withLock { state in
+            state.live.remove(id)
+            state.subscribers[key]?.removeAll { $0.id == id }
+            if state.subscribers[key]?.isEmpty == true {
+                state.subscribers[key] = nil
+            }
+        }
+    }
+}
+```
+
+Copying the list makes a subscriber added mid-delivery wait for the next event, and checking `live` before each call makes a cancel take effect at once. Publishing an `any Event` works because Swift opens the existential when it's passed to the generic `publish`, so `E` is the concrete type.
+
+Synchronous delivery has a consequence worth knowing: a nested publish runs depth-first (A, C, B in the example), so subscribers can see events in an order that differs from the order they were published. A bus that queues nested events and delivers them after the outer one gives A, B, C instead, at the cost of no longer having delivered everything when `publish` returns. Neither is wrong; pick one and document it. And this bus lives in memory: if an event must survive the app being killed, such as a purchase for analytics, write it to disk before publishing.
+
+</Approach>

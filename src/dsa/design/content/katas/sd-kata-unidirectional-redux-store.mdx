@@ -1,0 +1,77 @@
+A Redux store is small: it holds the state, runs every action through a chain of **middleware** and then a pure reducer, and tells subscribers when the state changes. The details are where homemade stores go wrong: middleware that runs in the wrong order, an action dispatched from inside another one that runs in the middle of it, and subscribers that see states out of order. Write the store, for a shopping basket.
+
+`UnidirectionalReduxStore.Store`: `init(initialState:reducer:middleware:)`, `dispatch(_:)`, `subscribe(_:)` and `unsubscribe(_:)`
+
+- **The chain.** `dispatch` passes the action to the middleware in array order: the first middleware sees it first. Each one gets a `Context`, the action, and `next`. Calling `next(action)` passes an action to the next middleware, and the last middleware's `next` calls the reducer. With no middleware, the reducer gets the action directly.
+- **What middleware may do.** Call `next` with the same action, with a different one, or not at all (the action is swallowed and the reducer never sees it). Code after `next` runs after the reducer, so a logger can read the state before and after. `context.state()` returns the state at the moment it's called.
+- **One action at a time.** `context.dispatch` starts a new action from the top of the chain, but never in the middle of another: an action dispatched while one is being processed (by a middleware, or by a subscriber) waits in a queue, and runs after the current action and its notifications have finished. Queued actions run in the order they were dispatched, all before the outer `dispatch` returns.
+- **Subscribers.** `subscribe` calls the listener straight away with the current state and returns an id. After each action, if the state changed (compare with `==`), every listener is called with the new state, in the order they subscribed. An action that leaves the state equal notifies no one. `unsubscribe(id)` stops that listener; an unknown id does nothing.
+
+## Examples
+
+| Middleware, in order | Dispatched | Reducer receives | Subscribers hear |
+| --- | --- | --- | --- |
+| none | `add("Milk")`, `add("Eggs")` | both, in order | two new states |
+| a logger, then a guard that blocks `add` during checkout | `add("Eggs")` while checking out | nothing | nothing |
+| one that turns `add("  oat milk ")` into `add("Oat Milk")` | `add("  oat milk ")` | `add("Oat Milk")` | one new state |
+| one that dispatches `checkoutStarted` when it sees `checkoutTapped`, then calls `next` | `checkoutTapped` | `checkoutTapped`, then `checkoutStarted` | one new state, after `checkoutStarted` |
+| one that answers `restoreSaved` by dispatching three `add`s and never calls `next` | `restoreSaved` | the three `add`s | three new states |
+
+## Constraints
+
+- The store is `@MainActor`, and so is everything that calls it: no locks needed.
+- A middleware calls `next` at most once. It can't keep `next` for later: it isn't escaping. Asynchronous work in a middleware dispatches a new action when it's done, which is how thunks work.
+- A subscriber that dispatches must not see a state from the future: every subscriber hears about one state before any subscriber hears about the next.
+
+<Hints>
+<Hint>
+Write the chain as a recursive function: `run(action, from: index)` calls `middleware[index]` with a `next` of `{ run($0, from: index + 1) }`, and when `index` reaches the end it calls the reducer.
+</Hint>
+<Hint>
+For one action at a time, keep a queue and an `isDispatching` flag. `dispatch` appends to the queue; if nothing is being dispatched, it drains the queue in a loop. A nested `dispatch` only appends, and the loop picks it up.
+</Hint>
+<Hint>
+Notify inside the loop, straight after each action: remember the state before `run`, compare after, and call every listener if it changed. Store listeners as `(id, closure)` pairs in an array to keep their order.
+</Hint>
+</Hints>
+
+## Solutions
+
+<Approach title="A queue drained one action at a time, through a recursive chain" time="O(m) per action for m middleware, plus O(s) to notify s subscribers" space="O(q) for q queued actions">
+
+```swift
+public func dispatch(_ action: Action) {
+    queue.append(action)
+    guard !isDispatching else { return }
+    isDispatching = true
+    defer { isDispatching = false }
+    while !queue.isEmpty {
+        let next = queue.removeFirst()
+        let before = state
+        run(next, from: 0)
+        if state != before {
+            let current = state
+            for entry in listeners { entry.listener(current) }
+        }
+    }
+}
+
+private func run(_ action: Action, from index: Int) {
+    guard index < middleware.count else {
+        reducer(&state, action)
+        return
+    }
+    let context = Context(state: { self.state }, dispatch: { self.dispatch($0) })
+    middleware[index](context, action) { passed in
+        self.run(passed, from: index + 1)
+    }
+}
+```
+
+Each middleware wraps everything after it, like the layers of an onion: the first in the list is outermost, so it sees the action first and finishes last. That's the same shape as Redux's `store => next => action` signature, written as one closure instead of three curried ones.
+
+The queue is the design decision that matters. Redux itself runs a dispatch from a middleware immediately, nested inside the current one, which is flexible but means a middleware can see the state change underneath it halfway through its own work. Flux's dispatcher refused nested dispatches outright, with an error. A queue sits between the two: dispatching from anywhere is allowed, but actions never interleave, so every subscriber sees every state in order. TCA arrived at the same rule from the other side: since version 1.25 it warns when an action is sent while another is being processed.
+
+Comparing the state before and after needs `State: Equatable`. With value types the comparison is the cost of change detection; a large state compared on every action is one of the reasons per-feature stores beat one store for the whole app.
+
+</Approach>

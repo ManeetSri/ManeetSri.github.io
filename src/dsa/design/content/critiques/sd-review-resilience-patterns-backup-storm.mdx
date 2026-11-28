@@ -1,0 +1,121 @@
+<Brief>
+
+A photo app backs up the camera roll overnight. Since the backup service shipped, the upload API falls over at about two every morning, the on-call engineer sees ten times the expected traffic, and some users find photos stored twice. Review the service as you would a pull request.
+
+```swift check ios title="PhotoBackupService.swift"
+import UIKit
+
+struct PendingPhoto: Sendable {
+    let id: UUID
+    let fileURL: URL
+}
+
+@MainActor
+final class PhotoBackupService {
+    private let session = URLSession.shared
+    private let endpoint = URL(string: "https://api.example.com/v1/photos")!
+    private(set) var uploadedCount = 0
+
+    // The server sends this silent push to every device at 02:00 UTC
+    func didReceiveBackupPush(pending: [PendingPhoto]) {
+        Task {
+            await backUp(pending)
+        }
+    }
+
+    func backUp(_ photos: [PendingPhoto]) async {
+        await withTaskGroup(of: Void.self) { group in
+            for photo in photos {
+                group.addTask {
+                    await self.upload(photo)
+                }
+            }
+        }
+    }
+
+    private func upload(_ photo: PendingPhoto) async {
+        guard let data = try? Data(contentsOf: photo.fileURL) else { return }
+        var request = URLRequest(url: endpoint)
+        request.httpMethod = "POST"
+        request.setValue("image/heic", forHTTPHeaderField: "Content-Type")
+
+        for attempt in 1...10 {
+            do {
+                let (_, response) = try await session.upload(for: request, from: data)
+                if (response as? HTTPURLResponse)?.statusCode == 201 {
+                    uploadedCount += 1
+                    return
+                }
+            } catch {
+                print("Upload \(attempt) failed: \(error)")
+            }
+        }
+    }
+}
+```
+
+</Brief>
+
+```workspace
+template: critique
+minutes: 25
+```
+
+```findings
+- id: unbounded-concurrency
+  title: Starts every upload at once
+  severity: high
+  lines: "22-28"
+  detail: "The task group adds one child per photo with no limit, so a 2,000-photo backlog is 2,000 uploads in flight. Each holds its whole file in memory, and they queue for a handful of connections, so most sit until they time out and then retry, adding load exactly when the server is struggling. Keep two to four in flight with a sliding window: add the next photo only when one finishes."
+- id: immediate-retries
+  title: Retries ten times with no delay
+  severity: high
+  lines: "37-47"
+  detail: "A failed upload is retried straight away, up to ten times. Every failure becomes ten requests in a few seconds, and because every device failed together they retry together. Use capped exponential backoff with full jitter, three or four attempts at most, and leave the rest to the next backup."
+- id: synchronised-fleet
+  title: Every device starts at the same moment
+  severity: high
+  lines: "14-18"
+  detail: "The server pushes every device at 02:00 UTC and each starts uploading the instant the push arrives: a thundering herd built into the schedule. Spread the start over a window with a random delay (or have the server stagger the pushes), and prefer a BGProcessingTask, which iOS runs when the device is charging and on Wi-Fi."
+- id: duplicate-uploads
+  title: Retries a POST with no idempotency key
+  severity: high
+  lines: "34-39"
+  detail: "POST isn't idempotent. When the server stores the photo but the 201 never arrives (a timeout, or the connection dropping after the body was sent), the retry stores a second copy: the duplicates users see. Send an Idempotency-Key header that stays the same for every attempt at this photo, such as its id, and have the server return the original result for a key it has seen."
+- id: retries-everything
+  title: Retries errors that can't succeed and ignores the server's signals
+  severity: medium
+  lines: "39-46"
+  detail: "Any status but 201 is retried, including 200 (success), 400, 401 and 413, which will fail the same way every time, and so is every thrown error, including cancellation. A 429 or 503 with Retry-After is retried at once instead of waiting as asked. Classify: retry timeouts, lost connections, 408, 429 and 5xx; wait for Retry-After; refresh on 401; stop on other 4xx and on cancellation."
+- id: main-thread-reads
+  title: Reads every photo into memory on the main thread
+  severity: medium
+  lines: "32"
+  detail: "The class is @MainActor, so `upload` runs on the main actor and `Data(contentsOf:)` reads a multi-megabyte file synchronously on the main thread, once per photo. Combined with unbounded concurrency, every file is in memory at once, a jetsam risk, and more so in the background. Upload from the file (`upload(for:fromFile:)`), which streams from disk, and keep the service off the main actor."
+- id: foreground-session
+  title: Long uploads on a foreground session, from a fire-and-forget task
+  severity: medium
+  lines: "15-18"
+  detail: "A silent push buys roughly 30 seconds of background time. After that the app is suspended and requests on URLSession.shared stall, then fail. The session is the shared one (line 10), and the untracked Task means nothing can tell the push handler when the work is done. Hand big uploads to a background URLSession, which the system runs outside the app and finishes even if the app is suspended."
+- id: silent-failures
+  title: Failures vanish
+  severity: low
+  lines: "44-47"
+  detail: "A missing file is skipped without a trace (line 32), and a photo that fails ten times stops, with only a print to show for it. Nothing records which photos still need backing up or why they failed. Keep each photo's state (pending, uploading, failed with a reason) in the persistent queue, and log with Logger so failures show up in diagnostics."
+```
+
+<ReferenceReview>
+
+**What matters most.** The outage and the duplicates come from three problems that multiply each other. Every device starts at 02:00 because the push arrives at 02:00. Each device then starts **every upload at once**. And each failed upload **retries ten times with no delay**. One bad minute on the server turns into a retry storm from the whole fleet. Separately, retrying a **non-idempotent POST** is why some photos are stored twice.
+
+**How I'd fix it, in small steps:**
+
+1. Stop the bleeding without an app release: have the server stagger the pushes across a two-hour window, and answer overload with `503` and `Retry-After`.
+2. Make uploads safe to retry: send `Idempotency-Key: <photo id>` and have the server deduplicate on it. Ship this before touching retries, so every later change is safe.
+3. Replace the retry loop with a policy: classify errors, back off exponentially with full jitter (base 1 s, cap 60 s, four attempts), honour `Retry-After`, and stop on cancellation.
+4. Bound concurrency to three uploads with a sliding-window task group, and upload from files rather than `Data`, off the main actor.
+5. Move the work to a background `URLSession` (or a `BGProcessingTask` that requires power and Wi-Fi), driven by a persistent queue that records each photo's state, so a failure is retried tomorrow rather than forgotten.
+
+**Tests to add:** with a stub HTTP client and a test clock, a 500 response leads to exactly four attempts at the expected delays; a `400` leads to one; `Retry-After: 30` delays the next attempt by 30 seconds; every attempt for one photo carries the same idempotency key; and with 50 pending photos, no more than three uploads are ever in flight.
+
+</ReferenceReview>

@@ -1,0 +1,318 @@
+## Why it matters
+
+Polling is the real-time technique that needs nothing new: no sockets, no special servers, no new failure modes. It's how most order-tracking screens, "new posts" pills and dashboards stay fresh, and done well it's cheaper and more reliable than a persistent connection. Done badly it melts servers and batteries. Interviewers like to hear polling proposed and *then* justified or rejected with numbers, because it shows you didn't reach for WebSockets by reflex.
+
+## Short polling
+
+The app asks, waits a fixed interval, and asks again:
+
+1. `GET /orders/841/status`
+2. Wait 15 seconds.
+3. Repeat while the screen is visible.
+
+Two numbers describe it. **Staleness:** an event waits for the next poll, so on average it's seen half an interval late, and at worst a whole interval plus a round trip. A 15-second poll means "about 8 seconds late, at most 16". **Cost:** each user makes one request per interval whether or not anything changed. A million people watching a screen that polls every 15 seconds is about 67,000 requests a second, and most of them answer "nothing new".
+
+That second number is why naive polling has a bad reputation. Four techniques make it cheap.
+
+### Make "nothing new" nearly free
+
+A **conditional request** lets the server answer "no change" without a body. The first response carries an `ETag`; the app sends it back in `If-None-Match`, and the server replies `304 Not Modified` when nothing changed: no JSON to build, send or decode. You'll go deep on these headers in D38.
+
+```http
+GET /orders/841/status HTTP/1.1
+If-None-Match: "v17"
+
+HTTP/1.1 304 Not Modified
+ETag: "v17"
+```
+
+### Ask only for what changed
+
+For a list, poll with a **cursor**: `GET /inbox/changes?since=c_9812` returns only what's new, plus the next cursor. An empty answer is tiny, and a busy one never resends what the app already has. The cursor also makes polling safe across gaps: an app that was offline for an hour asks with its old cursor and gets the whole hour.
+
+### Let the interval move
+
+A fixed interval is wrong most of the time: too slow while a delivery driver is two streets away, too fast while an order sits in the kitchen. **Adaptive polling** speeds up when things change and backs off while they don't, and lets the server ask for less. GitHub's REST API does the last part with an `X-Poll-Interval` header on its events endpoints, telling clients how many seconds to wait.
+
+```swift run title="PollSchedule.swift"
+import Foundation
+
+/// How long to wait before the next poll: soon while things are changing, longer while they aren't
+struct PollSchedule {
+    let fastest: Int
+    let slowest: Int
+    private(set) var interval: Int
+
+    init(fastest: Int, slowest: Int) {
+        self.fastest = fastest
+        self.slowest = slowest
+        interval = fastest
+    }
+
+    mutating func next(changed: Bool, serverMinimum: Int? = nil) -> Int {
+        // A change means someone is active: look again soon. Nothing new: wait twice as long.
+        interval = changed ? fastest : min(slowest, interval * 2)
+        // The server can always ask for less traffic, never more
+        if let serverMinimum {
+            interval = max(interval, serverMinimum)
+        }
+        return interval
+    }
+}
+
+var schedule = PollSchedule(fastest: 5, slowest: 60)
+let polls: [(changed: Bool, serverMinimum: Int?)] = [
+    (false, nil), (false, nil), (false, nil), (true, nil), (false, nil), (false, 30), (false, nil), (false, nil),
+]
+var now = 0
+for (index, poll) in polls.enumerated() {
+    let wait = schedule.next(changed: poll.changed, serverMinimum: poll.serverMinimum)
+    let result = poll.changed ? "changed" : "no change"
+    let hint = poll.serverMinimum.map { ", server asks for \($0) s" } ?? ""
+    print("Poll \(index + 1) at \(now) s: \(result)\(hint), next in \(wait) s")
+    now += wait
+}
+```
+
+```output
+Poll 1 at 0 s: no change, next in 10 s
+Poll 2 at 10 s: no change, next in 20 s
+Poll 3 at 30 s: no change, next in 40 s
+Poll 4 at 70 s: changed, next in 5 s
+Poll 5 at 75 s: no change, next in 10 s
+Poll 6 at 85 s: no change, server asks for 30 s, next in 30 s
+Poll 7 at 115 s: no change, next in 60 s
+Poll 8 at 175 s: no change, next in 60 s
+```
+
+Two refinements belong in production. Add a little **jitter** (say ±10%) to each wait, so a million phones that opened the app after the same push don't poll in lockstep; you met jitter in [retry with backoff](/design/learn/sd-resilience-retry-backoff). And tie the fastest interval to the product, not to a guess: a driver's position may justify 5 seconds, a kitchen status 30.
+
+### Poll only while someone is looking
+
+The cheapest poll is the one you don't make. Stop when the screen goes away and when the app leaves the foreground. In SwiftUI, `.task` does the first part for you: it cancels its task when the view disappears. Keying it on the scene phase does the second:
+
+```swift check ios title="OrderTracking.swift"
+import SwiftUI
+
+struct OrderStatusResponse: Decodable {
+    let state: String
+}
+
+@MainActor @Observable
+final class OrderTrackingModel {
+    private(set) var status = "Checking…"
+    private let orderID: String
+    private let session: URLSession
+    private var etag: String?
+
+    init(orderID: String, session: URLSession = .shared) {
+        self.orderID = orderID
+        self.session = session
+    }
+
+    /// Polls for as long as the calling task lives; SwiftUI's .task cancels it when the view goes away
+    func poll(every interval: Duration = .seconds(15)) async {
+        while !Task.isCancelled {
+            await refresh()
+            try? await Task.sleep(for: interval)
+        }
+    }
+
+    private func refresh() async {
+        var request = URLRequest(url: URL(string: "https://api.example.com/orders/\(orderID)/status")!)
+        request.cachePolicy = .reloadIgnoringLocalCacheData // the ETag is handled here, not by URLCache
+        if let etag { request.setValue(etag, forHTTPHeaderField: "If-None-Match") }
+        // Any failure keeps the last status on screen; the next poll tries again
+        guard case let (data, response)? = try? await session.data(for: request),
+              let http = response as? HTTPURLResponse, http.statusCode == 200,
+              let decoded = try? JSONDecoder().decode(OrderStatusResponse.self, from: data) else { return }
+        etag = http.value(forHTTPHeaderField: "ETag")
+        status = decoded.state
+    }
+}
+
+struct OrderTrackingView: View {
+    @Environment(\.scenePhase) private var scenePhase
+    let model: OrderTrackingModel
+
+    var body: some View {
+        Text(model.status)
+            .task(id: scenePhase) {
+                // Restarted on every phase change, so polling runs only while the app is active
+                guard scenePhase == .active else { return }
+                await model.poll()
+            }
+    }
+}
+```
+
+A `304` falls through the `statusCode == 200` guard and leaves the screen as it is, which is exactly what "not modified" means.
+
+## Long polling
+
+Short polling trades latency for simplicity. **Long polling** gets the latency back without a new protocol: the app asks, and the server *doesn't answer* until it has something to say or a timeout passes. The moment the answer arrives, the app asks again.
+
+```visual sequence
+title: Long polling with a cursor
+participants:
+  - { id: app, label: App }
+  - { id: api, label: Changes API }
+  - { id: feed, label: Message store }
+messages:
+  - [app, api, "GET /changes?cursor=c1&wait=25", { say: "The app asks for anything after cursor `c1` and says it's willing to wait 25 seconds." }]
+  - { note: Nothing new. The server holds the request open., over: api }
+  - [api, app, "200 · [] · cursor c1", { reply: true, say: "After 25 quiet seconds the server answers with **no changes**, well before any timeout on the way can fire." }]
+  - [app, api, "GET /changes?cursor=c1&wait=25", { say: "The app asks again straight away. This is the steady state: one request every 25 seconds per idle user." }]
+  - [feed, api, new message m42, { async: true, say: "Four seconds in, a message arrives on the server." }]
+  - [api, app, "200 · [m42] · cursor c2", { reply: true, say: "The held request completes **at once** with the change and a new cursor. Latency is about one network trip." }]
+  - [app, api, "GET /changes?cursor=c2&wait=25", { say: "The app saves `c2` with the message, then asks again. Anything that arrived in between is waiting after `c2`, so nothing falls into the gap." }]
+```
+
+The cursor is what makes long polling correct. Between one response and the next request there's a window of a round trip or more when no request is open. Events that happen then aren't lost, because the next request says "everything after `c2`" and the server returns them at once.
+
+Dropbox's API is a neat real example of a variation, **notify then fetch**: its `list_folder/longpoll` endpoint holds the request (30 seconds by default) and answers only "changes: true or false", plus an optional `backoff` telling the client to wait before polling again. The app then fetches the actual changes with its cursor through the normal endpoint. The held request stays tiny, and all the paging and decoding logic lives in one place.
+
+```swift check title="LongPoll.swift"
+import Foundation
+
+struct ChangesPage: Decodable, Sendable {
+    let changes: [String]
+    let cursor: String
+}
+
+/// Each request waits on the server until there are changes or about 25 seconds pass, then the loop asks again
+func longPoll(from start: String, session: URLSession, apply: @Sendable (ChangesPage) async throws -> Void) async throws {
+    var cursor = start
+    while !Task.isCancelled {
+        var components = URLComponents(string: "https://api.example.com/changes")!
+        components.queryItems = [URLQueryItem(name: "cursor", value: cursor), URLQueryItem(name: "wait", value: "25")]
+        var request = URLRequest(url: components.url!)
+        // Longer than the server's hold, or every quiet cycle ends as a client-side timeout
+        request.timeoutInterval = 40
+        let (data, response) = try await session.data(for: request)
+        guard (response as? HTTPURLResponse)?.statusCode == 200 else { throw URLError(.badServerResponse) }
+        let page = try JSONDecoder().decode(ChangesPage.self, from: data)
+        // Store the changes and the new cursor together, so a relaunch carries on from exactly here
+        try await apply(page)
+        cursor = page.cursor
+    }
+}
+```
+
+### The timeouts on the path
+
+A held request has to finish before *anything* between the app and the server gives up on it:
+
+- **URLSession:** `timeoutIntervalForRequest` (and `URLRequest.timeoutInterval`) is how long a task may go without receiving data, 60 seconds by default.
+- **Load balancers:** an AWS Application Load Balancer closes connections that are idle for 60 seconds by default.
+- **Proxies:** nginx's `proxy_read_timeout` is also 60 seconds by default.
+
+So servers hold for 20–30 seconds and then answer empty, comfortably under the shortest timeout on the path. A hold longer than one of them turns every quiet cycle into an error and a retry.
+
+### What it costs the server
+
+An idle long-polling user is one open request, which an event-driven server (Node, Go, Netty, Elixir) holds cheaply but a thread-per-request server does not. Each event costs a full HTTP response plus a new request with headers, so a busy stream (dozens of events a second) is far cheaper over SSE or a WebSocket. Long polling shines for **rare events with low latency**: a sign-in approved on another device, a payment confirmed, a file changed.
+
+## Trade-offs
+
+| | Fixed short poll | Adaptive short poll | Long poll | Persistent connection (for comparison) |
+| --- | --- | --- | --- | --- |
+| Latency | Half the interval on average | Low while active, high while quiet | About one round trip | Lowest |
+| Requests per idle user | One per interval | Falls to one per maximum interval | One per hold (about 25 s) | None, but heartbeats |
+| Server model | Any | Any | Must hold many open requests | Must hold many open connections |
+| Cacheable by a CDN | Yes, if the response is shared | Yes | No | No |
+| Failure modes | Few | Few | Timeouts on the path, held-request limits | Silent drops, reconnect storms |
+| Client complexity | Lowest | Low | Low, with a cursor | Medium–high |
+
+Fixed polling wins when freshness of tens of seconds is fine, and especially when many users share one response a CDN can cache (a match score, a status page). Adaptive polling wins for per-user data that changes in bursts. Long polling wins for rare events that must arrive quickly without building a real-time tier. Once events are frequent or flow both ways, move to SSE or a WebSocket.
+
+<Callout kind="interview">
+
+**Say** the numbers: "A 15-second poll means about 8 seconds of staleness on average. With a million viewers that's 67,000 requests a second, so each poll must be a `304` or an empty cursor page, ideally from a CDN." Then say when you'd stop: "If the product needs updates within a second or two, or the client sends as much as it receives, I'd move to SSE or a WebSocket." **Ask** how fresh it must be and whether the response is shared between users. **Red flags:** polling in the background, a fixed interval with no jitter, polling without a cursor or conditional request, and a long-poll hold longer than the load balancer's idle timeout.
+
+</Callout>
+
+<Callout kind="gotcha" title="iOS gotcha: BGAppRefreshTask is not a polling timer">
+
+A background refresh task runs when iOS decides: based on how often the user opens the app, battery and network conditions, possibly hours apart, and never if the user rarely uses it. It's for warming caches, not for "check every 5 minutes". If something must reach the user while the app isn't running, the server sends a push.
+
+</Callout>
+
+<Callout kind="gotcha" title="iOS gotcha: waitsForConnectivity and a poll that never returns">
+
+With `waitsForConnectivity = true` on the session configuration, a request made while offline waits for a connection instead of failing, for up to `timeoutIntervalForResource` (seven days by default). That's lovely for an upload and wrong for a poll: the loop silently stops. For polling, leave it off, or set a short resource timeout, so a failed poll fails fast and the next one tries again.
+
+</Callout>
+
+## Practice
+
+In the design exercise **"Live score updates for 5 million fans"**, today's app polls every 30 seconds and old versions will keep doing so. Work out what that costs through a CDN, why it can't meet a two-second target, and where polling still belongs in the new design.
+
+```cards
+- id: poll-staleness
+  front: "How stale is data from a short poll every n seconds?"
+  back: "Half an interval on average, and up to a whole interval plus a round trip at worst."
+- id: cheap-polls
+  front: "What makes a poll that finds nothing new cheap?"
+  back: "A conditional request (ETag and If-None-Match, answered with 304) or a cursor that returns an empty page, ideally served from a CDN when the response is shared."
+- id: long-poll-cursor
+  front: "Why does long polling need a cursor?"
+  back: "Between one response and the next request no request is open. The cursor makes the next request ask for everything after the last change, so events in that gap aren't lost."
+- id: long-poll-hold
+  front: "How long should a server hold a long-poll request?"
+  back: "Shorter than every timeout on the path, typically 20–30 s, because URLSession, load balancers and proxies commonly give up on idle connections after 60 s."
+```
+
+```quiz
+- id: q1
+  type: estimate
+  prompt: "An order screen polls every 20 seconds. On average, how many seconds late does a status change appear (ignoring network time)?"
+  answer: 10
+  unit: seconds
+  within: { percent: 20 }
+  explain: "A change lands at a random point between two polls, so it waits half the interval on average: 10 seconds, and up to 20 at worst."
+- id: q2
+  type: mcq
+  prompt: "Your long-poll endpoint holds requests for 90 seconds when nothing happens. Users behind your load balancer see a failed request every minute. Why?"
+  options:
+    - "The server runs out of threads"
+    - "Something on the path, such as the load balancer's 60-second idle timeout or URLSession's 60-second request timeout, closes the connection before the server answers"
+    - "HTTP doesn't allow responses that take longer than 60 seconds"
+    - "The cursor expires"
+  answer: 1
+  explain: "The hold must be shorter than every idle timeout on the path. Hold for about 25 seconds, answer empty, and let the client ask again."
+- id: q3
+  type: bug
+  prompt: "This long-poll loop loses messages under load. Which line causes it?"
+  code: |
+    var cursor = savedCursor
+    while !Task.isCancelled {
+        let page = try await api.changes(after: cursor)
+        cursor = try await api.latestCursor()
+        try await store.apply(page.changes)
+        try await store.save(cursor: cursor)
+    }
+  answer: 4
+  explain: "It asks the server for its *latest* cursor instead of using the cursor returned with this page. Anything that arrived between the two calls is skipped. Use `page.cursor`, and save it together with the changes it belongs to."
+- id: q4
+  type: multi
+  prompt: "Which of these make a 1-million-viewer short poll affordable? Choose all that apply."
+  options:
+    - "Answering unchanged polls with 304 Not Modified"
+    - "Serving a shared response from a CDN with a short max-age"
+    - "Adding jitter to each client's interval"
+    - "Polling from BGAppRefreshTask while the app is suspended"
+    - "Stopping when the screen isn't visible"
+  answer: [0, 1, 2, 4]
+  explain: "304s and a CDN make each poll cheap; jitter spreads them out; stopping when nobody is looking removes most of them. BGAppRefreshTask runs when iOS chooses and isn't a polling timer."
+- id: q5
+  type: mcq
+  prompt: "A sign-in approval screen waits for the user to tap Approve on their other device, usually within 30 seconds. What fits best?"
+  options:
+    - "A WebSocket connection to a dedicated real-time service"
+    - "Long polling one endpoint that answers as soon as the approval happens"
+    - "Polling every 60 seconds"
+    - "A silent push to the waiting device"
+  answer: 1
+  explain: "One rare event that should arrive within a second: long polling gives socket-like latency with a plain HTTP endpoint. A 60-second poll feels broken, a whole real-time tier is overkill, and silent pushes are throttled and not guaranteed."
+```

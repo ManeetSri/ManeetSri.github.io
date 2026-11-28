@@ -1,0 +1,266 @@
+## Why it matters
+
+Protocols are how Swift code says "I need something that can do this" without naming who does it. They're the seams that make code testable, the boundaries between modules, and, with protocol extensions, a way to share behaviour without a class hierarchy. They also hide one of Swift's best-known traps, where a method you thought you'd overridden is silently ignored. Interviewers reach for that trap because it separates people who use protocols from people who understand them.
+
+## Start from the capability, not the class
+
+The UIKit habit is a base class: a `BaseViewController` that every screen inherits, with loading spinners, error alerts and analytics built in. It works until a SwiftUI view, a cell or a widget needs one of those behaviours. They can't inherit from a view controller, and every screen inherits all of it whether it needs it or not.
+
+Protocol-oriented design, which Apple introduced at WWDC 2015, turns this around. Describe each **capability** as a small protocol, and let any type adopt the ones it needs: a struct, an enum, a class or an actor. It's [composition over inheritance](/design/learn/sd-principles-composition), with the compiler's help.
+
+Here's a capability almost every UIKit app wants: cells that know their own reuse identifier, so registering and dequeuing can't get the string wrong.
+
+```swift check ios
+import UIKit
+
+protocol Reusable {
+    static var reuseIdentifier: String { get }
+}
+
+extension Reusable {
+    // A default every conformer gets, and any one of them can replace
+    static var reuseIdentifier: String { String(describing: self) }
+}
+
+extension UITableView {
+    func register<Cell: UITableViewCell & Reusable>(_: Cell.Type) {
+        register(Cell.self, forCellReuseIdentifier: Cell.reuseIdentifier)
+    }
+
+    func dequeue<Cell: UITableViewCell & Reusable>(_: Cell.Type, for indexPath: IndexPath) -> Cell {
+        guard let cell = dequeueReusableCell(withIdentifier: Cell.reuseIdentifier, for: indexPath) as? Cell else {
+            preconditionFailure("\(Cell.reuseIdentifier) was registered with a different class")
+        }
+        return cell
+    }
+}
+
+final class OrderCell: UITableViewCell, Reusable {}
+
+func configure(_ table: UITableView, at indexPath: IndexPath) -> OrderCell {
+    table.register(OrderCell.self)
+    return table.dequeue(OrderCell.self, for: indexPath)
+}
+```
+
+Three ideas are working together. The protocol states the capability. The **protocol extension** provides a default, so `OrderCell` conforms with an empty body. And the generic constraint `UITableViewCell & Reusable` composes a class with a protocol, so `dequeue` returns an `OrderCell`, not a cell you have to cast.
+
+## A protocol is a contract, not a list of signatures
+
+A protocol's signatures are the part the compiler checks. Its **semantic requirements** are the part that matters, and you write them in the documentation:
+
+- `Collection` promises that `startIndex`, `endIndex` and subscripting are O(1). A conformance with an O(n) subscript compiles, and quietly makes algorithms built on it quadratic.
+- `Hashable` promises that equal values have equal hashes. Break it and a `Set` silently holds duplicates.
+- Your own `TokenProvider` might promise: "`validToken()` returns a token valid for at least 60 seconds, and concurrent callers trigger at most one refresh."
+
+That's [Liskov substitution](/design/learn/sd-solid-lsp) in protocol form: every conformer, including the fake in your tests, must keep the promises, or code that's correct against one conformer breaks against another. A practical habit is a **contract test**: one generic test helper, `func checkTokenProviderContract(_ make: () -> some TokenProvider)`, run against the real provider and every fake. The fake can't drift from the real thing without a test failing.
+
+Isolation is part of the contract too. A protocol marked `@MainActor` promises its methods run on the main actor; one that refines `Sendable` promises conformers can be shared across tasks. You'll design with those later in this module.
+
+## Protocol extensions: defaults and conveniences
+
+A protocol extension can add two different kinds of member, and the difference matters:
+
+1. **A default for a requirement.** The requirement is declared in the protocol, and the extension supplies an implementation conformers may replace. `reuseIdentifier` above is one.
+2. **A convenience that isn't a requirement.** A helper built on the requirements, which every conformer gets and none can customise.
+
+Extensions can also be **constrained**, so a helper appears only where it makes sense: `extension Collection where Element: Identifiable` can offer `firstIndex(of id: Element.ID)` to every array of identifiable models.
+
+And you can make types you don't own conform to protocols you do: **retroactive modelling**. The course's DesignKit package defines a one-method `HTTPClient` protocol, then makes `URLSession` conform in an extension, so production code passes `URLSession.shared` and tests pass a stub. Swift 6 warns only when *both* the type and the protocol belong to other modules (say, `URLSession` and `Identifiable`), and asks you to write `@retroactive` to acknowledge the risk: if Apple later adds the same conformance, which implementation runs depends on the build.
+
+## The dispatch trap
+
+Here's the trap. A **requirement** is dispatched dynamically: every conformance has a table of its implementations (the *protocol witness table*), and a call through the protocol looks the implementation up there. A member defined **only in an extension** has no entry in that table. It's chosen at compile time from the static type, so a conformer's member with the same name doesn't replace it. It only hides it when the conformer's own type is known.
+
+Analytics code is where this bites in real apps:
+
+```swift run
+protocol TrackedScreen {
+    var screenName: String { get }
+}
+
+extension TrackedScreen {
+    var screenName: String { String(describing: Self.self) }
+    // Not a requirement: a convenience every screen gets
+    var category: String { "general" }
+    func event() -> String { "\(category)/\(screenName)" }
+}
+
+struct CheckoutScreen: TrackedScreen {
+    var screenName: String { "checkout" }
+    var category: String { "commerce" }   // looks like an override; isn't one
+}
+
+struct SettingsScreen: TrackedScreen {}
+
+let checkout = CheckoutScreen()
+print(checkout.category)
+print(checkout.event())
+
+let screens: [any TrackedScreen] = [CheckoutScreen(), SettingsScreen()]
+for screen in screens {
+    print(screen.event())
+}
+```
+
+```output
+commerce
+general/checkout
+general/checkout
+general/SettingsScreen
+```
+
+`checkout.category` says "commerce", because the static type is `CheckoutScreen`. But `event()` lives in the extension, where the only thing known about `self` is that it's *some* `TrackedScreen`. It reads `screenName` through the witness table and gets "checkout", and reads `category`, which has no table entry, and gets the extension's "general". Every checkout event in your analytics dashboard is filed under the wrong category, and nothing crashes or warns. Step through the lookup:
+
+```visual flow
+title: How event() finds its members
+nodes:
+  - { id: call, label: screen.event(), kind: client, at: [0, 1] }
+  - { id: ext, label: event() in the extension, kind: service, at: [2, 1] }
+  - { id: table, label: Witness table, kind: store, at: [4, 0] }
+  - { id: fallback, label: "extension's category", kind: service, at: [4, 2] }
+edges:
+  - [call, ext, calls]
+  - [ext, table, screenName]
+  - [ext, fallback, category]
+steps:
+  - say: "`event()` isn't a requirement, so there's one copy of it, in the extension, compiled for every conformer."
+    send: call->ext
+  - say: "`screenName` **is** a requirement. The call goes through the conformance's witness table and finds `CheckoutScreen`'s implementation: \"checkout\"."
+    send: ext->table
+    state: { table: ok }
+    label: { table: screenName }
+  - say: "`category` isn't a requirement, so the table has no entry for it. The compiler picks the only `category` it can see for a generic `Self`: the extension's \"general\"."
+    send: ext->fallback
+    state: { fallback: error }
+  - say: "The fix is one line: declare `var category: String { get }` in the protocol. Now it has a table entry, and `CheckoutScreen`'s version wins everywhere."
+    hide: [fallback]
+    send: ext->table
+    label: { table: "+ category" }
+```
+
+The rule to remember: **if conformers should be able to customise it, it must be a requirement.** Keep extension-only members for conveniences that are the same for everyone, such as formatting a requirement's result.
+
+<Callout kind="gotcha" title="iOS gotcha: optional requirements are an Objective-C feature">
+
+UIKit's delegates have `optional` requirements because they're `@objc` protocols. A pure Swift protocol can't have them. The Swift equivalent is a requirement with a default implementation in an extension, which also keeps the protocol usable from structs and enums. Mark a protocol `@objc` only for Objective-C interop.
+
+</Callout>
+
+## Protocols that age well
+
+- **Small and role-based.** A protocol shaped like one caller's needs ([interface segregation](/design/learn/sd-solid-isp)) changes less than one shaped like the class that happens to implement it.
+- **Owned by the caller.** The module that *uses* `TokenProvider` declares it, and the implementation depends on it: [dependency inversion](/design/learn/sd-solid-dip).
+- **Requirements are customisation points; extensions are conveniences.** Decide deliberately which is which.
+- **Adding a requirement to a public protocol breaks every outside conformer**, unless you add a default implementation in an extension at the same time.
+- **`AnyObject` only when conformers must be classes**, typically so a delegate can be held `weak`.
+- **Not every type needs one.** A protocol with one conformer and no test double adds a file and a jump-to-definition and buys nothing. For a single injectable function, a closure or a struct of closures is lighter; you'll meet that style in D07.
+
+## Trade-offs
+
+| | Base class | Protocol + extensions | Struct of closures | Enum |
+| --- | --- | --- | --- | --- |
+| **Who can adopt it** | subclasses only | any type | anyone who builds the struct | the cases you list |
+| **Shared stored state** | yes | no; conformers store it | captured in closures | per case |
+| **Adding a new kind** | a subclass | a conformance, anywhere | a new value | edit the enum |
+| **Adding an operation** | edit the base class | a requirement with a default | a new closure property | a new `switch` |
+| **Test doubles** | subclass and override | a small fake type | pass different closures | not needed |
+| **Dispatch** | class vtable | witness table for requirements | closure call | `switch` |
+
+A base class wins when subclasses really share stored state and lifecycle, as UIKit's own `UIView` subclasses do. Protocols win for capabilities shared across unrelated types and for module boundaries. A struct of closures wins for one or two injectable functions. An enum wins when the set of kinds is closed and known, which you weighed in [the expression problem](/design/learn/sd-solid-expression-problem).
+
+<Callout kind="interview">
+
+**Say:** "I describe what the caller needs as a small protocol, owned by the caller's module. Requirements are the customisation points; defaults and helpers live in extensions." If protocol extensions come up, explain static versus dynamic dispatch with an example.
+
+**Ask:** how many conformers will there be, and who writes them? Is the set of kinds closed? Does the protocol cross a module boundary?
+
+**Red flags:** a protocol for every class "for testability", each with one conformer; a base class to share UI behaviour between view controllers and SwiftUI views; redeclaring an extension-only member in a conformer and expecting it to be called.
+
+</Callout>
+
+## Practice
+
+The **generic repository** kata, which also practises the next lesson on generics, starts from three small protocols: a remote source, an actor-bound local store and an entity with comparable ids. Notice how each one states a capability and a contract, and how a protocol can require its conformers to be actors.
+
+```cards
+- id: capability-protocols
+  front: "Why prefer small capability protocols to a base class for shared behaviour?"
+  back: "Any type can adopt them (structs, enums, classes, actors, SwiftUI views), each adopts only what it needs, and defaults come from protocol extensions."
+- id: dispatch-rule
+  front: "When does a conformer's member replace a protocol extension's member of the same name?"
+  back: "Only when it's declared as a requirement in the protocol. Extension-only members are chosen statically, so through the protocol or a generic they ignore the conformer's version."
+- id: semantic-requirements
+  front: "What are a protocol's semantic requirements?"
+  back: "The promises the compiler can't check, such as complexity, threading, error behaviour or Hashable's equal-means-equal-hash. Document them and test every conformer, fakes included, against them."
+```
+
+```quiz
+- id: q1
+  type: output
+  prompt: "What does this print?"
+  code: |
+    protocol Shape {
+        func describe() -> String
+    }
+    extension Shape {
+        func describe() -> String { "shape" }
+        func name() -> String { "generic" }
+        func summary() -> String { "\(name()): \(describe())" }
+    }
+    struct Circle: Shape {
+        func describe() -> String { "round" }
+        func name() -> String { "circle" }
+    }
+    print(Circle().summary())
+  answer: "generic: round"
+  explain: "`summary()` runs in the extension, where `self` is only known to be some `Shape`. `describe()` is a requirement, so the witness table finds Circle's \"round\". `name()` isn't, so the extension's \"generic\" is chosen at compile time."
+- id: q2
+  type: mcq
+  prompt: "Your networking module's public `ImageLoading` protocol has conformers in three other modules. You need to add `func prefetch(_ urls: [URL])`. What keeps those modules compiling?"
+  options:
+    - "Mark the new requirement `optional`"
+    - "Add a default implementation in a protocol extension"
+    - "Make the protocol `open`"
+    - "Nothing; every conformer must implement it"
+  answer: 1
+  explain: "A default in an extension satisfies the new requirement for existing conformers, and any of them can provide a better one later. `optional` needs `@objc`, and protocols can't be `open`."
+- id: q3
+  type: bug
+  prompt: "This doesn't compile. Which line needs to change?"
+  code: |
+    protocol OrderListDelegate {
+        func orderList(didSelect id: String)
+    }
+
+    final class OrderListController {
+        weak var delegate: OrderListDelegate?
+    }
+  answer: 1
+  explain: "`weak` needs a class reference, but the protocol could be adopted by a struct. Declare `protocol OrderListDelegate: AnyObject` so only classes conform, and the delegate can be held weakly to avoid a retain cycle."
+- id: q4
+  type: multi
+  prompt: "Which of these should be requirements in the protocol, not only members of an extension?"
+  options:
+    - "A behaviour some conformers need to do differently"
+    - "A convenience built only from other requirements, which should be the same for everyone"
+    - "A value each conformer must supply, like `screenName`"
+    - "A helper that formats a requirement's result for log messages"
+  answer: [0, 2]
+  explain: "Anything a conformer must provide or may customise has to be a requirement, so calls through the protocol find the conformer's version. Uniform conveniences built on top belong in an extension."
+- id: q5
+  type: truefalse
+  prompt: "`extension URLSession: HTTPClient`, where `HTTPClient` is your own protocol, needs `@retroactive`."
+  answer: false
+  explain: "Swift 6 asks for `@retroactive` only when both the type and the protocol come from other modules. Conforming someone else's type to your own protocol is ordinary retroactive modelling."
+- id: q6
+  type: mcq
+  prompt: "Twelve screens, some UIKit view controllers and some SwiftUI views, must all log a screen-view event the same way. Which design fits best?"
+  options:
+    - "A `BaseViewController` superclass that logs in `viewDidAppear`"
+    - "A small protocol with a default implementation in an extension"
+    - "Copy the logging code into each screen"
+    - "A singleton that every screen calls with a string"
+  answer: 1
+  explain: "SwiftUI views are structs and can't inherit from a view controller, so a base class covers only half the screens. A protocol with a default works for both, and screens that need a different name provide one."
+```

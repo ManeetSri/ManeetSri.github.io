@@ -1,0 +1,323 @@
+## Why it matters
+
+Initialisers are explicit but have to be threaded through every layer; the SwiftUI environment avoids the threading but only reaches views. Point-Free's **swift-dependencies** library takes a third path: every dependency is a value with a live, a preview and a test version, stored in one `DependencyValues` struct, read anywhere with a property wrapper, and overridden for a scope using Swift's task-local values. It's the dependency system under The Composable Architecture and is widely used without it. Even if you never adopt it, its design answers a question interviewers like: how do you make deep code testable without passing parameters through ten layers, and stay safe when Swift Testing runs tests in parallel?
+
+## From a struct of closures to a bag of values
+
+In [Dependencies as closures and structs](/design/learn/sd-functional-environment) a feature took its world as one struct of closures, passed in explicitly. That works until the struct has to travel through a coordinator, a view model, a use case and a repository only to reach the code that calls `now()`. swift-dependencies keeps the struct-of-closures idea for each dependency and changes how it's delivered:
+
+- **Each dependency is a value with three defaults**: `liveValue` for the app, `previewValue` for Xcode previews, `testValue` for tests. The library works out which context it's running in.
+- **All dependencies live in one `DependencyValues` struct**, extended with one computed property per dependency, in the same way as SwiftUI's `EnvironmentValues`.
+- **Code reads a dependency with `@Dependency(\.key)`**, from any type: models, services, use cases, not only views.
+- **Overrides apply to a scope.** `withDependencies { $0.date.now = … } operation: { … }` changes the values for that operation and the tasks it starts, and for nothing else.
+
+## What it looks like
+
+Declaring a dependency, using it in a model and overriding it in a test (this uses the library, so it isn't compiled here):
+
+```swift
+import Dependencies
+import DependenciesMacros
+import Foundation
+
+@DependencyClient
+struct TripsClient {
+    var upcoming: @Sendable () async throws -> [Trip]
+}
+
+extension TripsClient: DependencyKey {
+    static let liveValue = TripsClient(upcoming: {
+        let (data, _) = try await URLSession.shared.data(from: URL(string: "https://api.example.com/trips")!)
+        return try JSONDecoder().decode([Trip].self, from: data)
+    })
+    static let previewValue = TripsClient(upcoming: { [.lisbon, .kyoto] })
+    // @DependencyClient's generated init leaves every endpoint unimplemented: calling one fails the test
+    static let testValue = TripsClient()
+}
+
+extension DependencyValues {
+    var tripsClient: TripsClient {
+        get { self[TripsClient.self] }
+        set { self[TripsClient.self] = newValue }
+    }
+}
+
+@MainActor @Observable final class UpcomingTripsModel {
+    @ObservationIgnored @Dependency(\.tripsClient) private var tripsClient
+    @ObservationIgnored @Dependency(\.date.now) private var now
+    private(set) var trips: [Trip] = []
+
+    func load() async throws {
+        trips = try await tripsClient.upcoming().filter { $0.departure > now }
+    }
+}
+
+@Test func hidesTripsThatAlreadyLeft() async throws {
+    let model = withDependencies {
+        $0.tripsClient.upcoming = { [.departedYesterday, .lisbon] }
+        $0.date.now = Date(timeIntervalSince1970: 1_767_225_600)
+    } operation: {
+        UpcomingTripsModel()
+    }
+    try await model.load()
+    #expect(model.trips == [.lisbon])
+}
+```
+
+Notice what the model's initialiser *doesn't* have: parameters. The dependencies are declared as properties at the top of the type instead, which is where a reader looks for them. The library also ships the dependencies almost every app needs (`\.date`, `\.uuid`, `\.continuousClock`, `\.calendar`, `\.locale`, `\.timeZone`, `\.openURL` and more), so "inject the clock" becomes one line.
+
+The `@DependencyClient` macro is worth a closer look. It gives the struct a default initialiser in which every closure is **unimplemented**: calling one records a test failure naming the endpoint. Using that initialiser as the `testValue` means a test has to override exactly the endpoints it expects the code to call, and an unexpected call fails loudly instead of quietly returning something.
+
+## How it works underneath
+
+The whole system rests on a Swift feature you met in [Why to avoid singletons](/design/learn/sd-creational-singleton-alternatives): **task-local values**. A static `@TaskLocal` property holds the current `DependencyValues`. `withDependencies` copies it, applies your changes to the copy, and binds the copy for the length of the operation. Because it's a task local:
+
+- every function the operation calls sees the override, without parameters;
+- child tasks inherit it: `async let`, task groups and `Task { }`;
+- concurrent operations each see their own copy, so parallel tests can't interfere;
+- when the operation returns, the override is gone.
+
+The second half of the design is **when dependencies are read**. `@Dependency` captures the current values at the moment its owner is created, which is why the test above creates the model *inside* `withDependencies` and then uses it outside. Here's a twenty-line version of the mechanism, so you can watch both rules:
+
+```swift run title="Task-local dependencies, captured when the owner is created"
+import Foundation
+
+struct Dependencies: Sendable {
+    var now: @Sendable () -> Date = { Date() }
+    var region = "live"
+
+    @TaskLocal static var current = Dependencies()
+}
+
+func withDependencies<R>(_ update: (inout Dependencies) -> Void, operation: () -> R) -> R {
+    var values = Dependencies.current
+    update(&values)
+    return Dependencies.$current.withValue(values, operation: operation)
+}
+
+/// Captures its dependencies when it's created, as @Dependency does
+final class CouponModel: Sendable {
+    private let now: @Sendable () -> Date
+    let expires = Date(timeIntervalSince1970: 1_000)
+
+    init() {
+        now = Dependencies.current.now
+    }
+
+    var isValid: Bool { now() < expires }
+}
+
+let beforeExpiry = withDependencies {
+    $0.now = { Date(timeIntervalSince1970: 999) }
+} operation: {
+    CouponModel()
+}
+print("created inside the scope, used outside:", beforeExpiry.isValid)
+
+var testing = Dependencies.current
+testing.region = "test-region"
+await Dependencies.$current.withValue(testing) {
+    let child = Task { Dependencies.current.region }
+    let detached = Task.detached { Dependencies.current.region }
+    print("child task:", await child.value)
+    print("detached task:", await detached.value)
+}
+print("after the scope:", Dependencies.current.region)
+```
+
+```output
+created inside the scope, used outside: true
+child task: test-region
+detached task: live
+after the scope: live
+```
+
+The real library adds a good deal on top: context detection, merging of captured and current values, the unimplemented test defaults, preview traits and tools for escaping closures. You'll build a fuller version, with contexts and a property wrapper, in this module's kata.
+
+## Where task locals don't reach
+
+A task local belongs to a task. Anything that runs outside the task tree that set it sees the defaults instead:
+
+```visual timeline
+title: Who sees an override set in a test
+unit: ms
+lanes:
+  - { id: test, label: Test task }
+  - { id: child, label: "Task { }" }
+  - { id: detached, label: Task.detached }
+  - { id: gcd, label: GCD callback }
+  - { id: model, label: Model made in scope }
+spans:
+  - { lane: test, from: 0, to: 40, label: "withDependencies: now = 09:00", tone: active }
+  - { lane: child, from: 5, to: 25, label: sees 09:00, tone: ok }
+  - { lane: detached, from: 10, to: 30, label: sees the live clock, tone: error }
+  - { lane: gcd, from: 20, to: 35, label: sees the live clock, tone: error }
+  - { lane: model, from: 15, to: 70, label: captured 09:00 at creation, tone: ok }
+markers:
+  - { at: 40, label: scope ends }
+steps:
+  - { at: 0, say: "The test enters `withDependencies` and sets the clock to 09:00. The override is bound to **this task**." }
+  - { at: 5, say: "A `Task { }` created inside inherits task-local values, so it sees 09:00 too." }
+  - { at: 10, say: "`Task.detached` deliberately inherits nothing: no priority, no actor, **no task locals**. It sees the live clock." }
+  - { at: 20, say: "A `DispatchQueue` callback, a delegate method or a `NotificationCenter` closure runs outside any task, so it sees the defaults as well." }
+  - { at: 45, say: "After the scope ends the override is gone, but the model created inside it keeps the 09:00 clock it captured, which is exactly what a test wants." }
+```
+
+That's the main hazard of the approach. Code ported from completion handlers, delegate-based APIs such as `CLLocationManagerDelegate`, and Combine pipelines that hop to another scheduler can quietly read live dependencies in a test. The library's answer is `withEscapedDependencies`, which captures the current values so you can restore them inside the callback; the structural answer is to keep such code behind a client whose live implementation adapts the callbacks to `async`, so the code that *uses* it stays inside the task tree.
+
+## Contexts: live, preview and test
+
+The library decides which default to use by detecting where it's running: in an Xcode preview, `previewValue`; in a test, `testValue`; otherwise `liveValue`. Two rules make that useful rather than magical:
+
+- **A missing test value is a test failure.** If a dependency has no `testValue` and a test touches it, the library falls back to the live value *and* fails the test. Tests can't reach the network by accident.
+- **Preview values default to live ones.** A dependency with no `previewValue` uses `liveValue` in previews, so give a preview value to anything that would otherwise call a real server.
+
+For the app itself, `prepareDependencies` at the entry point overrides live values once at launch, for configuration the root decides, such as the staging host.
+
+Child models need one more step: they don't automatically inherit a parent's overrides. The parent creates them with `withDependencies(from: self) { … } operation: { ChildModel() }`, so a test that overrode the parent's clock overrides the child's too.
+
+## Designing a dependency client
+
+The library makes declaring a dependency cheap, so the design effort moves to the shape of each client:
+
+- **Endpoints in the feature's terms.** `upcoming() async throws -> [Trip]`, not `get(path:) -> Data`. The live value does the HTTP; the closure signature is what tests and previews have to fake, so keep it small and typed.
+- **Everything `Sendable`.** Closures are `@Sendable` and values are `Sendable`, so a client can be used from any actor, and the compiler checks it.
+- **Callback APIs adapted in the live value.** A location client exposes `updates: @Sendable () -> AsyncStream<CLLocation>`; the live value owns the `CLLocationManager` and its delegate and feeds the stream. The code that uses it stays inside the task tree, which also fixes the propagation problem above.
+- **Interface and implementation in separate modules.** Declare the client, its `testValue` and `previewValue` in a small module, conforming to `TestDependencyKey`, and add the `DependencyKey` conformance with `liveValue` in a module only the app target links. Features then compile and test without the live SDKs:
+
+```swift
+// TripsClientInterface: what features import. No URLSession, no SDKs.
+public struct TripsClient: Sendable {
+    public var upcoming: @Sendable () async throws -> [Trip]
+}
+
+extension TripsClient: TestDependencyKey {
+    public static let testValue = TripsClient(upcoming: unimplemented("TripsClient.upcoming", placeholder: []))
+    public static let previewValue = TripsClient(upcoming: { [.lisbon, .kyoto] })
+}
+
+// TripsClientLive: linked only by the app target
+extension TripsClient: DependencyKey {
+    public static let liveValue = TripsClient(upcoming: { try await TripsAPI.live.upcoming() })
+}
+```
+
+That's the same interface-module split you'd use with initialiser injection (D61 develops it). The library doesn't remove the need for module boundaries; it makes the live value one conformance in the right place.
+
+## Is it a service locator?
+
+In a strict sense it's an **ambient context**, a cousin of the service locator: a type's dependencies don't appear in its initialiser, and it pulls them from something global. The design blunts most of the usual costs:
+
+| Cost of a service locator | How dependency values handle it |
+| --- | --- |
+| Dependencies are hidden in method bodies | Declared as `@Dependency` properties at the top of the type, by convention |
+| A missing registration crashes at run time | Every key has defaults, and tests fail when they touch something they didn't override |
+| Tests share and mutate global state | Overrides are task-local copies, so parallel tests are isolated |
+| Lifetimes are accidental | Captured at creation; scopes are explicit `withDependencies` blocks |
+
+What remains is real: the compiler doesn't make a caller supply anything, a reader has to know the convention, and the guarantees weaken wherever code leaves the task tree. Teams that adopt it usually keep initialiser injection for the big structural pieces (a feature's repositories, a session) and use dependency values for the small, everywhere dependencies: time, UUIDs, randomness, analytics, feature flags.
+
+## Trade-offs
+
+| Approach | Reaches | Visible at the call site | Missing dependency | Parallel tests | Cost |
+| --- | --- | --- | --- | --- | --- |
+| Initialiser injection | Anything you pass it to | Yes | Compile error | Safe | Threading parameters through layers |
+| SwiftUI environment | Views only | No | The default runs | Safe | Bridging into view models |
+| Dependency values (swift-dependencies) | Any code inside the task tree | Declared on the type, not the call | Defaults; test failure in tests | Safe | A library, task-local pitfalls, a convention to learn |
+| Global or singleton | Everything | No | n/a | Unsafe | Flaky tests and leaked state |
+
+<Callout kind="interview">
+
+**What to say:** "Each dependency is a value with live, preview and test versions. Code reads it with `@Dependency`, and tests override it with `withDependencies`, which binds a copy in a task local, so overrides are scoped and parallel tests can't interfere. Dependencies are captured when a model is created, so I create models inside the override." Then name the hazard: `Task.detached` and callback-based APIs don't see task locals.
+
+**What to ask:** "Is the team already on TCA or swift-dependencies? How much callback-based or Combine code is left?"
+
+**Red flags:** describing it as "a global you can mock"; creating the model outside `withDependencies` and wondering why the override is ignored; using it for everything, including the structural dependencies that should be visible in initialisers.
+
+</Callout>
+
+<Callout kind="gotcha" title="Swift gotcha: @Observable needs @ObservationIgnored on @Dependency">
+
+The `@Observable` macro turns stored properties into tracked computed ones, and property wrappers can't be applied to those, so `@Dependency var client` inside an `@Observable` class doesn't compile. Mark each one `@ObservationIgnored @Dependency(\.client) var client`. Dependencies aren't state the view should observe anyway.
+
+</Callout>
+
+<Callout kind="gotcha" title="Swift gotcha: callbacks run outside the task tree">
+
+A `CLLocationManagerDelegate` method, a `URLSession` delegate callback, a `Timer` or a `DispatchQueue.main.async` closure isn't part of any Swift task, so it reads the default dependency values even inside a test that overrode them. Wrap such APIs in a client whose live value bridges to `async` (for example with `AsyncStream`), or capture the values with `withEscapedDependencies` before leaving the task.
+
+</Callout>
+
+## Practice
+
+**Dependency values with task-local overrides** has you build the core: a `DependencyValues` struct with live, preview and test defaults, `withDependencies` for scoped overrides that child tasks inherit, and a `@Dependency` property wrapper that captures values when its owner is created. The tests run twenty overlapping scopes at once.
+
+```cards
+- id: depvalues-shape
+  front: "How is a dependency declared in swift-dependencies?"
+  back: "As a value (often a struct of closures) conforming to `DependencyKey` with a `liveValue`, plus optional `testValue` and `previewValue`, and a computed property on `DependencyValues` that reads `self[Key.self]`."
+- id: depvalues-tasklocal
+  front: "Why are `withDependencies` overrides safe under parallel tests?"
+  back: "The values are stored in a task local: each override binds a copy for one operation and the tasks it starts, so concurrent tests each see their own values."
+- id: depvalues-capture
+  front: "When does `@Dependency` read its value, and what does that mean for tests?"
+  back: "It captures the current dependencies when its owner is created. Create the model inside `withDependencies` and it keeps the overrides after the scope ends; create it outside and it doesn't see them."
+- id: depvalues-escape
+  front: "Which code doesn't see task-local overrides?"
+  back: "Anything outside the task tree that set them: `Task.detached`, GCD callbacks, delegate methods, timers and notification closures."
+```
+
+```quiz
+- id: q1
+  type: mcq
+  prompt: "A test does `let model = UpcomingTripsModel()`, then `withDependencies { $0.date.now = fixedDate } operation: { await model.load() }`. The model still uses the real clock. Why?"
+  options:
+    - "`withDependencies` only works with synchronous code"
+    - "`@Dependency` captured the dependencies when the model was created, before the override existed"
+    - "Swift Testing doesn't support task locals"
+    - "`date.now` can't be overridden"
+  answer: 1
+  explain: "Dependencies are fixed at creation. Create the model inside the `operation` closure, then use it anywhere."
+- id: q2
+  type: output
+  prompt: "What does this print?"
+  code: |
+    enum Current {
+        @TaskLocal static var region = "live"
+    }
+
+    await Current.$region.withValue("test") {
+        let child = Task { Current.region }
+        let detached = Task.detached { Current.region }
+        print(await child.value, await detached.value)
+    }
+    print(Current.region)
+  answer: "test live\nlive"
+  explain: "Child tasks inherit task-local values; detached tasks inherit nothing. Outside the scope the default is back."
+- id: q3
+  type: multi
+  prompt: "Which of these would read the *live* clock inside a test that overrides `\\.date.now`? Choose all that apply."
+  options:
+    - "Code in an `async let` started inside the override"
+    - "A `CLLocationManagerDelegate` callback that reads `@Dependency(\\.date.now)`"
+    - "A model created inside the override, used after it ends"
+    - "A `DispatchQueue.main.async` closure scheduled inside the override"
+    - "Work inside a `Task.detached` started inside the override"
+  answer: [1, 3, 4]
+  explain: "Task locals reach child tasks and models capture them at creation. Delegate callbacks, GCD closures and detached tasks run outside the task tree, so they see the defaults."
+- id: q4
+  type: mcq
+  prompt: "Why does `@DependencyClient` make each endpoint unimplemented in the test value?"
+  options:
+    - "To make tests run faster"
+    - "So a test must override exactly the endpoints it expects to be called, and any unexpected call fails, naming the endpoint"
+    - "Because macros can't generate closures that return values"
+    - "So the live value can be used in tests"
+  answer: 1
+  explain: "An unimplemented endpoint records a test failure. The test states its contract with the outside world, and new, unexpected calls are caught instead of silently returning defaults."
+- id: q5
+  type: truefalse
+  prompt: "Because dependencies are read through a property wrapper rather than passed in, swift-dependencies has every drawback of a service locator."
+  answer: false
+  explain: "It shares one: dependencies aren't in the initialiser. But keys always have defaults, tests fail when they touch something un-overridden, overrides are task-local copies rather than global mutations, and dependencies are declared at the top of each type."
+```

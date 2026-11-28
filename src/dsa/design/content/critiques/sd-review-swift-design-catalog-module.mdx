@@ -1,0 +1,142 @@
+<Brief>
+
+`CatalogKit` is a Swift package module that three feature modules of a shop app import: Browse, Search and Checkout. It's the first module the team has split out, and its author wanted it "flexible", so everything is a protocol, an existential or `open`. Support has a ticket saying book rows never show the author. Review the module's public API and its row view as you would a pull request.
+
+```swift check ios title="CatalogKit.swift"
+import SwiftUI
+
+public protocol CatalogItem {
+    var id: String { get }
+    var title: String { get }
+    var price: Decimal { get }
+}
+
+public struct Book: CatalogItem, Decodable {
+    public var id: String
+    public var title: String
+    public var price: Decimal
+    public var author: String
+}
+
+public struct Course: CatalogItem, Decodable {
+    public var id: String
+    public var title: String
+    public var price: Decimal
+    public var lessonCount: Int
+}
+
+public struct AnyCatalogItem: CatalogItem {
+    private let base: any CatalogItem
+    public init(_ base: any CatalogItem) { self.base = base }
+    public var id: String { base.id }
+    public var title: String { base.title }
+    public var price: Decimal { base.price }
+}
+
+open class CatalogStore {
+    public var items: [AnyCatalogItem] = []
+    public var session: URLSession = .shared
+    public var lastResponse: [String: Any] = [:]
+
+    public init() {}
+    open func loadBooks(from url: URL) async throws {
+        let (data, response) = try await session.data(from: url)
+        lastResponse = ["status": (response as? HTTPURLResponse)?.statusCode ?? 0, "bytes": data.count]
+        let books = try JSONDecoder().decode([Book].self, from: data)
+        items = books.map { AnyCatalogItem($0) }
+    }
+
+    public func cheapest(in items: [any CatalogItem]) -> (any CatalogItem)? {
+        items.min { $0.price < $1.price }
+    }
+
+    public func resetForTesting() {
+        items = []
+        lastResponse = [:]
+    }
+}
+
+public struct CatalogRow: View {
+    public let item: any CatalogItem
+    public init(item: any CatalogItem) { self.item = item }
+
+    public var body: some View {
+        if let book = item as? Book {
+            return AnyView(VStack(alignment: .leading) {
+                Text(book.title)
+                Text(book.author).font(.caption)
+            })
+        }
+        if let course = item as? Course {
+            return AnyView(Text("\(course.title) · \(course.lessonCount) lessons"))
+        }
+        return AnyView(Text(item.title))
+    }
+}
+```
+
+</Brief>
+
+```workspace
+template: critique
+minutes: 25
+```
+
+```findings
+- id: eraser-breaks-rows
+  title: The hand-written eraser adds nothing, and it's why book rows lose their author
+  severity: high
+  lines: 23-29
+  detail: "`CatalogItem` has no associated types or `Self` requirements, so `any CatalogItem` already works; `AnyCatalogItem` is a second box around the first. Worse, the store wraps every book in it (line 41), so in `CatalogRow` the dynamic type is `AnyCatalogItem`, `item as? Book` fails, and every row from the store shows only its title: the support ticket. Every new requirement must also be copied into the eraser by hand. Delete it and store the concrete or existential type."
+- id: open-store
+  title: "`open` makes subclassing part of the module's public API"
+  severity: high
+  lines: 31-37
+  detail: "Any client module can subclass `CatalogStore` and override `loadBooks`, for example without setting `items`. From then on every internal change, such as adding a cache or calling `loadBooks` from `init`, can break a subclass in another module, and the store can't keep its own invariants. Make it `public final`; let clients configure it through `init` parameters or a protocol they implement."
+- id: public-mutable-state
+  title: Public mutable stored properties hand the store's state to every client
+  severity: high
+  lines: 32-34
+  detail: "Search can assign `items`, Checkout can swap `session` for every user of the store, and anyone can write `lastResponse`. Nothing can rely on `items` having come from the server, and changes can't be observed or validated. Use `public private(set) var items`, and take the URLSession (or a small HTTP client protocol) in `init` and keep it private."
+- id: any-dictionary
+  title: "`[String: Any]` is the most erased type there is"
+  severity: medium
+  lines: 34
+  detail: "Readers of `lastResponse` must know the keys and cast every value (line 39 writes an `Int` under \"status\"), so a typo or a changed type is a silent `nil`. `Any` isn't `Sendable`, so the store can never be made safe to share across actors while it holds this. A two-field struct says the same thing with types, or drop it: it's debugging state in a public API."
+- id: existential-signature
+  title: "`cheapest(in:)` throws away the caller's type"
+  severity: medium
+  lines: 44-46
+  detail: "A caller with `[Book]` gets back `(any CatalogItem)?` and has to cast to read `author`. Every element is boxed, and every `price` read is a dynamic call. It doesn't use the store either. A generic `static func cheapest<Item: CatalogItem>(in items: [Item]) -> Item?` returns a `Book` for books and is specialised by the compiler; keep an existential version only if mixed lists are a real need."
+- id: anyview-body
+  title: "`AnyView` hides the row's structure from SwiftUI"
+  severity: medium
+  lines: 58-69
+  detail: "The explicit `return`s switch off the `@ViewBuilder` that `body` would otherwise get, so each branch is wrapped in `AnyView`. SwiftUI then can't tell the branches apart by type: when an item changes kind, it compares the erased types at run time and replaces the whole row, losing its state and animations. Without the `return`s and `AnyView`, the builder produces a conditional view SwiftUI can diff."
+- id: type-switch
+  title: The row treats an open protocol as a closed set
+  severity: medium
+  lines: 59-68
+  detail: "`CatalogItem` is public, so any module can add a conformer (a Podcast next quarter), and it silently gets the title-only fallback: the compiler can't point at the missing case. If the kinds of item are fixed, say so with an enum (`case book(Book)`, `case course(Course)`) and switch exhaustively. If they're open, put what the row needs, such as a subtitle, into the protocol."
+- id: test-hook
+  title: A test-only method in the public API
+  severity: low
+  lines: 48-51
+  detail: "`resetForTesting()` is callable from production code in every client module, and removing it later breaks anyone who found it. Tests can reach internal members with `@testable import CatalogKit`; a test-support target in the same package can use a `package` method instead."
+```
+
+<ReferenceReview>
+
+**What matters most.** The visible bug, book rows without authors, comes from a design choice rather than a typo: a hand-written eraser around a protocol that never needed one, combined with a view that downcasts. Delete `AnyCatalogItem` first; that one change fixes the ticket. The two other high findings are about the module boundary. This is the team's first shared module, and `open` plus public mutable state means three other modules can already depend on details the author will want to change next month. Fixing that now costs a morning; fixing it after Browse subclasses the store costs a migration.
+
+**How I'd fix it, in small steps,** each its own pull request that leaves the app working:
+
+1. **Stop the bleeding:** remove `AnyCatalogItem`. Store `[any CatalogItem]` for now, so `as? Book` works again. Ship it; the ticket is closed.
+2. **Close the boundary:** make `CatalogStore` `public final`, make `items` `public private(set)`, take the session (better, an `HTTPClient` protocol) in `init` and keep it private. Delete `lastResponse`, or replace it with an internal struct for logging. Build all three client modules: anything that no longer compiles was relying on internals and needs a proper API.
+3. **Model what's really closed:** the catalog has books and courses, and every screen switches on that. Introduce `public enum CatalogEntry: Identifiable { case book(Book), course(Course) }`, store `[CatalogEntry]`, and write `CatalogRow` as a `@ViewBuilder` `switch` with no `AnyView`. Adding a podcast later becomes a compile error everywhere it must be handled, which is what you want.
+4. **Fix the helpers:** make `cheapest(in:)` a generic static function (or an extension on `Collection where Element: CatalogItem`), and delete `resetForTesting()` in favour of `@testable import` in CatalogKit's own tests.
+5. **Turn the rule on:** consider internal imports in client modules (`internal import CatalogKit` where nothing re-exports it), so the compiler stops CatalogKit types leaking into *their* public APIs too.
+
+**Tests to add.** Before step 1, a test that wraps a decoded `Book` exactly as `loadBooks` does and asserts that `as? Book` recovers it: it fails today and proves the fix. With the session injected, `loadBooks` gets tests for decoding and for an error status. A test-target build of each client module after step 2 is the real safety net: the compiler finds every leak for you.
+
+</ReferenceReview>

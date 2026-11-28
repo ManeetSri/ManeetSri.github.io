@@ -1,0 +1,177 @@
+<Brief>
+
+You're a staff engineer at a travel booking app. It's nine years old and has about **200 screens**: 120 in UIKit (most from storyboards), 80 in SwiftUI, all written since 2021. Six squads and 28 iOS engineers work on it, and it ships every week with phased release.
+
+The app runs on singletons. A quick count:
+
+- **46 types with `static let shared`**, and **3,100 `.shared` call sites**. The busiest are `APIClient` (720), `SessionManager` (540), `AnalyticsManager` (480), `FeatureFlags` (390), `ImageCache` (210) and `BasketManager` (160).
+- The code is split into an app target and 14 feature packages, but every package imports `Core`, where all 46 singletons live. Touching `Core` rebuilds everything: 9 minutes for an incremental build.
+- **Tests:** 1,900 unit tests, run serially because "parallel runs are flaky". They take 14 minutes and about 3% of runs fail for no reason.
+- **Privacy:** twice last year, someone signed out on a shared iPad and the next person saw the first person's saved trips and basket. Each fix added another `reset()` call to the sign-out path, which now resets 11 singletons by hand.
+- **Swift 6:** the packages are still in the Swift 5 language mode. Turning on strict checking in `Core` produces about 600 errors, almost all about `shared` instances.
+- The widget, the notification service extension and the share extension all link `Core`, so each one carries the whole app's service layer. The widget has crashed when it went over its memory limit.
+
+Leadership wants the singletons gone within three quarters, without stopping feature work: each squad can give about 15% of its time. Write the migration plan you'd take to the squad leads. Spend about 35 minutes.
+
+</Brief>
+
+```workspace
+template: migration
+minutes: 35
+```
+
+<ModelAnswer section="current">
+
+**Not all 46 singletons are the same problem.** Sorting them is the first piece of work, because each group gets a different treatment:
+
+- **Stateless facilities** (formatters, `Logger` wrappers, date helpers, about 12): harmless as globals; leave them, or turn them into plain functions and values.
+- **App-wide services** (`APIClient`, `ImageCache`, `FeatureFlags`, `AnalyticsManager`, about 18): one instance is right; *global access* is the problem. These need injecting, not removing.
+- **Per-user state** (`SessionManager`, `BasketManager`, saved trips, inbox, loyalty, 11 of them): these have the **wrong lifetime**. They live as long as the process, but should live as long as a signed-in session. That's the privacy bug: the 11 hand-written `reset()` calls are a scope implemented by memory.
+- **Wrappers over Apple's shared objects** (location, notifications, about 5): fine as one instance, behind a protocol.
+
+**What global access costs this team, concretely:** hidden dependencies (nobody can tell what a screen needs without reading it), serial and flaky tests (every test shares the same 46 objects), the 600 Swift 6 errors (shared mutable state), the 9-minute builds and bloated extensions (every package depends on everything through `Core`), and the cross-user data incidents.
+
+**Baseline before changing anything:** `.shared` call sites per singleton and per package (a script over `git grep`), test time and flake rate, incremental build time after touching a feature, widget peak memory, launch time (p50 and p90), and the count of sign-out `reset()` calls.
+
+</ModelAnswer>
+
+<ModelAnswer section="target">
+
+**Pure dependency injection, wired at a composition root, with two scopes.** No runtime container.
+
+- **`AppDependencies`**, built once in the `App` struct and the scene delegate: the API client, image cache, flags, analytics, location. Each is a protocol in a small **interface package** (`NetworkingInterface`, `AnalyticsInterface`…), with the implementation in a `…Live` package that only the app target links.
+- **`SessionDependencies`**, built at sign-in from the app's dependencies plus the user's token: the session, basket, saved trips, inbox, loyalty. The signed-in UI is created from it; **sign-out releases it**, and every per-user object dies with it. No more `reset()`.
+- **Each feature package declares what it needs** as a small `struct TripsDependencies` (or a `Has…` protocol composition) and exposes an entry point: `TripsFeature.makeRootViewController(dependencies:)` for UIKit, or a root view that takes the struct for SwiftUI. Features depend on interface packages only, never on `…Live` or on each other's internals.
+- **Inside a feature:** initialiser injection for view models and services; `instantiateViewController(identifier:creator:)` so storyboard screens get initialisers too; the SwiftUI environment only for cross-cutting values many views read (image loading, analytics actions), always with a safe default.
+- **Extensions get their own small roots** that link only what they use: the widget needs a read-only trip store and the image loader, not the basket.
+
+**Why not a container?** The compiler should check the graph. With 28 engineers, a missing registration that crashes on one rarely visited screen is exactly the failure we'd ship. Hand-wiring 200 screens is more typing, but it's ordinary Swift that anyone can read, and the features' dependency structs keep each part of the graph small. If the wiring code grows painful, a compile-time tool (SafeDI or Needle) can generate it later without changing the features, because they already take their dependencies as inputs. Whatever we choose, we choose **one style** and write it down in a decision record; three DI styles in one app is worse than any one of them.
+
+</ModelAnswer>
+
+<ModelAnswer section="steps">
+
+Every step leaves the app shippable, and none changes behaviour on its own.
+
+1. **Agree the target and lock the door (weeks 1–2).** A decision record with the scopes, the feature-entry pattern and examples. A CI check that counts `.shared` uses per package and fails if any count goes **up** (a ratchet), plus a dashboard of the counts.
+2. **Build the composition root around the singletons (weeks 2–4).** `AppDependencies.live` is created at launch from the existing instances (`api: APIClient.shared`, and so on). Nothing behaves differently, but there's now a place to pass things from:
+
+   ```swift check
+   import Foundation
+
+   protocol TripsLoading: Sendable {
+       func upcomingTrips() async throws -> [String]
+   }
+
+   final class APIClient: TripsLoading {
+       static let shared = APIClient()
+       func upcomingTrips() async throws -> [String] { [] }
+   }
+
+   struct AppDependencies: Sendable {
+       var trips: any TripsLoading
+
+       // Step 2: the root wraps today's singleton, so nothing changes yet
+       static let live = AppDependencies(trips: APIClient.shared)
+   }
+
+   @MainActor final class UpcomingTripsModel {
+       private let trips: any TripsLoading
+
+       // Step 4 bridge: old call sites keep compiling until the screen is reached from the root
+       init(trips: any TripsLoading = APIClient.shared) {
+           self.trips = trips
+       }
+   }
+   ```
+
+3. **Extract role protocols for the six busiest singletons** into interface packages, with only the members callers use. The singletons conform. This is mechanical and unblocks every squad.
+4. **Migrate leaf-first, one feature at a time (each squad, from week 4).** A squad converts its feature's entry point to take its dependency struct, then pushes injection down through its screens, using a default argument of `.shared` as a temporary bridge for call sites it hasn't reached. A feature is "done" when its `.shared` count is zero and its tests run in parallel.
+5. **Introduce the session scope early (weeks 4–10, platform team).** This one is about user privacy, so it doesn't wait for the long tail: build `SessionDependencies` at sign-in, move `BasketManager` and saved trips behind it first (the two incidents), root the signed-in UI in it, and replace the `reset()` calls one by one. Ship the new sign-out path behind a remote flag.
+6. **Give the extensions their own roots** once the services they use have interface packages. The widget stops linking `Core`.
+7. **Turn on parallel tests and Swift 6, package by package.** A package with no singletons left can run its tests in parallel and switch to the Swift 6 language mode; most of the 600 errors disappear with the globals rather than being annotated away.
+8. **Delete the singletons.** When a singleton's count reaches zero, remove `shared` (or make it private to the app target's root) so it can't come back. `Core` shrinks to stateless helpers.
+
+**Rough timeline:** quarter one for steps 1–3 and the session scope; quarter two for the squads' features (each about two to four weeks of its 15%); quarter three for the long tail, the extensions, Swift 6 and deletion.
+
+</ModelAnswer>
+
+<ModelAnswer section="risks">
+
+- **Two instances where there used to be one.** Code that builds `APIClient()` instead of receiving one gives you two token refreshers racing each other, or two image caches doubling memory. The root holds exactly one of each; during the migration a debug-only counter in each service's `init` asserts that it's created once, and the `.shared` bridges return the root's instance.
+- **Initialisation order and launch time.** Singletons used to be created lazily on first access. A root that eagerly builds everything at launch can slow the first frame. Use `lazy` properties (or factories) in the root for anything heavy, and watch launch time with signposts and MetricKit at each release.
+- **The sign-out change.** Rebuilding the signed-in UI from a new session is a real behaviour change: unsaved state in a screen is lost at sign-out, which is correct but worth checking with product. It ships behind a flag, with a UI test that signs out, signs in as someone else and checks the basket and saved trips are empty.
+- **Storyboards.** Screens that need constructor injection use `instantiateViewController(identifier:creator:)` or `@IBSegueAction`; anything left on `init(coder:)` gets property injection with a `precondition` in `viewDidLoad`, so a missing dependency fails loudly in development rather than as a blank screen.
+- **A migration that stalls at 80%.** Two systems forever is the most likely failure. The ratchet, the public dashboard and a deletion date per singleton keep it moving; the platform team takes over any feature a squad can't finish.
+- **Rollback.** Each step is a refactor with no behaviour change, so rolling back is reverting a PR. The one behaviour change, the session scope, has a kill switch.
+
+</ModelAnswer>
+
+<ModelAnswer section="measure">
+
+- **The migration itself:** `.shared` call sites from 3,100 to zero, tracked weekly per package; singletons deleted out of 34 to remove (the stateless dozen can stay).
+- **Tests:** suites running in parallel, time from 14 minutes towards 4, flake rate from 3% to under 0.5%.
+- **Privacy:** zero cross-user incidents, the sign-out `reset()` count at zero, and the sign-out UI test green on every build.
+- **Builds and extensions:** incremental build time after touching a feature package (target: under 2 minutes, because it no longer rebuilds everything), packages on the Swift 6 language mode, widget peak memory well under its limit.
+- **Guardrails:** launch time and crash-free sessions no worse than the baseline at every release.
+
+</ModelAnswer>
+
+```rubric
+- id: triage
+  label: Sorted the singletons by what's actually wrong with each
+  skill: requirements
+  look_for:
+    - Stateless helpers, app-wide services, per-user state and Apple wrappers treated differently
+    - Global access named as the problem for app-wide services, not having one instance
+    - Per-user singletons identified as a lifetime (scope) problem behind the privacy incidents
+    - A baseline in numbers (call sites, test time and flakiness, build time)
+- id: target
+  label: A concrete target with a composition root and scopes
+  skill: client
+  look_for:
+    - A composition root in the App or scene delegate that builds the graph
+    - An app scope and a session scope, with sign-out releasing the session's objects
+    - Features declaring what they need (dependency structs or protocols) and depending on interfaces only
+    - Storyboard screens injected through the creator API or a deliberate fallback
+    - Extensions with their own small roots
+- id: choice
+  label: Chose a DI approach and justified it
+  skill: tradeoffs
+  look_for:
+    - Pure DI, a container, a compile-time tool or swift-dependencies weighed against this team's size and risks
+    - Compile-time checking valued for a large team, or a clear mitigation if a runtime container is chosen
+    - One consistent style, written down
+- id: sequencing
+  label: Small steps in an order that pays off early
+  skill: architecture
+  look_for:
+    - The root built around existing singletons first, with no behaviour change
+    - Default-argument bridges so call sites migrate gradually
+    - The session scope prioritised because of the privacy incidents
+    - Leaf features first, deletion of each singleton as its count reaches zero
+- id: safety
+  label: Named the risks and kept the migration from stalling
+  skill: testing
+  look_for:
+    - Accidental second instances, launch time and the sign-out behaviour change as specific risks
+    - A ratchet or lint rule so new singleton uses can't appear
+    - Parallel tests and Swift 6 enabled per package as the payoff
+    - Metrics tracked through the migration, with guardrails
+- id: people
+  label: Planned it for six squads
+  skill: communication
+  look_for:
+    - A platform team doing the shared groundwork, squads migrating their own features
+    - A definition of done per feature and a visible dashboard
+```
+
+<Pitfalls>
+
+- Replacing `.shared` with a service locator or a container resolved from inside view models: the dependencies stay hidden and the crashes move to run time.
+- Treating every singleton the same, and spending months on formatters while the per-user state keeps leaking between accounts.
+- Starting with `Core`'s busiest singleton everywhere at once, in one enormous pull request that conflicts with every squad's work.
+- Building every service eagerly at launch and quietly slowing the first frame.
+- No ratchet, so new `.shared` uses arrive as fast as old ones leave, and the migration never finishes.
+
+</Pitfalls>

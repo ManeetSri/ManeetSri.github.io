@@ -1,0 +1,230 @@
+## Why it matters
+
+A result builder lets a closure full of ordinary statements, `if`, `for` and plain expressions, build a single value. It's how SwiftUI's `body` works, and how RegexBuilder, Swift Charts and SwiftUI's toolbars, scenes and commands describe themselves. Understanding the rewrite behind it explains SwiftUI's strangest compile errors, and it's the knowledge you need to decide whether your own code deserves a DSL (a small domain-specific language) or a plain array. "How does SwiftUI's `body` turn into a view?" is a common senior interview question.
+
+## What the compiler does with a builder closure
+
+A **result builder** is a type marked `@resultBuilder` with static methods named `build…`. When a closure is marked with the builder, the compiler rewrites its body into calls to those methods. Nothing magical happens at run time: the rewritten code is ordinary Swift.
+
+| You write | The compiler calls | Needed for |
+| --- | --- | --- |
+| an expression on its own line | `buildExpression(_:)` | turning each line into a component (optional; lets you accept several types) |
+| several lines in a block | `buildBlock(_:...)` | combining a block's components (required) |
+| `if` without `else` | `buildOptional(_:)`, with `nil` when false | optional parts |
+| `if`–`else`, `switch` | `buildEither(first:)` or `buildEither(second:)` | choosing a branch |
+| `for … in` | `buildArray(_:)` | repeated parts |
+| `if #available(…)` | `buildLimitedAvailability(_:)` | parts that use newer APIs |
+| the finished block | `buildFinalResult(_:)` | converting to the public result type (optional) |
+
+Since Swift 5.7 a builder can implement `buildPartialBlock(first:)` and `buildPartialBlock(accumulated:next:)` instead of `buildBlock`, combining lines two at a time. RegexBuilder uses it to work out the type of each capture as the pattern grows.
+
+## Build one: a password policy
+
+Here's a small builder for a sign-up form's password rules. Every component is a list of rules, so every method only has to concatenate:
+
+```swift run
+struct Rule: Sendable {
+    let message: String
+    let isValid: @Sendable (String) -> Bool
+
+    static func minLength(_ count: Int) -> Rule {
+        Rule(message: "At least \(count) characters") { $0.count >= count }
+    }
+
+    static let containsDigit = Rule(message: "At least one digit") { $0.contains(where: \.isNumber) }
+
+    static func isNot(_ word: String) -> Rule {
+        Rule(message: "Can't be \"\(word)\"") { $0.lowercased() != word }
+    }
+}
+
+@resultBuilder
+enum RulesBuilder {
+    static func buildExpression(_ rule: Rule) -> [Rule] { [rule] }
+    static func buildBlock(_ parts: [Rule]...) -> [Rule] { parts.flatMap { $0 } }
+    static func buildOptional(_ rules: [Rule]?) -> [Rule] { rules ?? [] }
+    static func buildEither(first rules: [Rule]) -> [Rule] { rules }
+    static func buildEither(second rules: [Rule]) -> [Rule] { rules }
+    static func buildArray(_ rules: [[Rule]]) -> [Rule] { rules.flatMap { $0 } }
+}
+
+func problems(with password: String, @RulesBuilder rules: () -> [Rule]) -> [String] {
+    rules().filter { !$0.isValid(password) }.map(\.message)
+}
+
+let isStaffAccount = true
+let banned = ["password", "letmein"]
+
+for password in ["sunny1", "Password", "correct-horse-battery-7"] {
+    let found = problems(with: password) {
+        Rule.minLength(8)
+        Rule.containsDigit
+        if isStaffAccount {
+            Rule.minLength(12)
+        }
+        for word in banned {
+            Rule.isNot(word)
+        }
+    }
+    print(password, "→", found.isEmpty ? "OK" : found.joined(separator: "; "))
+}
+```
+
+```output
+sunny1 → At least 8 characters; At least 12 characters
+Password → At least one digit; At least 12 characters; Can't be "password"
+correct-horse-battery-7 → OK
+```
+
+The policy reads as a list of rules, with the conditions and the loop exactly where a reader expects them. Step through the calls the rewritten closure makes:
+
+```visual sequence
+title: What the rules closure turns into
+participants:
+  - { id: closure, label: Rewritten closure }
+  - { id: builder, label: RulesBuilder }
+messages:
+  - [closure, builder, "buildExpression(min 8)", { say: "Each line goes through `buildExpression`, which wraps one `Rule` in a list." }]
+  - [closure, builder, "buildExpression(digit)"]
+  - [closure, builder, "buildBlock(min 12)", { say: "The `if` body is its own block. It's built only when `isStaffAccount` is true." }]
+  - [closure, builder, "buildOptional(…)", { say: "`buildOptional` gets the block's rules, or `nil` when the condition was false, and returns a list either way." }]
+  - [closure, builder, "buildBlock(isNot)", { say: "The `for` body is built once per word…" }]
+  - [closure, builder, "buildArray(…)", { say: "…and `buildArray` gets every iteration's list at once." }]
+  - [closure, builder, "buildBlock(a, b, c, d)", { say: "Finally the four top-level components are combined into the closure's result." }]
+  - [builder, closure, "[Rule]", { reply: true }]
+fragments:
+  - { kind: opt, label: isStaffAccount, from: 2, to: 2 }
+  - { kind: loop, label: for word in banned, from: 4, to: 4 }
+```
+
+## Design decisions in a builder
+
+**One component type, or many.** This builder turns everything into `[Rule]`, so it's tiny. SwiftUI's `ViewBuilder` keeps every child's concrete type: two `Text`s and an `Image` become a `TupleView<(Text, Text, Image)>`, and an `if`–`else` becomes a `_ConditionalContent<A, B>`. That's what lets SwiftUI diff views by structure, and it's also why SwiftUI builders are expensive to type-check. Keep types only when the consumer needs them.
+
+**`buildExpression` is a whitelist.** Once a builder declares `buildExpression`, every line must match one of its overloads. A stray `print(...)` or a forgotten value becomes a compile error instead of a silently ignored statement. Extra overloads add conveniences, such as accepting a plain `String` as a rule's message, but each one makes the type checker work harder.
+
+**`buildFinalResult` hides the representation.** Build with `[Rule]` internally, and return a `PasswordPolicy` struct from `buildFinalResult`, so callers never depend on the list.
+
+**Not every statement is allowed.** Declarations (`let`, `var`) are fine, and so are `if`, `if let`, `switch` and `for` when the builder has the matching method. `guard`, `while`, `break` and `continue` aren't supported, and an explicit `return` switches the builder off for the whole closure.
+
+<Callout kind="gotcha" title="Swift gotcha: return turns the builder off">
+
+Add `return` to a builder closure and the compiler treats it as an ordinary closure: no rewrite at all. In SwiftUI, `body` with a `return` on one branch must then return a single type from every path, which is how people end up wrapping branches in `AnyView`. Remove the `return`s and the builder handles the branches. A `guard` needs a `return` to exit, so it can't be used inside a builder; write an `if` instead.
+
+</Callout>
+
+## Where Apple uses them, and what that teaches
+
+- **`@ViewBuilder`** keeps types for diffing. Newer SDKs write its `buildBlock` with parameter packs, which removed the old limit of ten views in one block.
+- **RegexBuilder** (iOS 16) builds a typed `Regex` whose output tuple grows with each `Capture`, using `buildPartialBlock`.
+- **Swift Charts, `@ToolbarContentBuilder`, `@SceneBuilder`, `@CommandsBuilder`, `@TableColumnBuilder`:** each declares a tree of content where parts are conditional.
+- **Not builders:** SwiftData's `#Predicate` and Swift Testing's `#expect` look similar but are **macros**. A macro sees the source code and generates new code; a builder only rewrites statements into method calls you wrote. You'll compare the two in the next lesson.
+
+The pattern behind every one: a **tree-shaped, declarative description** with optional and repeated parts, written by many people, many times. That's when a DSL pays for itself.
+
+<Callout kind="gotcha" title="iOS gotcha: builder closures run again and again">
+
+`body` is re-evaluated whenever SwiftUI needs it, sometimes many times a second while scrolling or animating. Everything inside a builder closure runs each time: a `let formatter = DateFormatter()` there is created on every evaluation, and a network call there fires repeatedly. Keep builder closures to describing; do the work in a view model or a `.task`.
+
+</Callout>
+
+## Trade-offs
+
+| | Array literal | Fluent builder | Result builder | Macro |
+| --- | --- | --- | --- | --- |
+| **Conditions and loops** | awkward: ternaries, `+` | temporary variables | natural `if`, `for`, `switch` | whatever it generates |
+| **Type safety** | one element type | method by method | whitelisted by `buildExpression` | full, at expansion |
+| **Discoverability** | good | best: autocomplete after `.` | weaker: no dot to complete | weak until expanded |
+| **Compile time and errors** | cheap | cheap | can be slow; errors land on the rewrite | a separate plugin build |
+| **Cost to write** | none | small | small to medium | large |
+
+An array literal wins for a short, fixed list. A fluent builder wins when steps are mostly unconditional and discoverability matters, as in `URLComponents`-style configuration. A result builder wins for declarative trees with conditional and repeated parts, written often. A macro wins only when you need to generate declarations, which no builder can do.
+
+<Callout kind="interview">
+
+**Say:** "SwiftUI's `body` is a result builder. The compiler rewrites each statement into `buildExpression`, `buildBlock` and `buildEither` calls, which is why an `if`–`else` becomes a conditional view type and why an explicit `return` turns the builder off." For your own DSL, say what it describes, who writes it, and what the builder rejects.
+
+**Ask:** how many people will write code in this DSL, and how often? Does it need conditions and loops, or is it a fixed list?
+
+**Red flags:** a DSL for three lines of configuration; side effects inside builder closures; not knowing why `guard` doesn't work in `body`.
+
+</Callout>
+
+## Practice
+
+The **request DSL** kata asks you to build a result builder for `URLRequest`s with conditions and loops inside, and the one pass that turns its parts into a request.
+
+```cards
+- id: builder-rewrite
+  front: "What does the compiler do with a closure marked with a result builder?"
+  back: "It rewrites the body into static calls: `buildExpression` per line, `buildBlock` to combine, `buildOptional` for `if`, `buildEither` for `if`–`else` and `switch`, `buildArray` for `for`."
+- id: build-expression-whitelist
+  front: "Why declare `buildExpression` in a builder?"
+  back: "It turns each line into a component and accepts only the types you list, so stray statements become compile errors. Overloads add conveniences."
+- id: when-dsl
+  front: "When does a result-builder DSL pay for itself?"
+  back: "For tree-shaped, declarative descriptions with optional and repeated parts, written by many people many times: views, menus, requests, rules."
+```
+
+```quiz
+- id: q1
+  type: match
+  prompt: "Match each piece of syntax to the builder method it becomes."
+  pairs:
+    - ["`if` without `else`", "`buildOptional(_:)`"]
+    - ["`if`–`else` or `switch`", "`buildEither(first:)` and `buildEither(second:)`"]
+    - ["`for … in`", "`buildArray(_:)`"]
+    - ["Each expression on its own line", "`buildExpression(_:)`"]
+    - ["`if #available(iOS 18, *)`", "`buildLimitedAvailability(_:)`"]
+  explain: "Each control-flow form has its own method, and the builder supports only the forms whose methods it implements. Without `buildArray`, a `for` loop doesn't compile."
+- id: q2
+  type: output
+  prompt: "What does this print?"
+  code: |
+    @resultBuilder
+    enum Lines {
+        static func buildBlock(_ parts: [String]...) -> [String] { parts.flatMap { $0 } }
+        static func buildExpression(_ line: String) -> [String] { [line] }
+        static func buildOptional(_ part: [String]?) -> [String] { part ?? ["(none)"] }
+    }
+
+    func text(@Lines _ build: () -> [String]) -> String {
+        build().joined(separator: " ")
+    }
+
+    let vip = false
+    print(text {
+        "Hello"
+        if vip {
+            "VIP"
+        }
+        "Bye"
+    })
+  answer: "Hello (none) Bye"
+  explain: "The `if` is false, so `buildOptional` receives `nil`, and this builder chooses to return `[\"(none)\"]` for it. The builder, not the language, decides what a missing part means."
+- id: q3
+  type: truefalse
+  prompt: "You can use `guard` to exit early inside a result builder closure."
+  answer: false
+  explain: "A `guard` must leave the scope, which needs `return` or similar, and builders don't support that control flow: the compiler reports that a closure containing a control flow statement can't be used with the builder. Use `if` instead."
+- id: q4
+  type: mcq
+  prompt: "Which of these is the best candidate for a result-builder DSL?"
+  options:
+    - "Three onboarding pages that never change"
+    - "A settings screen whose sections depend on account type, feature flags and region"
+    - "Five brand colours"
+    - "The base URL of the API"
+  answer: 1
+  explain: "A DSL earns its place when a declarative description has conditional and repeated parts. Fixed lists and single values are clearer as literals and constants."
+- id: q5
+  type: mcq
+  prompt: "A SwiftUI `body` shows a `Text` and an `Image`. Someone adds `return` before the `Image`. Why does it stop compiling?"
+  options:
+    - "`Image` can't be returned from `body`"
+    - "The explicit `return` turns the builder off, so the `Text` line becomes an unused value and only one type may be returned"
+    - "`return` isn't allowed in computed properties"
+    - "SwiftUI requires at least two views"
+  answer: 1
+  explain: "With a `return`, the closure is no longer rewritten. The `Text` becomes an unused expression, and `body` must return one concrete type from an ordinary closure."
+```

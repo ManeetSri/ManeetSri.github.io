@@ -1,0 +1,309 @@
+## Why it matters
+
+Every persistent connection on a phone dies, many times a day: in lifts and tunnels, when Wi-Fi hands over to cellular, when the app is suspended, when the server deploys. The quality of a real-time feature is mostly decided by what happens next: how fast the app notices, how politely it reconnects, and whether it picks up where it left off. Get it wrong and you get chat apps that silently stop receiving, and fleets of phones that knock a recovering server over. "What happens when the connection drops?" is the follow-up to every WebSocket answer in an interview.
+
+## How connections die
+
+A connection can end in four ways, and only two of them tell you:
+
+- **A clean close.** One side sends a close frame with a code, such as `1001` from a draining server. You know at once, and you know why.
+- **A reset.** The server process crashed, or a middlebox gave up, and the next packet is answered with a TCP reset. The pending receive fails with an error within moments.
+- **Silence.** The phone walked into a lift; a NAT on the carrier's network forgot the connection's mapping; Wi-Fi handed over to cellular and the old route is gone; a server lost power. Neither side is told. The socket still looks open, receives nothing, and a send may sit in a buffer for minutes before TCP gives up. TCP's own keepalive is no help: by default it waits two hours before probing.
+- **Suspension.** The app stops running a few seconds after the user leaves. Nothing reads the socket or answers the server, which closes it after its own timeout; iOS may reclaim the socket too. Either way, the connection you return to is gone.
+
+Silence is the dangerous one, because the app keeps showing "Live" over data that stopped flowing. Detecting it is the heartbeat's job.
+
+```visual timeline
+title: A connection dies silently in a lift
+unit: s
+lanes:
+  - { id: app, label: App }
+  - { id: net, label: Network }
+  - { id: server, label: Server }
+spans:
+  - { lane: net, from: 0, to: 12, label: connected, tone: ok }
+  - { lane: net, from: 12, to: 52, label: no signal, tone: error }
+  - { lane: app, from: 0, to: 25, label: "looks live" }
+  - { lane: app, from: 25, to: 35, label: waiting for pong, tone: wait }
+  - { lane: app, from: 35, to: 52, label: reconnecting…, tone: active }
+  - { lane: app, from: 52, to: 60, label: resumed, tone: ok }
+  - { lane: server, from: 0, to: 45, label: holding socket }
+  - { lane: server, from: 45, to: 47, label: cleanup, tone: error }
+markers:
+  - { at: 12, label: lift }
+  - { at: 25, label: ping }
+steps:
+  - { at: 5, say: "The app is connected and pings every 25 seconds, unless other traffic already proves the connection is alive." }
+  - { at: 12, say: "The doors close. Packets stop in both directions, but neither side receives anything that says so: the socket still looks open." }
+  - { at: 25, say: "The heartbeat timer fires and the app sends a **ping**. It won't arrive, but the app doesn't know that yet." }
+  - { at: 35, say: "No pong within the 10-second timeout: the app declares the connection dead, closes it, shows **Reconnecting…** and starts its backoff loop." }
+  - { at: 47, say: "The server's own check notices the client went quiet, frees the connection and marks the user offline. Both sides need a heartbeat." }
+  - { at: 55, say: "Signal returns. The next attempt connects, resubscribes and catches up from its last sequence number." }
+```
+
+## Heartbeats
+
+A **heartbeat** is a small message one side sends on a timer and the other answers. If no answer comes within a timeout, the connection is treated as dead, whatever the socket says. Use WebSocket ping frames or an application message such as `{"type": "ping"}`; MQTT builds it in as keep-alive.
+
+Three numbers to choose:
+
+- **Interval.** Shorter than the shortest idle timeout on the path, or the path closes healthy connections for you. Proxies and load balancers often cut idle connections at 60 seconds, and some cellular NATs drop idle mappings after a few minutes or less, so 20–30 seconds is a common choice. Socket.IO's default is a ping every 25 seconds.
+- **Timeout.** Long enough for a slow cellular round trip, typically 10–20 seconds. Too short and a congested network causes needless reconnects.
+- **Detection time** follows from both: up to interval plus timeout. With 25 and 10, a dead connection is noticed within 35 seconds, and usually sooner, because…
+
+…**any traffic counts**. A connection that just delivered a message is alive. Reset the ping timer on every frame received and ping only when the connection has been quiet. A busy chat never needs a heartbeat; an idle one sends one every 25 seconds.
+
+**Both sides check.** The server needs its own heartbeat (or to expect the client's) to free memory held by dead connections and to know who's really online. And prefer heartbeats that reach your application, not only the first proxy: a load balancer or proxy that terminates WebSockets may answer protocol pings itself, which proves the path to the proxy and says nothing about whether your server is still processing messages.
+
+Every heartbeat wakes the radio. The last lesson of this module puts a battery cost on that choice.
+
+## When to reconnect, and when not to
+
+Reconnect when:
+
+- the receive loop fails, or the server closes with a code that invites it (`1001`, `1006`, `1011`, `1012`, `1013`);
+- a heartbeat goes unanswered;
+- the **network path changes**: it comes back after being unavailable, or moves from Wi-Fi to cellular. The old socket is bound to the old route and may hang for a long time before failing, so don't wait for the heartbeat to find out;
+- the app returns to the foreground;
+- the server asks: a "reconnect" message during a deploy, ideally with a suggested delay.
+
+Don't reconnect when:
+
+- there's **no network**: wait for a path instead of burning attempts and battery;
+- the user **signed out**, or the server closed with a normal `1000`;
+- **authentication failed**: refresh the token first; if the refresh fails too, sign the user out instead of looping;
+- the server says **this app version is too old**: show "please update";
+- the app is in the **background**: close the connection deliberately and reconnect when it returns.
+
+## Backoff, jitter and when to reset
+
+Reconnection is a retry, and everything from [retry with backoff](/design/learn/sd-resilience-retry-backoff) applies: capped exponential delays, full jitter, and a loop that stops when told. Two details are specific to connections.
+
+**Jitter the first attempt too.** When a server restarts, every connected client drops at the same instant. If they all reconnect immediately, the first wave is the whole fleet at once. A random delay of a second or two before the first attempt spreads it out.
+
+**Reset the backoff only when a connection proves itself**, not when TCP connects. A server that's overloaded, or rejecting a token after the upgrade, may accept connections and close them a moment later. A client that resets its backoff on every successful connect will hammer that server at the base rate forever. Reset once the connection has delivered something (a pong, a message) or stayed up for a while.
+
+The result is a small state machine, the same one the kata for this lesson asks you to build:
+
+```visual states
+title: A reconnecting client
+states:
+  - { id: idle, label: Idle, at: [0, 0] }
+  - { id: connecting, label: Connecting, at: [1, 0] }
+  - { id: connected, label: Connected, at: [2.5, 0] }
+  - { id: waiting, label: Waiting, at: [1.75, 1.3] }
+  - { id: stopped, label: Stopped, at: [3.5, 1.3] }
+initial: idle
+final: [stopped]
+transitions:
+  - [idle, connecting, start]
+  - [connecting, connected, opened]
+  - [connecting, waiting, failed]
+  - [connected, waiting, dropped]
+  - [connected, waiting, pongTimeout]
+  - [waiting, connecting, timerFired]
+  - [connected, stopped, stop]
+  - [waiting, stopped, stop]
+intro: "The client starts **idle**. It owns one thing: whether a connection should exist, and when to try again."
+events:
+  - { event: start, say: "`start`: the app is active and online, so the client connects." }
+  - { event: failed, say: "The connect fails. Retry 0 waits `base` (1 s), with jitter." }
+  - { event: timerFired, say: "The timer fires and it tries again." }
+  - { event: failed, say: "Another failure in a row: retry 1 waits twice as long, 2 s." }
+  - { event: timerFired, say: "It tries again…" }
+  - { event: opened, say: "…and connects. It resubscribes to every topic and catches up from its last sequence number. The backoff isn't reset yet." }
+  - { event: dropped, say: "The connection closed before delivering anything, so this counts as failure number three in the row: retry 2 waits 4 s." }
+  - { event: timerFired, say: "Next attempt." }
+  - { event: opened, say: "This time messages arrive: the connection has proved itself, and the backoff resets to retry 0." }
+  - { event: pongTimeout, say: "Later, a ping goes unanswered. The client closes the silent connection and waits `base` again, because the last connection was healthy." }
+  - { event: stop, say: "The user leaves the app. `stop` cancels the timer and nothing reconnects until the app is active again." }
+```
+
+In the foreground, cap the delay at 30–60 seconds and show the state honestly: "Reconnecting…" after the first failure, "Offline" when there's no path, and the last data you had in the meantime.
+
+## Resuming, not restarting
+
+A new connection is a blank slate on the server: it doesn't know what this client was subscribed to or what it last saw. The client must restore its session, in order:
+
+1. **Authenticate** the new connection, with a fresh token if the old one expired.
+2. **Resubscribe** to every topic. The client, not the server, is the owner of "what this app currently cares about"; keep that set in the client and replay it on every connect.
+3. **Catch up** on what was missed while disconnected, from the last sequence number per channel, an SSE `Last-Event-ID`, or a cursor for the HTTP API.
+4. **Go live**, applying new events on top.
+
+The order of 2 and 3 matters more than it looks: subscribing *after* fetching the catch-up opens a window where events slip between the two. The next lesson works through that race and the sequence numbers that close it.
+
+## The server's side: reconnect storms
+
+A gateway holding 50,000 connections that crashes sends 50,000 clients to the other gateways at once, and each reconnect costs a TCP handshake, a TLS handshake (the expensive part; [TLS session resumption](/design/learn/sd-net-tls-handshake) helps) and an authentication check. Servers protect themselves too:
+
+- **Drain gradually on deploys.** Close connections a slice at a time over minutes with `1001` or `1012`, rather than all at once.
+- **Send hints.** A "reconnect in 0–30 seconds" message with a random delay per client turns a spike into a ramp.
+- **Refuse early when overloaded.** Answering `1013 Try Again Later` (or `503` on the upgrade) costs far less than accepting a connection the server can't serve.
+- **Keep spare capacity for the storm**, not only for the steady state: the steady state is idle connections, but the storm is handshakes.
+
+## Supervising the connection in an iOS app
+
+Something in the app must turn the platform's signals into "connect now" and "disconnect now": the scene phase and the network path. Keep that separate from the client that does the connecting, so each is testable:
+
+```swift check ios title="ConnectionSupervisor.swift"
+import Network
+import SwiftUI
+
+/// Decides when the live connection should exist: the app is active and there's a network path
+@MainActor @Observable
+final class ConnectionSupervisor {
+    enum Network: Equatable {
+        case unknown
+        case online(NWInterface.InterfaceType?)
+        case offline
+    }
+
+    private(set) var network = Network.unknown
+    private var isActive = false
+    private let monitor = NWPathMonitor()
+    /// Starts a connection now, replacing any existing one and skipping any backoff wait
+    private let connect: @MainActor () -> Void
+    private let disconnect: @MainActor () -> Void
+
+    init(connect: @escaping @MainActor () -> Void, disconnect: @escaping @MainActor () -> Void) {
+        self.connect = connect
+        self.disconnect = disconnect
+        monitor.pathUpdateHandler = { [weak self] path in
+            let status = path.status
+            let interface = [NWInterface.InterfaceType.wifi, .cellular, .wiredEthernet].first { path.usesInterfaceType($0) }
+            Task { @MainActor in self?.pathChanged(satisfied: status == .satisfied, interface: interface) }
+        }
+        monitor.start(queue: DispatchQueue(label: "live.path-monitor"))
+    }
+
+    func scenePhaseChanged(to phase: ScenePhase) {
+        isActive = phase == .active
+        if isActive, case .online = network {
+            connect()
+        } else if !isActive {
+            // A suspended app can't keep a socket alive; close it cleanly and reconnect on return
+            disconnect()
+        }
+    }
+
+    private func pathChanged(satisfied: Bool, interface: NWInterface.InterfaceType?) {
+        let previous = network
+        network = satisfied ? .online(interface) : .offline
+        guard satisfied else {
+            // No path: stop the backoff loop instead of burning attempts, and show "Offline"
+            disconnect()
+            return
+        }
+        // Back online, or moved from Wi-Fi to cellular: the old socket is tied to the old route
+        if isActive, previous != network {
+            connect()
+        }
+    }
+}
+```
+
+The root view forwards `scenePhase` with `.onChange(of: scenePhase)`, and the reconnecting client underneath owns backoff, heartbeats and resubscription. Neither knows about the other's concerns, which is what lets the kata test the client with a fake transport and a test clock.
+
+## Trade-offs
+
+| Heartbeat interval | Detects a dead connection within | Radio and server cost | Risk |
+| --- | --- | --- | --- |
+| 10 s | About 20 s | High: the radio rarely rests | Battery drain; heartbeats outnumber real messages |
+| 25–30 s | About 40 s | Moderate | The usual default |
+| 60 s or more | Over a minute | Low | Idle timeouts on the path close healthy connections; stale "Live" screens |
+
+| Reconnect policy | Recovery for one client | Fleet behaviour | Wins when |
+| --- | --- | --- | --- |
+| Immediately, in a loop | Fastest | A storm that can take the server down | Never |
+| Fixed delay | Predictable | Synchronised waves | A handful of clients |
+| Backoff with jitter, reset on connect | Good | Hammering servers that accept then close | Almost never; reset too early |
+| Backoff with jitter, reset when healthy, server hints honoured | Good | Smooth | The default |
+
+<Callout kind="interview">
+
+**Say** detection, policy and resumption in that order: "Heartbeats every 25 seconds when the connection is quiet, with a 10-second timeout, on both sides. On a drop, path change or return to the foreground, reconnect with capped exponential backoff and full jitter, including on the first attempt, and reset only after the new connection delivers something. Don't retry while offline or after an auth failure. Every new connection re-authenticates, resubscribes and catches up from the last sequence number." **Ask** how the server drains connections on deploys. **Red flags:** relying on TCP to notice dead connections, reconnecting in a loop without backoff, resetting backoff on connect, and forgetting to resubscribe.
+
+</Callout>
+
+<Callout kind="gotcha" title="iOS gotcha: the socket you come back to">
+
+When the app returns from the background, the `URLSessionWebSocketTask` object is still there and may look open, but the connection behind it is almost certainly dead. Waiting for a heartbeat to discover that shows stale data for half a minute. Close the socket when the scene goes to the background, and open a new one as soon as it's active again.
+
+</Callout>
+
+<Callout kind="gotcha" title="iOS gotcha: satisfied isn't the same as online">
+
+`NWPathMonitor` reports `.satisfied` when there's a route, not when your server is reachable: a captive portal on hotel Wi-Fi is satisfied, and so is a network that drops everything. Treat a path change as a reason to try now, never as proof the connection will work, and keep the heartbeat as the real test. Path updates can also arrive in quick bursts during a handover, so a short debounce (half a second or so) before reconnecting avoids opening two sockets.
+
+</Callout>
+
+## Practice
+
+The kata **"A reconnecting socket client"** has you build the state machine above as an actor: connect over an injected transport, resubscribe after every reconnect, ping on a test clock, close silent connections and back off with a reset rule that resists flapping. It builds on the [backoff schedule](/design/learn/sd-resilience-retry-backoff) from D14. The review **"a live-scores socket client"** then shows what happens without any of it: no heartbeat, instant reconnects, lost subscriptions and receive loops that multiply.
+
+```cards
+- id: silent-death
+  front: "Why can't an app rely on TCP to tell it a connection has died?"
+  back: "A connection lost to a NAT timeout, a network handover or a dead server sends nothing; the socket looks open. TCP's keepalive defaults to two hours. Only an application heartbeat finds out in seconds."
+- id: heartbeat-numbers
+  front: "How do you choose a heartbeat interval?"
+  back: "Shorter than the shortest idle timeout on the path (often 60 s), commonly 20–30 s, with a 10–20 s timeout. Ping only when the connection is quiet: any received frame proves it's alive."
+- id: backoff-reset
+  front: "When should a reconnecting client reset its backoff?"
+  back: "When the new connection proves itself by delivering something or staying up a while, not when TCP connects. Otherwise a server that accepts and immediately closes gets hammered at the base rate."
+- id: resume-order
+  front: "What must a client do on every new connection, in order?"
+  back: "Authenticate, resubscribe to every topic (the client owns that list), catch up from its last sequence number or cursor, then apply live events."
+```
+
+```quiz
+- id: q1
+  type: estimate
+  prompt: "A client pings after 25 seconds of silence and waits 10 seconds for the answer. What's the longest a silently dead connection can go unnoticed, in seconds?"
+  answer: 35
+  unit: seconds
+  within: { percent: 10 }
+  explain: "In the worst case the connection dies just after the last frame: 25 s until the ping, then 10 s waiting for a pong that never comes."
+- id: q2
+  type: sort
+  prompt: "Reconnect now, or wait for something else first?"
+  buckets: [Reconnect with backoff now, Wait for something else]
+  items:
+    - [The heartbeat timed out, 0]
+    - [The server closed with 1001 during a deploy, 0]
+    - [NWPathMonitor reports no path, 1]
+    - [The server closed with 4001 token expired, 1]
+    - [The app moved from Wi-Fi to cellular, 0]
+    - [The scene moved to the background, 1]
+  explain: "Timeouts, deploys and network handovers are reasons to reconnect. With no path, wait for one; with an expired token, refresh it first; in the background, close and wait for the app to be active again."
+- id: q3
+  type: mcq
+  prompt: "After a bad deploy, the server accepts WebSocket upgrades and closes each one half a second later. Your clients reset their backoff whenever a connection opens. What happens?"
+  options:
+    - "Clients back off to the cap and wait"
+    - "Every client reconnects at the base delay forever, so the fleet hammers the broken server at full rate"
+    - "The heartbeat catches it and stops reconnection"
+    - "Nothing: half a second is a healthy connection"
+  answer: 1
+  explain: "Each open resets the backoff, each close starts it again at `base`. Resetting only after the connection delivers something, or stays up for a while, lets the delays grow."
+- id: q4
+  type: order
+  prompt: "Put the steps after a successful reconnect in order."
+  lines:
+    - "Authenticate the new connection"
+    - "Resubscribe to every topic the app cares about"
+    - "Catch up from the last sequence number of each channel"
+    - "Apply live events as they arrive"
+  explain: "The server knows nothing about a new connection until it's told. Subscribing before catching up means events that arrive in between are buffered rather than lost."
+- id: q5
+  type: multi
+  prompt: "A gateway holding 80,000 connections is about to be deployed. Which steps soften the reconnect storm? Choose all that apply."
+  options:
+    - "Close connections in slices over several minutes"
+    - "Send each client a reconnect hint with a random delay"
+    - "Have clients reconnect immediately so the outage is short"
+    - "Refuse upgrades with 1013 when a gateway is overloaded"
+    - "Support TLS session resumption"
+  answer: [0, 1, 3, 4]
+  explain: "Gradual draining, randomised hints and early refusal spread and limit the load, and resumption makes each TLS handshake cheaper. Immediate reconnection turns 80,000 drops into one spike."
+```

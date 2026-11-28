@@ -1,0 +1,150 @@
+A recipe screen in a UIKit app shows a title, a cooking time, a servings stepper, the ingredient list scaled to the servings, and a favourite button. Build it the MVP way: the view controller becomes a **passive view** that only does what it's told, and a **presenter** makes every decision. Then prove the decisions with a spy, without UIKit.
+
+`MVPRecipeDetail.Presenter`: `view`, `viewDidLoad() async`, `increaseServingsTapped()`, `decreaseServingsTapped()` and `favouriteTapped() async`
+
+The presenter is `@MainActor`. It loads the recipe through a `RecipeService` and talks to its view only through the `RecipeView` protocol.
+
+- **The view.** The view controller owns the presenter, so the presenter must hold its `view` **weakly**, or the two keep each other alive. Every rule must still run when the view has gone.
+- **Loading.** `viewDidLoad()` calls `setLoading(true)`, fetches the recipe, calls `setLoading(false)`, then shows everything in this order: `showHeader(title:duration:)`, `showServings(_:canDecrease:canIncrease:)`, `showIngredients(_:)` and `setFavourite(_:)`. If the fetch fails, it calls `setLoading(false)` and then `showError(loadFailedMessage)`. A cancelled fetch turns loading off and shows no error.
+- **Duration.** Under an hour, `"35 min"`. Whole hours, `"1 h"`. Otherwise `"1 h 15 min"`.
+- **Servings.** The stepper starts at the recipe's own servings and moves one at a time within `servingsRange` (1 to 12). Each change calls `showServings` then `showIngredients`. The text is `"1 serving"` or `"4 servings"`; `canDecrease` and `canIncrease` say whether the next step is allowed. A tap that would leave the range does nothing at all.
+- **Ingredient lines.** Scale each quantity by servings ÷ the recipe's servings, round to one decimal place, and drop a trailing `.0`: `"187.5 g flour"`, `"75 g sugar"`. An ingredient with no unit reads `"1.5 bananas"`.
+- **Favourite.** `favouriteTapped()` flips the favourite **at once** with `setFavourite`, then tells the service. If the service fails, it flips it back and calls `showError(favouriteFailedMessage)`; if it was cancelled, it flips it back silently. Taps while a request is in flight are ignored.
+- **Before loading,** every tap does nothing.
+
+## Examples
+
+Banana bread serves 4 and takes 75 minutes: 250 g flour, 100 g sugar, 3 bananas, 120 ml milk.
+
+| After | The view is told |
+| --- | --- |
+| `viewDidLoad()` | `setLoading(true)`, `setLoading(false)`, header `"Banana bread"` / `"1 h 15 min"`, servings `"4 servings"` (both buttons on), ingredients `["250 g flour", "100 g sugar", "3 bananas", "120 ml milk"]`, favourite `false` |
+| one decrease | servings `"3 servings"`, ingredients `["187.5 g flour", "75 g sugar", "2.3 bananas", "90 ml milk"]` |
+| three decreases | servings `"1 serving"` with `canDecrease` false, ingredients `["62.5 g flour", "25 g sugar", "0.8 bananas", "30 ml milk"]` |
+| a fourth decrease | nothing |
+| `favouriteTapped()`, then the service fails | favourite `true`, favourite `false`, error `"Couldn't update your favourites."` |
+| a failed load | `setLoading(true)`, `setLoading(false)`, error `"Couldn't load this recipe."` |
+
+## Constraints
+
+- Foundation only: no UIKit. The tests' view is a spy that records each call, and they compare the whole sequence, so make exactly the calls described, in that order.
+- Each favourite request is held open by the tests until they finish it, so they can check the button flipped before the service answered.
+- A recipe's `servings` is at least 1.
+
+<Hints>
+<Hint>
+`public weak var view: (any RecipeView)?` compiles because `RecipeView` is `AnyObject`-constrained. Call it with optional chaining, `view?.showError(…)`, so nothing breaks when it's gone.
+</Hint>
+<Hint>
+Keep the presenter's own state (the loaded recipe, the current servings, the favourite, whether a favourite request is running) in private properties. The view holds no state the presenter needs back.
+</Hint>
+<Hint>
+`(value * 10).rounded() / 10` rounds to one decimal place. A rounded value equal to its own `.rounded()` is whole: print it as an `Int`, otherwise with `String(format: "%.1f", …)`, which always uses a full stop whatever the device's locale.
+</Hint>
+<Hint>
+For the favourite, set a flag before the `await` and clear it in a `defer`. Flip the state first, call the service, and undo the flip in the `catch`.
+</Hint>
+</Hints>
+
+## Solutions
+
+<Approach title="A presenter that owns the screen's state and formats everything" time="O(ingredients) per servings change" space="O(ingredients)">
+
+```swift
+@MainActor
+public final class Presenter {
+    public weak var view: (any RecipeView)?
+
+    private let recipeID: String
+    private let service: any RecipeService
+    private var recipe: Recipe?
+    private var isLoading = false
+    private var servings = 0
+    private var isFavourite = false
+    private var isUpdatingFavourite = false
+
+    public init(recipeID: String, service: any RecipeService) {
+        self.recipeID = recipeID
+        self.service = service
+    }
+
+    public func viewDidLoad() async {
+        guard recipe == nil, !isLoading else { return }
+        isLoading = true
+        view?.setLoading(true)
+        defer { isLoading = false }
+        do {
+            let recipe = try await service.recipe(id: recipeID)
+            self.recipe = recipe
+            servings = min(max(recipe.servings, servingsRange.lowerBound), servingsRange.upperBound)
+            isFavourite = recipe.isFavourite
+            view?.setLoading(false)
+            view?.showHeader(title: recipe.title, duration: MVPRecipeDetail.duration(minutes: recipe.minutes))
+            showServings()
+            view?.setFavourite(isFavourite)
+        } catch {
+            view?.setLoading(false)
+            if !(error is CancellationError) {
+                view?.showError(loadFailedMessage)
+            }
+        }
+    }
+
+    public func increaseServingsTapped() { changeServings(by: 1) }
+    public func decreaseServingsTapped() { changeServings(by: -1) }
+
+    public func favouriteTapped() async {
+        guard let recipe, !isUpdatingFavourite else { return }
+        let wanted = !isFavourite
+        isFavourite = wanted
+        isUpdatingFavourite = true
+        view?.setFavourite(wanted)
+        defer { isUpdatingFavourite = false }
+        do {
+            try await service.setFavourite(wanted, recipeID: recipe.id)
+        } catch {
+            isFavourite = !wanted
+            view?.setFavourite(!wanted)
+            if !(error is CancellationError) {
+                view?.showError(favouriteFailedMessage)
+            }
+        }
+    }
+
+    private func changeServings(by step: Int) {
+        guard recipe != nil, servingsRange.contains(servings + step) else { return }
+        servings += step
+        showServings()
+    }
+
+    private func showServings() {
+        guard let recipe else { return }
+        view?.showServings(servings == 1 ? "1 serving" : "\(servings) servings",
+                           canDecrease: servings > servingsRange.lowerBound,
+                           canIncrease: servings < servingsRange.upperBound)
+        view?.showIngredients(recipe.ingredients.map { ingredient in
+            let amount = MVPRecipeDetail.amount(ingredient.quantity * Double(servings) / Double(recipe.servings))
+            return ingredient.unit.isEmpty ? "\(amount) \(ingredient.name)" : "\(amount) \(ingredient.unit) \(ingredient.name)"
+        })
+    }
+}
+
+static func duration(minutes: Int) -> String {
+    guard minutes >= 60 else { return "\(minutes) min" }
+    let hours = minutes / 60, rest = minutes % 60
+    return rest == 0 ? "\(hours) h" : "\(hours) h \(rest) min"
+}
+
+static func amount(_ value: Double) -> String {
+    let rounded = (value * 10).rounded() / 10
+    return rounded == rounded.rounded() ? String(Int(rounded)) : String(format: "%.1f", rounded)
+}
+```
+
+The view controller that goes with it is a few lines per method: `showIngredients` sets a label's text or applies a snapshot, `setFavourite` sets the button's `isSelected`. It has nothing to test, which is the point of a passive view. Everything a product manager would ask about (how rounding works, when the stepper stops, what happens when favouriting fails) lives in the presenter and runs in milliseconds against a spy.
+
+Two details carry most of the weight. The **weak** `view` breaks the cycle: the view controller holds its presenter strongly, and the presenter's tasks may outlive the screen, so it must never assume the view is there. And the **optimistic** favourite flips before the network answers, so the button feels instant. The flag that ignores taps in flight stops a quick double tap from sending "on" and "off" requests that could arrive in either order.
+
+The cost of MVP shows in the tests: they compare exact call sequences, so reordering two calls that a user would never notice breaks them. Testing only the calls an interaction *added* (the tests call `reset()` after loading) keeps that brittleness in check.
+
+</Approach>

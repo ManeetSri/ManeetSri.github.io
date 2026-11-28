@@ -1,0 +1,318 @@
+## Why it matters
+
+Generics let you write a component once and still keep the type information its callers care about: an API client that hands back a `User` for the user endpoint, a cache for any key, a repository that can't be wired to the wrong store. They move mistakes from run time, where a user finds them, to compile time, where you do. They also cost something: signatures that spread through the code base and slower builds. Knowing where that cost is worth paying is the design skill, and "design a type-safe API client" is a favourite interview prompt that tests exactly that.
+
+## Abstract over a type, and keep it
+
+Compare two ways to write a decoding helper:
+
+```swift
+func decode(_ data: Data) throws -> Any                                   // the caller must cast, and can cast wrongly
+func decode<T: Decodable>(_ type: T.Type, from data: Data) throws -> T    // the caller gets a T
+```
+
+Both are "reusable". Only the second keeps the type. Inside a generic function the compiler knows only what the constraints promise (`T` is `Decodable`), which is the abstraction; at every call site it knows exactly what `T` is, which is the safety. In optimised builds it can also **specialise** the function: compile a copy for `User` that calls `User`'s decoding directly, with no lookups. Across a module boundary it can do that only when the function's body is visible to the caller, for example when it's marked `@inlinable`.
+
+## Associated types: protocols that describe families
+
+A plain protocol describes one capability. A protocol with an **associated type** describes a family of related types, where each conformer fixes the type for itself. The classic iOS use is an API client where every endpoint knows what it returns:
+
+```swift run
+import Foundation
+
+protocol Endpoint {
+    associatedtype Response: Decodable
+    var path: String { get }
+}
+
+struct User: Decodable { let name: String }
+struct Order: Decodable { let id: Int; let pence: Int }
+
+struct UserEndpoint: Endpoint {
+    typealias Response = User
+    let id: Int
+    var path: String { "/users/\(id)" }
+}
+
+struct OrdersEndpoint: Endpoint {
+    typealias Response = [Order]
+    var path: String { "/orders" }
+}
+
+struct APIClient {
+    // Stands in for the network: canned JSON for each path
+    let responses: [String: String]
+
+    func send<E: Endpoint>(_ endpoint: E) throws -> E.Response {
+        let json = responses[endpoint.path] ?? "null"
+        return try JSONDecoder().decode(E.Response.self, from: Data(json.utf8))
+    }
+}
+
+let client = APIClient(responses: [
+    "/users/7": #"{"name": "Maneet"}"#,
+    "/orders": #"[{"id": 1, "pence": 1250}, {"id": 2, "pence": 899}]"#,
+])
+
+let user = try client.send(UserEndpoint(id: 7))    // a User: no cast, no Any
+let orders = try client.send(OrdersEndpoint())     // an [Order]
+print(user.name)
+print(orders.map(\.pence).reduce(0, +))
+```
+
+```output
+Maneet
+2149
+```
+
+The pairing of a path with its response type lives in one place, the endpoint, and the compiler enforces it everywhere. Asking for `OrdersEndpoint` and treating the result as a `User` is a compile error. The real client is `async` and sits on `URLSession`; you'll build it in full in D33.
+
+## Primary associated types
+
+Since Swift 5.7 a protocol can name its most important associated types in angle brackets: its **primary associated types**.
+
+```swift
+protocol Repository<Model> {
+    associatedtype Model: Identifiable
+    func all() async throws -> [Model]
+    func save(_ model: Model) async throws
+}
+```
+
+That lets callers constrain the family without writing a generic parameter list: `func show(_ repository: some Repository<Order>)` takes any repository of orders, and `let repository: any Repository<Order>` stores one. The standard library uses the same feature: `some Collection<Order>`, `any Clock<Duration>`, and since iOS 18, `any AsyncSequence<Data, any Error>`. Choose primary associated types the way the standard library does: the types a *caller* will want to pin down (a repository's model), not implementation details (its storage).
+
+<Callout kind="gotcha" title="Swift gotcha: an unconstrained existential loses its associated types">
+
+With `let repository: any Repository` (no `<Order>`), Swift doesn't know what `Model` is. Calling `repository.save(order)` fails with "member 'save' cannot be used on value of type 'any Repository'", and `repository.all()` returns `[Any]`. Constrain it (`any Repository<Order>`), or move the code into a generic function.
+
+</Callout>
+
+## Phantom types: safety that costs nothing
+
+A generic parameter doesn't have to be stored. A **phantom type** parameter exists only to tag a value, so values that look the same can't be mixed up:
+
+```swift
+struct ID<Entity>: Hashable, Sendable {
+    let raw: String
+}
+
+struct Customer {}
+struct Order {}
+
+func cancel(_ order: ID<Order>) { /* … */ }
+
+let customer = ID<Customer>(raw: "c_19")
+cancel(customer)
+```
+
+```text title="What you'll see"
+error: cannot convert value of type 'ID<Customer>' to expected argument type 'ID<Order>'
+```
+
+At run time `ID<Customer>` and `ID<Order>` are both a `String`, with no extra memory or work. At compile time they're different types, so an order id can never reach an API that expects a customer id. It's the next step after [replacing primitives with domain types](/design/learn/sd-modelling-domain-types): one generic type gives every entity its own id type.
+
+## Conditional conformance: generic view state
+
+Generic types can conform to a protocol only when their parameters do. That makes one generic view state reusable across every screen:
+
+```swift check
+enum Loadable<Value> {
+    case idle
+    case loading
+    case loaded(Value)
+    case failed(message: String)
+}
+
+extension Loadable: Equatable where Value: Equatable {}
+extension Loadable: Sendable where Value: Sendable {}
+
+extension Loadable {
+    var value: Value? {
+        if case .loaded(let value) = self { return value }
+        return nil
+    }
+
+    func map<New>(_ transform: (Value) -> New) -> Loadable<New> {
+        switch self {
+        case .idle: .idle
+        case .loading: .loading
+        case .loaded(let value): .loaded(transform(value))
+        case .failed(let message): .failed(message: message)
+        }
+    }
+}
+
+struct OrderSummary: Equatable, Sendable {
+    let count: Int
+}
+
+let state: Loadable<[Int]> = .loaded([1250, 899])
+let summary = state.map { OrderSummary(count: $0.count) }
+let isEqual = summary == .loaded(OrderSummary(count: 2))
+```
+
+`Loadable<[Order]>` is `Equatable` when `Order` is, so a view model test can compare whole states with `==`; `Loadable<AVPlayer>` isn't, and nothing breaks.
+
+## Where clauses describe relationships
+
+Constraints can relate several types. A repository that joins a remote source and a local store must use the same model on both sides:
+
+```swift
+struct Repository<Remote: RemoteSource, Local: LocalStore> where Remote.Model == Local.Model {
+    // … a [Remote.Model] from the network *is* a [Local.Model] for the store
+}
+```
+
+The `where` clause is a **same-type constraint**. Without it, "the API and the store must agree" lives in documentation and in casts. With it, `Repository(remote: OrdersAPI(), local: ProductStore())` doesn't compile. You'll build this repository in the practice kata.
+
+## The cost: generic creep
+
+Generic parameters spread. If a type stores a generic value and wants to keep its concrete type, it must become generic too, and so must whatever stores *it*. Watch it climb from the data layer to the screen:
+
+```visual flow
+title: A generic parameter climbing to the screen
+nodes:
+  - { id: view, label: FeedView, kind: view, at: [0, 0] }
+  - { id: vm, label: FeedViewModel, kind: service, at: [2, 0] }
+  - { id: repo, label: FeedRepository, kind: service, at: [4, 0] }
+  - { id: client, label: HTTP client, kind: external, at: [4, 2] }
+edges:
+  - [view, vm, holds]
+  - [vm, repo, holds]
+  - [repo, client, holds]
+steps:
+  - say: "The repository is generic over its HTTP client, so tests can pass a stub. A good, local use of generics."
+    show: [repo, client]
+    label: { repo: "Repo<Client>" }
+  - say: "The view model stores the repository. To keep its concrete type, it gets a generic parameter too: `FeedViewModel<Repo: FeedLoading>`."
+    show: [vm]
+    state: { vm: active }
+    label: { vm: "ViewModel<Repo>" }
+  - say: "The view stores the view model, so the view becomes `FeedView<VM>`. Nothing here cares which client is used, yet everything has to spell it."
+    show: [view]
+    state: { view: active }
+    label: { view: "FeedView<VM>" }
+  - say: "The app, every preview and every test now writes `FeedView<FeedViewModel<FeedRepository<URLSessionClient>>>`. Changing the client means touching all of them."
+    state: { view: error, vm: error }
+  - say: "Stop it at the boundary: the view model stores `any FeedLoading`. The existential costs a dynamic call on a method that then waits for the network: nothing you could measure."
+    state: { view: ok, vm: ok }
+    label: { view: FeedView, vm: any FeedLoading }
+```
+
+Generics are still the right tool *inside* each layer: the repository, the cache and the API client are better for knowing their types. What doesn't need to know is the code that only *uses* them.
+
+## Rules of thumb
+
+- **Generic for algorithms, containers and infrastructure:** caches, repositories, API clients, view state like `Loadable`. Type relationships matter there, and performance sometimes does.
+- **An existential where a long-lived object stores a dependency**, such as a view model holding its repository, to stop generic creep. The next lesson weighs `some` against `any` in detail.
+- **Wait for the second type.** A generic with one concrete instantiation is an abstraction with no payoff yet, and it makes every signature harder to read.
+- **Name parameters for what they are:** `Model`, `Response`, `Client`, rather than `T`, `U`, `V`, once there's more than one.
+
+## Trade-offs
+
+| | Concrete types | Generic type or function | Protocol with associated types | `Any` and casts |
+| --- | --- | --- | --- | --- |
+| **Type safety** | full | full | full | checked at run time, if at all |
+| **Reuse** | none: copy and edit | high | high: a family of types | high, unsafely |
+| **Call-site readability** | best | good | good with primary associated types | casts everywhere |
+| **Spreads to callers** | no | yes, if stored | yes, if stored generically | no |
+| **Build time and binary size** | smallest | specialisation adds code | specialisation adds code | smallest |
+
+Concrete types win until a second use appears. Generics win for reusable infrastructure whose callers need the exact type back. Protocols with associated types win when each conformer fixes a type, like endpoints and their responses. `Any` is left for the edges where the type really is unknown, such as a JSON value of any shape, and even there an enum is usually better.
+
+<Callout kind="interview">
+
+**Say:** for an API client, "each endpoint is a type with an associated `Response`, and `send` returns `E.Response`, so the compiler pairs every request with its model." Mention phantom-typed ids if identifiers come up, and where you'd stop generics spreading.
+
+**Ask:** how many concrete types will use this? Does the caller need the exact type back, or only the capability?
+
+**Red flags:** `[String: Any]` or `Any` passed between layers with casts at the other end; a generic parameter list that reaches the SwiftUI view; generics introduced for a single type "in case".
+
+</Callout>
+
+## Practice
+
+The **generic repository** kata asks you to build the repository from this lesson: an in-memory store and a repository joined by `where Remote.Model == Local.Model`, with three fetch policies. It works for any entity, and the compiler refuses to pair the wrong two.
+
+```cards
+- id: generic-keeps-type
+  front: "What does a generic function give you that a function taking `Any` doesn't?"
+  back: "The caller gets the exact type back, checked at compile time, and the optimiser can specialise the code for that type."
+- id: associated-type-family
+  front: "When does a protocol need an associated type?"
+  back: "When each conformer fixes a related type for itself, like an endpoint's `Response` or a repository's `Model`."
+- id: phantom
+  front: "What is a phantom type parameter?"
+  back: "A generic parameter that isn't stored and only tags a value, so `ID<Order>` and `ID<Customer>` can't be mixed up, at no run-time cost."
+- id: generic-creep
+  front: "What's generic creep, and how do you stop it?"
+  back: "Storing a generic value forces the storing type to be generic too, up to the views. Store an existential (`any FeedLoading`) at the boundary where only the capability matters."
+```
+
+```quiz
+- id: q1
+  type: mcq
+  prompt: "With the `Endpoint` protocol from this lesson, what is the type of `try client.send(UserEndpoint(id: 7))`?"
+  options:
+    - "`Any`, to be cast to `User`"
+    - "`User`"
+    - "`any Decodable`"
+    - "`Data`, to be decoded by the caller"
+  answer: 1
+  explain: "`send` returns `E.Response`, and `UserEndpoint` fixes `Response` as `User`. The compiler substitutes it at the call site, so the caller gets a `User` with no cast."
+- id: q2
+  type: blank
+  prompt: "Fill in the blanks so callers can write `some Repository<Order>`."
+  code: |
+    protocol Repository___ {
+        associatedtype Model: Identifiable
+        func all() async throws -> [Model]
+    }
+
+    func showOrders(from repository: some Repository___) async throws {
+        let orders = try await repository.all()
+        print(orders.count)
+    }
+  answers: ["<Model>", "<Order>"]
+  explain: "`protocol Repository<Model>` declares `Model` as the primary associated type, and `some Repository<Order>` constrains it at the use site, with no generic parameter list."
+- id: q3
+  type: output
+  prompt: "What does this print?"
+  code: |
+    enum Loadable<Value> {
+        case loading
+        case loaded(Value)
+    }
+    extension Loadable: Equatable where Value: Equatable {}
+
+    let state: Loadable<[Int]> = .loaded([1, 2])
+    print(state == .loaded([1, 2]), state == .loading)
+  answer: "true false"
+  explain: "`[Int]` is `Equatable`, so `Loadable<[Int]>` gets a synthesised `==` through the conditional conformance. Equal payloads in the same case are equal; different cases aren't."
+- id: q4
+  type: truefalse
+  prompt: "`ID<Customer>` and `ID<Order>`, both wrapping one `String`, take the same memory, yet passing one where the other is expected doesn't compile."
+  answer: true
+  explain: "The phantom parameter isn't stored, so both are a bare `String` at run time. To the type checker they're different types. That's the whole point: safety with no cost."
+- id: q5
+  type: sort
+  prompt: "Generic parameter or existential (`any`)?"
+  buckets: [Generic parameter, Existential]
+  items:
+    - ["A sort helper run over 50,000 items in a hot loop", 0]
+    - [The repository a view model stores for its lifetime, 1]
+    - [An LRU cache's key and value types, 0]
+    - ["A feed that mixes banner, product and video items", 1]
+    - [The endpoint passed to an API client's send method, 0]
+  explain: "Generics where the exact type matters or performance does: algorithms, containers, request and response pairing. Existentials where something stores a dependency and only needs the capability, or where a collection really mixes types."
+- id: q6
+  type: mcq
+  prompt: "A view model became `FeedViewModel<Repo: FeedLoading>` only so tests can inject a fake. What's the usual consequence?"
+  options:
+    - "Nothing: generics are free"
+    - "Its view and everything that creates it must become generic or name the concrete repository type"
+    - "It can no longer be tested"
+    - "It can no longer be used on the main actor"
+  answer: 1
+  explain: "A stored generic dependency pushes its type parameter upward. Storing `any FeedLoading` gives the same testability, since the fake still conforms, without the spreading signatures."
+```

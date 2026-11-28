@@ -1,0 +1,94 @@
+When someone likes a post on a train with no signal, the app shows the heart at once and queues the like in an outbox, to send when the connection comes back. Write the flush that empties it, split the functional-core way: two pure functions make every decision, and a thin shell does the work through dependencies passed in as closures.
+
+**The core**
+
+`QueuedLikesOutbox.batch(from outbox: [PendingLike], limit: Int, maxFailures: Int) -> [PendingLike]`
+
+- The likes to send this time, in outbox order, skipping any whose `failures` has reached `maxFailures`, and at most `limit` of them.
+
+`QueuedLikesOutbox.applying(_ outcomes: [String: Outcome], to outbox: [PendingLike]) -> [PendingLike]`
+
+- The outbox after a flush, in the same order. `outcomes` maps a post id to what happened when it was sent: `.sent` and `.rejected` likes are removed, a `.failed` like stays with one more failure, and a like with no outcome (it wasn't in the batch) is unchanged.
+
+**The shell**
+
+`QueuedLikesOutbox.flush(_ dependencies: Dependencies, limit: Int = 5, maxFailures: Int = 3) async -> Int`
+
+- `Dependencies` holds four closures: `isOnline`, `load`, `send` and `save`.
+- Offline, return `0` and call nothing else.
+- Otherwise load the outbox and take a batch. If it's empty, return `0` without saving.
+- Send the batch one like at a time, in order, so the server sees likes in the order they were made.
+- Save the outbox with the outcomes applied, once, and return how many likes were `.sent`.
+
+## Examples
+
+| Outbox (id: failures) | Outcomes | Batch (limit 2, max 3) | Saved afterwards | Returns |
+| --- | --- | --- | --- | --- |
+| `a: 0, b: 3, c: 0, d: 0` | `c` fails | `a, c` (`b` has failed 3 times) | `b: 3, c: 1, d: 0` | `1` |
+| `a: 0, b: 0`, offline | none | not taken | nothing is loaded or saved | `0` |
+| `a: 3, b: 5` | none | empty | nothing is saved | `0` |
+
+## Constraints
+
+- `batch` and `applying` are pure, so test them with plain values.
+- `flush` decides nothing that the core could decide; its only branches are "offline?" and "nothing to send?".
+- Tests build `Dependencies` from closures that record every call, so they can check what was loaded, sent and saved, and in what order.
+
+<Hints>
+<Hint>
+`outbox.lazy.filter { … }.prefix(limit)` stops looking once it has enough. Wrap it in `Array(…)`, and guard against a negative limit with `max(0, limit)`.
+</Hint>
+<Hint>
+`applying` is a `compactMap` over the outbox: return `nil` to drop a like, a copy with `failures + 1` to keep a failed one, or the like itself.
+</Hint>
+<Hint>
+In `flush`, collect the outcomes in a `[String: Outcome]` as you send, then hand them to `applying`. Counting `.sent` values gives the return value.
+</Hint>
+</Hints>
+
+## Solutions
+
+<Approach title="Decide in the core, act in the shell" time="O(n) for an outbox of n likes" space="O(n)">
+
+```swift
+public static func batch(from outbox: [PendingLike], limit: Int, maxFailures: Int) -> [PendingLike] {
+    Array(outbox.lazy.filter { $0.failures < maxFailures }.prefix(max(0, limit)))
+}
+
+public static func applying(_ outcomes: [String: Outcome], to outbox: [PendingLike]) -> [PendingLike] {
+    outbox.compactMap { like in
+        switch outcomes[like.postID] {
+        case .sent?, .rejected?:
+            return nil
+        case .failed?:
+            var retried = like
+            retried.failures += 1
+            return retried
+        case nil:
+            return like
+        }
+    }
+}
+
+public static func flush(_ dependencies: Dependencies, limit: Int = 5, maxFailures: Int = 3) async -> Int {
+    guard dependencies.isOnline() else { return 0 }
+    let outbox = await dependencies.load()
+    let likes = batch(from: outbox, limit: limit, maxFailures: maxFailures)
+    guard !likes.isEmpty else { return 0 }
+
+    var outcomes: [String: Outcome] = [:]
+    for like in likes {
+        outcomes[like.postID] = await dependencies.send(like)
+    }
+    await dependencies.save(applying(outcomes, to: outbox))
+    return outcomes.values.filter { $0 == .sent }.count
+}
+```
+
+Notice the shape: impure (load), pure (batch), impure (send), pure (applying), impure (save). Every rule a product manager might change, such as the batch size, which failures to give up on, or what a 4xx means, lives in a function you can test with one line.
+
+In the app, the live dependencies wrap real things: `isOnline` reads an `NWPathMonitor`'s current path, `load` and `save` read and write a file in Application Support, and `send` calls `URLSession` and maps the status code to an `Outcome`. None of that needs a protocol or a mock class: a test passes four closures.
+
+One known gap, on purpose: the outbox is loaded, then saved after the sends finish, so a like queued during a flush would be overwritten. A real app runs flushes and enqueues through one actor, or reloads and merges before saving. Spotting that is exactly the kind of thing a reviewer should ask about.
+
+</Approach>

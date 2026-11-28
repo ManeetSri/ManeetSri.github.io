@@ -1,0 +1,288 @@
+## Why it matters
+
+Trees are everywhere in an app: the view hierarchy, menus and submenus, settings screens, folders, document outlines, comment threads. The **composite** pattern lets code treat a single item and a group of items the same way, so the code that walks the tree never asks which one it has. It's why one call lays out a whole screen, and why a context menu can nest as deeply as you like. In interviews it surfaces as "design nested comments" or "design the menu system for an editor", where the model you choose for the tree decides how hard everything after it will be.
+
+## The pattern: component, leaf, composite
+
+A composite has three roles:
+
+- **Component**: the interface every node shares, such as "lay yourself out", "count your items" or "does this point hit you?".
+- **Leaf**: a node with no children. It answers the question itself.
+- **Composite**: a node that holds children. It answers by asking each child the same question and combining the answers.
+
+The engine is recursion. A composite doesn't know how deep its children go, or whether they're leaves or composites themselves; it just asks them. So the same one-line call works on a single button or a whole screen.
+
+<Callout kind="analogy">
+
+A company's headcount. Ask a team and it counts its people. Ask a department and it asks each team and adds the answers. Ask the company and it asks each department. Nobody needs a different question for a team, a department or the whole company.
+
+</Callout>
+
+## UIKit is a composite
+
+Every `UIView` can hold subviews, which can hold subviews, all the way down from the window. Almost everything UIKit does to views is a recursive walk of that tree:
+
+- **Layout**: a layout pass calls `layoutSubviews` on the views that need it, and each positions its own subviews.
+- **Visibility**: `isHidden` hides a view and everything inside it, and `alpha` multiplies down the tree.
+- **Hit-testing**: finding which view a touch belongs to.
+
+Hit-testing shows the pattern at its clearest. `hitTest(_:with:)` on a view returns `nil` if the view is hidden, has user interaction disabled, or is almost transparent (alpha below 0.01), or if the point is outside it. Otherwise it asks its subviews, **front-most first** (the last one added), with the point converted into each one's coordinates, and returns the first answer that isn't `nil`. If no subview claims the point, the view returns itself.
+
+```visual flow
+title: Which view did the user tap?
+nodes:
+  - { id: window, label: UIWindow, kind: view, at: [2, 0] }
+  - { id: root, label: Root view, kind: view, at: [2, 1] }
+  - { id: header, label: Header, kind: view, at: [0.5, 2] }
+  - { id: table, label: Table view, kind: view, at: [3.5, 2] }
+  - { id: avatar, label: Avatar, kind: view, at: [0, 3] }
+  - { id: follow, label: Follow button, kind: view, at: [1, 3] }
+  - { id: cell1, label: Cell 1, kind: view, at: [3, 3] }
+  - { id: cell2, label: Cell 2, kind: view, at: [4, 3] }
+edges:
+  - [window, root]
+  - [root, header]
+  - [root, table]
+  - [header, avatar]
+  - [header, follow]
+  - [table, cell1]
+  - [table, cell2]
+steps:
+  - say: "A touch lands on the second row. UIKit asks the root of the tree, the window, `hitTest(point, with: event)`."
+    state: { window: active }
+  - say: The window contains the point, so it asks its subview. The root view contains it too, so it asks *its* subviews, **front-most first**.
+    send: window->root
+    state: { window: null, root: active }
+  - say: "The table view was added after the header, so it's asked first. It contains the point, and asks its own cells: front-most first again."
+    send: root->table
+    state: { root: null, table: active }
+  - say: "Cell 2 contains the point and has no subview there, so it returns **itself**. That answer goes back up unchanged."
+    send: table->cell2
+    state: { table: null, cell2: ok }
+    label: { cell2: hit }
+  - say: The header and everything in it were never asked. Had cell 2 been hidden or had interaction disabled, it would have returned `nil`, and the table view would have asked cell 1 next.
+    state: { header: wait, avatar: wait, follow: wait }
+```
+
+One method, written once on `UIView`, finds the right view in a tree of any shape. SwiftUI's views compose the same way, though there the tree is built from values (a stack holds its children in a `TupleView`), as you'll see in D18.
+
+## Menus: a composite in UIKit's API
+
+`UIMenu` is the pattern almost straight from the textbook. `UIAction` (a leaf) and `UIMenu` (a composite) are both subclasses of `UIMenuElement`, and a menu's `children` array holds `UIMenuElement` values, so a menu can hold actions and more menus, to any depth:
+
+```swift check ios
+import UIKit
+
+@MainActor
+func photoMenu(isFavourite: Bool, loadAlbums: @escaping @MainActor () -> [String]) -> UIMenu {
+    // Leaves: one command each
+    let favourite = UIAction(title: isFavourite ? "Unfavourite" : "Favourite", image: UIImage(systemName: isFavourite ? "heart.slash" : "heart")) { _ in }
+    let delete = UIAction(title: "Delete", image: UIImage(systemName: "trash"), attributes: .destructive) { _ in }
+
+    // Composites: menus whose children are leaves or more menus
+    let share = UIMenu(title: "Share", image: UIImage(systemName: "square.and.arrow.up"), children: [
+        UIAction(title: "Copy Link") { _ in },
+        UIAction(title: "Message") { _ in },
+    ])
+    let albums = UIDeferredMenuElement.uncached { completion in
+        // A placeholder child: the albums are fetched only when this submenu opens
+        completion(loadAlbums().map { name in UIAction(title: name) { _ in } })
+    }
+    let addToAlbum = UIMenu(title: "Add to Album", image: UIImage(systemName: "rectangle.stack.badge.plus"), children: [albums])
+    let dangerZone = UIMenu(options: .displayInline, children: [delete])
+
+    return UIMenu(children: [favourite, share, addToAlbum, dangerZone])
+}
+```
+
+Three details are worth noticing. `.displayInline` turns a submenu into a section of its parent, separated by a divider, which is how you group the destructive action at the bottom. `UIDeferredMenuElement` is a child that stands in for children it doesn't have yet: a [virtual proxy](/design/learn/sd-structural-proxy) living inside a composite. And the same `UIMenu` can be a button's `menu`, a context menu or a bar button's menu; UIKit walks the tree to draw it wherever it goes.
+
+## Composites in Swift: three shapes
+
+Swift gives you three ways to build your own composite, and the choice matters more than it first appears.
+
+**A uniform node**: one type whose instances may have children. Every node can be a parent, like a `UIView`. It's the simplest shape, and it suits trees where any item can grow children: comments and replies, an outline of headings, folders.
+
+```swift run
+struct Comment {
+    let author: String
+    let text: String
+    var replies: [Comment] = []
+
+    // Every operation: this comment's part, combined with its replies' answers
+    var totalCount: Int {
+        1 + replies.reduce(0) { $0 + $1.totalCount }
+    }
+
+    var depth: Int {
+        1 + (replies.map(\.depth).max() ?? 0)
+    }
+
+    func printThread(indent: Int = 0) {
+        print(String(repeating: "  ", count: indent) + "\(author): \(text)")
+        for reply in replies {
+            reply.printThread(indent: indent + 1)
+        }
+    }
+}
+
+let thread = Comment(author: "Asha", text: "Which architecture for a small app?", replies: [
+    Comment(author: "Ben", text: "MVVM, kept simple.", replies: [
+        Comment(author: "Asha", text: "Even for one screen?", replies: [
+            Comment(author: "Ben", text: "Then plain SwiftUI state is enough."),
+        ]),
+    ]),
+    Comment(author: "Chen", text: "Whatever the team already knows."),
+])
+
+thread.printThread()
+print("\(thread.totalCount) comments, \(thread.depth) levels deep")
+```
+
+```output
+Asha: Which architecture for a small app?
+  Ben: MVVM, kept simple.
+    Asha: Even for one screen?
+      Ben: Then plain SwiftUI state is enough.
+  Chen: Whatever the team already knows.
+5 comments, 4 levels deep
+```
+
+**An enum with leaf and group cases**, such as `case action(Action)` and `case menu(title: String, children: [Element])`. The set of node kinds is closed, every `switch` must handle each one, and the compiler checks every operation you add. Leaves simply have no children. The recursion goes through an `Array`, which stores its elements on the heap, so the enum doesn't need `indirect`; you need `indirect` only when a case holds the enum itself directly, as in `case not(Rule)`.
+
+**A protocol with conforming types**: the component is a protocol, and leaves and composites are types that conform. The set of kinds is open: another module can add a node type without touching yours, as third-party libraries add `UIView` subclasses. The price is that nothing checks that every operation handles every kind.
+
+### Where does "add a child" go?
+
+The classic version of the pattern has a famous tension. If child-management methods such as `add(_:)` live on the shared component, every node looks alike (**transparency**), but adding a child to a leaf must fail at run time. If they live only on the composite, the compiler stops you (**safety**), but code must know which kind it holds before adding. UIKit chose transparency: `addSubview(_:)` is on every `UIView`, even a `UILabel`. The enum shape is the safe choice: an `.action` has nowhere to put children.
+
+## Working with trees in practice
+
+**Showing a tree.** SwiftUI renders a composite directly: `List(items, children: \.children) { item in … }` (and `OutlineGroup`) draws disclosure arrows from a key path to each item's children. In UIKit, `NSDiffableDataSourceSectionSnapshot` holds hierarchical items with expand and collapse.
+
+**Store flat, present as a tree.** A server usually sends comments as a flat list, each with a `parentID`. Keep them that way in storage: updating one comment, paginating replies, or deep-linking to a single comment is easy in a flat table and painful in nested data. Build the tree on the device when you need to show it. Real apps also cap the depth they draw, with a "continue this thread" link past five or six levels.
+
+**Deep trees and the stack.** Recursion uses the call stack, one frame per level. A normal tree is a few levels deep, but a tree from untrusted data can be thousands deep, and threads other than the main thread get only 512 KB of stack by default. Where depth isn't under your control, walk the tree with an explicit stack (an array of nodes to visit) instead.
+
+**Cost.** Asking the whole tree is O(n) every time. For a large tree that's queried constantly, such as a total that shows in a badge, cache the aggregate on each node and update it when the tree changes.
+
+## Trade-offs
+
+| | Uniform node (struct with children) | Enum with leaf and group cases | Protocol with conforming types |
+| --- | --- | --- | --- |
+| Adding a new kind of node | add a field | edit every `switch` | add a type, even in another module |
+| Adding a new operation | one method | one method, checked by the compiler | a requirement every type must implement |
+| Leaves can have children | yes | no | your choice |
+| Value semantics | yes | yes | if the types are structs |
+| Exhaustive checking | not needed | yes | no |
+| Fits | comments, outlines, folders | menus, rule trees, document blocks | view hierarchies, plug-in widgets |
+
+This is the [expression problem](/design/learn/sd-solid-expression-problem) again: enums make new operations cheap and new kinds expensive, protocols the reverse. Pick the enum when one module owns the set of kinds; pick the protocol when others must extend it; pick the uniform node when every item really can have children.
+
+<Callout kind="interview">
+
+**What to say for "nested comments":** "I'd store comments flat with a `parentID` and a sort key, page replies separately, and build the tree on the device for display, capping the drawn depth. The display model is a composite: a comment with replies, so counting, rendering and collapsing are each one recursive function."
+
+**What to ask:** how deep threads get, whether replies load lazily, and whether the server can return counts so the app doesn't need the whole tree to show "12 replies".
+
+**Red flags:** storing the whole thread as one nested blob that's rewritten for every reply; unbounded recursion over server data; separate code paths for "a comment" and "a comment with replies".
+
+</Callout>
+
+<Callout kind="gotcha" title="iOS gotcha: empty children show a disclosure arrow">
+
+`List(_:children:)` takes a key path to an **optional** array of children. A leaf must return `nil`; an empty array means "a group with nothing in it", so SwiftUI draws a disclosure arrow that opens onto nothing. Map your leaves to `nil` when you build the display model.
+
+</Callout>
+
+## Practice
+
+The kata gives you a menu tree as an enum composite and asks four questions of it: count the actions, filter out unavailable ones (removing submenus left empty), find the path of titles to an action, and report duplicate ids. Each is one recursive function with the leaf-and-composite shape from this lesson.
+
+```cards
+- id: composite-roles
+  front: "What are the three roles in the composite pattern?"
+  back: "The **component** (the interface every node shares), the **leaf** (answers itself) and the **composite** (holds children, answers by asking each child and combining)."
+- id: composite-hit-test
+  front: "How does `UIView.hitTest(_:with:)` use the composite pattern?"
+  back: "A view that can't be hit returns nil; otherwise it asks its subviews front-most first and returns the first non-nil answer, or itself. The same method works for any tree."
+- id: composite-shapes
+  front: "When do you choose an enum composite over a protocol-based one?"
+  back: "When one module owns the closed set of node kinds: new operations are cheap and compiler-checked. Choose a protocol when other modules must add kinds."
+- id: composite-flat-storage
+  front: "How should an app store nested comments?"
+  back: "Flat, with a parent id, which makes updates, pagination and deep links easy. Build the tree on the device only for display."
+```
+
+```quiz
+- id: q1
+  type: order
+  prompt: "Put the steps `hitTest(_:with:)` takes for one view in order."
+  lines:
+    - "Return nil if the view is hidden, has interaction disabled or is almost transparent"
+    - "Return nil if the point is outside the view"
+    - "Ask each subview, front-most first, with the point converted to its coordinates"
+    - "Return the first answer from a subview that isn't nil"
+    - "If no subview claims the point, return the view itself"
+  explain: "Each view rules itself out first, then delegates to its children, and only claims the touch when none of them do. The recursion is what lets one method handle a tree of any shape."
+- id: q2
+  type: output
+  prompt: "What does this print?"
+  code: |
+    enum Node {
+        case file(name: String, bytes: Int)
+        case folder(name: String, children: [Node])
+
+        var bytes: Int {
+            switch self {
+            case .file(_, let bytes): bytes
+            case .folder(_, let children): children.reduce(0) { $0 + $1.bytes }
+            }
+        }
+
+        var fileCount: Int {
+            switch self {
+            case .file: 1
+            case .folder(_, let children): children.reduce(0) { $0 + $1.fileCount }
+            }
+        }
+    }
+
+    let photos = Node.folder(name: "Photos", children: [
+        .file(name: "beach.heic", bytes: 300),
+        .folder(name: "2025", children: [
+            .file(name: "snow.heic", bytes: 200),
+            .folder(name: "Empty", children: []),
+        ]),
+    ])
+    print(photos.bytes, photos.fileCount)
+  answer: "500 2"
+  explain: "Each folder adds up its children's answers, and an empty folder contributes 0 to both. Only the two files count as files, at whatever depth they sit."
+- id: q3
+  type: truefalse
+  prompt: "An enum like `enum Element { case action(Action); case menu(title: String, children: [Element]) }` won't compile unless it's marked `indirect`."
+  answer: false
+  explain: "The recursion goes through an `Array`, which keeps its elements in separate heap storage, so the enum has a fixed size. `indirect` is needed only when a case holds the enum directly, such as `case not(Rule)`."
+- id: q4
+  type: sort
+  prompt: "Which composite shape fits each tree best?"
+  buckets: [Uniform node, Enum, Protocol and types]
+  items:
+    - ["A comment thread where any comment can have replies", 0]
+    - ["A context menu of actions and submenus, owned by one feature", 1]
+    - ["A home dashboard where feature modules contribute their own widget types", 2]
+    - ["A document outline where any heading may have subheadings", 0]
+    - ["Validation rules: all-of, any-of, not, and a fixed set of checks", 1]
+    - ["A plug-in system where third-party code adds new node kinds", 2]
+  explain: "Uniform nodes suit trees where every item can have children. Enums suit a closed set owned by one module, where the compiler checks every operation. Protocols suit open sets that other modules extend."
+- id: q5
+  type: mcq
+  prompt: "Your app shows threads of up to 10,000 comments from the server, each with a `parentID`. Which approach is best?"
+  options:
+    - "Store each thread as one nested JSON blob and rewrite it when a reply arrives"
+    - "Store comments flat with their parent ids, page replies, and build a depth-capped tree for display"
+    - "Fetch the whole thread on every screen open and recurse over it on the main thread"
+    - "Give each comment a reference to its parent object, and no list of replies"
+  answer: 1
+  explain: "Flat storage makes single-comment updates, pagination and deep links cheap; the tree is a presentation built when needed, capped so deep chains don't overflow the layout or the stack."
+```

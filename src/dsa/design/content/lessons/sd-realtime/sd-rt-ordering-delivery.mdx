@@ -1,0 +1,303 @@
+## Why it matters
+
+A chat message that appears twice, a reply shown above its question, a message typed in a tunnel that never arrives, a live score that flicks from 2–1 back to 1–1: these are delivery and ordering bugs, and they're the ones users screenshot. As soon as you say "WebSocket" in an interview, the next question is "what if the connection drops while a message is in flight?" A senior answer names the guarantee each kind of message needs and the mechanism that provides it, at every hop.
+
+## Where messages go missing, or double
+
+Follow one message from Ana's phone to Ben's. Each hop can fail on its own:
+
+1. **Ana's app to the server.** The send can be lost on the way, *or* the server can store it and the acknowledgement can be lost on the way back. To Ana's app these look identical: a timeout. That's the **ambiguous failure** you met with [idempotency keys](/design/learn/sd-api-idempotency), and it's the root of every duplicate.
+2. **Inside the server.** The gateway can crash after accepting the message but before it's stored, or after storing but before publishing it to Ben's gateway.
+3. **The server to Ben's app.** Ben may be offline. His connection may be silently dead, so the server writes into a socket nobody reads. Or he may be connected to a gateway that hasn't subscribed to the conversation yet.
+4. **Inside Ben's app.** The app can receive the message and crash, or be terminated, before saving it.
+
+Remember from the WebSocket lesson that `send` completing only means "written to the kernel". No single layer can promise delivery for the hops after it; each hop needs its own rule.
+
+## Three guarantees
+
+| Guarantee | Mechanism | Loses messages? | Duplicates? | Fits |
+| --- | --- | --- | --- | --- |
+| **At most once** | Send once, never retry | Yes, when anything fails | Never | Typing indicators, presence, cursor positions, a GPS fix replaced in a second |
+| **At least once** | Retry until acknowledged | No, as long as someone keeps retrying | Yes, after an ambiguous failure | Most events, with a receiver that tolerates duplicates |
+| **Exactly once** | At-least-once delivery plus idempotent processing | No | Absorbed by the receiver | Chat messages, payments, orders, anything a user would notice twice |
+
+Exactly-once *delivery* isn't achievable over a network that can lose acknowledgements: the sender can never be sure the other side has it, so it must either risk losing it or risk sending it twice. What systems achieve is exactly-once **effect**: deliver at least once, and make applying a message twice the same as applying it once. People call it "effectively once", and every serious messaging system works this way, including Kafka's "exactly-once" processing. You'll meet the server-side version in D45.
+
+So the design question is never "which guarantee does the protocol give?" but "what does each kind of message need, and who deduplicates?"
+
+## Sending: client ids, acknowledgements and the outbox
+
+The sending side gets exactly-once effect from three pieces:
+
+- **A client-generated id**, created once when the user taps Send and stored with the message. Every retry of *that* message carries the same id.
+- **An outbox**: the message is saved locally as pending before it's sent, and a sender loop keeps retrying pending messages, across reconnects and relaunches, until each is acknowledged. The local row also drives optimistic UI: the message appears at once with a clock icon. You'll build a full outbox in D39.
+- **A server that deduplicates** on (sender, client id). The first time it sees the id it stores the message and assigns its sequence number; any later attempt with the same id gets the *original* acknowledgement back, with the same sequence number.
+
+```visual sequence
+title: A lost acknowledgement doesn't make a duplicate
+participants:
+  - { id: app, label: "Ana's app" }
+  - { id: gateway, label: Chat gateway }
+  - { id: store, label: Message store }
+messages:
+  - [app, app, "save pending · id c-81f2", { say: "Ana taps Send. The app saves the message locally as **pending**, with a client id it creates now, and shows it straight away." }]
+  - [app, gateway, "send · c-81f2", { say: "The app sends it over the socket." }]
+  - [gateway, store, "insert unless c-81f2 exists"]
+  - [store, gateway, stored as seq 1042, { reply: true, say: "The server stores it, assigns sequence number **1042** in this conversation, and remembers the client id." }]
+  - { note: "The ack is lost when the train enters a tunnel.", over: [app, gateway] }
+  - [app, gateway, "send · c-81f2", { say: "After reconnecting, the outbox resends everything still pending, with the **same** client id." }]
+  - [gateway, store, "insert unless c-81f2 exists"]
+  - [store, gateway, already seq 1042, { reply: true, say: "The server recognises the id and stores nothing new." }]
+  - [gateway, app, "ack · c-81f2 · seq 1042", { reply: true, say: "It answers with the original sequence number. The app marks the row sent, with seq 1042: one message, on every device." }]
+```
+
+The acknowledgement matters for the echo too. When the server broadcasts Ana's message to the conversation, Ana's own other devices receive it, and so may the very app that sent it. The echo carries the client id, so the app matches it to its pending row instead of appending a second copy.
+
+## Receiving: sequence numbers per channel
+
+On the receiving side, the server gives every message in a **channel** (a conversation, a match, a document) a sequence number: 1, 2, 3…, with no gaps, assigned at the moment it accepts the message. The client remembers the last number it applied, per channel, and judges every arrival against it:
+
+- **The next number:** apply it.
+- **A number it has already applied:** a duplicate from a resend or a replay. Drop it.
+- **A number further ahead:** something is missing. Hold it back, and fill the gap.
+
+Why per channel, not one global counter? A global counter needs every message in the system to pass through one point of coordination, which becomes the bottleneck. Users only perceive order *within* a conversation, and channels are independent, so each channel's counter can live with that channel's data on whichever shard owns it.
+
+### Filling a gap
+
+A gap means the client missed something: a lost frame before a reconnect, a gateway that was briefly behind, or two paths (the socket and a push-triggered fetch) racing each other. A short grace period lets a message that's merely late arrive by itself. After that, the client asks for exactly what's missing: a resend over the socket, or `GET /conversations/7/messages?after=41` over HTTP.
+
+```visual timeline
+title: A gap in a conversation, and how it's filled
+unit: s
+lanes:
+  - { id: arrive, label: Network }
+  - { id: buffer, label: Held back }
+  - { id: shown, label: Shown }
+spans:
+  - { lane: arrive, from: 0, to: 0.4, label: "41", tone: ok }
+  - { lane: shown, from: 0.4, to: 1, label: "41" }
+  - { lane: arrive, from: 1, to: 1.4, label: "43", tone: active }
+  - { lane: buffer, from: 1.4, to: 3.6, label: "43 (gap at 42)", tone: wait }
+  - { lane: arrive, from: 1.8, to: 2.2, label: "44", tone: active }
+  - { lane: arrive, from: 3.4, to: 3.6, label: "resend 42", tone: error }
+  - { lane: arrive, from: 3.8, to: 4.2, label: "42", tone: ok }
+  - { lane: shown, from: 4.2, to: 5, label: "42, 43, 44", tone: ok }
+markers:
+  - { at: 3.4, label: grace over }
+steps:
+  - { at: 0.4, say: "Message **41** is the next number, so it's shown at once." }
+  - { at: 1.4, say: "**43** arrives, but the app expected 42. Showing 43 now would put it in the wrong place, so it's held back." }
+  - { at: 2.2, say: "**44** joins it. The gap is still 42." }
+  - { at: 3.4, say: "After a 2-second grace period 42 still hasn't come, so the app asks for exactly that: a resend of **42**." }
+  - { at: 4.2, say: "42 arrives, and the run 42, 43, 44 is shown in order. Each was applied once, whatever arrived twice." }
+```
+
+The buffer must be bounded. If a client is hundreds of messages behind (it was offline for a day, or its last sequence number has aged out of the server's replay window), filling the gap message by message is slower than starting again: the client fetches a **snapshot** (the latest 50 messages, or the current state of a document) and continues from the snapshot's sequence number. The kata for this lesson builds that buffer: grace period, resend ranges, duplicates, an overflow that asks for a resync, and the resume.
+
+### The snapshot race
+
+Opening a conversation has a classic bug. The obvious order is to fetch the history over HTTP, then subscribe to live events. But messages that arrive *between* those two steps are in neither: too late for the history, too early for the subscription.
+
+The fix reverses the order and uses sequence numbers to stitch the two together:
+
+1. **Subscribe first**, and buffer live events without applying them.
+2. **Fetch the snapshot.** The response says which sequence number it's complete up to, say 1040.
+3. **Apply the buffered events after 1040**, drop those at or before it, and go live.
+
+Many protocols fold this into the subscription itself, "subscribe to conversation 7 from seq 1040", so the server replays and then streams on one channel. It's the same idea as SSE's `Last-Event-ID`.
+
+## Applying exactly once on the device
+
+At-least-once delivery means the app *will* see duplicates, so applying must be idempotent:
+
+```swift run title="IdempotentApply.swift"
+import Foundation
+
+/// One message as the server delivers it: `seq` is its place in the conversation, assigned by the server
+struct Delivery {
+    let seq: Int
+    let text: String
+}
+
+/// Appends whatever arrives, in arrival order
+struct NaiveThread {
+    private(set) var lines: [String] = []
+
+    mutating func apply(_ delivery: Delivery) {
+        lines.append(delivery.text)
+    }
+}
+
+/// Keyed by the server's sequence number: a redelivery overwrites itself, and order comes from the server
+struct KeyedThread {
+    private var bySeq: [Int: String] = [:]
+    private(set) var duplicates = 0
+
+    var lines: [String] { bySeq.keys.sorted().compactMap { bySeq[$0] } }
+
+    mutating func apply(_ delivery: Delivery) {
+        if bySeq[delivery.seq] != nil { duplicates += 1 }
+        bySeq[delivery.seq] = delivery.text
+    }
+}
+
+// At-least-once delivery on a flaky connection: a resend after a reconnect, one message overtaken
+// by the next on another path, and a replay of the start when the app reopened the conversation
+let arrivals = [
+    Delivery(seq: 1, text: "Hi"),
+    Delivery(seq: 2, text: "Are you there?"),
+    Delivery(seq: 2, text: "Are you there?"),
+    Delivery(seq: 4, text: "See you at 6"),
+    Delivery(seq: 3, text: "Running late"),
+    Delivery(seq: 1, text: "Hi"),
+]
+
+var naive = NaiveThread()
+var keyed = KeyedThread()
+for delivery in arrivals {
+    naive.apply(delivery)
+    keyed.apply(delivery)
+}
+print("Appended as they arrived: \(naive.lines.joined(separator: " | "))")
+print("Keyed by sequence number: \(keyed.lines.joined(separator: " | "))")
+print("Duplicates absorbed: \(keyed.duplicates)")
+```
+
+```output
+Appended as they arrived: Hi | Are you there? | Are you there? | See you at 6 | Running late | Hi
+Keyed by sequence number: Hi | Are you there? | Running late | See you at 6
+Duplicates absorbed: 2
+```
+
+In a real app the dictionary is your database:
+
+- **Upsert by server id.** In SwiftData, mark the server's message id `@Attribute(.unique)` and inserting a model with an existing id updates it instead of adding a row; Core Data has uniqueness constraints with a merge policy; in SQLite it's `INSERT … ON CONFLICT DO UPDATE`.
+- **Save the cursor with the data.** Write the messages and the channel's last sequence number in the **same transaction**. Save the cursor first and crash, and the app skips messages it never stored; save the messages first and crash, and you only replay a few, which upserts absorb. One transaction removes the question.
+- **Sort by sequence number, not by arrival or by device clocks.**
+
+## Whose order?
+
+The server's. The sequence number assigned when the server accepted a message is the one order every device agrees on. Device clocks disagree by seconds or minutes, and a message composed offline at 10:02 may reach the server after one sent at 10:05; ordering by the sender's timestamp would reshuffle the conversation differently on every phone. Show the sender's time as a label if you like, but order by sequence number. (Clock skew gets its own lesson in D39.)
+
+Server order within a channel also gives you **causality for free** where users notice it: Ben can only reply to a message he has seen, so his reply is accepted, and numbered, after it. *Across* channels there's no such promise. A message in one conversation that refers to an edit in another must not assume the edit has arrived; fetch what it refers to if it's missing.
+
+Edits, deletes and reactions are events too. Give them sequence numbers in the same channel, and they're ordered with the messages they change. Make them idempotent: "set the text of message 1042 to …, version 3" can be applied twice; "append ' (edited)'" cannot.
+
+### Send state, not deltas, when you can
+
+For live data such as scores, prices and positions, the cheapest delivery guarantee is no guarantee at all, if each message carries the **whole current state with a version**: `{"match": 841, "home": 2, "away": 1, "version": 17}`. Applying it is "keep it if the version is newer". Duplicates are harmless, a late message is ignored, and a lost one is repaired by the next. A **delta** such as "home +1" needs exactly-once processing, or the score drifts. Use deltas when state is too big to resend (a long document), and state everywhere else.
+
+## Push notifications are not a delivery channel
+
+It's tempting to treat APNs as a backup path for messages. It isn't one. When a device is offline, APNs stores **only the most recent notification** for your app on that device, for a limited time, and discards the rest. Notifications can be delayed, coalesced or throttled, and silent pushes in particular are dropped freely. A push is a hint that something happened; the app must still sync from its last sequence number when it runs. You'll see the full list of what APNs doesn't promise in D46.
+
+## Trade-offs
+
+| Message kind | Guarantee | Mechanism | Cost |
+| --- | --- | --- | --- |
+| Typing, presence, cursors | At most once | Send and forget; expire on the receiver | Nothing: a lost one is replaced by the next or expires |
+| Live state (scores, positions) | At most once, made safe by versions | Full state plus a version; keep the newest | Bigger messages than deltas |
+| Chat messages, comments | Exactly-once effect | Client ids, outbox, server dedupe, sequence numbers, idempotent apply | Storage for ids and cursors; resend and gap logic on both sides |
+| Payments, orders | Exactly-once effect, strictly | Idempotency keys persisted with the intent; server-side dedupe window | Server state per key; careful retry rules |
+| Analytics events | At least once | Batch, retry, dedupe on the server by event id | Occasional double counts if the dedupe window is short |
+
+<Callout kind="interview">
+
+**Say** the guarantee per message type and who enforces it: "Chat messages get exactly-once effect: the app creates a client id and keeps the message in an outbox until it's acknowledged, the server deduplicates on that id and assigns a per-conversation sequence number, and the receiver applies by sequence number in one transaction with its cursor, filling gaps from the server. Typing indicators are at most once and simply expire." **Ask** whether order matters across conversations (it rarely should) and how long the server keeps history for replay. **Red flags:** "WebSockets are reliable, so messages arrive", ordering by device timestamps, a client id generated per attempt, and push notifications as the backup delivery path.
+
+</Callout>
+
+<Callout kind="gotcha" title="Swift gotcha: UUID() in the wrong place">
+
+`let id = UUID()` inside the function that sends a request gives every retry a new id, and the server's deduplication can never match them. The id belongs to the user's intent: create it when the message is composed, store it in the outbox row with the message, and read it from there on every attempt, including after a relaunch.
+
+</Callout>
+
+<Callout kind="gotcha" title="iOS gotcha: the cursor saved in UserDefaults">
+
+Keeping each conversation's last sequence number in `UserDefaults` while the messages live in SwiftData or Core Data means two stores written at different moments. A crash between them either skips messages forever (cursor saved first) or depends on duplicates being harmless (messages saved first). Keep the cursor in the same database as the messages, written in the same save.
+
+</Callout>
+
+## Practice
+
+The kata **"An ordering buffer"** builds the receiving side: deliver in sequence order, drop duplicates, wait a grace period before asking for a resend of exactly the missing ranges, ask for a resync when the buffer overflows, and resume from a snapshot without losing what arrived meanwhile. Then the design exercise **"Live score updates for 5 million fans"** asks you to make scores impossible to double or reverse at the scale of a cup final, with VAR corrections in the feed.
+
+```cards
+- id: exactly-once
+  front: "Why is 'exactly once' achieved as an effect rather than as delivery?"
+  back: "A sender can't know whether a lost acknowledgement means the message arrived, so it must risk loss or duplication. Systems deliver at least once and make processing idempotent, so duplicates have no effect."
+- id: client-id
+  front: "How does a client id prevent duplicate chat messages?"
+  back: "It's created once when the user sends, stored in the outbox and reused on every retry. The server deduplicates on it and returns the original sequence number to any repeat."
+- id: per-channel-seq
+  front: "Why number messages per channel instead of globally?"
+  back: "A global counter is a single point of coordination for the whole system. Users only perceive order within a conversation, and per-channel counters scale with the channels."
+- id: snapshot-race
+  front: "How do you open a conversation without losing messages between the history fetch and the live subscription?"
+  back: "Subscribe first and buffer, fetch the snapshot (which says which sequence number it covers), then apply buffered events after that number and drop the rest."
+```
+
+```quiz
+- id: q1
+  type: sort
+  prompt: "Which guarantee does each need?"
+  buckets: [At most once is fine, Exactly-once effect]
+  items:
+    - [A typing indicator, 0]
+    - [A chat message, 1]
+    - [A rider's GPS position sent every 2 seconds, 0]
+    - [Placing a food order, 1]
+    - [A collaborative cursor position, 0]
+    - [A reaction on a message, 1]
+  explain: "Ephemeral, frequently replaced data can be lost without harm. Anything a user would notice missing or doubled needs at-least-once delivery with idempotent processing. A reaction is small but still visible if it doubles or vanishes."
+- id: q2
+  type: mcq
+  prompt: "The client last applied sequence number 41 in a conversation, and now receives 44. What should it do?"
+  options:
+    - "Apply 44 at once, so the user sees it quickly"
+    - "Drop 44 as a duplicate"
+    - "Hold 44 back, wait briefly for 42 and 43, then ask for exactly those if they don't arrive"
+    - "Discard everything and refetch the whole conversation"
+  answer: 2
+  explain: "44 is ahead of a gap. Showing it now risks the wrong order; dropping it loses data. A short grace period handles reordering, a targeted resend handles loss, and a snapshot is only worth it when the gap is large."
+- id: q3
+  type: bug
+  prompt: "Messages occasionally go missing forever after the app is terminated mid-sync. Which line is responsible?"
+  code: |
+    func handle(_ batch: [Message], channel: Channel) throws {
+        defaults.set(batch.last!.seq, forKey: "cursor-\(channel.id)")
+        for message in batch {
+            try database.upsert(message)
+        }
+        try database.save()
+    }
+  answer: 2
+  explain: "The cursor is saved, in a different store, before the messages are. If the app dies before `database.save()`, the next sync starts after messages that were never stored. Save the cursor in the same transaction as the messages."
+- id: q4
+  type: mcq
+  prompt: "Live scores are pushed as `home +1` and `away +1` events over a socket that sometimes resends after reconnecting. Users report impossible scores. What's the simplest robust fix?"
+  options:
+    - "Use QoS 2"
+    - "Send the full score with a version in every event, and keep only the newest version"
+    - "Add a client-side delay before applying events"
+    - "Order events by the device's clock"
+  answer: 1
+  explain: "A resent delta is applied twice. A full state with a version is idempotent: a duplicate or a late, older version is simply ignored, and a lost one is repaired by the next update."
+- id: q5
+  type: order
+  prompt: "Put the steps for opening a conversation without missing messages in order."
+  lines:
+    - "Subscribe to the conversation's live events and buffer them"
+    - "Fetch the latest messages, noting the sequence number the snapshot covers"
+    - "Apply the snapshot"
+    - "Apply buffered events with a higher sequence number and drop the rest"
+    - "Apply new live events as they arrive"
+  explain: "Subscribing first means nothing that happens during the fetch is lost; the snapshot's sequence number says which buffered events are already included."
+- id: q6
+  type: truefalse
+  prompt: "If an app is offline when five chat notifications are sent, APNs delivers all five when it comes back online."
+  answer: false
+  explain: "APNs keeps only the most recent notification per app on an offline device, for a limited time. Pushes are hints; the app syncs from its cursor to get the messages."
+```

@@ -1,0 +1,100 @@
+Product wants the app to ask for an App Store review at a good moment: after a successful order, once the person has had a few, and not so often that it's annoying. The first version called `UserDefaults.standard` and StoreKit from inside the order confirmation screen, so nobody could test the rules, and a bug that asked on every order shipped twice.
+
+Write the rules as a **policy that owns its abstractions**. The policy declares the two protocols it needs, `HistoryStore` and `ReviewRequesting`, in its own words. The details (UserDefaults, StoreKit) implement them, so the source-code dependencies point from the details to the policy. Then write one of those details yourself: a history store over a key–value store.
+
+`SolidReviewPrompt.ReviewPromptPolicy(store:requester:appVersion:now:)` with `orderCompleted() async -> Bool` and `noteProblem()`, and `SolidReviewPrompt.KeyValueHistoryStore` with `load()` and `save(_:)`
+
+**The policy.** Each call to `orderCompleted()`:
+
+1. Loads the history and counts this order (`completedOrders += 1`).
+2. Asks for a review, by calling `requester.requestReview()` once, only if **all** of these hold:
+   - no problem has been noted in this launch (`noteProblem()` was never called on this policy);
+   - `completedOrders` is now at least `ordersBeforeAsking` (3);
+   - the app hasn't asked in this `appVersion` before (`lastPromptVersion` is different);
+   - it has never asked, or at least `minimumGap` (120 days) has passed since `lastPromptDate`, measured with `now()`.
+3. If it asked, records `now()` and `appVersion` in the history.
+4. Saves the history, whether or not it asked, and returns whether it asked.
+
+**The adapter.** `KeyValueHistoryStore` keeps the history as JSON (`JSONEncoder`, `JSONDecoder`) under `KeyValueHistoryStore.key` in an `InMemoryKeyValueStore`, which stands in for UserDefaults. `load()` returns a fresh `History()` when nothing is stored or the data can't be decoded.
+
+## Examples
+
+Version `"2.0"` throughout unless stated; days count from an arbitrary start.
+
+| History before | Call | Asks? | History after |
+| --- | --- | --- | --- |
+| 0 orders | `orderCompleted()` × 3 | no, no, yes | 3 orders, asked on day 0 in 2.0 |
+| 2 orders | `noteProblem()`, then `orderCompleted()` | no | 3 orders, never asked |
+| 3 orders, asked in 2.0 on day 0 | `orderCompleted()` on day 400, still 2.0 | no: same version | 4 orders |
+| 9 orders, asked in 2.0 on day 0 | `orderCompleted()` in 2.1 on day 30 | no: under 120 days | 10 orders |
+| 10 orders, asked in 2.0 on day 0 | `orderCompleted()` in 2.1 on day 120 | yes | 11 orders, asked on day 120 in 2.1 |
+
+## Constraints
+
+- The policy is `@MainActor`, because the real requester calls StoreKit's `AppStore.requestReview(in:)`, which runs on the main actor.
+- One policy exists per launch; a relaunch is a new policy over the same store.
+- Calls to `orderCompleted()` don't overlap (orders complete one at a time), so you needn't guard against two loads racing.
+- Read the time only through `now`, never `Date()`, so tests can choose the day.
+- The system decides whether a prompt actually appears (Apple shows it at most three times in 365 days), so "asked" means "called the requester", not "the person saw it".
+
+<Hints>
+<Hint>
+`orderCompleted()` is load, change, save. Work out one `Bool` from the four conditions, act on it, then save.
+</Hint>
+<Hint>
+`history.lastPromptDate.map { now.timeIntervalSince($0) >= Self.minimumGap } ?? true` handles "never asked" and "asked long enough ago" in one expression.
+</Hint>
+<Hint>
+`noteProblem()` only sets a stored `Bool`. It's per launch, so it isn't saved in the history.
+</Hint>
+<Hint>
+In the adapter, `try?` turns a decoding failure into `nil`, and `guard let … else { return History() }` covers both "nothing stored" and "can't read it".
+</Hint>
+</Hints>
+
+## Solutions
+
+<Approach title="Rules against owned protocols, and an adapter that depends on them" time="O(1) per order" space="O(1)">
+
+```swift
+public func orderCompleted() async -> Bool {
+    var history = await store.load()
+    history.completedOrders += 1
+    let date = now()
+    let shouldAsk = !hadProblem
+        && history.completedOrders >= Self.ordersBeforeAsking
+        && history.lastPromptVersion != appVersion
+        && history.lastPromptDate.map { date.timeIntervalSince($0) >= Self.minimumGap } ?? true
+    if shouldAsk {
+        requester.requestReview()
+        history.lastPromptDate = date
+        history.lastPromptVersion = appVersion
+    }
+    await store.save(history)
+    return shouldAsk
+}
+
+// KeyValueHistoryStore
+public func load() async -> History {
+    guard let data = await store.data(for: Self.key),
+          let history = try? JSONDecoder().decode(History.self, from: data) else { return History() }
+    return history
+}
+```
+
+In the app, the remaining details are a few lines each, and they live in the app target (the composition root), not next to the policy:
+
+```swift
+@MainActor struct StoreKitReviewRequester: SolidReviewPrompt.ReviewRequesting {
+    let scene: () -> UIWindowScene?
+    func requestReview() {
+        if let scene = scene() { AppStore.requestReview(in: scene) }
+    }
+}
+```
+
+**Why this is dependency inversion and not only injection.** The protocols are named for what the *policy* needs ("a history store", "ask for a review"), they live in the policy's file or module, and they use only the policy's types. StoreKit and UserDefaults never appear in them. So you can move the policy into a feature package that doesn't import StoreKit, test every rule in milliseconds, and replace UserDefaults with a synced store later without touching a rule.
+
+**What to watch next.** The policy is an `@MainActor` class that suspends at `await store.load()`. If two orders could complete at once, both calls could load the same count and one increment would be lost: that's actor reentrancy, and the fix is to keep the history in memory after the first load, or to move the counting into the store. Note the assumption in a comment, or design it out.
+
+</Approach>

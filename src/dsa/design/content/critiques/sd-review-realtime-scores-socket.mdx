@@ -1,0 +1,146 @@
+<Brief>
+
+A football app's live match screen gets its scores from this WebSocket client. It worked in testing on office Wi-Fi. On the first big weekend, users reported scores frozen for whole halves, the app getting hot, and the backend team reported tens of thousands of open connections per thousand users and a reconnect storm after every deploy. Review it as you would a pull request.
+
+```swift check ios title="LiveScoresClient.swift"
+import UIKit
+
+struct ScoreUpdate: Decodable {
+    let matchID: String
+    let home: Int
+    let away: Int
+    let minute: Int
+}
+
+@MainActor
+final class LiveScoresClient {
+    static let shared = LiveScoresClient()
+
+    var onUpdate: (([ScoreUpdate]) -> Void)?
+    private var task: URLSessionWebSocketTask?
+    private var history: [ScoreUpdate] = []
+    private var followed: Set<String> = []
+
+    func connect(token: String) {
+        let url = URL(string: "wss://live.example.com/scores?token=\(token)")!
+        task = URLSession.shared.webSocketTask(with: url)
+        task?.resume()
+        listen(token: token)
+    }
+
+    func follow(_ matchID: String) {
+        followed.insert(matchID)
+        let message = #"{"type":"subscribe","matchID":"\#(matchID)"}"#
+        task?.send(.string(message)) { _ in }
+    }
+
+    private func listen(token: String) {
+        Task {
+            do {
+                guard let task else { return }
+                let message = try await task.receive()
+                if case .string(let text) = message {
+                    let update = try JSONDecoder().decode(ScoreUpdate.self, from: Data(text.utf8))
+                    history.append(update)
+                    history.sort { $0.minute < $1.minute }
+                    onUpdate?(history)
+                }
+                listen(token: token)
+            } catch {
+                connect(token: token)
+            }
+        }
+    }
+
+    func disconnect() {
+        task?.cancel(with: .normalClosure, reason: nil)
+    }
+}
+
+final class MatchViewController: UITableViewController {
+    var matchID = ""
+    var token = ""
+    private var rows: [ScoreUpdate] = []
+
+    override func viewDidLoad() {
+        super.viewDidLoad()
+        LiveScoresClient.shared.onUpdate = { [weak self] updates in
+            self?.rows = updates
+            self?.tableView.reloadData()
+        }
+        LiveScoresClient.shared.connect(token: token)
+        LiveScoresClient.shared.follow(matchID)
+    }
+}
+```
+
+</Brief>
+
+```workspace
+template: critique
+minutes: 25
+```
+
+```findings
+- id: no-heartbeat
+  title: Nothing notices a connection that has gone silent
+  severity: high
+  lines: "19-24, 32-36"
+  detail: "There's no ping and no timeout, so the only way the client learns the connection died is an error from `receive()`. After a Wi-Fi to cellular handover, a carrier NAT timeout or a lift, nothing arrives and nothing fails: the await on line 36 waits indefinitely and the screen shows a score that stopped updating. That's the 'frozen for a whole half' report. Ping when the connection has been quiet for about 25 seconds and treat a missing pong within about 10 seconds as a drop."
+- id: tight-reconnect
+  title: Reconnects instantly, forever, whatever went wrong
+  severity: high
+  lines: "44-46"
+  detail: "Every error calls `connect` straight away: no backoff, no jitter, no limit, no check for being offline, and no look at the close code. In Airplane Mode each attempt fails at once, so the loop spins, keeping the CPU and radio busy (the hot phone). After a deploy closes every socket, every phone reconnects in the same second, which is the storm the backend sees. Use capped exponential backoff with full jitter, reset only after a healthy connection, wait for a network path instead of retrying offline, and stop on auth failures and normal closures."
+- id: no-resubscribe
+  title: After any reconnect, the app is connected but subscribed to nothing
+  severity: high
+  lines: "19-23, 26-29"
+  detail: "`followed` is recorded but never resent: a new connection is a blank slate on the server, so after the first drop the socket is open and silent. And nothing catches up on what was missed while disconnected, so a goal scored during the gap never appears. On every connect, resubscribe to every followed match and fetch each one's current state (or resume from its last sequence number) before applying live updates."
+- id: decode-kills-connection
+  title: One message it can't decode tears the connection down
+  severity: high
+  lines: "38, 44-45"
+  detail: "The decode shares the `do` with `receive()`, so any message that isn't a `ScoreUpdate` (a heartbeat, an error, a new `card` event the server added last week) lands in the reconnect path. The server sends the same kind of message again, and the client loops. Decode into an envelope with a `type`, ignore types it doesn't know, log malformed messages, and keep the connection."
+- id: multiplying-loops
+  title: Receive loops and sockets multiply with every visit and every failure
+  severity: high
+  lines: "15, 21, 35, 66"
+  detail: "`connect` replaces `task` without closing the old one, and each `listen` re-reads `task` on every iteration. Opening a second match screen starts a second loop that ends up reading the same socket as the first, while the old socket stays open with nobody reading it. When the socket fails, every loop calls `connect`, and each call leaks another connection. That's how a thousand users hold tens of thousands of server connections. Own exactly one connection and one receive loop, cancel the old task before replacing it, and make `connect` do nothing when already connected."
+- id: main-actor-work
+  title: Every message is decoded, sorted and rendered on the main thread
+  severity: medium
+  lines: "10-11, 38-41, 62-64"
+  detail: "The whole client is `@MainActor`, so JSON decoding, appending, re-sorting the entire history and a full `reloadData()` run on the main thread for each message. A goal triggers bursts of updates across every followed match, and scrolling stutters exactly when people are watching. Decode in a socket actor, apply updates to a small state off the main thread, and hand the screen only what changed (a diffable snapshot)."
+- id: unbounded-history
+  title: Keeps every update forever, ordered by match minute
+  severity: medium
+  lines: "16, 39-41"
+  detail: "`history` grows by one entry per update for as long as the app runs, across every match, and each update copies the whole array to the screen and re-sorts it, so each message costs more than the last. Sorting by `minute` can't order two events in the same minute (a goal and its VAR reversal), and a late resend is inserted into the past. The screen needs the latest state per match: keep a dictionary keyed by `matchID`, and apply an update only if its server sequence number or version is newer."
+- id: token-in-url
+  title: The access token is sent in the URL
+  severity: medium
+  lines: "20"
+  detail: "Query strings end up in load balancer, proxy and server logs, and in crash reports that capture URLs. A native app can set headers on the upgrade request: build a `URLRequest` with an `Authorization` header (or use a short-lived ticket if the server can only read the URL)."
+- id: lifecycle
+  title: No owner for the connection's lifetime
+  severity: low
+  lines: "12, 14, 50-52, 62-67"
+  detail: "A singleton with one `onUpdate` closure means the latest screen silently steals updates from any other. `viewDidLoad` connects, but nothing ever calls `disconnect()`: not when the screen goes away, and not when the app goes to the background, where the socket dies with suspension and the error path then reconnects in a loop on return. Let an app-level supervisor open the connection while the app is active and online, close it in the background, and let screens subscribe and unsubscribe."
+```
+
+<ReferenceReview>
+
+**Most important first.** This client fails in the three ways real-time code most often fails on phones. It **can't tell a dead connection from a quiet one** (no heartbeat), so scores freeze without an error. It **loses its subscriptions** on every reconnect and never catches up, so even when it reconnects, it shows nothing new. And it **reconnects badly**: instantly and forever, on any error including decoding errors, with receive loops and sockets that multiply. Those explain all three bug reports: frozen scores, hot phones, and the backend's connection count and deploy storms.
+
+**How I'd fix it, in small steps:**
+
+1. **Stop the bleeding.** Cancel the old task before creating a new one, guard `connect` against being called twice, and keep exactly one receive loop. Move the decode out of the `do` that drives reconnection, decode into an envelope with a `type`, and ignore unknown types. These are small diffs and remove the storm multiplier at once.
+2. **Split the layers.** A `LiveSocket` actor owns one `URLSessionWebSocketTask` built from a `URLRequest` with an `Authorization` header, decodes off the main thread, and exposes an `AsyncThrowingStream` of typed messages. A `LiveScoresConnection` above it owns reconnection: capped exponential backoff with full jitter, a reset only after a connection delivers something, heartbeats when quiet, close codes honoured, and no retries while `NWPathMonitor` reports no path.
+3. **Resume, don't restart.** The connection keeps the set of followed matches and, on every connect, resubscribes to each and fetches its current state over HTTP (or resumes from its last sequence number) before applying live updates.
+4. **Replace history with state.** Keep `[matchID: MatchState]`, apply an update only when its version or sequence number is newer, and publish changes to the screen as a diffable snapshot from a main-actor view model.
+5. **Give the connection a lifetime.** An app-level supervisor connects when the scene is active and a path exists, disconnects in the background, and screens subscribe and unsubscribe instead of calling `connect`. Remove the singleton callback.
+
+**Tests to add.** Drive the connection with a fake transport and a `TestClock`: a quiet connection is closed after ping plus timeout; failures back off 1, 2, 4 s up to the cap and reset after a healthy connection; every reconnect resends every subscription; an unknown message type doesn't close the connection; `stop` leaves no task or loop running. For the state, test that duplicate and older updates are ignored and that two events in the same minute keep the server's order.
+
+</ReferenceReview>

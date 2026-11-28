@@ -1,0 +1,282 @@
+## Why it matters
+
+One phone is never a load problem, but two million phones running the same code are. A sync that fires on every app launch, a retry loop shipped by mistake, or a push that wakes everyone at once can generate more traffic than your backend was sized for, and you can't redeploy the app to stop it. Servers enforce rate limits with `429 Too Many Requests`; a well-behaved client stays under them, slows down when asked, and spreads its work out. Interviewers expect you to treat the client as part of the capacity plan, and to know the limits iOS itself places on your app.
+
+## Why limit on the client at all
+
+The server's limiter is the enforcement: it protects the backend whatever clients do. A client-side limiter is cooperation, and it pays for itself several ways:
+
+- **Users see fewer errors.** A request that waits half a second is better than one that fails with `429` and has to be retried.
+- **Client bugs stay small.** A limiter around the API client turns "a loop that calls `/sync` every frame" from an outage into a slow feature.
+- **Paid APIs stay affordable.** Maps, translation and AI APIs bill per call; a limiter is a budget you can reason about.
+- **Battery and data.** Every request wakes the radio. Fewer, spread-out requests cost less.
+
+And at fleet scale, small per-device habits become big numbers. Move the sliders: a push to every user is the classic way to multiply your traffic in one minute.
+
+```visual estimator
+title: What a fleet of phones does to your API
+inputs:
+  - { id: devices, label: Installed devices, min: 10000, max: 100000000, value: 2000000, scale: log, unit: devices }
+  - { id: activePct, label: Share active at a busy moment, min: 1, max: 50, step: 1, value: 10, unit: "%" }
+  - { id: perMinute, label: Requests per active device per minute, min: 0.5, max: 20, step: 0.5, value: 2 }
+  - { id: pushPct, label: Share that opens the app within a minute of a push to everyone, min: 1, max: 30, step: 1, value: 8, unit: "%" }
+  - { id: launchRequests, label: Requests one app launch makes, min: 1, max: 40, step: 1, value: 12 }
+outputs:
+  - { id: steady, label: Requests per second at a busy moment, formula: devices * activePct / 100 * perMinute / 60, format: si, unit: /s }
+  - { id: burst, label: Extra requests per second in the minute after the push, formula: devices * pushPct / 100 * launchRequests / 60, format: si, unit: /s }
+  - { id: factor, label: How many times busier the push minute is, formula: (steady + burst) / steady }
+```
+
+With the defaults, the push minute is almost six times busier than an ordinary busy moment, and every launch's dozen requests arrive inside the same sixty seconds. Halving the requests a launch makes, or spreading the push over ten minutes, does more for the backend than any server-side tuning.
+
+## Three kinds of limit
+
+| Limit | Question it answers | Mechanism | Example |
+| --- | --- | --- | --- |
+| **Rate** | How many per second (or minute)? | Token bucket, minimum spacing | 5 search requests a second |
+| **Concurrency** | How many at once? | Worker pool, permits | 3 uploads in flight |
+| **Quota** | How many per day or month? | A persisted counter | 50 free translations a day |
+
+Concurrency limits were the subject of [Producer–consumer and work queues](/design/learn/sd-resilience-producer-consumer); this lesson is mostly about rates and the server's signals. Quotas need persistence: a counter in memory resets every time iOS terminates the app.
+
+iOS also places limits on *you*, and a design that ignores them fails quietly:
+
+- **WidgetKit** gives each widget a daily budget of timeline reloads; Apple's guidance is that a frequently viewed widget gets roughly 40 to 70 a day. Plan reloads around events, not a timer.
+- **Background refresh** (`BGAppRefreshTask`) runs when the system decides, based on how the user uses your app. You request; iOS grants.
+- **App Store review prompts** (`requestReview`) are shown at most three times in 365 days, whatever your code asks.
+- **Geocoding** with `CLGeocoder` is rate-limited per app; Apple's documentation asks for at most one request per user action.
+
+## A token bucket on the client
+
+A **token bucket** holds up to `capacity` tokens and refills at a steady rate. Each request takes a token. A full bucket allows a burst of `capacity` requests at once, and after that requests go at the refill rate. It's the most common client limiter because it's forgiving of the bursts real screens make (a screen appears and fires five requests) while capping the sustained rate. Step through a burst of eight:
+
+```visual rateLimiter
+title: "A client token bucket: bursts of 5, then 2 a second"
+algorithm: token-bucket
+capacity: 5
+refillPerSecond: 2
+requests: [{ at: 0, count: 8 }, 1, 1.5, 2, 2.5, 3, 3.2, 4]
+```
+
+The simulator rejects requests that find the bucket empty, which is what a server does. A client usually shouldn't reject its own user's request: it should **delay** it. A small change makes the bucket answer "how long must this request wait?" instead of "yes or no". Letting the token count go below zero turns the bucket into a queue of reservations:
+
+```swift run title="TokenBucket.swift"
+// A token bucket that never refuses: it tells each request how long to wait instead
+struct TokenBucket {
+    let capacity: Double
+    let refillPerSecond: Double
+    private var tokens: Double
+    private var updatedAt = 0.0
+
+    init(capacity: Double, refillPerSecond: Double) {
+        self.capacity = capacity
+        self.refillPerSecond = refillPerSecond
+        tokens = capacity
+    }
+
+    /// Takes a token for a request made at `now` (in seconds), and returns how long it must wait to be sent
+    mutating func reserve(at now: Double) -> Double {
+        tokens = min(capacity, tokens + (now - updatedAt) * refillPerSecond)
+        updatedAt = now
+        tokens -= 1
+        // Below zero is a queue of reservations: each one waits for the refill to reach it
+        return tokens >= 0 ? 0 : -tokens / refillPerSecond
+    }
+}
+
+var bucket = TokenBucket(capacity: 5, refillPerSecond: 2)
+// The user opens a screen that fires 8 requests at once
+let burst = (1...8).map { _ in bucket.reserve(at: 0) }
+print("Burst of 8 at 0 s, waits:", burst)
+// Three seconds later the bucket has refilled enough to send at once again
+print("One more at 3 s, wait:", bucket.reserve(at: 3))
+```
+
+```output
+Burst of 8 at 0 s, waits: [0.0, 0.0, 0.0, 0.0, 0.0, 0.5, 1.0, 1.5]
+One more at 3 s, wait: 0.0
+```
+
+Time is passed in as a number, so the arithmetic is testable on its own. In the app, an actor wraps it with an injected clock. Notice the order inside `acquire()`: the reservation happens *before* the sleep, so callers arriving during one caller's wait queue up behind it rather than all seeing a full bucket. That's the actor lesson's "decide before you await" again.
+
+```swift check title="RequestPacer.swift"
+// Paces requests through a token bucket on an injected clock. Reserving happens before the sleep,
+// so callers arriving during someone else's wait queue up behind it rather than all going at once.
+actor RequestPacer<C: Clock> where C.Duration == Duration {
+    private let capacity: Double
+    private let refillPerSecond: Double
+    private let clock: C
+    private var tokens: Double
+    private var updatedAt: C.Instant
+    private var pausedUntil: C.Instant?
+
+    init(capacity: Int, refillPerSecond: Double, clock: C) {
+        self.capacity = Double(capacity)
+        self.refillPerSecond = refillPerSecond
+        self.clock = clock
+        tokens = Double(capacity)
+        updatedAt = clock.now
+    }
+
+    /// Waits until this request may be sent
+    func acquire() async throws {
+        let now = clock.now
+        let elapsed = updatedAt.duration(to: now) / .seconds(1)
+        tokens = min(capacity, tokens + elapsed * refillPerSecond)
+        updatedAt = now
+        tokens -= 1
+        var wait = tokens >= 0 ? Duration.zero : .seconds(-tokens / refillPerSecond)
+        if let pausedUntil, now < pausedUntil {
+            wait = max(wait, now.duration(to: pausedUntil))
+        }
+        if wait > .zero {
+            try await clock.sleep(for: wait)
+        }
+    }
+
+    /// The server said 429 or 503 with Retry-After: hold every request until then, not only the one that failed
+    func pause(for retryAfter: Duration) {
+        let until = clock.now.advanced(by: retryAfter)
+        pausedUntil = max(pausedUntil ?? until, until)
+    }
+}
+```
+
+In production you pass `ContinuousClock()`, which keeps counting while the device sleeps and never jumps when the user changes the time. In tests you pass a test clock and move it by hand.
+
+## Listening to the server
+
+Your limiter guesses; the server knows. Three signals are worth handling:
+
+- **`429 Too Many Requests`**: you're over the limit. Often comes with `Retry-After`.
+- **`503 Service Unavailable` with `Retry-After`**: the server is overloaded or in maintenance and says when to come back.
+- **Quota headers** such as `X-RateLimit-Remaining` and `X-RateLimit-Reset` (GitHub's style; an IETF draft standardises `RateLimit` and `RateLimit-Policy` fields). They let you slow down *before* hitting the limit.
+
+`Retry-After` is either a number of seconds or an HTTP date, and both appear in the wild:
+
+```swift check title="HTTPURLResponse+RetryAfter.swift"
+import Foundation
+
+extension HTTPURLResponse {
+    /// How long the server asked us to wait, from a Retry-After header in seconds ("120")
+    /// or as an HTTP date ("Wed, 21 Oct 2026 07:28:00 GMT")
+    func retryAfter(now: Date = .now) -> TimeInterval? {
+        guard let value = value(forHTTPHeaderField: "Retry-After")?.trimmingCharacters(in: .whitespaces) else {
+            return nil
+        }
+        if let seconds = TimeInterval(value) {
+            return max(0, seconds)
+        }
+        let formatter = DateFormatter()
+        formatter.locale = Locale(identifier: "en_US_POSIX")
+        formatter.timeZone = TimeZone(identifier: "GMT")
+        formatter.dateFormat = "EEE, dd MMM yyyy HH:mm:ss zzz"
+        guard let date = formatter.date(from: value) else { return nil }
+        return max(0, date.timeIntervalSince(now))
+    }
+}
+```
+
+The important design point is the **scope** of the pause. A `429` on one request is information about the whole API, or at least the whole endpoint: hold *every* request to it until the time has passed (that's `pause(for:)` above). Retrying only the failed request, at once, while five others carry on, is how a client turns a rate limit into a ban.
+
+## Where the limiter lives
+
+Put it in the networking layer, wrapped around the HTTP client as a decorator, the pattern from [Decorator: logging and caching by wrapping](/design/learn/sd-structural-decorator). Screens never see it; some of their requests take a moment longer. Inside, a few choices matter:
+
+- **Per host or per endpoint.** Your API, the image CDN and a third-party maps API have different limits; give each its own bucket.
+- **Separate budgets by priority.** A user tapping "Send" shouldn't queue behind 200 background sync requests. Give user-initiated work its own budget, or let it jump the queue. Keeping one kind of work from starving another is the **bulkhead** idea, which gets its own lesson soon.
+- **Delay, drop or batch.** User actions are delayed, with a spinner if it's long. Analytics are **batched**: one request every 30 seconds carrying 50 events is a far better limiter than pacing 50 requests. Low-value telemetry can be dropped.
+- **Spread scheduled work.** Anything on a timer gets jitter: "sync every hour" becomes "every hour, plus a random 0–10 minutes", so a fleet doesn't hit the server on the hour. Ask the backend to stagger pushes to everyone over several minutes.
+
+## Trade-offs
+
+| Approach | Handles bursts | Respects the server | Complexity | Wins when |
+| --- | --- | --- | --- | --- |
+| No client limit | Not at all | Only by failing | None | Tiny traffic, no known limits |
+| Minimum spacing between requests | Badly: every request waits | Roughly | Low | One kind of request with a strict per-second limit |
+| Token bucket | Yes, up to the capacity | Within the rate you configure | Low | Most APIs with a published rate limit |
+| Concurrency limit | Queues the excess | Indirectly | Low | Uploads, downloads, slow endpoints |
+| Server-driven pause (`Retry-After`) | Not on its own | Exactly | Medium | Always, on top of one of the others |
+| Batching | Turns many into one | The most | Medium | Analytics, logs, read receipts |
+
+<Callout kind="interview">
+
+**Say** the fleet maths out loud ("two million devices syncing once a minute is 33,000 requests a second") and design to shrink it: batch, jitter scheduled work, ask for staggered pushes, and pace requests with a token bucket per host. Then say you honour `429` and `Retry-After` for the whole endpoint. **Ask** what the API's limits are and whether some calls are billed. **Red flags:** retrying a `429` immediately, one global lock that serialises every request, and timers that fire at the same wall-clock moment on every device.
+
+</Callout>
+
+<Callout kind="gotcha" title="iOS gotcha: limiting with Date">
+
+A limiter that measures time with `Date()` breaks when the wall clock moves: the user changes the time zone or the time, or the network corrects it. The bucket can refill instantly, or not for hours. Measure intervals with `ContinuousClock` (or `SuspendingClock` if time asleep shouldn't count), which only moves forward. Keep `Date` for what the server tells you, such as a `Retry-After` date.
+
+</Callout>
+
+<Callout kind="gotcha" title="iOS gotcha: extensions are separate processes">
+
+A widget, a share extension and a notification service extension each run in their own process, with their own memory. A limiter or quota counter inside the app is invisible to them, but they all spend the same API quota. If the limit matters across them, keep the counter in shared storage in an App Group container, or route the work through the app.
+
+</Callout>
+
+## Practice
+
+The review **"the 2 a.m. photo backup storm"** has a service that treats a `429` like any other failure and retries it at once, while every device in the fleet starts at the same moment. Use this lesson's ideas to say what the client should do instead, and what to ask the backend team for.
+
+```cards
+- id: why-client-limit
+  front: "If the server enforces rate limits, why limit on the client too?"
+  back: "Fewer user-visible errors, client bugs that can't become outages, predictable cost for paid APIs, and less battery and data. The server enforces; the client cooperates."
+- id: three-limits
+  front: "What are the three kinds of client limit?"
+  back: "Rate (N per interval, a token bucket), concurrency (N in flight, a worker pool or permits) and quota (N per day, a persisted counter)."
+- id: retry-after-scope
+  front: "A request gets `429` with `Retry-After: 30`. What should the client do?"
+  back: "Pause every request to that endpoint or host for 30 seconds, not only the failed one, then resume through the limiter."
+- id: fleet-jitter
+  front: "Why add jitter to scheduled work like an hourly sync?"
+  back: "Without it every device fires at the same moment, multiplying the peak. A random offset spreads the same total load evenly."
+```
+
+```quiz
+- id: q1
+  type: estimate
+  prompt: "3 million devices each run a background sync once an hour, spread evenly. Each sync makes 4 requests. Roughly how many requests a second does the backend see?"
+  answer: 3300
+  unit: requests a second
+  within: { factor: 1.5 }
+  explain: "3M × 4 = 12M requests an hour; ÷ 3,600 s ≈ 3,300 a second. If every device synced on the hour instead, those 12M requests would arrive in the first minute or so: more than 50 times the rate."
+- id: q2
+  type: trace
+  prompt: "A delaying token bucket has capacity 3 and refills 1 token a second, starting full. Five requests arrive at once at 0 s. How long must each wait? Give the five waits in seconds, separated by commas."
+  answer: "0, 0, 0, 1, 2"
+  explain: "Three tokens cover the first three. The fourth makes the count −1, so it waits for one token (1 s); the fifth waits for two (2 s)."
+- id: q3
+  type: mcq
+  prompt: "The upload endpoint answers one of five concurrent uploads with `429` and `Retry-After: 20`. What should the client do?"
+  options:
+    - "Retry that upload straight away; the others are fine"
+    - "Retry that upload after 20 seconds, and keep sending the others"
+    - "Hold every request to the endpoint for 20 seconds, then resume through the limiter"
+    - "Treat it as a permanent failure and show an error"
+  answer: 2
+  explain: "A rate limit describes the client's traffic, not one request. Carrying on with the others keeps the client over the limit and invites a longer block."
+- id: q4
+  type: multi
+  prompt: "Which of these are limits iOS places on your app, which a design must plan around? Choose all that apply."
+  options:
+    - "A daily budget of widget timeline reloads"
+    - "When `BGAppRefreshTask` work actually runs"
+    - "How often the App Store review prompt is really shown"
+    - "How many `URLSession` data tasks you may create per second"
+  answer: [0, 1, 2]
+  explain: "WidgetKit budgets reloads, the system schedules background refresh, and the review prompt is capped at three times a year. URLSession doesn't rate-limit task creation; your server does."
+- id: q5
+  type: mcq
+  prompt: "An analytics SDK sends one request per event, and a busy screen produces 40 events a minute per user. What's the best fix?"
+  options:
+    - "A token bucket of 1 request a second"
+    - "Batch events and send one request every 30 seconds, or sooner if 50 are waiting, plus when the app goes to the background"
+    - "Drop every event after the tenth each minute"
+    - "Send them over a WebSocket instead"
+  answer: 1
+  explain: "Batching removes most requests without losing events, and the background trigger saves the batch before suspension. Pacing 40 separate requests still wakes the radio 40 times."
+```

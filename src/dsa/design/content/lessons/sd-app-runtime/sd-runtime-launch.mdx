@@ -1,0 +1,280 @@
+## Why it matters
+
+Launch is the one interaction every user has with your app, every time, and it's measured: Xcode's Organizer charts your launch times from real devices, and iOS kills an app that takes too long. Most slow launches aren't one big mistake but a pile of reasonable-looking work that all happens before the first frame. Interviewers ask "how would you make launch faster?" to see whether you can break launch into phases and say what belongs in each.
+
+## Cold, warm and resume
+
+Not every launch costs the same.
+
+- **Cold launch:** the app hasn't run since the device restarted, or was evicted long ago. Its code and data must come from storage, and nothing is cached. This is the slow case and the one to optimise.
+- **Warm launch:** the app was terminated recently, so parts of it are still in memory and the system's caches. Same code path, less waiting on storage.
+- **Resume:** the app was suspended, not terminated. None of the launch sequence runs; the scene comes back to the foreground. It's fast unless your `willEnterForeground` work is slow.
+
+Apple's long-standing target is the **first frame within about 400 ms** of the tap. That sounds generous until you see how many steps share it.
+
+## From tap to first frame
+
+```visual timeline
+title: A cold launch that hits its budget (illustrative times)
+unit: ms
+lanes:
+  - { id: system, label: System }
+  - { id: main, label: Main thread }
+  - { id: bg, label: Background }
+spans:
+  - { lane: system, from: 0, to: 40, label: start process }
+  - { lane: main, from: 40, to: 150, label: dyld }
+  - { lane: main, from: 150, to: 180, label: static init }
+  - { lane: main, from: 180, to: 240, label: didFinishLaunching, tone: active }
+  - { lane: main, from: 240, to: 320, label: scene + root screen, tone: active }
+  - { lane: main, from: 320, to: 370, label: layout + commit, tone: active }
+  - { lane: system, from: 370, to: 400, label: render, tone: ok }
+  - { lane: bg, from: 320, to: 560, label: read cached feed, tone: wait }
+  - { lane: main, from: 560, to: 590, label: show content, tone: ok }
+markers:
+  - { at: 400, label: first frame }
+  - { at: 590, label: useful }
+steps:
+  - { at: 20, say: "The tap: SpringBoard shows your **launch screen** (a static image built from Info.plist or a storyboard) while the system starts your process." }
+  - { at: 120, say: "**dyld**, the dynamic linker, maps your executable and every dynamic library it needs, then fixes up their pointers. System frameworks come pre-linked in the shared cache; your own dynamic frameworks are the cost you control." }
+  - { at: 170, say: "**Static initialisers** run: Objective-C `+load` methods and C++ global constructors. Swift globals and statics don't run here: they're lazy." }
+  - { at: 220, say: "`main()` calls `UIApplicationMain`, which creates the app delegate and calls `application(_:didFinishLaunchingWithOptions:)`. Everything you do here delays the first frame." }
+  - { at: 300, say: "The scene connects: `scene(_:willConnectTo:options:)` builds the window and the root view controller (or the SwiftUI `App` and its first `body`)." }
+  - { at: 360, say: "The first layout pass runs and **Core Animation commits** the layer tree to the render server." }
+  - { at: 400, say: "The **first frame** is on screen. This is what Apple's launch metrics measure: time to first draw." }
+  - { at: 590, say: "Meanwhile the cached feed loaded off the main thread, so the screen became **useful** soon after. That stretch is the *extended launch*, and it's yours to design." }
+```
+
+### Before main: dyld and static initialisers
+
+Everything before `main()` is **pre-main** time, and you control two parts of it:
+
+- **Dynamic libraries.** Each of your own dynamic frameworks is a file to find, map and fix up. Ten of them can cost tens of milliseconds on an older phone. Static linking, or Xcode 15's **mergeable libraries**, removes that cost. You'll weigh the trade-offs in D61.
+- **Static initialisers.** Objective-C `+load` methods and C++ global constructors run for every class that has them, before your first line of Swift. Some third-party SDKs still use them.
+
+Swift is kind here: **global variables and `static` properties are initialised lazily**, on first use, exactly once. An SDK wrapped in a `static let` costs nothing until something touches it:
+
+```swift run title="Lazy statics cost nothing at launch"
+// Swift globals and statics are initialised lazily, on first use, and exactly once.
+// Nothing here runs at launch until someone touches it.
+enum Analytics {
+    static let client: String = {
+        print("  configuring the analytics SDK")
+        return "AnalyticsClient"
+    }()
+}
+
+enum ImageCache {
+    static let shared: [String: Int] = {
+        print("  building the image cache")
+        return [:]
+    }()
+}
+
+print("main() starts")
+print("first frame is on screen")
+print("user taps Share, which logs an event")
+print("  using \(Analytics.client)")
+print("user taps Share again")
+print("  using \(Analytics.client)")
+print("ImageCache was never touched, so it was never built")
+```
+
+```output
+main() starts
+first frame is on screen
+user taps Share, which logs an event
+  configuring the analytics SDK
+  using AnalyticsClient
+user taps Share again
+  using AnalyticsClient
+ImageCache was never touched, so it was never built
+```
+
+Laziness cuts both ways: the first tap on Share now pays the SDK's setup cost. That's usually the right trade, but for anything on the critical path of the first interaction, warm it up deliberately after the first frame.
+
+### After main: your code
+
+From `UIApplicationMain` on, every millisecond is your code, all on the **main thread**, and none of it can overlap with drawing the first frame. The work that commonly sneaks in:
+
+- third-party SDKs initialised "first thing" because their README says so;
+- a database migration or a large file decoded synchronously;
+- reading many keychain items, each a round trip to a system daemon;
+- a semaphore waiting for a network call (remote config, a token refresh) before showing UI;
+- building every tab's view controller, not only the visible one.
+
+## Designing the launch path
+
+Sort every piece of launch work into one of four tiers, and be stingy with the first.
+
+| Tier | Runs | What belongs there |
+| --- | --- | --- |
+| **Before the first frame** | Synchronously in `didFinishLaunching` and scene connection | Crash reporting (so it catches everything after), the session token, building the *first* screen, registering BGTask handlers |
+| **Right after the first frame** | From the first screen's `viewDidAppear(_:)` or `.task`, or a utility-priority task | Analytics, remote config fetch, the rest of the SDKs, prefetching the next screen |
+| **When idle** | Low-priority tasks, or a BGProcessingTask | Cache cleanup, index rebuilding, large migrations that can run in steps |
+| **Never at launch** | On first use | Anything only some users need: a statics-backed SDK, a feature's dependencies |
+
+And show something real as soon as you can. The first frame should be the screen's **structure** (navigation, placeholders) with cached content filling in moments later, rather than a spinner over an empty screen:
+
+```swift check ios title="FeedViewController.swift"
+import UIKit
+
+struct Feed: Codable, Sendable {
+    var items: [String]
+}
+
+protocol FeedCache: Sendable {
+    func load() async -> Feed?
+}
+
+protocol FeedAPI: Sendable {
+    func fetch() async throws -> Feed
+}
+
+protocol DeferredServices: Sendable {
+    func start() async
+}
+
+@MainActor
+final class FeedViewController: UIViewController {
+    private let cache: any FeedCache
+    private let api: any FeedAPI
+    private let deferred: any DeferredServices
+    private var startedDeferred = false
+
+    init(cache: any FeedCache, api: any FeedAPI, deferred: any DeferredServices) {
+        self.cache = cache
+        self.api = api
+        self.deferred = deferred
+        super.init(nibName: nil, bundle: nil)
+    }
+
+    required init?(coder: NSCoder) { nil }
+
+    override func viewDidLoad() {
+        super.viewDidLoad()
+        showPlaceholders() // the first frame shows the screen's shape, not a spinner
+        Task {
+            // The cache decodes off the main actor; the screen updates as each answer arrives
+            if let cached = await cache.load() { show(cached) }
+            if let fresh = try? await api.fetch() { show(fresh) }
+        }
+    }
+
+    override func viewDidAppear(_ animated: Bool) {
+        super.viewDidAppear(animated)
+        guard !startedDeferred else { return }
+        startedDeferred = true
+        // The first frame is on screen: start what launch didn't need
+        Task(priority: .utility) { await deferred.start() }
+    }
+
+    private func showPlaceholders() {}
+    private func show(_ feed: Feed) {}
+}
+```
+
+## Measuring it
+
+Measure on a real, older device, from a cold launch, in a release build: the simulator and debug builds lie in both directions.
+
+- **Instruments' App Launch template** shows each phase, including pre-main, with the main thread's work underneath.
+- **`XCTApplicationLaunchMetric`** in a performance test turns launch time into a number CI can track.
+- **MetricKit** reports real users' launches as histograms: `histogrammedTimeToFirstDraw` for normal launches, `histogrammedOptimizedTimeToFirstDraw` for prewarmed ones, and `histogrammedApplicationResumeTime`. Since iOS 16, `extendLaunchMeasurement(forTaskID:)` lets you include the "until useful" stretch too.
+- **Signposts** (`OSSignposter`) around your own launch steps make them show up by name in Instruments.
+
+### Prewarming and the watchdog
+
+Since iOS 15, the system may **prewarm** your app: run its launch sequence up to, but not including, `UIApplicationMain`, at a moment it chooses, then hold it until the user taps. So pre-main work may happen minutes before the launch it belongs to, possibly while the device is locked. Code in static initialisers mustn't depend on the time, on protected data or on the user having tapped a moment ago. If you measure from process start yourself, check whether the `ActivePrewarm` environment variable is `1`.
+
+At the other end, a **watchdog** terminates an app that takes too long to launch, roughly 20 seconds, with the exception code `0x8badf00d`. Nobody waits 20 seconds on purpose; this usually means the main thread is blocked on the network at launch, and it hits users on bad connections while the developer's Wi-Fi never shows it.
+
+## Trade-offs
+
+| Approach | Launch time | First interaction | Complexity | When it wins |
+| --- | --- | --- | --- | --- |
+| Initialise everything eagerly at launch | Worst | Fastest | Lowest | Tiny apps with almost nothing to set up |
+| Defer to after the first frame | Good | Fast | Low | The default for SDKs and non-critical services |
+| Lazy, on first use | Best | First use pays the cost | Low, but costs are harder to see | Features many users never open |
+| Splash screen while loading | Hides the problem, adds a screen | Slow | Low | Almost never; the launch screen already covers process start |
+
+<Callout kind="interview">
+
+**Say** launch in phases, and what you'd cut from each: "Pre-main: fewer dynamic frameworks, no static initialisers. Main: only crash reporting and the session before the first frame; analytics and remote config after it. First screen: placeholders and cached content, never a network wait." **Ask** how launch is measured today and on which devices; you can't improve what isn't measured. **Red flags:** a splash screen that waits for remote config, synchronous network calls at launch, and "we'll optimise later" with no metric.
+
+</Callout>
+
+<Callout kind="gotcha" title="iOS gotcha: the launch screen can't run code">
+
+The launch screen is a static image the system renders before your process exists, so it can't show a spinner, an animation or data. Teams that want a branded "loading" moment often add a second, fake splash screen with a timer. That adds time to every launch for every user; make the real first screen look ready instead.
+
+</Callout>
+
+## Practice
+
+[The launch review](/design/practice/sd-review-app-runtime-launch-main-thread) asks you to find what's blocking the first frame in a realistic app delegate and scene delegate, and to plan the fix in steps.
+
+```cards
+- id: launch-kinds
+  front: "What's the difference between a cold launch, a warm launch and a resume?"
+  back: "Cold: nothing cached, everything from storage. Warm: recently terminated, partly cached. Resume: the app was only suspended, so no launch code runs at all."
+- id: pre-main
+  front: "What happens before main(), and what can you do about it?"
+  back: "dyld maps and fixes up the executable and dynamic libraries, then static initialisers run. Use fewer dynamic frameworks (static or mergeable) and avoid +load and C++ static constructors."
+- id: lazy-statics
+  front: "Do Swift globals and static lets cost launch time?"
+  back: "No. They're initialised lazily on first use, exactly once, so the cost moves to whoever touches them first."
+- id: watchdog
+  front: "What does a 0x8badf00d termination at launch usually mean?"
+  back: "The watchdog killed the app for taking too long, usually because the main thread was blocked, often on the network."
+```
+
+```quiz
+- id: q1
+  type: order
+  prompt: "Put a cold launch in order."
+  lines:
+    - "The system starts the process and shows the launch screen"
+    - "dyld loads and fixes up the executable and its dynamic libraries"
+    - "Static initialisers run"
+    - "`application(_:didFinishLaunchingWithOptions:)`"
+    - "`scene(_:willConnectTo:options:)` builds the window and root screen"
+    - "Core Animation commits the first frame"
+  explain: "Pre-main work (process start, dyld, static initialisers) comes first, then your app delegate, then the scene, and the first frame is committed after the first layout."
+- id: q2
+  type: sort
+  prompt: "When should each piece of work run in a shopping app's launch?"
+  buckets: [Before the first frame, Right after the first frame, On first use]
+  items:
+    - [Starting the crash reporter, 0]
+    - [Fetching remote config, 1]
+    - [Configuring the AR try-on SDK, 2]
+    - [Reading the session token from the Keychain, 0]
+    - [Initialising the analytics SDK, 1]
+  explain: "The crash reporter must be running before anything can crash, and the first screen needs the session. Analytics and remote config can wait a frame. Most users never open AR try-on, so it waits until they do."
+- id: q3
+  type: mcq
+  prompt: "Launch is slow only for users on poor connections, and some crash reports show `0x8badf00d`. What's the likeliest cause?"
+  options:
+    - "Too many dynamic frameworks"
+    - "The main thread waits synchronously on a network call, such as remote config, during launch"
+    - "A static initialiser runs too often"
+    - "The launch screen storyboard is too complex"
+  answer: 1
+  explain: "Framework and initialiser costs don't depend on the network. Time that grows with connection quality, ending in the watchdog's code, means launch is blocked on a request. Show cached UI and apply the config when it arrives."
+- id: q4
+  type: truefalse
+  prompt: "Wrapping an SDK's setup in a Swift `static let` means its cost is paid during pre-main, before your app delegate runs."
+  answer: false
+  explain: "Swift globals and statics are lazy. The cost is paid the first time something reads the property, which can be well after launch."
+- id: q5
+  type: mcq
+  prompt: "Since iOS 15, iOS may prewarm your app. What does that mean for code in static initialisers?"
+  options:
+    - "It runs twice on every launch"
+    - "It may run long before the user taps, possibly while the device is locked, so it mustn't depend on the time, protected data or user intent"
+    - "It no longer runs at all"
+    - "It runs after the first frame instead of before"
+  answer: 1
+  explain: "Prewarming runs the launch sequence up to `UIApplicationMain` ahead of time. Anything before that point may run at an unexpected moment, without access to data protected until unlock."
+```

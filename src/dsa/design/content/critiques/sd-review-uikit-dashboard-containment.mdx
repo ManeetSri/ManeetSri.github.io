@@ -1,0 +1,140 @@
+<Brief>
+
+This is the home dashboard of a budgeting app: a UIKit summary at the top, a SwiftUI spending chart below it, and a promo banner that marketing swaps several times a session. Users say the chart always shows £0, the app gets slower the longer it's open, and analytics records two "summary viewed" events per visit. Review it as you would a pull request: what's wrong, what matters most, and how you'd fix it.
+
+```swift check ios title="DashboardViewController.swift"
+import SwiftUI
+import UIKit
+
+struct SpendingChart: View {
+    let total: Decimal
+    var body: some View {
+        Text(total, format: .currency(code: "GBP")).font(.largeTitle)
+    }
+}
+
+final class SummaryViewController: UIViewController {
+    func reload() {}
+
+    @objc func refreshTapped() {
+        (parent as! DashboardViewController).refreshAll()
+    }
+}
+
+final class PromoViewController: UIViewController {}
+
+final class DashboardViewController: UIViewController {
+    private let summary = SummaryViewController()
+    private var promo: PromoViewController?
+
+    override func viewDidLoad() {
+        super.viewDidLoad()
+        addChild(summary)
+        view.addSubview(summary.view)
+        summary.view.frame = CGRect(x: 0, y: 0, width: view.bounds.width, height: 200)
+
+        let chart = UIHostingController(rootView: SpendingChart(total: 0))
+        chart.view.translatesAutoresizingMaskIntoConstraints = false
+        view.addSubview(chart.view)
+    }
+
+    override func viewDidLayoutSubviews() {
+        super.viewDidLayoutSubviews()
+        guard let chartView = view.subviews.last else { return }
+        NSLayoutConstraint.activate([
+            chartView.topAnchor.constraint(equalTo: view.topAnchor, constant: 200),
+            chartView.leadingAnchor.constraint(equalTo: view.leadingAnchor),
+            chartView.trailingAnchor.constraint(equalTo: view.trailingAnchor),
+        ])
+    }
+
+    override func viewWillAppear(_ animated: Bool) {
+        super.viewWillAppear(animated)
+        summary.viewWillAppear(animated)
+        NotificationCenter.default.addObserver(forName: UIApplication.significantTimeChangeNotification, object: nil, queue: .main) { _ in
+            MainActor.assumeIsolated { self.refreshAll() }
+        }
+    }
+
+    func showPromo(_ next: PromoViewController) {
+        promo?.view.removeFromSuperview()
+        addChild(next)
+        view.addSubview(next.view)
+        next.didMove(toParent: self)
+        promo = next
+    }
+
+    func refreshAll() {
+        summary.reload()
+    }
+}
+```
+
+</Brief>
+
+```workspace
+template: critique
+minutes: 25
+```
+
+```findings
+- id: hosting-not-contained
+  title: The chart's hosting controller is a local that's never added as a child
+  severity: high
+  lines: 31-33
+  detail: "`UIHostingController` is a view controller, but only its view is added. Nothing holds the controller, so ARC frees it when `viewDidLoad` returns, and with no reference left nobody can ever set a new `rootView`: that's why the chart is stuck at £0. Even if it were kept, it's not a child, so it gets no appearance or size-transition callbacks from the dashboard. Keep it in a property, embed it with `addChild` and `didMove(toParent:)`, and give it a model it observes."
+- id: promo-never-removed
+  title: Swapping promos removes the old view but never the old child
+  severity: high
+  lines: 54-60
+  detail: "The old promo's view is taken out, but `willMove(toParent: nil)` and `removeFromParent()` are never called, so every promo ever shown stays in `children`, is never freed, and keeps receiving appearance and size callbacks, with whatever timers or observers it started. Several swaps a session is a steady leak, and part of why the app slows down."
+- id: observer-per-appearance
+  title: A new notification observer on every appearance, never removed
+  severity: high
+  lines: 49-51
+  detail: "Each `viewWillAppear` adds another block observer and throws the token away, so after ten visits a time change refreshes the dashboard ten times. The block captures `self` strongly and NotificationCenter keeps it, so the dashboard can never be freed either. Observe once (keep the token and remove it), or pair adding and removing in `viewDidAppear` and `viewDidDisappear`, and capture `self` weakly."
+- id: manual-appearance-forwarding
+  title: Calls the child's appearance method by hand
+  severity: medium
+  lines: 48
+  detail: "`summary` is a contained child, so UIKit already forwards appearance to it. Calling `summary.viewWillAppear(animated)` as well delivers it twice, which is the doubled \"summary viewed\" event. Remove the call; a container that really needs control overrides `shouldAutomaticallyForwardAppearanceMethods` and uses `beginAppearanceTransition` and `endAppearanceTransition`."
+- id: constraints-every-layout
+  title: Activates new constraints on every layout pass, on whichever view is last
+  severity: medium
+  lines: 36-44
+  detail: "`viewDidLayoutSubviews` runs many times, and each run adds three more constraints, so they pile up and every pass gives the engine more to solve. Worse, `view.subviews.last` becomes the promo's view after `showPromo`, so the chart's constraints get pinned to the wrong view. Create the constraints once, in `viewDidLoad`, against a stored reference to the chart's view."
+- id: frame-from-viewdidload
+  title: Sizes the summary from view.bounds in viewDidLoad
+  severity: medium
+  lines: 29
+  detail: "In `viewDidLoad` the root view doesn't have its final size yet, and the frame has no autoresizing mask or constraints, so the summary keeps whatever width it got: wrong in a sheet, in iPad split view and after rotation. Pin it with constraints instead."
+- id: child-casts-parent
+  title: The summary force-casts its parent
+  severity: medium
+  lines: 15
+  detail: "`parent as!` crashes whenever the summary is embedded anywhere else, or tapped before it has a parent, and it welds the child to this one container. Give the summary an `onRefresh` closure that the dashboard sets when it embeds it."
+- id: missing-did-move
+  title: The summary never gets didMove(toParent:)
+  severity: low
+  lines: 27-28
+  detail: "`addChild` sends `willMove(toParent:)`, but completing the move is the container's job. Without `didMove(toParent: self)`, any setup the child does there never runs, and the containment is left half finished."
+```
+
+<ReferenceReview>
+
+**Most important first.** Three problems get worse every minute the app is open. The **promo swap** leaks a whole view controller each time, because the old promo is never removed as a child. The **notification observer** is added on every appearance and never removed, so refreshes multiply and the dashboard itself can never be freed. And the **chart** can't work at all: its hosting controller is a local that ARC frees at the end of `viewDidLoad`, so nothing can ever give it a real total.
+
+**The pattern underneath** is containment done by hand, differently each time: one child half added, one only as a view, one removed only as a view, and a parent forwarding callbacks UIKit already sends. The fix is to stop writing containment inline.
+
+**How I'd fix it, in small steps:**
+
+1. Add `embed(_:in:)` and `unembed()` helpers (add the child, place its view with constraints, `didMove`; and the reverse) and use them for the summary, the chart and the promo. That fixes the promo leak, the missing `didMove` and the chart's lifetime in one change.
+2. Keep the chart's hosting controller in a property and pass it an `@Observable` spending model instead of a constant, so the chart updates when the data does. Set `sizingOptions = .intrinsicContentSize` so Auto Layout sizes it.
+3. Move all layout into `viewDidLoad` with constraints against stored views: the summary pinned to the top, the chart below it, the promo below that. Delete the `viewDidLayoutSubviews` override and the frame maths.
+4. Delete `summary.viewWillAppear(animated)`.
+5. Observe the time-change notification once (in `viewDidLoad`, keeping the token and removing it in `deinit`, or with a `Task` over `NotificationCenter.default.notifications(named:)` cancelled in `viewDidDisappear`), capturing `self` weakly.
+6. Replace the summary's `parent as!` with an `onRefresh` closure the dashboard sets when embedding it.
+
+**Tests to add:** after `showPromo` twice, `children` contains exactly one promo and a weak reference to the first one is nil. Drive an appearance with `beginAppearanceTransition(true, animated: false)` and `endAppearanceTransition()` and assert a spy summary saw `viewWillAppear` once. Post the notification after three appearances and assert one refresh. Lay out the dashboard twice with `layoutIfNeeded()` and assert the number of constraints didn't change. Finally, a test that releases the dashboard and checks it deallocates catches the next leak of this kind.
+
+</ReferenceReview>

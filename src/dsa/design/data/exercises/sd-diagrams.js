@@ -1,2 +1,39 @@
 // Design exercises and architecture reviews for D09 · Diagrams & design communication
-export default [];
+export default [
+    {
+        id: 'sd-design-diagrams-c4-grocery',
+        kind: 'design',
+        title: 'C4 views of a grocery delivery app',
+        difficulty: 'easy',
+        patterns: ['architecture', 'privacy'],
+        lessons: ['sd-diagrams-c4-context', 'sd-diagrams-why', 'sd-diagrams-deployment-dfd', 'sd-diagrams-whiteboarding'],
+        minutes: 30,
+        template: 'component',
+        mock: false,
+        lists: [],
+        summary: 'Write the system context and container views of a grocery app, with its extensions and push flows, for new engineers and a security review.',
+    },
+    {
+        id: 'sd-design-diagrams-podcast-components',
+        kind: 'design',
+        title: 'Component view of a podcast app',
+        difficulty: 'medium',
+        patterns: ['architecture', 'modularity', 'background'],
+        lessons: ['sd-diagrams-c4-component', 'sd-diagrams-uml-sequence', 'sd-diagrams-uml-state-activity', 'sd-diagrams-uml-class'],
+        minutes: 35,
+        template: 'component',
+        mock: false,
+        lists: [],
+        summary: 'Map a podcast app’s components and interfaces, trace an overnight background download step by step, and draw the download’s state machine.',
+    },
+    {
+        id: 'sd-review-diagrams-sync-doc',
+        kind: 'critique',
+        title: 'Review: the offline sync design doc',
+        difficulty: 'medium',
+        patterns: ['offline', 'leadership', 'privacy'],
+        lessons: ['sd-diagrams-reading', 'sd-diagrams-design-docs', 'sd-diagrams-why'],
+        minutes: 25,
+        summary: 'A design doc whose diagram contradicts its text, whose hardest part is “TBD”, and whose rollout plan rolls back an iOS app.',
+    },
+];

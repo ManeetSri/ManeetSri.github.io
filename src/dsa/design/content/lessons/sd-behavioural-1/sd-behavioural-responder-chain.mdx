@@ -1,0 +1,216 @@
+## Why it matters
+
+When a button with no target is tapped, when the user presses ⌘C, or when a menu item says "Delete", UIKit has to decide which object should act. It asks a chain of objects in turn, starting from the one the user is focused on: the **responder chain**. It's Apple's own chain of responsibility (the pattern after this lesson), and it explains how the keyboard is dismissed, how edit menus and keyboard shortcuts find their target, and how a cell can trigger an action in a view controller it has never heard of. Interviewers ask about it to see whether you know UIKit beyond the views you can see.
+
+## A chain of objects that might handle it
+
+A **responder** is any `UIResponder`: every `UIView`, `UIViewController`, `UIWindow`, `UIWindowScene` and `UIApplication`. Each has a `next` responder, and following `next` from any responder walks up towards the application:
+
+- **A view:** its view controller, if it's that controller's root view; otherwise its superview.
+- **A view controller:** the superview of its view for a child controller, the presenting controller for a presented one, the window for the window's root controller.
+- **A window:** its window scene. **A scene:** the application. **The application:** the app delegate, if the app delegate is itself a responder.
+
+One responder is special: the **first responder**. It's the object receiving keyboard input (a text field being edited), and the starting point for actions and commands that have no target. Views become it with `becomeFirstResponder()` and give it up with `resignFirstResponder()`.
+
+Touches arrive by a different route first: UIKit hit-tests to find the deepest view under the finger and delivers the touch there; a view that doesn't handle it can pass it up the same chain. D17 covers event delivery and hit-testing in full. Here, the interest is the chain as a design tool.
+
+## Nil-targeted actions
+
+Give a control a **nil target**, and UIKit searches the chain for an object that implements the action, starting from the first responder (or from the control itself when nothing is first responder):
+
+```visual flow
+title: A nil-targeted action looking for a handler
+nodes:
+  - { id: button, label: Add button, kind: view, at: [0, 0] }
+  - { id: cell, label: Product cell, kind: view, at: [0, 1] }
+  - { id: table, label: Table view, kind: view, at: [0, 2] }
+  - { id: list, label: Product list controller, kind: service, at: [0, 3], w: 1.5 }
+  - { id: nav, label: Navigation controller, kind: service, at: [2, 3], w: 1.5 }
+  - { id: window, label: Window, kind: view, at: [2, 2] }
+  - { id: scene, label: Window scene, kind: service, at: [2, 1] }
+  - { id: app, label: UIApplication, kind: client, at: [2, 0] }
+edges:
+  - [button, cell]
+  - [cell, table]
+  - [table, list]
+  - [list, nav]
+  - [nav, window]
+  - [window, scene]
+  - [scene, app]
+steps:
+  - say: "The cell's button has **no target**. When it's tapped, UIKit asks each responder in turn whether it implements `addToBasket(_:)`."
+    show: [button, cell]
+    send: button->cell
+  - say: "The cell doesn't (its content view and the cell both pass), so the question moves to its next responder, the table view."
+    show: [table]
+    send: cell->table
+  - say: "The table view is the controller's root view, so its next responder is the controller. It implements `addToBasket(_:)`, and the search stops."
+    show: [list]
+    send: table->list
+    state: { list: ok }
+    label: { list: handles it }
+  - say: "Had nobody implemented it, the search would have gone on through the navigation controller, the window, the scene and the application, and the tap would silently have done nothing."
+    show: [nav, window, scene, app]
+```
+
+```swift check ios title="Actions that travel the responder chain"
+import UIKit
+
+/// Names the action so #selector can refer to it. Any responder may implement it.
+@MainActor @objc protocol ProductActions {
+    func addToBasket(_ sender: Any?)
+}
+
+final class ProductCell: UITableViewCell {
+    let addButton = UIButton(configuration: .borderless())
+
+    override init(style: UITableViewCell.CellStyle, reuseIdentifier: String?) {
+        super.init(style: style, reuseIdentifier: reuseIdentifier)
+        addButton.configuration?.title = "Add"
+        // No target: UIKit searches the responder chain for something that implements the action
+        addButton.addTarget(nil, action: #selector(ProductActions.addToBasket(_:)), for: .touchUpInside)
+        contentView.addSubview(addButton)
+    }
+
+    required init?(coder: NSCoder) { nil }
+}
+
+final class ProductListViewController: UITableViewController, ProductActions {
+    private var products = ["Mug", "Beans", "Grinder"]
+    private(set) var basket: [String] = []
+
+    @objc func addToBasket(_ sender: Any?) {
+        // The sender is the button; find its row from where it sits in the table
+        guard let button = sender as? UIView else { return }
+        let point = button.convert(CGPoint.zero, to: tableView)
+        guard let indexPath = tableView.indexPathForRow(at: point) else { return }
+        basket.append(products[indexPath.row])
+    }
+
+    // ⌘B works on the selected row; the command has no target, so it travels the chain too
+    override var keyCommands: [UIKeyCommand]? {
+        [UIKeyCommand(title: "Add to Basket", action: #selector(addSelectedToBasket), input: "b", modifierFlags: .command)]
+    }
+
+    @objc private func addSelectedToBasket() {
+        guard let row = tableView.indexPathForSelectedRow?.row else { return }
+        basket.append(products[row])
+    }
+
+    // The standard Delete action, offered only while a row is selected
+    override func delete(_ sender: Any?) {
+        guard let row = tableView.indexPathForSelectedRow?.row else { return }
+        products.remove(at: row)
+        tableView.reloadData()
+    }
+
+    override func canPerformAction(_ action: Selector, withSender sender: Any?) -> Bool {
+        if action == #selector(delete(_:)) || action == #selector(addSelectedToBasket) {
+            return tableView.indexPathForSelectedRow != nil
+        }
+        return super.canPerformAction(action, withSender: sender)
+    }
+}
+
+@MainActor
+func dismissKeyboard() {
+    // The classic nil-targeted action: whoever is first responder resigns
+    UIApplication.shared.sendAction(#selector(UIResponder.resignFirstResponder), to: nil, from: nil, for: nil)
+}
+```
+
+Three techniques are in there:
+
+- **A nil-targeted control action** lets the cell stay ignorant of the controller. An `@objc protocol` names the selector, so `#selector` is checked at compile time without the cell importing the controller.
+- **`keyCommands` and the standard edit actions** (`copy(_:)`, `paste(_:)`, `delete(_:)` from `UIResponderStandardEditActions`) are found the same way. That's why ⌘B and the Edit menu work on the selected row without being wired to it. Commands in the iPad menu bar and Mac Catalyst menus, built with `buildMenu(with:)`, are delivered like this too.
+- **`canPerformAction(_:withSender:)`** lets a responder say "not right now". UIKit uses it to grey out menu items and to skip a responder while searching. (`target(forAction:withSender:)` is the method that does the searching, and you can override it to redirect an action.)
+
+`dismissKeyboard()` is the classic one-liner: it sends `resignFirstResponder` to whoever is first responder, without knowing which text field that is.
+
+<Callout kind="gotcha" title="iOS gotcha: the search starts at the first responder, not at the button">
+If a search field in the navigation bar is being edited, it's the first responder, and a nil-targeted action from a cell starts in *its* chain: search bar, navigation bar, navigation controller, window. The list controller isn't on that path, so the tap does nothing. Nil targets are ideal for commands that should act on whatever is focused; for "this cell's button", a closure or delegate is more predictable.
+</Callout>
+
+## SwiftUI has no responder chain
+
+SwiftUI views aren't responders, so you can't send them actions. SwiftUI solves the same problems in the opposite direction: instead of requests bubbling **up**, capabilities flow **down** through the environment. `@Environment(\.dismiss)` hands a view the power to dismiss whatever presented it; `@FocusState` tracks focus; `.focusedValue` and `@FocusedValue` let menu commands (declared with `.commands`) act on the focused window or field. In a mixed app, UIKit's chain still carries actions for the UIKit parts, including hosting controllers.
+
+## Trade-offs
+
+| | Nil-targeted action | Delegate or closure | Notification |
+| --- | --- | --- | --- |
+| Sender knows the receiver | No, only the action's name | Yes, through a protocol or closure | No |
+| Who handles it | The first responder up the chain that can | Exactly the object you set | Every observer |
+| Depends on focus | Yes: it starts at the first responder | No | No |
+| Disable it | `canPerformAction` | Your own code | Your own code |
+| Typing | Selector only; the sender is `Any?` | Fully typed | Untyped payload |
+| Wins when | Menus, shortcuts and edit actions that act on whatever is focused | One component reporting to its owner | Many listeners |
+
+<Callout kind="interview">
+**Say:** "The responder chain is UIKit's chain of responsibility: a nil-targeted action starts at the first responder and walks `next` until something implements it and `canPerformAction` agrees. That's how the Edit menu and keyboard shortcuts find the focused object."
+
+**Ask:** Should this act on whatever's focused (a command), or on one specific object (a callback)? The answer decides whether the chain is the right tool.
+
+**Red flags:** walking `superview` by hand to find a view controller; relying on nil targets for core flows (they fail silently when nothing handles them); not knowing that SwiftUI views aren't in the chain.
+</Callout>
+
+```cards
+- id: responder-chain
+  front: "In what order does UIKit try responders for a nil-targeted action?"
+  back: "From the first responder (or the sender if nothing is first responder) up through `next`: views, their controllers, the window, the scene, the application, then the app delegate."
+- id: first-responder
+  front: "What is the first responder?"
+  back: "The responder that receives keyboard input, such as the text field being edited. Nil-targeted actions and key commands start their search there."
+- id: can-perform
+  front: "How does a responder refuse an action it implements?"
+  back: "Override `canPerformAction(_:withSender:)` to return false. UIKit then skips it, and greys out matching menu items."
+```
+
+```quiz
+- id: q1
+  type: order
+  prompt: "A text field sits in the root view of a form controller, which is the window's root view controller. Put the responders in the order a nil-targeted action visits them."
+  lines:
+    - "The text field (the first responder)"
+    - "The form controller's root view"
+    - "The form view controller"
+    - "The window"
+    - "The window scene"
+    - "UIApplication"
+  explain: "A view's next responder is its superview, or its controller if it's the controller's root view; the root controller's next is the window, then the scene, then the application (and the app delegate after it)."
+- id: q2
+  type: mcq
+  prompt: "A cell's button uses a nil target to reach the list controller. It works, except while the user is typing in the navigation bar's search field. Why?"
+  options:
+    - "Nil-targeted actions only work for menus"
+    - "The search field is first responder, so the search starts in its chain, which doesn't pass through the list controller"
+    - "Cells stop being responders while the keyboard is up"
+    - "The action must be marked `@MainActor`"
+  answer: 1
+  explain: "UIKit starts at the first responder. The search field's chain goes through the navigation bar and navigation controller, not the list controller, so nobody handles the action. Use a closure or delegate for cell-to-owner callbacks."
+- id: q3
+  type: match
+  prompt: "Match each UIResponder API to what it does."
+  pairs:
+    - ["next", The responder after this one in the chain]
+    - ["canPerformAction(_:withSender:)", Says whether this responder will handle an action right now]
+    - ["target(forAction:withSender:)", Finds the object that will actually handle an action]
+    - ["becomeFirstResponder()", Makes this the starting point for keyboard input and commands]
+  explain: "Those four are the whole mechanism: a linked list (`next`), a search (`target(forAction:)`), a veto (`canPerformAction`) and a starting point (the first responder)."
+- id: q4
+  type: multi
+  prompt: "Which of these travel the responder chain?"
+  options:
+    - "A control action added with a nil target"
+    - "A `UIKeyCommand` such as ⌘B"
+    - "`copy(_:)` from the edit menu"
+    - "A NotificationCenter post"
+    - "A closure stored in a cell's `onBuy` property"
+  answer: [0, 1, 2]
+  explain: "Actions without a target, key commands and standard edit actions all start at the first responder and walk up. Notifications go through the notification centre to every observer, and closures are called directly."
+- id: q5
+  type: truefalse
+  prompt: "SwiftUI views are responders, so a nil-targeted action can reach a SwiftUI view directly."
+  answer: false
+  explain: "SwiftUI views aren't `UIResponder`s. SwiftUI hands capabilities down through the environment (`dismiss`, focus, focused values) instead of bubbling requests up."
+```

@@ -1,0 +1,342 @@
+## Why it matters
+
+A table of 10,000 rows scrolls smoothly because UIKit only ever makes about a screenful of cells and keeps reusing them. Create a `DateFormatter` in every cell, or a new `URLSession` for every request, and the same reuse idea is working against you. Reuse is a creational decision with direct consequences for frame rate, memory and network cost, and "why does the wrong image appear in my cell?" is one of the most common iOS interview questions there is.
+
+## The pattern
+
+An **object pool** keeps a set of ready-made objects. A client **checks one out**, uses it, and **returns** it; the pool creates a new object only when none is free, and may cap how many it keeps. It pays off when three things are true:
+
+1. **Creating the object is expensive** compared with using it: building a view hierarchy with layers and constraints, setting up a formatter, compiling a regular expression, opening a network connection.
+2. **Objects are used briefly and often**, like rows flying past during a scroll.
+3. **Only a bounded number are needed at once**, such as a screenful of cells.
+
+When those aren't true, don't pool. Swift allocates ordinary objects quickly, and a pool adds bookkeeping and a new class of bug: an object that comes back still carrying the last user's state. Model objects, view models and small helpers should just be created.
+
+<Callout kind="analogy">
+
+A pool is a cloakroom's rack of hangers, not a hanger factory. Nobody makes a new hanger per coat; they take one from the rack, and it goes back when the coat leaves. The rack has a fixed size, and before a hanger is reused, the last coat comes off it.
+
+</Callout>
+
+There are really two shapes of reuse on iOS, and they're worth keeping apart:
+
+- **A pool of interchangeable instances**, each used by one client at a time: cells, annotation views, video players, network connections.
+- **One shared instance used by everyone**, because it's expensive to create and safe to share once configured: a formatter, a `CIContext`, a compiled `Regex`. That's closer to the flyweight you'll meet in D11, and often it's a `static let`.
+
+## Cell reuse: the pool you use every day
+
+`UITableView` and `UICollectionView` run a pool per **reuse identifier**:
+
+- You **register** a cell class (or a `UICollectionView.CellRegistration`) for an identifier.
+- When a row is about to appear, your code **dequeues** a cell. If a cell with that identifier is waiting in the reuse queue, you get it back; otherwise the view creates a new one.
+- When a row scrolls off screen, its cell goes **into the reuse queue** rather than being destroyed.
+- Just before a recycled cell is returned from dequeue, UIKit calls its **`prepareForReuse()`**.
+
+```visual states
+title: The life of a reusable cell
+states:
+  - { id: none, label: Not created, at: [0, 0] }
+  - { id: visible, label: On screen, at: [2, 0] }
+  - { id: queued, label: Reuse queue, at: [2, 1] }
+  - { id: freed, label: Deallocated, at: [4, 1] }
+initial: none
+final: [freed]
+transitions:
+  - [none, visible, dequeue, queue empty]
+  - [visible, queued, scrollOff]
+  - [queued, visible, dequeue, queue has one]
+  - [queued, freed, purge]
+intro: "Before the first row appears, no cells exist. The table creates them only when a dequeue finds the reuse queue empty."
+events:
+  - { event: dequeue, say: "`dequeue` with an empty queue **creates** a cell. This happens about a screenful of times, then rarely again." }
+  - { event: scrollOff, say: "The row scrolls away, so its cell moves to the **reuse queue** instead of being destroyed." }
+  - { event: dequeue, say: "A new row appears. `prepareForReuse()` runs, and the same cell comes back to be configured with **new** content." }
+  - { event: scrollOff, say: "Back in the queue. A long scroll is this loop, thousands of times, with no new allocations." }
+  - { event: purge, say: "Spare cells are released when the table no longer needs them, for example when it goes away." }
+```
+
+That's why a list of 10,000 rows creates roughly a screenful of cells plus a few spares, and why scrolling costs configuration rather than construction. The exact number of spares is UIKit's business; your code should never depend on it.
+
+### The wrong-image bug
+
+The classic reuse bug: a cell starts downloading a photo, the user scrolls, the cell is reused for another row, and then the first download finishes and puts the old photo into the new row. The fix has two halves:
+
+```swift check ios
+import UIKit
+
+protocol ThumbnailLoading: Sendable {
+    func thumbnail(for photoID: String) async -> UIImage?
+}
+
+final class PhotoCell: UICollectionViewCell {
+    private let imageView = UIImageView()
+    private var loadTask: Task<Void, Never>?
+    private var photoID: String?
+
+    override init(frame: CGRect) {
+        super.init(frame: frame)
+        imageView.contentMode = .scaleAspectFill
+        imageView.clipsToBounds = true
+        contentView.addSubview(imageView)
+    }
+
+    required init?(coder: NSCoder) {
+        fatalError("PhotoCell is created in code")
+    }
+
+    override func layoutSubviews() {
+        super.layoutSubviews()
+        imageView.frame = contentView.bounds
+    }
+
+    override func prepareForReuse() {
+        super.prepareForReuse()
+        // The previous row's download is no longer wanted
+        loadTask?.cancel()
+        loadTask = nil
+    }
+
+    func configure(photoID: String, loader: any ThumbnailLoading) {
+        self.photoID = photoID
+        imageView.image = nil
+        loadTask = Task { [weak self] in
+            let image = await loader.thumbnail(for: photoID)
+            // The cell may have been reused for another photo while we waited
+            guard let self, !Task.isCancelled, self.photoID == photoID else { return }
+            self.imageView.image = image
+        }
+    }
+}
+```
+
+1. **Cancel** work that belongs to the previous row in `prepareForReuse()`.
+2. **Check identity** when the result arrives: only apply it if the cell still shows the same item.
+
+And notice where the content is reset: in `configure`, not in `prepareForReuse()`. Apple's guidance is that `prepareForReuse()` should only reset things unrelated to content, such as alpha, editing and selection state, and stay cheap, because it runs during scrolling. The code that configures the cell must set **every** piece of content, every time. A cell that sets a badge only when there is one will show stale badges on rows without one.
+
+In a collection view with a diffable data source, there's an even cleaner approach: don't push async results into a cell at all. Store the loaded thumbnail in a cache keyed by item id, then call `reconfigureItems(_:)` on the snapshot (iOS 15 and later). The data source reconfigures whichever cell currently shows that item, if any, so a stale cell can't receive it.
+
+### SwiftUI lists
+
+You don't manage reuse in SwiftUI, but it still happens. On iOS, `List` is backed by a UIKit collection view and recycles its cells. `LazyVStack` and `LazyVGrid` create rows only as they come near the screen, but don't recycle them the way `List` does, so very long or heavy feeds usually hold up better in a `List`. In both, **stable identity** is what makes updates cheap: an `id` that changes on every update, such as `.id(UUID())`, forces SwiftUI to throw rows away and build new ones. You'll go deeper in D18.
+
+## Expensive helpers: share one, don't make many
+
+`DateFormatter` and `NumberFormatter` are the textbook expensive helpers: creating one sets up locale and calendar data, which is far more work than formatting a single date. Making one per cell is a measurable scrolling cost. The fix isn't a pool; it's **one shared, configured instance per format**, created once:
+
+```swift check
+import Foundation
+
+enum Formatters {
+    // Configured once, never mutated afterwards
+    static let orderDate: DateFormatter = {
+        let formatter = DateFormatter()
+        formatter.dateStyle = .medium
+        formatter.timeStyle = .none
+        return formatter
+    }()
+}
+
+func orderSummary(placedAt date: Date) -> String {
+    "Ordered " + Formatters.orderDate.string(from: date)
+}
+```
+
+Apple documents `DateFormatter` as thread-safe on iOS 7 and later, and current SDKs mark it `Sendable`, so this `static let` compiles in Swift 6. The rule that keeps it safe is the one in the comment: configure it inside the initialiser closure and **never** change its properties afterwards. A shared formatter whose `dateFormat` one screen changes is a data race and a wrong-date bug at once.
+
+Since iOS 15 there's usually a better option: the `FormatStyle` APIs. Styles are small `Sendable` value types, they respect the user's locale by default, and Foundation caches the expensive formatter machinery underneath, so the reuse is done for you:
+
+```swift run
+import Foundation
+
+let ukLocale = Locale(identifier: "en_GB")
+let utc = TimeZone(identifier: "UTC")!
+
+let orderDate = Date(timeIntervalSince1970: 1_750_000_000)
+let dateStyle = Date.FormatStyle(date: .abbreviated, time: .omitted, locale: ukLocale, timeZone: utc)
+let priceStyle = Decimal.FormatStyle.Currency(code: "GBP", locale: ukLocale)
+
+print(orderDate.formatted(dateStyle))
+print(Decimal(string: "1234.5")!.formatted(priceStyle))
+print((0.256).formatted(.percent.precision(.fractionLength(1)).locale(ukLocale)))
+```
+
+```output
+15 Jun 2025
+£1,234.50
+25.6%
+```
+
+The locale and time zone are fixed here so the output is the same on every machine; in an app you'd usually leave them out and get the user's.
+
+Other objects in the "create once, share" group:
+
+- **`CIContext`**: Apple's Core Image documentation says to create one and reuse it, because creating a context is expensive. It's thread-safe once created.
+- **Regular expressions**: compile a `Regex` or `NSRegularExpression` once, as a `static let`, not inside a loop.
+- **Metal objects**: one `MTLDevice` and long-lived command queues, not one per frame.
+
+## `URLSession`: a pool you get for free
+
+A `URLSession` keeps its connections open and reuses them for later tasks to the same host, multiplexing many requests over one HTTP/2 connection. Creating a **new session for every request** throws that away: each request pays for its own connection and TLS handshake, which on a mobile network can cost more than the request itself. It can also leak: a session strongly retains its delegate until you invalidate it, and Apple's documentation warns that a session you never invalidate leaks memory until the app exits.
+
+So make **one session per configuration**, usually created at start-up, and reuse it for everything with that configuration: one default session for API calls, perhaps one background session for uploads.
+
+## Writing your own pool
+
+When you do need a pool, such as a handful of reusable video players for a vertical feed or decoders for an image pipeline, a good one follows a few rules:
+
+- **Reset on the way in or out**, so no state leaks from one use to the next.
+- **Cap the idle count**, and drain it on a memory warning: idle pooled objects are memory you're choosing to keep.
+- **Ignore double returns.** Returning the same object twice would hand it to two clients at once.
+- **Offer a scoped API** where you can, so returning is automatic:
+
+```swift run
+final class Pool<Resource: AnyObject> {
+    private var idle: [Resource] = []
+    private let make: () -> Resource
+    private let reset: (Resource) -> Void
+    private(set) var created = 0
+
+    init(make: @escaping () -> Resource, reset: @escaping (Resource) -> Void) {
+        self.make = make
+        self.reset = reset
+    }
+
+    // Lend a resource for the length of `body`, and always take it back, even if body throws
+    func borrow<T>(_ body: (Resource) throws -> T) rethrows -> T {
+        let resource: Resource
+        if let recycled = idle.popLast() {
+            resource = recycled
+        } else {
+            created += 1
+            resource = make()
+        }
+        defer {
+            reset(resource)
+            idle.append(resource)
+        }
+        return try body(resource)
+    }
+}
+
+final class Scratchpad {
+    var bytes: [UInt8] = []
+}
+
+let pool = Pool(make: { Scratchpad() }, reset: { $0.bytes.removeAll(keepingCapacity: true) })
+
+for row in 0..<1_000 {
+    pool.borrow { pad in pad.bytes.append(UInt8(row % 256)) }
+}
+print("1,000 borrows one after another:", pool.created, "created")
+
+pool.borrow { outer in
+    pool.borrow { inner in
+        print("nested borrows get different objects:", outer !== inner)
+    }
+}
+print("after nesting:", pool.created, "created")
+```
+
+```output
+1,000 borrows one after another: 1 created
+nested borrows get different objects: true
+after nesting: 2 created
+```
+
+`defer` guarantees the return even when `body` throws, and the pool grows only to the largest number of objects in use **at the same time**. This pool isn't thread-safe; like UIKit's cell queues, it's meant to be used from one thread or actor. A pool shared across tasks belongs in an actor, and if the resource is scarce (only so many hardware video decoders), callers that find it empty must **wait** rather than make another, which turns the pool into a semaphore.
+
+## Trade-offs
+
+| | Create every time | One shared, configured instance | A pool of instances | `FormatStyle` values |
+| --- | --- | --- | --- | --- |
+| Creation cost | Every use | Once | Once per instance in use at the same time | Handled by Foundation |
+| Memory | Freed after use | One object, forever | Idle objects kept until drained | Tiny values |
+| Stale-state risk | None | Only if someone mutates it | Real: reset on every reuse | None |
+| Thread safety | Not an issue | Must be immutable or thread-safe | Confine to one thread, or use an actor | `Sendable` |
+| Best for | Cheap objects: models, small helpers | Formatters, `CIContext`, `Regex`, `URLSession` | Cells, players, decoders, connections | Formatting dates, numbers and currencies |
+
+<Callout kind="interview">
+
+**What to say** about the wrong image in a reused cell: "Cells are pooled per reuse identifier. The old download completes after the cell has been reused, so I cancel it in `prepareForReuse` and check the cell still shows the same item before applying the result. Better still, put the image in a cache and reconfigure the item through the data source."
+
+**What to ask:** "How expensive is this object to create, and how many are in use at once?" If creation is cheap or the number is unbounded, a pool is the wrong tool.
+
+**Red flags:** constructing cells instead of dequeuing them; heavy work in `prepareForReuse`; a `DateFormatter` per cell; a new `URLSession` per request; a pool for plain model objects.
+
+</Callout>
+
+<Callout kind="gotcha" title="iOS gotcha: one reuse identifier per cell layout">
+
+Each reuse identifier is its own queue. If two quite different layouts share one identifier and one cell class, every reuse has to tear down one layout and build the other, which is the cost reuse was meant to avoid. Give each distinct layout its own cell class and identifier, and let content vary within a layout.
+
+</Callout>
+
+## Practice
+
+The **reuse pool** kata has you build the pool behind `dequeueReusableCell`: per-identifier queues, factories for new elements, `prepareForReuse` before an element is handed out again, a cap on idle elements, and a drain for memory warnings. Its tests scroll through 1,000 rows and count how many elements were ever created. The **singletons and hidden construction** review also hides a reuse mistake in its networking code.
+
+```cards
+- id: pool-when
+  front: "When does an object pool pay off?"
+  back: "When objects are expensive to create, used briefly and often, and only a bounded number are needed at once. Otherwise, just create them."
+- id: wrong-image
+  front: "How do you stop a reused cell from showing the previous row's image?"
+  back: "Cancel the old load in `prepareForReuse()` and check the cell still shows the same item when the result arrives, or store results in a cache and reconfigure the item through the data source."
+- id: prepare-for-reuse
+  front: "What belongs in `prepareForReuse()`, and what doesn't?"
+  back: "Cheap resets of non-content state (selection, alpha, editing) and cancelling stale work. Content is set, every time and completely, by the code that configures the cell."
+- id: session-per-request
+  front: "What does creating a new `URLSession` per request cost?"
+  back: "Connection reuse: each request pays for its own connection and TLS handshake. A session with a delegate also leaks until it's invalidated."
+```
+
+```quiz
+- id: q1
+  type: estimate
+  prompt: "A table view fills an iPhone screen with rows 88 points tall on an 852-point-tall screen. Roughly how many cells will it create while scrolling through 5,000 rows?"
+  answer: 11
+  unit: cells
+  within: { factor: 2 }
+  explain: "About a screenful: 852 ÷ 88 ≈ 10 rows visible, plus one or two partly visible and a spare or two. Reuse means the total doesn't grow with the number of rows."
+- id: q2
+  type: bug
+  prompt: "Rows without a discount sometimes show a discount badge after scrolling. Which line causes it?"
+  code: |
+    func configure(_ cell: ProductCell, with product: Product) {
+        cell.titleLabel.text = product.name
+        cell.priceLabel.text = product.price.formatted(.currency(code: "GBP"))
+        if let discount = product.discount {
+            cell.badge.isHidden = false
+            cell.badge.text = "\(discount)% off"
+        }
+    }
+  answer: 4
+  explain: "The `if` only ever *shows* the badge. A reused cell that last showed a discounted product keeps its badge. Configuration must set every piece of content each time: add `else { cell.badge.isHidden = true }`, or set `cell.badge.isHidden = product.discount == nil` first."
+- id: q3
+  type: sort
+  prompt: "How should each of these be created?"
+  buckets: ["Create every time", "One shared instance", "A pool"]
+  items:
+    - ["An `Order` model decoded from JSON", 0]
+    - ["A `DateFormatter` with a fixed medium date style", 1]
+    - ["Video players for a vertical feed, at most three in use", 2]
+    - ["The app's `URLSession` for API calls", 1]
+    - ["Collection view cells", 2]
+    - ["A view model for a detail screen", 0]
+  explain: "Cheap objects are created. Expensive objects that are safe to share once configured get one instance. Expensive objects that one client uses at a time, a bounded number at once, are pooled."
+- id: q4
+  type: truefalse
+  prompt: "`prepareForReuse()` is the right place to load the new row's image, since it runs just before the cell is reused."
+  answer: false
+  explain: "`prepareForReuse()` doesn't know which row the cell will show next; it should only cancel old work and reset non-content state, cheaply. Loading and content belong in the code that configures the cell for its item."
+- id: q5
+  type: mcq
+  prompt: "An app creates `URLSession(configuration: .default, delegate: self, delegateQueue: nil)` inside each request method of an API client. What are the consequences? Pick the best answer."
+  options:
+    - "None: sessions are cheap and share everything"
+    - "No connection reuse between requests, and each session retains its delegate until invalidated, so they leak"
+    - "Requests run one at a time"
+    - "Responses are never cached"
+  answer: 1
+  explain: "A session reuses connections for its own tasks, so a session per request pays for a new connection and handshake every time. Sessions also keep a strong reference to their delegate until invalidated. Create one session per configuration and reuse it."

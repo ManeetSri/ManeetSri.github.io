@@ -1,0 +1,127 @@
+A shop's search screen shows filter chips: "Under £20", "Acme", "In stock". Each kind of filter is its own small struct, and the screen keeps the active ones in a `Set` so tapping a chip toggles it. But `SearchFilter` refines `Hashable`, and an existential never conforms to its own protocol, so `Set<any SearchFilter<Product>>` doesn't compile. Write the type eraser that makes it work.
+
+`SearchFilterErasure.AnySearchFilter<Item>`, plus `SearchFilterErasure.apply(_:to:) -> [Item]`
+
+- `init(_:)` wraps any `SearchFilter` whose `Item` matches. `label` and `matches(_:)` forward to the wrapped filter.
+- Two erased filters are **equal** only when they wrap the **same concrete type** and those two values are equal. `BrandIs(name: "Acme")` and `BrandStartsWith(name: "Acme")` have the same stored property but are different filters.
+- `hash(into:)` must agree with `==`: equal filters hash the same.
+- Erasing an already erased filter must not nest it: `AnySearchFilter(AnySearchFilter(f))` equals `AnySearchFilter(f)`, and unwraps to `f`.
+- `base(as:)` returns the wrapped filter if it's that type, otherwise `nil`.
+- `apply(_:to:)` returns the items that pass every active filter, in their original order. No filters means every item.
+
+## Examples
+
+| Code | Result |
+| --- | --- |
+| `AnySearchFilter(BrandIs(name: "Acme")) == AnySearchFilter(BrandIs(name: "Acme"))` | `true` |
+| `AnySearchFilter(BrandIs(name: "Acme")) == AnySearchFilter(BrandStartsWith(name: "Acme"))` | `false` |
+| A set built from `BrandIs("Acme")`, `BrandIs("Acme")`, `InStockOnly()` | 2 filters |
+| `AnySearchFilter(PriceAtMost(pence: 1500)).base(as: BrandIs.self)` | `nil` |
+| `apply([BrandStartsWith("Acme"), InStockOnly()], to: products)` | the in-stock products whose brand starts with "Acme", in order |
+
+## Constraints
+
+- Keep `AnySearchFilter` a value type: it's stored in a `Set` and passed across actors, so it must stay `Sendable`.
+- Don't add requirements to `SearchFilter`. The tests define their own filters, which only implement what the protocol asks for.
+- No `AnyHashable` is needed, though a solution built on it is fine if it meets every rule above.
+
+<Hints>
+<Hint>
+Store the filter as `any SearchFilter<Item>`. The primary associated type keeps `Item` known, so `matches(_:)` and `label` can be called straight through the existential.
+</Hint>
+<Hint>
+For `==`, write a small generic function `isEqual<F: SearchFilter>(_ left: F, to right: any SearchFilter<Item>) -> Bool` and call it with the left filter's existential. Swift opens the existential, so inside the function `F` is the left filter's concrete type: cast the right one with `as? F`, then compare.
+</Hint>
+<Hint>
+In `hash(into:)`, combine `ObjectIdentifier(type(of: wrapped))` before the filter's own hash, so filters of different types with the same fields spread out. In `init`, check `filter as? AnySearchFilter<Item>` first and copy it instead of wrapping it.
+</Hint>
+</Hints>
+
+## Solutions
+
+<Approach title="Wrap an existential, open it to compare" time="O(1) per comparison" space="O(1)">
+
+```swift
+public struct AnySearchFilter<Item>: SearchFilter {
+    private let wrapped: any SearchFilter<Item>
+
+    public init<Filter: SearchFilter>(_ filter: Filter) where Filter.Item == Item {
+        if let erased = filter as? AnySearchFilter<Item> {
+            self = erased
+        } else {
+            wrapped = filter
+        }
+    }
+
+    public var label: String { wrapped.label }
+
+    public func matches(_ item: Item) -> Bool {
+        wrapped.matches(item)
+    }
+
+    public static func == (lhs: AnySearchFilter, rhs: AnySearchFilter) -> Bool {
+        func isEqual<F: SearchFilter>(_ left: F, to right: any SearchFilter<Item>) -> Bool {
+            guard let right = right as? F else { return false }
+            return left == right
+        }
+        return isEqual(lhs.wrapped, to: rhs.wrapped)
+    }
+
+    public func hash(into hasher: inout Hasher) {
+        hasher.combine(ObjectIdentifier(type(of: wrapped)))
+        wrapped.hash(into: &hasher)
+    }
+
+    public func base<Filter: SearchFilter>(as type: Filter.Type) -> Filter? {
+        wrapped as? Filter
+    }
+}
+
+public static func apply<Item>(_ filters: Set<AnySearchFilter<Item>>, to items: [Item]) -> [Item] {
+    items.filter { item in filters.allSatisfy { $0.matches(item) } }
+}
+```
+
+This is the modern shape of a type eraser: since Swift 5.7, an existential with a primary associated type can do most of the work, and the eraser exists only to add the conformance an existential can't have. The `==` trick is **implicit existential opening**: passing `any SearchFilter<Item>` to a generic parameter hands the function the concrete type, which is how you get at `Self` requirements like `==` without a class hierarchy.
+
+The older pattern, a private abstract `Box` class with a generic subclass per filter type, still works: it's how the standard library's `AnySequence` and Combine's `AnyPublisher` are built inside. It needs more code, a class allocation per filter and care to stay `Sendable`, so prefer the existential version on Swift 5.7 and later.
+
+</Approach>
+
+<Approach title="Closures, with AnyHashable for equality" time="O(1) per comparison" space="O(1)">
+
+```swift
+public struct AnySearchFilter<Item>: SearchFilter {
+    private let identity: any Hashable & Sendable
+    private let matcher: @Sendable (Item) -> Bool
+    public let label: String
+
+    public init<Filter: SearchFilter>(_ filter: Filter) where Filter.Item == Item {
+        if let erased = filter as? AnySearchFilter<Item> {
+            self = erased
+            return
+        }
+        identity = filter
+        matcher = { filter.matches($0) }
+        label = filter.label
+    }
+
+    public func matches(_ item: Item) -> Bool { matcher(item) }
+
+    public static func == (lhs: AnySearchFilter, rhs: AnySearchFilter) -> Bool {
+        AnyHashable(lhs.identity) == AnyHashable(rhs.identity)
+    }
+
+    public func hash(into hasher: inout Hasher) {
+        hasher.combine(AnyHashable(identity))
+    }
+
+    public func base<Filter: SearchFilter>(as type: Filter.Type) -> Filter? {
+        identity as? Filter
+    }
+}
+```
+
+`AnyHashable` compares the wrapped type as well as the value, so equality comes for free. Notice where it lives, though: **`AnyHashable` isn't `Sendable`**, so storing one in a `Sendable` struct fails to compile in Swift 6. Storing `any Hashable & Sendable` and wrapping it only for the comparison keeps the eraser `Sendable`. The cost of this style is a stored closure for every requirement, so it suits protocols with one or two, such as a validator or a loader.
+
+</Approach>

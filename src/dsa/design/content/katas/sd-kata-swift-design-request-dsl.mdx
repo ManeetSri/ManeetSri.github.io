@@ -1,0 +1,117 @@
+An API client builds dozens of requests, each with a method, a path, a few query items and headers, some of them only under conditions. Write a small result-builder DSL so each request reads like a description of itself, with ordinary `if`, `if`–`else` and `for` inside:
+
+```swift
+let request = DeclarativeRequest.request(baseURL) {
+    Method.post
+    Path("v2", "orders")
+    for id in selectedIDs {
+        Query("id", id)
+    }
+    if includeDrafts {
+        Query("drafts", "true")
+    }
+    Header("Accept", "application/json")
+    Body(orderJSON)
+}
+```
+
+`DeclarativeRequest.Builder` (a `@resultBuilder`), `DeclarativeRequest.parts(_:) -> [Part]` and `DeclarativeRequest.request(_:_:) -> URLRequest`
+
+The DSL's words (`Method`, `Path`, `Query`, `Header`, `Body`) and the `Part` enum are written for you. Every builder method is declared; you write their bodies, and `request`.
+
+- **The builder** turns each line into parts, in the order written: a `Method` is one `.method`, a `Path` is one `.path` per segment, a `Query` is one `.query`, a `Header` is one `.header`, and a `Body` is a `Content-Type` header followed by `.body`.
+- `if` without `else` adds its parts only when the condition holds; `if`–`else` adds exactly one branch's parts; `for` adds the parts of every iteration.
+- **`request`** applies the parts in order to the base URL:
+  - GET unless a `.method` part says otherwise; the last one wins.
+  - Path segments are appended in order.
+  - Query items keep their order and may repeat (`id=1&id=2`). With no query items the URL has no `?`.
+  - Headers are set in order, so a later value for the same name replaces an earlier one.
+  - The last body wins.
+
+## Examples
+
+| Builder lines | Result |
+| --- | --- |
+| `Method.post`, `Path("v1", "orders")` | parts `[.method(.post), .path("v1"), .path("orders")]` |
+| `Path("orders")`, `if false { Query("drafts", "true") }` | parts `[.path("orders")]` |
+| `Path("v1", "search")`, `Query("q", "green tea")`, `Query("page", "2")` | `GET https://api.example.com/v1/search?q=green%20tea&page=2` |
+| `Method.put`, `Path("cart")`, `Method.delete` | `DELETE https://api.example.com/cart` |
+| `Header("Accept", "text/plain")`, `Body(json)`, `Header("Accept", "application/json")` | body `json`, `Content-Type: application/json`, `Accept: application/json` |
+
+## Constraints
+
+- Every builder method works on `[Part]`, so the pieces always combine by concatenation.
+- Build URLs with Foundation (`URL.append(path:)` and `URLComponents`) rather than gluing strings, so segments and values are percent-encoded for you.
+- No shared state: `request` is a pure function of its base URL and the closure.
+
+<Hints>
+<Hint>
+The compiler rewrites the closure into calls: each line goes through the `buildExpression` overload for its type, and the results are passed together to `buildBlock`. So `buildBlock(_ parts: [Part]...)` only has to flatten.
+</Hint>
+<Hint>
+`if` without `else` becomes `buildOptional` with `nil` when the condition is false. `if`–`else` becomes `buildEither(first:)` or `buildEither(second:)`. A `for` loop collects each iteration's block into an array and calls `buildArray`. All four only flatten or unwrap.
+</Hint>
+<Hint>
+In `request`, walk the parts once, collecting the method, the query items, the headers and the body, and appending path segments to a copy of the URL as you go. Add the query with `URLComponents` only if there is one, because setting `queryItems` to an empty array leaves a trailing `?`.
+</Hint>
+</Hints>
+
+## Solutions
+
+<Approach title="A builder of [Part], then one pass to build the request" time="O(p) for p parts" space="O(p)">
+
+```swift
+@resultBuilder
+public enum Builder {
+    public static func buildExpression(_ method: Method) -> [Part] { [.method(method)] }
+    public static func buildExpression(_ path: Path) -> [Part] { path.segments.map(Part.path) }
+    public static func buildExpression(_ query: Query) -> [Part] { [.query(name: query.name, value: query.value)] }
+    public static func buildExpression(_ header: Header) -> [Part] { [.header(name: header.name, value: header.value)] }
+    public static func buildExpression(_ body: Body) -> [Part] {
+        [.header(name: "Content-Type", value: body.contentType), .body(body.data)]
+    }
+
+    public static func buildBlock(_ parts: [Part]...) -> [Part] { parts.flatMap { $0 } }
+    public static func buildOptional(_ parts: [Part]?) -> [Part] { parts ?? [] }
+    public static func buildEither(first parts: [Part]) -> [Part] { parts }
+    public static func buildEither(second parts: [Part]) -> [Part] { parts }
+    public static func buildArray(_ parts: [[Part]]) -> [Part] { parts.flatMap { $0 } }
+}
+
+public static func request(_ base: URL, @Builder _ build: () -> [Part]) -> URLRequest {
+    var url = base
+    var method = Method.get
+    var query: [URLQueryItem] = []
+    var headers: [(String, String)] = []
+    var body: Data?
+
+    for part in build() {
+        switch part {
+        case .method(let chosen): method = chosen
+        case .path(let segment): url.append(path: segment)
+        case .query(let name, let value): query.append(URLQueryItem(name: name, value: value))
+        case .header(let name, let value): headers.append((name, value))
+        case .body(let data): body = data
+        }
+    }
+
+    if !query.isEmpty, var components = URLComponents(url: url, resolvingAgainstBaseURL: false) {
+        components.queryItems = (components.queryItems ?? []) + query
+        url = components.url ?? url
+    }
+
+    var request = URLRequest(url: url)
+    request.httpMethod = method.rawValue
+    for (name, value) in headers {
+        request.setValue(value, forHTTPHeaderField: name)
+    }
+    request.httpBody = body
+    return request
+}
+```
+
+Two decisions keep this small. **One component type:** because everything is `[Part]`, `buildBlock` never has to deal with mixed types, which is what makes SwiftUI's `ViewBuilder` so much more complicated (it keeps each child's concrete type). **`buildExpression` overloads** let each DSL word be its own small type with its own initialiser, and also act as a whitelist: a stray `print(...)` or `42` on a line is a compile error, not a silently ignored statement.
+
+Compared with a fluent builder (`.method(.post).path("orders")`), the DSL wins when parts are conditional or repeated: `if` and `for` read naturally, where a fluent chain needs temporary variables. It loses on discoverability (autocomplete can't list the words after a dot) and on error messages, which the compiler reports against the rewritten code.
+
+</Approach>

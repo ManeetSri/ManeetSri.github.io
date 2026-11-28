@@ -1,0 +1,405 @@
+## Why it matters
+
+Undo, a Cancel button on an edit sheet, an autosaved draft, and putting the user back where they were after iOS terminated your app in the background all need the same thing: a snapshot of state you can return to later. The **Memento** pattern is the discipline for taking those snapshots without exposing what's inside them. In Swift, value types make snapshots almost free, which changes how you design undo, and interviewers like it because the obvious version has a subtle aliasing bug.
+
+## The pattern: originator, memento, caretaker
+
+The Gang of Four's intent: capture and externalise an object's internal state, without violating its encapsulation, so it can be restored to that state later. Three roles:
+
+- The **originator** is the object whose state matters: a document, a canvas, a form. It can make a memento of itself and restore itself from one.
+- The **memento** is the snapshot. To everyone except the originator, it's **opaque**: a sealed envelope.
+- The **caretaker** keeps mementos (an undo stack, a restoration store) and hands them back. It never looks inside.
+
+Why insist on opacity? Because the caretaker would otherwise depend on the originator's internals. An undo stack that reads `snapshot.strokes` breaks when the canvas changes how it stores strokes. An opaque memento lets the originator change freely, and lets one generic caretaker serve many originators.
+
+## In Swift, a value is already a memento
+
+When the state is a struct, `let snapshot = canvas` is a complete, independent copy. Arrays and strings inside it use **copy-on-write**: the copy shares storage with the original until one of them is changed, so taking a snapshot costs almost nothing, and an edit copies only what it touches.
+
+The run below builds the three roles. The memento wraps the canvas in a property only the originator's file can read; the caretaker keeps a bounded undo stack and a redo stack. At the end, it shows the trap.
+
+```swift run title="Originator, memento and caretaker"
+struct Canvas {
+    var strokes: [String] = []
+    var colour = "black"
+}
+
+// The originator: it makes mementos of itself and restores from them
+final class Sketch {
+    struct Memento {
+        fileprivate let canvas: Canvas   // in an app, only Sketch's file can read this
+    }
+
+    private(set) var canvas = Canvas()
+
+    func draw(_ stroke: String) { canvas.strokes.append(stroke) }
+    func save() -> Memento { Memento(canvas: canvas) }
+    func restore(_ memento: Memento) { canvas = memento.canvas }
+}
+
+// The caretaker: it keeps mementos and never looks inside them
+struct History {
+    let limit: Int
+    private var undoStack: [Sketch.Memento] = []
+    private var redoStack: [Sketch.Memento] = []
+
+    init(limit: Int) {
+        self.limit = limit
+    }
+
+    mutating func willChange(from current: Sketch.Memento) {
+        undoStack.append(current)
+        if undoStack.count > limit { undoStack.removeFirst() }
+        redoStack.removeAll()   // a new edit starts a new branch
+    }
+
+    mutating func undo(from current: Sketch.Memento) -> Sketch.Memento? {
+        guard let previous = undoStack.popLast() else { return nil }
+        redoStack.append(current)
+        return previous
+    }
+
+    var canRedo: Bool { !redoStack.isEmpty }
+
+    mutating func redo(from current: Sketch.Memento) -> Sketch.Memento? {
+        guard let next = redoStack.popLast() else { return nil }
+        undoStack.append(current)
+        return next
+    }
+}
+
+let sketch = Sketch()
+var history = History(limit: 3)
+
+@MainActor func draw(_ stroke: String) {
+    history.willChange(from: sketch.save())
+    sketch.draw(stroke)
+}
+
+for stroke in ["sun", "hill", "tree", "house"] { draw(stroke) }
+print("drawn:", sketch.canvas.strokes)
+
+while let previous = history.undo(from: sketch.save()) {
+    sketch.restore(previous)
+}
+print("undo all:", sketch.canvas.strokes, "(the limit of 3 dropped the oldest step)")
+
+if let next = history.redo(from: sketch.save()) { sketch.restore(next) }
+print("redo:", sketch.canvas.strokes)
+
+draw("river")
+print("new edit:", sketch.canvas.strokes, "· can redo:", history.canRedo)
+
+// A struct that holds class instances copies the references, not the objects
+final class Layer {
+    var name: String
+    init(name: String) { self.name = name }
+}
+
+struct Board {
+    var layers: [Layer]
+}
+
+var board = Board(layers: [Layer(name: "Background")])
+let snapshot = board
+board.layers[0].name = "Sky"
+print("snapshot sees:", snapshot.layers[0].name)
+```
+
+```output
+drawn: ["sun", "hill", "tree", "house"]
+undo all: ["sun"] (the limit of 3 dropped the oldest step)
+redo: ["sun", "hill"]
+new edit: ["sun", "hill", "river"] · can redo: false
+snapshot sees: Sky
+```
+
+Three design decisions are visible in the output:
+
+- **The history is bounded.** With a limit of 3, undoing everything stops at `["sun"]`: the oldest step was dropped. Unbounded history is a memory leak with a nice name.
+- **A new edit clears redo.** After undoing, drawing "river" starts a new branch, and redoing into the old branch would make no sense.
+- **A copy is only as deep as its values.** `Board` is a struct, but its layers are class instances, so the "snapshot" shares them and sees "Sky". A memento must be made of values all the way down, or it copies the class instances explicitly.
+
+In this single-file program `fileprivate` hides nothing. In an app, `Sketch` and its `Memento` live in their own file, so the undo stack in another file can hold a memento but can't read or change what's inside it. That's opacity, enforced by the compiler.
+
+## Snapshot undo vs command undo
+
+In [Command and UndoManager](/design/learn/sd-behavioural-command) you undid edits by running each command's inverse. Snapshots are the other way to undo: restore the state as it was before.
+
+- **Commands** store a small description of each change, and need an inverse that's exactly right. Inverses are where undo bugs live: "undo delete" must put the item back at the right index with the right identity.
+- **Mementos** store the whole state (or the part that changed), and can't get the inverse wrong, because there isn't one. They cost memory proportional to the state's size times the history's length.
+
+You don't have to choose one machinery. `UndoManager` is happy to restore snapshots: register an undo that puts the old value back.
+
+```swift check title="Snapshot undo with UndoManager"
+import Foundation
+
+struct Note: Equatable {
+    var title: String
+    var body: String
+}
+
+@MainActor
+final class NoteEditor {
+    private(set) var note: Note
+    let undoManager = UndoManager()
+
+    init(note: Note) {
+        self.note = note
+        undoManager.levelsOfUndo = 50   // bound the history
+    }
+
+    func setTitle(_ title: String) {
+        change { $0.title = title }
+        undoManager.setActionName("Rename")
+    }
+
+    private func change(_ edit: (inout Note) -> Void) {
+        let before = note                 // the memento: a complete, independent copy
+        edit(&note)
+        undoManager.registerUndo(withTarget: self) { editor in
+            editor.restore(before)
+        }
+    }
+
+    private func restore(_ snapshot: Note) {
+        let current = note
+        note = snapshot
+        // Registering during an undo records the redo step
+        undoManager.registerUndo(withTarget: self) { editor in
+            editor.restore(current)
+        }
+    }
+}
+```
+
+Hand the system this undo manager (return it from your view controller's `undoManager` property, or register with the one SwiftUI provides as `@Environment(\.undoManager)`) and you get the system's undo for free: shake to undo, ⌘Z on a hardware keyboard, and the Undo menu items on iPad and Mac, all of which find it through the responder chain. Typing is the usual exception to "one snapshot per change": group keystrokes into one undo step, as text views do, or a sentence takes fifty undos.
+
+## Cancel is a memento too
+
+An edit sheet with Save and Cancel is a memento in disguise. Edit a **copy**; the original is the snapshot. Save writes the copy back, Cancel throws it away, and there's nothing to restore because the original was never touched.
+
+```swift check ios title="Editing a copy in SwiftUI"
+import SwiftUI
+
+struct Profile: Equatable {
+    var name: String
+    var bio: String
+}
+
+struct ProfileEditor: View {
+    let original: Profile
+    let onSave: (Profile) -> Void
+    @State private var draft: Profile
+    @Environment(\.dismiss) private var dismiss
+
+    init(profile: Profile, onSave: @escaping (Profile) -> Void) {
+        original = profile
+        self.onSave = onSave
+        _draft = State(initialValue: profile)   // edit a copy; the original is the snapshot
+    }
+
+    var body: some View {
+        NavigationStack {
+            Form {
+                TextField("Name", text: $draft.name)
+                TextField("Bio", text: $draft.bio, axis: .vertical)
+            }
+            .toolbar {
+                ToolbarItem(placement: .cancellationAction) {
+                    Button("Cancel") { dismiss() }
+                }
+                ToolbarItem(placement: .confirmationAction) {
+                    Button("Save") {
+                        onSave(draft)
+                        dismiss()
+                    }
+                    .disabled(draft == original)
+                }
+            }
+            .interactiveDismissDisabled(draft != original)   // no swipe-away with unsaved changes
+        }
+    }
+}
+```
+
+Comparing the draft with the original also gives you "has anything changed?" for free, which disables Save and blocks the swipe-to-dismiss that would lose edits. Core Data and SwiftData offer the same idea at the store level: `rollback()` on a context discards every unsaved change, returning to the last saved state.
+
+## Mementos that outlive the process
+
+iOS suspends your app in the background and can terminate it at any moment to reclaim memory, without running any more of your code. Users still expect to come back to the half-written message and the scroll position they left. **State restoration** is a memento that's written to disk while you still can, and read back at the next launch.
+
+```visual timeline
+title: A draft survives the app being terminated
+unit: min
+lanes:
+  - { id: user, label: User }
+  - { id: app, label: App }
+  - { id: disk, label: Restoration data }
+spans:
+  - { lane: user, from: 0, to: 3, label: writing a draft, tone: active }
+  - { lane: user, from: 3, to: 30, label: using other apps, tone: wait }
+  - { lane: app, from: 0, to: 3, label: running }
+  - { lane: app, from: 3, to: 4, label: snapshot, tone: active }
+  - { lane: app, from: 4, to: 12, label: suspended, tone: wait }
+  - { lane: app, from: 30, to: 32, label: relaunch and restore, tone: ok }
+  - { lane: disk, from: 4, to: 32, label: "draft id + cursor", tone: ok }
+markers:
+  - { at: 12, label: iOS terminates the app }
+  - { at: 30, label: user returns }
+steps:
+  - { at: 2, say: "The user is halfway through a draft. Everything is in memory." }
+  - { at: 4, say: "Moving to the background, the scene is asked for its **restoration activity**. This is the last moment to write the memento." }
+  - { at: 12, say: "Memory is tight, so iOS terminates the suspended app. None of your code runs: whatever wasn't saved is gone." }
+  - { at: 32, say: "The user returns. The scene reconnects with the saved activity, and the app rebuilds the screen from the snapshot." }
+```
+
+In SwiftUI, `@SceneStorage("key")` is a per-scene memento for small values (strings, numbers, `Bool`, `URL`, `Data`, and `RawRepresentable` enums): the selected tab, the id of the open item. In UIKit, the scene delegate hands iOS an `NSUserActivity` when the scene goes to the background, and reads it back on reconnect:
+
+```swift check ios title="A versioned restoration memento in UIKit"
+import UIKit
+
+struct ComposeSnapshot: Codable {
+    static let currentVersion = 2
+    var version = ComposeSnapshot.currentVersion
+    var draftID: UUID
+    var cursorLocation: Int
+}
+
+final class SceneDelegate: UIResponder, UIWindowSceneDelegate {
+    static let composeActivity = "com.example.notes.compose"   // also listed under NSUserActivityTypes in Info.plist
+    var window: UIWindow?
+    var currentSnapshot: ComposeSnapshot?
+
+    // Going to the background: hand iOS the memento to keep
+    func stateRestorationActivity(for scene: UIScene) -> NSUserActivity? {
+        guard let snapshot = currentSnapshot, let data = try? JSONEncoder().encode(snapshot) else { return nil }
+        let activity = NSUserActivity(activityType: Self.composeActivity)
+        activity.addUserInfoEntries(from: ["snapshot": data])
+        return activity
+    }
+
+    // Relaunched: read it back, and start fresh if anything about it is wrong
+    func scene(_ scene: UIScene, willConnectTo session: UISceneSession, options connectionOptions: UIScene.ConnectionOptions) {
+        guard let activity = session.stateRestorationActivity,
+              activity.activityType == Self.composeActivity,
+              let data = activity.userInfo?["snapshot"] as? Data,
+              let snapshot = try? JSONDecoder().decode(ComposeSnapshot.self, from: data),
+              snapshot.version == ComposeSnapshot.currentVersion else { return }
+        currentSnapshot = snapshot   // open the draft by id and put the cursor back
+    }
+}
+```
+
+A persisted memento has rules an in-memory one doesn't:
+
+- **Version it.** The snapshot written by today's build is read by next month's. Store a version, and migrate or discard old ones.
+- **Fail soft.** If decoding fails, restore nothing. A crash at launch on every launch, until the user deletes the app, is far worse than an empty screen.
+- **Store identifiers, not objects.** Save the draft's id and the cursor, not the draft's text and attachments; the draft itself already lives in your database. Restoration data should be small.
+- **Don't restore what shouldn't come back.** A half-finished payment, a one-time code, an alert about an error that's no longer true. And never secrets: restoration data isn't the Keychain.
+
+D16 and D20 cover the restoration lifecycle and restoring whole navigation stacks; the memento rules above apply to all of it.
+
+## Trade-offs
+
+| | Snapshot undo (memento) | Command undo | Edit a copy | Persisted restoration memento |
+| --- | --- | --- | --- | --- |
+| Correctness risk | Low: no inverse to get wrong | Each inverse must be exact | Very low | Versioning and decoding |
+| Memory | State size × history length (shared storage helps) | Small per step | One copy | Small, if it stores ids |
+| Granularity | Whole state, or a slice | Exactly one change | All or nothing | Where the user was, not everything |
+| Survives termination | No | No | No | Yes, by design |
+| Merging with other edits (sync, collaboration) | Poor: a snapshot overwrites | Good: operations can be rebased | Poor | Not its job |
+
+**Snapshots** win when state is small or structurally shared, and inverses would be fiddly: a drawing, a form, a filter panel. **Commands** win when state is large (a long document) or edits must merge with other people's: collaborative editors send operations, never whole snapshots. **Edit a copy** is the default for any modal edit. **Restoration** is a separate, persisted memento, and should hold the least that rebuilds the screen.
+
+<Callout kind="interview">
+
+If an interviewer asks you to add undo, ask what the state looks like and how big it gets, then choose: "the filter panel's state is a small struct, so I'd snapshot it; for the document I'd record operations, because they're small and they'll merge with sync later." Mention bounding the history and grouping keystrokes. For restoration, say what you'd persist (ids, not content) and how you'd version it. Red flags: snapshotting a class instance (every entry aliases one object), unbounded history, and restoring with `try!`.
+
+</Callout>
+
+<Callout kind="gotcha" title="Swift gotcha: a struct full of classes isn't a snapshot">
+
+Copying a struct copies its stored properties. If those are class references (a view model, an `NSMutableAttributedString`, a `Layer` object), the snapshot and the live state share them, and every "snapshot" changes as the user edits. Make the state values all the way down, or copy the reference types explicitly (`copy()` on `NSCopying` types) when you take the memento.
+
+</Callout>
+
+<Callout kind="gotcha" title="iOS gotcha: @SceneStorage is per scene, and it's temporary">
+
+Each window on iPad has its own `@SceneStorage`, which is what you want for "where was I in this window". It's discarded when the user removes the scene from the app switcher, and Apple advises against putting sensitive data in it. Durable things, like the draft itself, belong in your own storage; scene storage holds only the pointer back to them.
+
+</Callout>
+
+## Practice
+
+**Review a draft editor's undo history** is an architecture review of a compose screen whose undo history and autosave look fine on a quick read. Find why undo does nothing, what happens to memory with photos attached, what the autosave does to typing, and what an app update does to the saved draft.
+
+```cards
+- id: memento-roles
+  front: "What are the three roles in the Memento pattern?"
+  back: "The originator makes and restores snapshots of itself, the memento is the snapshot (opaque to everyone else), and the caretaker keeps mementos without looking inside."
+- id: value-memento
+  front: "Why are Swift structs natural mementos, and when aren't they?"
+  back: "Copying a struct gives an independent value, and copy-on-write makes it cheap. It stops being a snapshot when the struct holds class references, which the copy shares."
+- id: snapshot-vs-command
+  front: "When does command undo beat snapshot undo?"
+  back: "When state is large, or edits must merge with other people's or with sync: operations are small and can be rebased, while a snapshot overwrites everything."
+- id: persisted-memento
+  front: "What rules apply to a restoration memento that a memory-only one escapes?"
+  back: "Version it, fail soft on decode errors, store identifiers rather than content, and don't restore transient or sensitive state."
+```
+
+```quiz
+- id: q1
+  type: output
+  prompt: "What does this print?"
+  code: |
+    final class Draft {
+        var text = ""
+    }
+
+    var history: [Draft] = []
+    let draft = Draft()
+    for word in ["Dear", "Dear Sam", "Dear Sam,"] {
+        history.append(draft)
+        draft.text = word
+    }
+    print(history.map(\.text))
+  answer: "[\"Dear Sam,\", \"Dear Sam,\", \"Dear Sam,\"]"
+  explain: "`Draft` is a class, so every history entry is the same object, and each shows its latest text. With `struct Draft` the entries would be `[\"\", \"Dear\", \"Dear Sam\"]`: three real snapshots."
+- id: q2
+  type: mcq
+  prompt: "A long-form writing app syncs documents between a user's iPhone and Mac. Which undo design fits best?"
+  options:
+    - "Snapshot the whole document before every keystroke"
+    - "Record each edit as an operation with an inverse, grouped by typing pauses"
+    - "Save the document to UserDefaults on every change and reload it on undo"
+    - "Edit a copy and discard it on undo"
+  answer: 1
+  explain: "Documents are large, and edits must merge with changes arriving from the other device. Small operations do both; whole snapshots would cost memory and overwrite remote edits when restored."
+- id: q3
+  type: multi
+  prompt: "You persist a restoration memento for a compose screen. Which belong in it? Choose all that apply."
+  options:
+    - "The draft's identifier"
+    - "The cursor position"
+    - "The full text and photo data of the draft"
+    - "A schema version"
+    - "The one-time code the user was typing to verify their phone number"
+  answer: [0, 1, 3]
+  explain: "Keep it small and safe: an id to find the draft, where the user was, and a version so later builds can read it. The content already lives in your store, and a one-time code is both transient and sensitive."
+- id: q4
+  type: truefalse
+  prompt: "In an edit sheet that edits a copy of the model, Cancel has to restore the model from a saved snapshot."
+  answer: false
+  explain: "The original was never touched: the copy was the thing being edited. Cancel throws the copy away, and Save writes it back."
+- id: q5
+  type: order
+  prompt: "Put the steps of a correct snapshot undo in order, for one edit followed by an undo."
+  lines:
+    - "Copy the current state as a memento"
+    - "Push the memento on the undo stack and clear the redo stack"
+    - "Apply the edit to the live state"
+    - "On undo, push a memento of the current state on the redo stack"
+    - "Restore the state from the memento popped off the undo stack"
+  explain: "The snapshot is taken before the change, a new edit invalidates redo, and undo saves where you are before going back, so redo can return."

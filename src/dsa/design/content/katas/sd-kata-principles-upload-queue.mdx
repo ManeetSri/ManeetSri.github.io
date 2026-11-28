@@ -1,0 +1,113 @@
+A photo app uploads in the background with several workers at once. The first version of its queue had a query that changed state and a check-then-act across two calls, and once in a while the same photo uploaded twice:
+
+```swift
+// The old API, as workers used it
+if let next = await queue.peekNext() {        // a query...
+    await queue.markUploading(next.id)        // ...then a command: another worker can get in between
+    try await upload(next)
+}
+let pending = await queue.pendingJobs         // a property that also dropped expired jobs
+```
+
+Write the replacement, an actor that follows command–query separation everywhere it can, and breaks it in exactly one place, on purpose.
+
+`PrinciplesUploadQueue.Queue(maxAttempts:)`
+
+- **Queries**, with no side effects: `waitingCount` (jobs waiting to be claimed) and `status(of:) -> Status?` (`nil` for an id the queue has never seen).
+- **Commands**, which return nothing:
+  - `enqueue(id:fileName:)` adds a job to the back of the line. An id the queue already knows is ignored, whatever its status, so a retried enqueue can't duplicate a job.
+  - `complete(_:)` marks an uploading job `.done`.
+  - `fail(_:)` sends an uploading job to the back of the line to try again, or marks it `.failed` once it has been claimed `maxAttempts` times.
+  - `complete` and `fail` ignore any job that isn't uploading, so a duplicate or late call is harmless.
+- **The one exception:** `claimNext() -> Job?` takes the job at the front of the line, marks it `.uploading(attempt:)` and returns it, all in one step. It's a command that reports what it did, like `popLast()`, so two workers can never claim the same job.
+
+## Examples
+
+| Calls | Result |
+| --- | --- |
+| enqueue `a`, enqueue `b`, `claimNext()` × 3 | `a` (attempt 1), `b` (attempt 1), `nil` |
+| enqueue `a` twice, `waitingCount` | `1` |
+| `maxAttempts: 2`: claim `a`, `fail("a")`, claim, `fail("a")` | `.waiting` after the first failure, `.failed` after the second; the retry is attempt 2 |
+| enqueue `a`, `complete("a")` before claiming it | nothing changes: `a` is still `.waiting` |
+| 60 jobs, 8 workers each looping on `claimNext()` | every job claimed exactly once, and all `.done` |
+
+## Constraints
+
+- `maxAttempts` below 1 is treated as 1.
+- A job that's failed or done stays that way; enqueueing its id again does nothing.
+- Retries go to the back of the line, behind jobs that haven't had a turn yet.
+- Every method runs on the actor, so nothing inside a method needs an `await`. Keep it that way: an `await` inside `claimNext()` would let another worker in halfway through.
+
+<Hints>
+<Hint>
+Keep two pieces of state: a dictionary from id to an entry (file name, status, number of claims) and an array of waiting ids, front first. The queries read them; only the commands write.
+</Hint>
+<Hint>
+`guard case .uploading = entries[id]?.status else { return }` is a compact way to ignore commands for jobs that aren't uploading, including unknown ids.
+</Hint>
+<Hint>
+In `claimNext()`, remove the id from the line, bump its claim count, set `.uploading(attempt:)` and build the `Job`, with no suspension point in between. The actor guarantees nobody else runs during that.
+</Hint>
+</Hints>
+
+## Solutions
+
+<Approach title="An actor with pure queries, idempotent commands and one atomic claim" time="O(1) per call, except claimNext's removeFirst, O(n)" space="O(n)">
+
+```swift
+public actor Queue {
+    private struct Entry {
+        let fileName: String
+        var status: Status
+        var claims = 0
+    }
+
+    private let maxAttempts: Int
+    private var entries: [String: Entry] = [:]
+    private var line: [String] = []          // waiting ids, front first
+
+    public init(maxAttempts: Int = 3) {
+        self.maxAttempts = max(1, maxAttempts)
+    }
+
+    public var waitingCount: Int { line.count }
+
+    public func status(of id: String) -> Status? { entries[id]?.status }
+
+    public func enqueue(id: String, fileName: String) {
+        guard entries[id] == nil else { return }
+        entries[id] = Entry(fileName: fileName, status: .waiting)
+        line.append(id)
+    }
+
+    public func claimNext() -> Job? {
+        guard !line.isEmpty, var entry = entries[line[0]] else { return nil }
+        let id = line.removeFirst()
+        entry.claims += 1
+        entry.status = .uploading(attempt: entry.claims)
+        entries[id] = entry
+        return Job(id: id, fileName: entry.fileName, attempt: entry.claims)
+    }
+
+    public func complete(_ id: String) {
+        guard case .uploading = entries[id]?.status else { return }
+        entries[id]?.status = .done
+    }
+
+    public func fail(_ id: String) {
+        guard case .uploading(let attempt) = entries[id]?.status else { return }
+        if attempt >= maxAttempts {
+            entries[id]?.status = .failed
+        } else {
+            entries[id]?.status = .waiting
+            line.append(id)
+        }
+    }
+}
+```
+
+The queue is the information expert on every job's status and the creator of the `Job` values it hands out, which is why nothing outside can get its books wrong. Workers receive immutable `Job` values, so a worker holding one can't change the queue's state by accident; only commands can.
+
+Making `complete` and `fail` ignore calls that don't apply makes them **idempotent**: calling one twice has the same effect as calling it once. That matters in real upload code, where a retry after a timeout can report the same result twice. For a long queue, replace the array with a deque, such as `Deque` from the swift-collections package, so claiming stays O(1).
+
+</Approach>

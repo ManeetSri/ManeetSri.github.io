@@ -1,0 +1,302 @@
+## Why it matters
+
+A hand-written composition root is plain code: clear, checked by the compiler, and longer with every service you add. A **DI container** is a library that does the wiring for you: you register how to build each type and for how long it lives, then ask for the type you want and the container builds everything it needs. Swinject and Factory are the two most common in iOS codebases, and you'll meet one in most large apps. Interviewers ask about them to see whether you know what a container buys, what it costs, and the one rule that keeps it from turning into a service locator.
+
+## What a container does
+
+Every container, in any language, does three jobs:
+
+1. **Registration.** For each type, a factory (how to build it) and a lifetime (transient, singleton, scoped).
+2. **Resolution.** Ask for a type and the container calls its factory, which asks the container for the factory's own dependencies, and so on down the graph.
+3. **Lifetime management.** It keeps singletons, scopes instances to child containers, and builds transients fresh.
+
+Java and C# containers add **auto-wiring**: they read a class's constructor by reflection and resolve its parameters without being told. Swift has no runtime reflection of initialisers, so Swift containers make you write each factory closure yourself (Swinject has an add-on, SwinjectAutoregistration, that generates them for initialisers with up to about twenty parameters). That's worth knowing, because it shrinks the container's main benefit: you still write a line of wiring per type.
+
+Here's one resolution, step by step:
+
+```visual sequence
+title: Resolving a checkout screen's model
+participants:
+  - { id: root, label: Scene delegate }
+  - { id: session, label: Session container }
+  - { id: app, label: App container }
+  - { id: factory, label: Factories }
+messages:
+  - [root, session, "resolve(CheckoutModel)", { say: "The composition root asks the **session's** child container for a checkout model. This is the only resolve call in the app's own code." }]
+  - [session, app, "not here: ask parent", { say: "`CheckoutModel` was registered by the app container, so the child passes the lookup up to its parent." }]
+  - [app, factory, "CheckoutModel factory", { say: "It's transient: the container runs its factory, which needs two dependencies." }]
+  - [factory, session, "resolve(Basket)", { say: "The factory resolves from the container that was asked, so it can reach the session's own services." }]
+  - [session, factory, "this session's basket", { reply: true, say: "`Basket` is registered in the session container as a singleton for that session: built once at sign-in, returned every time." }]
+  - [factory, app, "resolve(PaymentsClient)"]
+  - [app, factory, "the app's one client", { reply: true, say: "`PaymentsClient` is an app-wide singleton, already built, so the cached instance comes back." }]
+  - [factory, root, "new CheckoutModel", { reply: true, say: "The model is built with both and returned. Nothing inside `CheckoutModel` knows a container exists: it took both through its initialiser." }]
+```
+
+That last sentence is the point. A container used well is **invisible to the code it builds**.
+
+## Swinject
+
+Swinject is one of the oldest Swift containers, modelled on .NET's. Registration and resolution look like this (it's a third-party library, so this isn't compiled here):
+
+```swift
+import Swinject
+
+let app = Container()
+app.register((any PaymentsClient).self) { _ in LivePaymentsClient(session: .shared) }
+    .inObjectScope(.container)                       // one for the container's lifetime
+app.register(CheckoutModel.self) { resolver in       // default scope: .graph
+    CheckoutModel(basket: resolver.resolve(Basket.self)!, payments: resolver.resolve((any PaymentsClient).self)!)
+}
+
+// At sign-in: a child container for the session
+let session = Container(parent: app)
+session.register(Basket.self) { _ in Basket(userID: "ana") }.inObjectScope(.container)
+
+let checkout = session.resolve(CheckoutModel.self)   // CheckoutModel?: nil if anything is missing
+```
+
+The features to know:
+
+- **Object scopes.** `.transient` (always new), `.graph` (the default: shared within one top-level `resolve`, new for the next), `.container` (a singleton for that container and its children) and `.weak` (shared while someone holds it). Custom scopes can be reset with `resetObjectScope(_:)`.
+- **Child containers.** `Container(parent:)` sees its parent's registrations and adds its own: a natural session scope. Drop the child and its singletons go with it.
+- **Assemblies.** An `Assembly` groups one module's registrations, and an `Assembler` combines them at launch, so each feature package can own its wiring.
+- **Thread safety.** Resolution isn't thread-safe by default; `container.synchronize()` returns a resolver that is.
+- **Circular dependencies.** Supported by resolving one side in an `initCompleted` callback and setting it as a property: property injection, done by the container.
+- **Storyboards.** SwinjectStoryboard injects into view controllers that storyboards create.
+
+And its costs:
+
+- **Every mistake is a run-time mistake.** `resolve` returns an optional. A missing registration, a typo in the type, or registering `LivePaymentsClient.self` while resolving `(any PaymentsClient).self` gives `nil`, and the `!` crashes when that screen opens, possibly only on a path QA didn't take.
+- **The types don't say what's needed.** Nothing stops a registration for `CheckoutModel` being deleted while three screens still resolve it.
+- **It predates strict concurrency.** Its resolvers and factory closures aren't `Sendable`-checked, so Swift 6 apps keep resolution on one actor (usually the main actor, at the composition root) and register types that are themselves `Sendable` where they cross actors.
+
+## Factory
+
+Factory takes a different approach: each registration is a **computed property** on a container, so resolving something that doesn't exist won't compile. Version 3 (the current one, imported as `FactoryKit`) looks like this:
+
+```swift
+import FactoryKit
+
+extension Container {
+    var paymentsClient: Factory<any PaymentsClient> {
+        self { LivePaymentsClient(session: .shared) }.singleton
+    }
+
+    var checkoutModel: Factory<CheckoutModel> {
+        self { CheckoutModel(basket: self.basket(), payments: self.paymentsClient()) }
+    }
+
+    var basket: Factory<Basket> {
+        self { Basket() }.scope(.session)              // a custom scope you declare, reset at sign-out
+    }
+}
+
+// Resolving: call the factory
+let model = Container.shared.checkoutModel()
+
+// Or a property wrapper, which resolves from Container.shared
+final class ReceiptsModel {
+    @Injected(\.paymentsClient) private var payments
+}
+
+// Tests and previews: replace one registration
+Container.shared.paymentsClient.register { FakePaymentsClient() }
+```
+
+The features to know:
+
+- **Compile-time-safe lookups.** `Container.shared.checkoutModel()` must name a property that exists, so there's no "missing registration" crash. A factory always has a default.
+- **Scopes:** `unique` (the default: new every time), `.singleton`, `.cached` (kept until the cache is reset), `.shared` (weak) and custom scopes such as `.scope(.session)`.
+- **Contexts** let a registration change in a particular environment: `.onPreview { … }`, `.onTest { … }`, `.onDebug { … }` and `.onArg("mock-payments") { … }` for a launch argument, which is handy for UI tests.
+- **Swift Testing support:** version 3's `.container` trait gives each test a fresh shared container, so tests that register fakes can run in parallel.
+
+And its costs:
+
+- **`Container.shared` is a global.** `@Injected` and `Container.shared.x()` inside a model are service-locator calls: the dependencies vanish from the initialiser, and tests must register fakes into the container rather than pass them. Factory works well as DI when you resolve at the root and pass values down, and as a locator when you resolve everywhere. The library supports both; the team decides which it is.
+- **Defaults hide wiring mistakes.** Because every factory has a default, a test that forgets to register a fake quietly uses the live one, unless a context such as `.onTest` says otherwise.
+- **Scopes are global per container.** A `.scope(.session)` is reset explicitly at sign-out; forget the reset and the next user gets the last user's basket.
+
+## Using any container well
+
+Whichever you pick, the same rules decide whether it helps:
+
+- **Resolve at the composition root only**, plus the framework-created entry points that can't receive injection. Everything else receives its dependencies through initialisers and never imports the container.
+- **Never inject the container itself.** An object that holds a resolver can fetch anything, which is a service locator with extra steps.
+- **Keep registrations next to the code they register.** One assembly (or one container extension) per feature module, combined at launch.
+- **Verify the graph in a test.** For a runtime container, a single test that resolves every top-level type turns "crashes when the user opens Settings" into a red build:
+
+```swift run title="A container smoke test finds missing registrations before users do"
+struct NotRegistered: Error, CustomStringConvertible {
+    let type: String
+    var description: String { "nothing is registered for \(type)" }
+}
+
+/// The smallest possible runtime container: a type-keyed table of factories
+final class Container {
+    private var factories: [ObjectIdentifier: (Container) throws -> Any] = [:]
+
+    func register<T>(_ type: T.Type, factory: @escaping (Container) throws -> T) {
+        factories[ObjectIdentifier(type)] = factory
+    }
+
+    func resolve<T>(_ type: T.Type) throws -> T {
+        guard let factory = factories[ObjectIdentifier(type)], let value = try factory(self) as? T else {
+            throw NotRegistered(type: String(describing: type))
+        }
+        return value
+    }
+}
+
+protocol PaymentsClient {}
+struct LivePaymentsClient: PaymentsClient {}
+struct Basket {}
+struct TripsModel {}
+struct CheckoutModel {
+    let basket: Basket
+    let payments: any PaymentsClient
+}
+struct SettingsModel {
+    let payments: any PaymentsClient
+}
+
+let container = Container()
+container.register(Basket.self) { _ in Basket() }
+container.register(TripsModel.self) { _ in TripsModel() }
+// The bug: the concrete type is registered, but every factory asks for the protocol
+container.register(LivePaymentsClient.self) { _ in LivePaymentsClient() }
+container.register(CheckoutModel.self) { try CheckoutModel(basket: $0.resolve(Basket.self), payments: $0.resolve((any PaymentsClient).self)) }
+container.register(SettingsModel.self) { try SettingsModel(payments: $0.resolve((any PaymentsClient).self)) }
+
+// The smoke test: resolve every screen's model, as the app eventually will
+let screens: [(String, () throws -> Any)] = [
+    ("TripsModel", { try container.resolve(TripsModel.self) }),
+    ("CheckoutModel", { try container.resolve(CheckoutModel.self) }),
+    ("SettingsModel", { try container.resolve(SettingsModel.self) }),
+]
+for (name, resolve) in screens {
+    do {
+        _ = try resolve()
+        print("ok      \(name)")
+    } catch {
+        print("FAILED  \(name): \(error)")
+    }
+}
+```
+
+```output
+ok      TripsModel
+FAILED  CheckoutModel: nothing is registered for PaymentsClient
+FAILED  SettingsModel: nothing is registered for PaymentsClient
+```
+
+Without the smoke test, this app launches fine and crashes the first time someone opens checkout. With a hand-written root, the same mistake wouldn't compile.
+
+## When a container earns its place
+
+Most iOS apps don't need one. A Swift composition root is short code with compile-time checking, and Swift's lack of auto-wiring removes much of what containers save in other languages. A container starts to pay when:
+
+- **The graph is large and deeply scoped**, with many child scopes created at run time, and hand-written scope objects are getting repetitive.
+- **Modules register themselves.** Plug-in style apps where a feature package contributes services without the app target knowing its types.
+- **You're leaving a service locator.** Moving from `.shared` everywhere to a container resolved at the root is a smaller step than going straight to pure DI, and the container can be removed later.
+- **The team already knows one.** Familiarity counts; a consistent container beats a half-finished migration to something purer.
+
+It costs a dependency on a third-party library, a second mental model for lifetimes, failure modes that move from compile time to run time (Swinject) or from "missing" to "silently live" (Factory), and the constant temptation to resolve from anywhere.
+
+## Trade-offs
+
+| Approach | Missing dependency is caught | Scopes | Wiring per type | Testing story | Swift 6 fit | Wins when |
+| --- | --- | --- | --- | --- | --- | --- |
+| Hand-written root (pure DI) | At compile time | Objects you write | One initialiser call | Build a root from fakes | Natural: it's your code | Most apps |
+| Swinject | At run time (a smoke test helps) | Built-in, child containers | One factory closure | Register fakes in a test container | Needs care: not `Sendable`-checked | Large, scope-heavy graphs; teams that know it |
+| Factory | Can't be missing; may be silently live | Built-in, custom scopes | One computed property | Register over the default, `.container` trait | Good in version 3 | Teams wanting container convenience with typed lookups |
+| swift-dependencies | Defaults; test failure in tests | Task-local scopes | One key and property | `withDependencies` | Designed for it | Small, everywhere dependencies; TCA codebases |
+| Compile-time generation (next lesson) | At build time | Component tree | Annotations | Generated mocks or fakes | Depends on the tool | Very large apps with many teams |
+
+<Callout kind="interview">
+
+**What to say:** "A container registers factories with lifetimes and builds the graph on request. I'd resolve only at the composition root and keep every type container-agnostic, with constructor injection, so the container could be swapped out or removed. With a runtime container like Swinject I'd add a smoke test that resolves every top-level type. For most iOS apps a hand-written root is enough, because Swift has no auto-wiring and the compiler checks hand-written code."
+
+**What to ask:** "Is there a container already? Where is `resolve` called from today? How are tests isolated?"
+
+**Red flags:** `container.resolve` inside view models; the container passed into objects "so they can get what they need"; force-unwrapped resolves without a test that exercises them; choosing a container before the app has more than a dozen services.
+
+</Callout>
+
+<Callout kind="gotcha" title="Swift gotcha: keys are exact types">
+
+Containers key registrations by the exact type. Register `LivePaymentsClient.self` and resolve `(any PaymentsClient).self`, and the lookup fails, as the smoke test showed; register `(any PaymentsClient).self` and resolve `(any PaymentsClient)?.self`, and it fails again. Register under the protocol your consumers ask for.
+
+</Callout>
+
+<Callout kind="gotcha" title="Swift gotcha: a default scope that makes copies">
+
+Factory's default scope is `unique` and Swinject's is `.graph`: both make a new instance for each top-level request. Forget `.singleton` (or `.container`) on the API client and every screen gets its own client, its own token-refresh logic and its own cache, which shows up as duplicate refresh calls and doubled memory rather than as an error.
+
+</Callout>
+
+## Practice
+
+**A scoped container with cycle detection** builds the core of Swinject's model: type-keyed registration, singleton and transient lifetimes, child containers for a session, and a clear error, with the path, when registrations form a cycle. It's [cycle detection in a directed graph](/dsa/learn/gt-cycles), applied to object construction.
+
+```cards
+- id: containers-jobs
+  front: "What three jobs does a DI container do?"
+  back: "Registration (a factory and a lifetime per type), resolution (building a type and, recursively, its dependencies) and lifetime management (singletons, scopes, transients)."
+- id: containers-rule
+  front: "What single rule keeps a container from becoming a service locator?"
+  back: "Resolve only at the composition root (and unavoidable framework entry points). Everything else takes its dependencies through initialisers and never sees the container."
+- id: containers-swinject-factory
+  front: "How do Swinject and Factory differ in how mistakes surface?"
+  back: "Swinject's `resolve` returns an optional, so a missing or mistyped registration fails at run time. Factory's lookups are computed properties, so they can't be missing, but a forgotten override silently uses the default."
+- id: containers-smoke-test
+  front: "How do you catch a runtime container's wiring mistakes before users do?"
+  back: "A smoke test that builds the production container and resolves every top-level type, so a missing registration fails the build instead of crashing a screen."
+```
+
+```quiz
+- id: q1
+  type: mcq
+  prompt: "A team adopts Swinject and calls `AppContainer.shared.resolve(APIClient.self)!` inside every view model's initialiser. What have they built?"
+  options:
+    - "Dependency injection, because a container is involved"
+    - "A service locator: objects pull their dependencies from a global, so the dependencies are hidden and tests must configure the global"
+    - "Compile-time-safe DI"
+    - "Pure DI"
+  answer: 1
+  explain: "What makes it injection is who asks. Resolving inside the object is a lookup; resolving at the root and passing values down is injection, with or without a container."
+- id: q2
+  type: sort
+  prompt: "Which Swinject object scope fits each?"
+  buckets: [".transient", ".graph", ".container", ".weak"]
+  items:
+    - [The app's one `URLSession`-backed API client, 2]
+    - [A fresh request builder every time one is asked for, 0]
+    - [A unit of work shared by a screen's model and its helpers while that screen is built, 1]
+    - [A heavy audio engine kept only while some screen holds it, 3]
+  explain: "`.container` is the singleton scope, `.transient` always builds, `.graph` shares within one top-level resolve, and `.weak` shares while anyone holds a strong reference."
+- id: q3
+  type: mcq
+  prompt: "Every screen in a Factory-based app is suddenly making its own token refresh call. The registration is `var api: Factory<any APIClient> { self { LiveAPIClient() } }`. What's wrong?"
+  options:
+    - "Factory can't register protocols"
+    - "The default scope is `unique`, so each resolve builds a new client; it needs `.singleton`"
+    - "`Container.shared` was reset"
+    - "Each screen needs its own container"
+  answer: 1
+  explain: "Without a scope modifier, Factory builds a new instance on every call. Shared services need an explicit lifetime."
+- id: q4
+  type: multi
+  prompt: "When does a DI container genuinely earn its place in an iOS app? Choose all that apply."
+  options:
+    - "The app has six services and two screens"
+    - "Feature modules must contribute services without the app target knowing their types"
+    - "The team is moving off a service locator and wants a smaller first step than pure DI"
+    - "The team wants view models to fetch their own dependencies"
+    - "A large graph with many run-time child scopes has made hand-written scope objects repetitive"
+  answer: [1, 2, 4]
+  explain: "Containers help with self-registering modules, migrations and large scope-heavy graphs. A tiny app is clearer with a hand-written root, and models fetching their own dependencies is the locator anti-pattern."
+- id: q5
+  type: recall
+  prompt: "Your app uses Swinject and crashed in production because a registration was deleted. What would you put in place?"
+  model: "A unit test that builds the production container (the same assemblies the app uses) and resolves every top-level type: each screen's model, each flow, each extension's root. Run it on every pull request. Longer term, keep resolution at the composition root only, with constructor injection inside, so the graph is small to verify and could move to compile-time wiring."
+```

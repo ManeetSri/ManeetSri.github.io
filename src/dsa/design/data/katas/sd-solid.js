@@ -1,2 +1,47 @@
 // Katas for D04 · SOLID in Swift
-export default [];
+export default [
+    {
+        id: 'sd-kata-solid-signup-split',
+        kind: 'problem',
+        title: 'Split the sign-up form',
+        difficulty: 'easy',
+        patterns: ['principles', 'testing'],
+        lessons: ['sd-solid-srp'],
+        swiftTest: 'SolidSignUpTests',
+        lists: [],
+        minutes: 30,
+    },
+    {
+        id: 'sd-kata-solid-pricing-rules',
+        kind: 'problem',
+        title: 'Open pricing rules',
+        difficulty: 'medium',
+        patterns: ['principles', 'swift'],
+        lessons: ['sd-solid-ocp', 'sd-solid-expression-problem'],
+        swiftTest: 'SolidCheckoutPricingTests',
+        lists: [],
+        minutes: 35,
+    },
+    {
+        id: 'sd-kata-solid-flag-layers',
+        kind: 'problem',
+        title: 'Layered feature flags',
+        difficulty: 'medium',
+        patterns: ['principles', 'swift', 'flags'],
+        lessons: ['sd-solid-lsp', 'sd-solid-isp'],
+        swiftTest: 'SolidFlagLayersTests',
+        lists: [],
+        minutes: 30,
+    },
+    {
+        id: 'sd-kata-solid-review-prompt',
+        kind: 'problem',
+        title: 'A review prompt that owns its dependencies',
+        difficulty: 'medium',
+        patterns: ['principles', 'di', 'testing'],
+        lessons: ['sd-solid-dip'],
+        swiftTest: 'SolidReviewPromptTests',
+        lists: [],
+        minutes: 35,
+    },
+];

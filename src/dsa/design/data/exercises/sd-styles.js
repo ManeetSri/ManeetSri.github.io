@@ -1,2 +1,39 @@
 // Design exercises and architecture reviews for D08 · Architecture styles
-export default [];
+export default [
+    {
+        id: 'sd-design-styles-field-inspections',
+        kind: 'design',
+        title: 'Choose the styles for a field-inspection app',
+        difficulty: 'medium',
+        patterns: ['architecture', 'offline', 'modularity'],
+        lessons: ['sd-styles-choosing', 'sd-styles-monoliths', 'sd-styles-client-server'],
+        minutes: 45,
+        template: 'feature',
+        mock: true,
+        lists: [],
+        summary: 'An offline-first inspection app with legal records and forms that change monthly: pick a style at every scale and defend each one.',
+    },
+    {
+        id: 'sd-design-styles-editor-blocks',
+        kind: 'design',
+        title: 'A plug-in system for a notes editor’s blocks',
+        difficulty: 'hard',
+        patterns: ['architecture', 'modularity', 'api'],
+        lessons: ['sd-styles-microkernel'],
+        minutes: 35,
+        template: 'component',
+        mock: false,
+        lists: [],
+        summary: 'Let four teams add block types to an editor core without losing data the app can’t read, or the typing budget.',
+    },
+    {
+        id: 'sd-review-styles-checkout-bus',
+        kind: 'critique',
+        title: 'Review: a checkout built on an event bus',
+        difficulty: 'medium',
+        patterns: ['architecture', 'concurrency', 'payments'],
+        lessons: ['sd-styles-event-driven', 'sd-styles-choosing'],
+        minutes: 30,
+        summary: 'A design doc that ranks correctness first, and a checkout that sends payments through string events. Find why customers are charged twice.',
+    },
+];

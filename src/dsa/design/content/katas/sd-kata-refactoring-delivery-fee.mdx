@@ -1,0 +1,148 @@
+The checkout's delivery fee is one long function of nested `if`s that nobody dares touch, and the business wants to add a new country next sprint. Rewrite it as code you'd be happy to change, without changing what any customer pays. The original stays in the package as `legacyFee`: the tests are characterisation tests that compare your version with it.
+
+`CharacterisedDeliveryFee.fee(for:) -> Int?`
+
+- `Order` is the parameter object that replaces the legacy function's seven parameters. `Speed` replaces its `express: Bool`.
+- Return the fee in pence, exactly as `legacyFee` computes it for the same inputs, or `nil` where `legacyFee` returns `-1` (the shop doesn't deliver there).
+- Keep every quirk. Some of the legacy behaviour looks like a bug. Characterisation means recording what the code does, not what it should do: changing a quirk is a product decision for a separate pull request.
+- Don't call `legacyFee` from your version. It's the oracle, and it gets deleted once the new code has shipped.
+
+Here is the code you're replacing (it's also `legacyFee` in the package):
+
+```swift
+if country == "GB" {
+    if subtotal > 5000 && !express {
+        fee = 0
+    } else {
+        fee = 399
+        if weight > 2000 {
+            fee = fee + ((weight - 2000) / 500 + 1) * 100
+        }
+        if express {
+            fee = fee + 500
+        }
+    }
+} else if country == "IE" || country == "FR" || country == "DE" {
+    fee = 999
+    if weight > 2000 {
+        fee = fee + ((weight - 2000) / 500 + 1) * 250
+    }
+    if express {
+        fee = fee * 2
+    }
+} else {
+    return -1
+}
+if member {
+    if express {
+        fee = fee - 250
+        if fee < 0 {
+            fee = 0
+        }
+    } else {
+        fee = 0
+    }
+}
+if promo == "FREESHIP" && country == "GB" && !express {
+    fee = 0
+}
+if items > 10 && fee > 0 {
+    fee = fee + 100
+}
+return fee
+```
+
+## Examples
+
+| Order | Fee | What it pins down |
+| --- | --- | --- |
+| £10.00, GB, standard | `399` | the base price |
+| £50.01, GB, standard | `0` | free above £50 |
+| £50.00, GB, standard | `399` | *above*, not from: exactly £50 still pays |
+| £10.00, GB, 2,500 g | `599` | 2,500 g counts as two 500 g steps (2,499 g is one) |
+| £10.00, DE, 3,000 g, express | `3498` | Europe doubles the whole fee for express, surcharge included |
+| £10.00, GB, express, member | `649` | members get £2.50 off express |
+| £10.00, IE, standard, member | `0` | members' standard delivery is free in Europe too |
+| £10.00, GB, 11 items | `499` | bulky handling, only when delivery isn't free |
+| £10.00, country `"gb"` | `nil` | codes match exactly |
+
+## Constraints
+
+- Amounts are whole pence and weights whole grams, all zero or more; `items` is at least 1.
+- The golden-master test checks 7,560 orders: every combination of values on both sides of each threshold, including unsupported and lower-case country codes and a lower-case promo code. The named tests pin each quirk on its own, so a failure tells you which rule you changed.
+- Keep `Order`, `Speed` and `legacyFee` as they are; add whatever private types and helpers you like.
+
+<Hints>
+<Hint>
+Read the legacy code as a pipeline: first a price for the destination, then three adjustments in a fixed order (member discount, promo code, bulky handling). Order matters: bulky handling is checked *after* the discounts have had a chance to make delivery free.
+</Hint>
+<Hint>
+The destination is the only real branching. A small private `enum Zone` with a failable `init?(country:)` (domestic, Europe, or nil) turns the `-1` sentinel into an optional and gives each zone its own price.
+</Hint>
+<Hint>
+Give each quirk a name and a comment, such as `freeStandardAbove = 5000` and a `weightSteps(_:)` that says "exactly 2,500 g is two steps". When a test fails, run it on its own: its name says which rule you changed.
+</Hint>
+</Hints>
+
+## Solutions
+
+<Approach title="A zone's price, then named adjustments in the legacy order" time="O(1)" space="O(1)">
+
+```swift
+private static let freeStandardAbove = 5000      // strictly above: £50.00 pays
+private static let memberExpressDiscount = 250
+private static let bulkyAbove = 10
+private static let bulkyHandling = 100
+
+private enum Zone {
+    case domestic, europe
+
+    init?(country: String) {
+        switch country {
+        case "GB": self = .domestic
+        case "IE", "FR", "DE": self = .europe
+        default: return nil
+        }
+    }
+
+    func price(for order: Order) -> Int {
+        switch self {
+        case .domestic:
+            if order.speed == .standard && order.subtotal > freeStandardAbove { return 0 }
+            let standard = 399 + weightSteps(order.weight) * 100
+            return order.speed == .express ? standard + 500 : standard
+        case .europe:
+            let standard = 999 + weightSteps(order.weight) * 250
+            return order.speed == .express ? standard * 2 : standard
+        }
+    }
+}
+
+/// Steps of 500 g over 2 kg, counted the legacy way: exactly 2,500 g is already two.
+private static func weightSteps(_ weight: Int) -> Int {
+    weight > 2000 ? (weight - 2000) / 500 + 1 : 0
+}
+
+public static func fee(for order: Order) -> Int? {
+    guard let zone = Zone(country: order.country) else { return nil }
+    var fee = zone.price(for: order)
+    if order.member {
+        fee = order.speed == .express ? max(0, fee - memberExpressDiscount) : 0
+    }
+    if order.promo == "FREESHIP" && zone == .domestic && order.speed == .standard {
+        fee = 0
+    }
+    if order.items > bulkyAbove && fee > 0 {
+        fee += bulkyHandling
+    }
+    return fee
+}
+```
+
+The structure now matches how the business talks about delivery: where it's going, then discounts, then handling. Adding a country is one line in `Zone.init`, and adding a zone is a new case whose missing price the compiler points out.
+
+Notice what the characterisation tests taught along the way. The legacy floor at zero for members' express can never trigger at today's prices (the cheapest express fee is £8.99), so it's dead code; `max(0, …)` keeps the intent at no cost. The 2,500 g rule and the case-sensitive codes look like bugs, and now they have names and tests of their own. If the product owner agrees they're bugs, fixing each is a one-line change in a pull request whose test diff shows exactly which customers pay differently.
+
+A switch on a closed `Zone` enum is the right tool here. The set of zones is small and changes rarely, and each new zone should force you to price it. You'd reach for a protocol per zone only if zones came from configuration or other modules.
+
+</Approach>

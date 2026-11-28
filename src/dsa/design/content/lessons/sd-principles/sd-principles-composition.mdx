@@ -1,0 +1,436 @@
+## Why it matters
+
+Almost every UIKit codebase that's a few years old has a `BaseViewController`, and most of them have become the most feared file in the project. Composition over inheritance is the principle that explains why, and what to build instead. It's also a staple interview question in the form "how would you share loading, error and analytics behaviour across forty screens?"
+
+## What the principle says
+
+The *Design Patterns* book by Gamma, Helm, Johnson and Vlissides (the "Gang of Four", 1994) put it in one line: **favour object composition over class inheritance.**
+
+- **Inheritance** is *white-box* reuse. A subclass sees, and depends on, how its parent works inside: which methods call which, in what order. The relationship is fixed when you compile.
+- **Composition** is *black-box* reuse. An object holds other objects and uses them through their interfaces. It can't see their insides, and it can swap them while running.
+
+Swift already leans this way. Structs and enums can't inherit at all; classes inherit from at most one superclass; protocols give you polymorphism without a hierarchy. The principle mostly targets the hierarchies **you** build. Subclassing `UIViewController` and `UIView` is how UIKit asks you to plug in, and that's fine.
+
+## The base view controller problem
+
+It starts reasonably. Every screen needs a spinner, an error alert and screen tracking, so they go in a base class:
+
+```swift check ios title="The hierarchy, early on"
+import UIKit
+
+enum Analytics {
+    static func track(_ event: String, _ properties: [String: String] = [:]) {}
+}
+
+class BaseViewController: UIViewController {
+    let spinner = UIActivityIndicatorView(style: .large)
+    var screenName: String { "unknown" }
+
+    override func viewDidAppear(_ animated: Bool) {
+        super.viewDidAppear(animated)
+        Analytics.track("screen_viewed", ["name": screenName])
+    }
+
+    func showError(_ error: any Error) {
+        let alert = UIAlertController(title: "Something went wrong", message: error.localizedDescription, preferredStyle: .alert)
+        alert.addAction(UIAlertAction(title: "OK", style: .default))
+        present(alert, animated: true)
+    }
+}
+
+class BaseListViewController: BaseViewController {
+    let tableView = UITableView()
+    private(set) var page = 0
+
+    func loadPage(_ page: Int) {}     // subclasses override this
+
+    func loadNextPage() {
+        page += 1
+        loadPage(page)
+    }
+}
+```
+
+Then the requirements arrive, and you can step through what happens next:
+
+```visual flow
+title: One hierarchy, one new requirement
+groups:
+  - { id: inheritance, label: Inheritance, nodes: [base, list, search] }
+  - { id: composition, label: Composition, nodes: [tracker, settings, searchPart, overlay] }
+nodes:
+  - { id: base, label: Base screen, kind: view, at: [0, 0] }
+  - { id: list, label: Base list, kind: view, at: [2, 0] }
+  - { id: search, label: Search list, kind: view, at: [4, 0] }
+  - { id: tracker, label: Screen tracker, at: [0, 2] }
+  - { id: settings, label: Settings, kind: view, at: [2, 2] }
+  - { id: searchPart, label: Search, at: [4, 2] }
+  - { id: overlay, label: State overlay, at: [2, 3.2] }
+edges:
+  - [list, base, subclass]
+  - [search, list, subclass]
+  - [settings, tracker, owns]
+  - [settings, searchPart, owns]
+  - [settings, overlay]
+steps:
+  - say: "`BaseViewController` gives every screen a spinner, error alerts and screen tracking."
+    show: [base]
+  - say: "List screens need paging, so `BaseListViewController` subclasses it and adds a page counter."
+    send: list->base
+  - say: "Search screens subclass the list. Each level inherits **everything** above it, needed or not."
+    send: search->list
+  - say: "Settings needs search but has no pages. Subclassing gets both: single inheritance can't say *search without paging*."
+    state: { search: error, list: error }
+    label: { list: unwanted }
+  - say: "Composed instead, Settings **owns** small parts: a tracker, a search controller and a state overlay."
+    show: [composition]
+    state: { search: null, list: null }
+    label: { list: null }
+  - say: "Each part is tested on its own, and a screen takes only what it needs. Paging, later, is one more part, not another layer."
+    send: [settings->tracker, settings->searchPart, settings->overlay]
+    state: { settings: ok }
+```
+
+The problems are structural, not a matter of tidier code:
+
+- **All or nothing.** Every screen inherits every behaviour, so the base class grows for its most demanding child.
+- **Combinations explode.** Behaviours are independent (search, paging, pull to refresh, empty states), but a single-inheritance tree can only express one path through them.
+- **Hidden contracts.** Forget `super.viewDidAppear(animated)` in one subclass and that screen silently stops being tracked. The rule exists only in the base class's head.
+- **Fragile base class.** A change inside the parent can break children that never changed, which the next section shows.
+
+## The fragile base class, in 50 lines
+
+Here's a shared image cache, and a subclass that counts insertions for a metrics dashboard. The subclass author reads the public methods and overrides both:
+
+```swift run title="A subclass broken by its parent's internals"
+class ImageCache {
+    private(set) var keys: [String] = []
+
+    func insert(_ key: String) {
+        keys.append(key)
+    }
+
+    func insert(contentsOf newKeys: [String]) {
+        for key in newKeys {
+            insert(key)          // the parent reuses its own single insert
+        }
+    }
+}
+
+final class CountingImageCache: ImageCache {
+    private(set) var insertions = 0
+
+    override func insert(_ key: String) {
+        insertions += 1
+        super.insert(key)
+    }
+
+    override func insert(contentsOf newKeys: [String]) {
+        insertions += newKeys.count
+        super.insert(contentsOf: newKeys)
+    }
+}
+
+let cache = CountingImageCache()
+cache.insert(contentsOf: ["avatar-1", "avatar-2", "avatar-3"])
+print("Subclass: stored \(cache.keys.count), counted \(cache.insertions)")
+
+// Composition: own a cache and forward to it through its public interface
+final class InsertionCounter {
+    private let cache = ImageCache()
+    private(set) var insertions = 0
+
+    var keys: [String] { cache.keys }
+
+    func insert(_ key: String) {
+        insertions += 1
+        cache.insert(key)
+    }
+
+    func insert(contentsOf newKeys: [String]) {
+        insertions += newKeys.count
+        cache.insert(contentsOf: newKeys)
+    }
+}
+
+let counter = InsertionCounter()
+counter.insert(contentsOf: ["avatar-1", "avatar-2", "avatar-3"])
+print("Composed: stored \(counter.keys.count), counted \(counter.insertions)")
+```
+
+```output
+Subclass: stored 3, counted 6
+Composed: stored 3, counted 3
+```
+
+The subclass double-counts because the parent's batch insert calls the single insert, which is overridden. Nothing in the public API says so. Worse, if the parent's next version stops reusing `insert(_:)`, the bug disappears and a different one may appear. The composed counter can't see how `ImageCache` works inside, so neither change can touch it. (This is the classic example from Joshua Bloch's *Effective Java*, moved to an iOS cache.)
+
+## Composing behaviours on iOS
+
+Each base-class behaviour becomes a small part that a screen chooses to hold.
+
+### Owned helper objects
+
+A screen tracker, a search controller, a pager: each is a small object the view controller creates or receives, and calls from its lifecycle methods. Each can be tested without a view controller at all. UIKit itself went this way: `view.keyboardLayoutGuide` (iOS 15) replaced the keyboard-avoidance code that used to live in base classes.
+
+### Child view controllers
+
+A loading, empty and error overlay is a whole view with its own lifecycle, so make it a child view controller. Containment is UIKit's built-in composition:
+
+```swift check ios title="Embedding a state overlay"
+import UIKit
+
+final class StateOverlayViewController: UIViewController {
+    private let spinner = UIActivityIndicatorView(style: .large)
+
+    override func viewDidLoad() {
+        super.viewDidLoad()
+        spinner.translatesAutoresizingMaskIntoConstraints = false
+        view.addSubview(spinner)
+        NSLayoutConstraint.activate([
+            spinner.centerXAnchor.constraint(equalTo: view.centerXAnchor),
+            spinner.centerYAnchor.constraint(equalTo: view.centerYAnchor),
+        ])
+    }
+
+    func showLoading(_ isLoading: Bool) {
+        view.isHidden = !isLoading
+        isLoading ? spinner.startAnimating() : spinner.stopAnimating()
+    }
+}
+
+extension UIViewController {
+    func embed(_ child: UIViewController) {
+        addChild(child)
+        child.view.frame = view.bounds
+        child.view.autoresizingMask = [.flexibleWidth, .flexibleHeight]
+        view.addSubview(child.view)
+        child.didMove(toParent: self)
+    }
+}
+```
+
+Any screen can `embed(StateOverlayViewController())`, whatever its superclass. You'll meet containment in depth in D17.
+
+### SwiftUI: modifiers and containers
+
+SwiftUI views are structs, so there's no inheritance to reach for. Behaviour that wraps content becomes a container view; behaviour you attach becomes a modifier:
+
+```swift check ios title="The same behaviours, composed in SwiftUI"
+import SwiftUI
+
+enum Loadable<Value> {
+    case loading
+    case loaded(Value)
+    case failed(String)
+}
+
+struct LoadableView<Value, Content: View>: View {
+    let state: Loadable<Value>
+    let retry: () -> Void
+    @ViewBuilder let content: (Value) -> Content
+
+    var body: some View {
+        switch state {
+        case .loading:
+            ProgressView()
+        case .loaded(let value):
+            content(value)
+        case .failed(let message):
+            ContentUnavailableView {
+                Label("Couldn't load", systemImage: "exclamationmark.triangle")
+            } description: {
+                Text(message)
+            } actions: {
+                Button("Try again", action: retry)
+            }
+        }
+    }
+}
+
+extension View {
+    func trackScreen(_ name: String, with track: @escaping (String) -> Void) -> some View {
+        onAppear { track(name) }
+    }
+}
+
+struct OrdersScreen: View {
+    let state: Loadable<[String]>
+    let reload: () -> Void
+    let track: (String) -> Void
+
+    var body: some View {
+        LoadableView(state: state, retry: reload) { orders in
+            List(orders, id: \.self) { Text($0) }
+        }
+        .trackScreen("orders", with: track)
+    }
+}
+```
+
+`OrdersScreen` picks the loadable container and screen tracking, and nothing else. Another screen can use tracking without the container.
+
+### Protocols with default implementations
+
+A protocol extension can give conforming types behaviour for free, which looks like inheritance without the hierarchy. It works well for small, **stateless** helpers. It can't add stored properties, and its dispatch rules surprise people (see the gotcha below), so don't use it to rebuild a base class.
+
+## When inheritance is the right tool
+
+Composition is the default, not a ban:
+
+- **Frameworks designed for subclassing.** `UIView.layoutSubviews()`, `draw(_:)`, `UICollectionViewLayout` and `UIViewController` itself are documented hook points. The framework defines the contract, which is the part app hierarchies lack.
+- **A shallow, true "is a" relationship** where every subclass can stand in for its parent, as [Liskov substitution: classes vs protocols](/design/learn/sd-solid-lsp) requires. One level deep is usually fine; three levels is where hidden contracts pile up.
+- **Mark classes `final` by default.** It documents "not designed for subclassing", and lets the compiler call methods directly instead of through dynamic dispatch. Swift already applies this across modules: a `public` class can't be subclassed outside its module unless it's declared `open`, because designing for inheritance is a deliberate decision.
+
+## Trade-offs
+
+| Way to share behaviour | Can hold state | Mix and match | Testable alone | Swap at runtime | Wins when |
+| --- | --- | --- | --- | --- | --- |
+| Subclassing your own base class | Yes | No: one path through the tree | No: needs the hierarchy | No | A shallow, true "is a", or a framework hook |
+| Protocol with default implementation | No | Yes | Partly | No | Small stateless helpers shared by many types |
+| Owned helper objects | Yes | Yes | Yes | Yes | Behaviour with its own state: tracking, paging, search |
+| Child view controllers | Yes, with lifecycle | Yes | Yes | Yes | A piece of UI with its own views and lifecycle |
+| SwiftUI modifiers and containers | Yes, via `@State` inside | Yes | Yes, with previews | Yes | Any SwiftUI screen |
+
+<Callout kind="interview">
+
+**What to say:** model the shared states as data (a `Loadable` enum), render them with one reusable component, and attach cross-cutting behaviour such as analytics as a separate part. Then say why: each screen takes only what it needs, and each part is tested once.
+
+**What to ask:** "Which of these behaviours do *all* screens really need?" Usually it's fewer than the base class contains.
+
+**Red flags interviewers listen for:** "I'd create a `BaseViewController`" as the first answer; hierarchies three deep; and protocols with default implementations used to fake multiple inheritance with stored state.
+
+</Callout>
+
+<Callout kind="gotcha" title="Swift gotcha: protocol extension methods aren't overridable">
+
+A method that's only in a protocol *extension*, not declared in the protocol, is dispatched statically. Call it through the protocol type and you get the extension's version, even if the conforming type has its own:
+
+```swift run title="Which trackAppearance runs?"
+protocol ScreenTracking {
+    var screenName: String { get }
+}
+
+extension ScreenTracking {
+    func trackAppearance() -> String { "viewed \(screenName)" }   // not a requirement
+}
+
+struct OrdersScreen: ScreenTracking {
+    var screenName: String { "orders" }
+    func trackAppearance() -> String { "viewed orders, with filters" }
+}
+
+let screen = OrdersScreen()
+let tracked: any ScreenTracking = screen
+print(screen.trackAppearance())
+print(tracked.trackAppearance())
+```
+
+```output
+viewed orders, with filters
+viewed orders
+```
+
+`screenName` is a requirement, so it's dispatched dynamically; `trackAppearance()` isn't. Declare a method in the protocol itself whenever conforming types may provide their own.
+
+</Callout>
+
+## Practice
+
+The kata [Compose a playback queue](/design/practice/sd-kata-principles-playback-queue) replaces a hierarchy of player subclasses (shuffling, repeating, skip-limited) with small parts a player holds, so every combination works, including ones nobody wrote a subclass for.
+
+```cards
+- id: white-black-box
+  front: "Why is inheritance called white-box reuse?"
+  back: "A subclass depends on how its parent works inside, such as which methods call which. Composition uses objects only through their interfaces, so their insides can change."
+- id: fragile-base
+  front: "What is the fragile base class problem?"
+  back: "A change inside a parent class breaks subclasses that never changed, because they relied on internal behaviour the public API never promised."
+- id: base-vc-alternatives
+  front: "What replaces a BaseViewController full of shared behaviour?"
+  back: "Small parts each screen chooses: helper objects (tracking, paging), child view controllers (state overlays), and in SwiftUI, container views and modifiers."
+- id: when-inherit
+  front: "When is subclassing a good choice?"
+  back: "For hook points a framework designed for it, such as `layoutSubviews()`, and shallow, true \"is a\" relationships. Mark other classes `final`."
+```
+
+```quiz
+- id: q1
+  type: output
+  prompt: "What does this print?"
+  code: |
+    class Counter {
+        var total = 0
+        func add(_ n: Int) { total += n }
+        func addTwice(_ n: Int) {
+            add(n)
+            add(n)
+        }
+    }
+
+    final class LoggingCounter: Counter {
+        var calls = 0
+        override func add(_ n: Int) {
+            calls += 1
+            super.add(n)
+        }
+        override func addTwice(_ n: Int) {
+            calls += 1
+            super.addTwice(n)
+        }
+    }
+
+    let counter = LoggingCounter()
+    counter.addTwice(5)
+    print(counter.total, counter.calls)
+  answer: "10 3"
+  explain: "`addTwice` counts one call, then the parent's `addTwice` calls the overridden `add` twice, counting two more. The subclass depends on how the parent is written inside: the fragile base class."
+- id: q2
+  type: mcq
+  prompt: "Forty screens need a loading spinner, an error state with retry, and screen-view analytics. Which design scales best?"
+  options:
+    - "A `BaseViewController` with all three, which every screen subclasses"
+    - "A protocol `LoadingScreen` whose extension adds a stored spinner and analytics"
+    - "A `Loadable` state enum rendered by one reusable view or child view controller, with analytics attached separately"
+    - "Copy the code into each screen so they stay independent"
+  answer: 2
+  explain: "Each screen composes the parts it needs, and each part is tested once. A base class forces all three on every screen; protocol extensions can't hold stored properties; forty copies duplicate real knowledge."
+- id: q3
+  type: multi
+  prompt: "Which are good uses of inheritance in an iOS app? Choose all that apply."
+  options:
+    - "Overriding `layoutSubviews()` in a custom `UIView`"
+    - "A `BaseListViewController` with paging, which a settings screen subclasses for its search bar"
+    - "Subclassing `UICollectionViewLayout` for a custom layout"
+    - "A three-level hierarchy of network services sharing request-building code"
+  answer: [0, 2]
+  explain: "UIKit designed `layoutSubviews()` and `UICollectionViewLayout` as hook points with documented contracts. The settings screen inherits paging it doesn't want, and request-building code is better shared by composing a request builder."
+- id: q4
+  type: truefalse
+  prompt: "A `public` Swift class in your framework can be subclassed by apps that import it."
+  answer: false
+  explain: "Outside its module, a class can be subclassed only if it's declared `open`. Swift makes designing for inheritance an explicit choice."
+- id: q5
+  type: bug
+  prompt: "Which line makes the profile screen silently stop being tracked?"
+  code: |
+    class BaseViewController: UIViewController {
+        var screenName: String { "unknown" }
+        override func viewDidAppear(_ animated: Bool) {
+            super.viewDidAppear(animated)
+            Analytics.track("screen_viewed", ["name": screenName])
+        }
+    }
+
+    final class ProfileViewController: BaseViewController {
+        override var screenName: String { "profile" }
+        override func viewDidAppear(_ animated: Bool) { startAvatarAnimation() }
+        func startAvatarAnimation() {}
+    }
+  answer: 11
+  explain: "The override never calls `super.viewDidAppear(animated)`, so the profile screen is never tracked. Nothing warns you: the rule lives only in the base class."
+- id: q6
+  type: recall
+  prompt: "Explain to a teammate why a protocol extension isn't a safe replacement for a base class."
+  model: "Protocol extensions can't add stored properties, so stateful behaviour doesn't fit. And methods that are only in the extension, not in the protocol, are dispatched statically: a conforming type's own version is skipped when called through the protocol type."
+```

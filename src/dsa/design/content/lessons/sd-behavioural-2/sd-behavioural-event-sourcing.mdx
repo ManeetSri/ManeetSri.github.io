@@ -1,0 +1,251 @@
+## Why it matters
+
+Most apps store **current state**: the shopping list as it is now. **Event sourcing** stores what *happened* instead (an item was added, renamed, checked, removed) and works out the current state by replaying those events. You'll rarely event-source a whole iOS app, but pieces of the idea are everywhere: offline outboxes of pending changes, undo logs, audit trails, sync engines and collaborative editing. Interviewers bring it up in offline-first, messaging and sync designs, and when they ask how you'd reproduce a bug from a user's data. This lesson is a preview; D39 builds sync on top of it.
+
+## State is a fold over events
+
+An **event** is a fact in the past tense: `itemAdded`, `itemChecked`. Events go into an append-only **log**. Nothing is ever updated or deleted in place; a correction is another event (`itemRenamed`).
+
+The current state is what you get by starting empty and applying every event in order. That's a reduce, with the reducer you wrote in [Reducers: state changes as pure functions](/design/learn/sd-functional-reducers): `state = events.reduce(initial, apply)`. The difference is that you **keep the log** and treat the state as a disposable, derived view of it.
+
+<Callout kind="analogy">
+
+A bank doesn't store your balance and edit it. It stores transactions, and the balance is the sum of them. If the balance looks wrong, the statement shows exactly how it got there, and fixing a mistake means adding a correcting transaction, not rubbing one out.
+
+</Callout>
+
+Keep events apart from **commands**. A command is a request that may be refused: "check item 3" fails if item 3 was removed on another device. An event is the record that something *did* happen. The [Command pattern](/design/learn/sd-behavioural-command) gave requests a type; event sourcing gives their outcomes a permanent home.
+
+```visual flow
+title: Commands in, events appended, projections derived
+nodes:
+  - { id: ui, label: List screen, kind: view, at: [0, 0] }
+  - { id: handler, label: Command handler, kind: service, at: [2, 0] }
+  - { id: log, label: Event log, kind: store, at: [4, 0] }
+  - { id: list, label: List state, kind: cache, at: [0, 2] }
+  - { id: feed, label: Activity feed, kind: cache, at: [2, 2] }
+  - { id: sync, label: Sync outbox, kind: queue, at: [4, 2] }
+edges:
+  - [ui, handler, command]
+  - [handler, log, append]
+  - [log, list, apply, { style: data }]
+  - [log, feed, apply, { style: data }]
+  - [log, sync, queue, { style: async }]
+  - [list, ui, render]
+steps:
+  - say: "The user taps Milk. The screen sends a **command**, `check(milk)`: a request that can still be refused."
+    send: ui->handler
+  - say: "The handler checks the rules (Milk exists and isn't checked) and appends a fact, `itemChecked(milk)`. Events are never edited."
+    send: handler->log
+    label: { log: event 7 }
+  - say: "Each **projection** folds the new event into its own view of the data: the list, and an activity feed."
+    send: [log->list, log->feed]
+  - say: "The screen renders the list projection. It never reads the log itself."
+    send: list->ui
+  - say: "The same event is queued for upload. Other devices apply it to their logs: you sync **what happened**, not a snapshot that would overwrite their edits."
+    send: log->sync
+    state: { sync: wait }
+```
+
+## A shopping list, event-sourced
+
+```swift run title="Replaying a log, travelling in time, and starting from a snapshot"
+// Facts, in the past tense. Once appended, never edited.
+enum ListEvent {
+    case itemAdded(id: Int, name: String)
+    case itemRenamed(id: Int, name: String)
+    case itemChecked(id: Int)
+    case itemRemoved(id: Int)
+}
+
+struct Item {
+    let id: Int
+    var name: String
+    var isChecked = false
+}
+
+// A projection: the current list, derived by applying events in order
+struct ShoppingList {
+    private(set) var items: [Item] = []
+
+    mutating func apply(_ event: ListEvent) {
+        switch event {
+        case .itemAdded(let id, let name):
+            items.append(Item(id: id, name: name))
+        case .itemRenamed(let id, let name):
+            if let index = items.firstIndex(where: { $0.id == id }) { items[index].name = name }
+        case .itemChecked(let id):
+            if let index = items.firstIndex(where: { $0.id == id }) { items[index].isChecked = true }
+        case .itemRemoved(let id):
+            items.removeAll { $0.id == id }
+        }
+    }
+
+    var summary: String {
+        items.map { "\($0.isChecked ? "[x]" : "[ ]") \($0.name)" }.joined(separator: ", ")
+    }
+}
+
+func replay(_ events: some Sequence<ListEvent>, from start: ShoppingList = ShoppingList()) -> ShoppingList {
+    events.reduce(into: start) { list, event in list.apply(event) }
+}
+
+let log: [ListEvent] = [
+    .itemAdded(id: 1, name: "Milk"),
+    .itemAdded(id: 2, name: "Bread"),
+    .itemAdded(id: 3, name: "Eggs"),
+    .itemRenamed(id: 2, name: "Sourdough"),
+    .itemChecked(id: 1),
+    .itemRemoved(id: 3),
+]
+
+print("now:", replay(log).summary)
+print("after 3 events:", replay(log.prefix(3)).summary)   // time travel
+
+// A second projection of the same facts
+let activity = log.map { event -> String in
+    switch event {
+    case .itemAdded(_, let name): "added \(name)"
+    case .itemRenamed(_, let name): "renamed to \(name)"
+    case .itemChecked: "checked an item"
+    case .itemRemoved: "removed an item"
+    }
+}
+print("activity:", activity.suffix(3).joined(separator: "; "))
+
+// A snapshot (a memento) after 4 events, so launch replays only the tail
+let snapshot = replay(log.prefix(4))
+let fromSnapshot = replay(log.dropFirst(4), from: snapshot)
+print("from snapshot:", fromSnapshot.summary, "· replayed", log.count - 4, "events")
+```
+
+```output
+now: [x] Milk, [ ] Sourdough
+after 3 events: [ ] Milk, [ ] Bread, [ ] Eggs
+activity: renamed to Sourdough; checked an item; removed an item
+from snapshot: [x] Milk, [ ] Sourdough · replayed 2 events
+```
+
+Each line shows something a current-state store can't do without extra work:
+
+- **Time travel.** The state after any event is a replay of a prefix. Debugging a user's report becomes "replay their log and watch where it goes wrong".
+- **Many projections.** The list and the activity feed are two folds over the same facts. Adding a third (a count badge, a search index) needs no migration: replay the log into it.
+- **Snapshots keep replay fast.** A snapshot is a [memento](/design/learn/sd-behavioural-memento) of a projection at a known position in the log. Launch loads the snapshot and replays only the events after it.
+
+## What it costs
+
+Event sourcing trades simple writes for permanent obligations. These are the ones that bite:
+
+- **Events are forever, so their schema is too.** Every build must read every event any earlier build wrote. Renaming a field means keeping a decoder for the old shape, or **upcasting**: converting old events to the new shape as they're read.
+- **The log only grows.** Snapshots fix replay time but not storage. Long-lived logs need compaction: replace a prefix with a snapshot once nobody can need the history.
+- **Deleting is hard.** "Delete my data" collides with "never delete events". Systems handle it by compacting the user's events away, or by encrypting each user's events with their own key and destroying the key (**crypto-shredding**).
+- **Ordering across devices.** Two phones appending offline produce two logs. Merging them needs an order everyone agrees on, and device clocks disagree. That's the heart of D39.
+- **Two models to keep in step.** The log is the truth and projections lag behind it, so code that reads a projection right after a command can see stale data.
+
+## Where it shows up on iOS
+
+You'll more often use event-sourced *parts* than build a fully event-sourced app:
+
+- **An offline outbox.** While offline, the app records operations (`itemChecked(3)`) in a durable queue and uploads them in order when the network returns, instead of uploading a whole snapshot that would overwrite other devices' edits.
+- **Undo history.** An editor's log of operations, from which undo removes or inverts the latest.
+- **Store change history.** Core Data's persistent history tracking and SwiftData's history API (iOS 18's `fetchHistory(_:)`) record the inserts, updates and deletes each transaction made, so a widget, an extension or your sync code can catch up from a saved token. That's a change log rather than event sourcing, since the rows remain the source of truth, but you consume it the same way: from a position, in order.
+- **Analytics.** An append-only stream of what users did, projected later into funnels and dashboards.
+
+## Trade-offs
+
+| | Current state only | Current state plus a change log | Event sourcing |
+| --- | --- | --- | --- |
+| Source of truth | The rows | The rows | The events |
+| History, audit, time travel | None | Recent changes | Complete |
+| New views of old data | Migration | Partly | Replay into a new projection |
+| Sync | Snapshots: last writer wins | Changes since a token | Operations: mergeable |
+| Storage and complexity | Lowest | Moderate | Highest: versioning, snapshots, compaction |
+| Deleting data | Easy | Easy, plus pruning the log | Hard: compaction or crypto-shredding |
+
+**Current state** is right for most app data: preferences, caches, content the server owns. **A change log** next to it wins when extensions or sync code need to catch up on what changed. **Event sourcing** wins where history *is* the product or the merge strategy: collaborative documents, financial ledgers, chat, and offline-first apps whose devices must converge.
+
+<Callout kind="interview">
+
+In an offline-first or sync design, say you'd record local changes as **operations** in a durable outbox rather than overwriting snapshots, apply them to local state immediately, and upload them in order with ids so the server can de-duplicate. Mention the costs before the interviewer does: event versioning, log growth with snapshots, and how deletion works. Questions to ask: *Do users edit the same data on several devices? Do we need an audit trail?* Red flags: event-sourcing everything by default, events named like commands (`checkItem` instead of `itemChecked`), and mutating events after they're written.
+
+</Callout>
+
+<Callout kind="gotcha" title="Swift gotcha: Codable enums don't forgive renamed cases">
+
+Synthesised `Codable` encodes an enum case by its name. Rename `itemChecked` to `itemCompleted` and every event already on disk fails to decode. For persisted events, write the coding keys explicitly, keep old case names decodable for as long as old events exist, and add tests that decode events saved by previous versions.
+
+</Callout>
+
+```cards
+- id: es-core
+  front: "What is the core idea of event sourcing?"
+  back: "Store an append-only log of facts that happened, and derive current state (and any other view) by replaying them in order."
+- id: command-vs-event
+  front: "How does a command differ from an event?"
+  back: "A command is a request that can be refused (check item 3). An event is a fact that it happened (item 3 was checked), and it's never edited."
+- id: snapshots
+  front: "Why does an event-sourced app keep snapshots?"
+  back: "So launch doesn't replay the whole log: load the snapshot of a projection at a known position, then apply only the events after it."
+- id: es-costs
+  front: "What are the main costs of event sourcing?"
+  back: "Event schemas must be readable forever, the log keeps growing, deleting data needs compaction or crypto-shredding, and merging logs needs an agreed order."
+```
+
+```quiz
+- id: q1
+  type: mcq
+  prompt: "A shared grocery list is edited on two phones while both are offline. Which approach lets both sets of edits survive when they reconnect?"
+  options:
+    - "Each phone uploads its whole list; the server keeps the newest"
+    - "Each phone records operations like `itemChecked(3)` and uploads them; the server and other devices apply them in an agreed order"
+    - "Each phone uploads its whole list; the server keeps the longest"
+    - "Lock the list so only one phone can edit at a time"
+  answer: 1
+  explain: "Snapshots overwrite: whichever arrives last wins and the other phone's edits vanish. Operations from both phones can be applied to the same list, which is why sync engines exchange what happened."
+- id: q2
+  type: output
+  prompt: "What does this print?"
+  code: |
+    enum Event {
+        case deposited(Int)
+        case withdrew(Int)
+    }
+
+    let log: [Event] = [.deposited(100), .withdrew(30), .deposited(50), .withdrew(70)]
+    func balance(_ events: some Sequence<Event>) -> Int {
+        events.reduce(0) { total, event in
+            switch event {
+            case .deposited(let amount): total + amount
+            case .withdrew(let amount): total - amount
+            }
+        }
+    }
+    print(balance(log), balance(log.prefix(2)))
+  answer: "50 70"
+  explain: "100 − 30 + 50 − 70 = 50 for the whole log, and replaying only the first two events gives the balance at that moment: 70."
+- id: q3
+  type: sort
+  prompt: "Command or event?"
+  buckets: [Command, Event]
+  items:
+    - ["checkItem(id: 3)", 0]
+    - ["itemChecked(id: 3)", 1]
+    - ["paymentCaptured(orderID: 81)", 1]
+    - ["capturePayment(orderID: 81)", 0]
+    - ["messageDelivered(id: 9)", 1]
+  explain: "Commands are imperatives that may be refused; events are past-tense facts. Naming them that way keeps the log honest."
+- id: q4
+  type: multi
+  prompt: "You add a `quantity` field to the `itemAdded` event in version 3 of the app. What must the app do? Choose all that apply."
+  options:
+    - "Keep decoding `itemAdded` events written without `quantity`, using a default"
+    - "Rewrite every old event on disk in the new format at launch"
+    - "Test decoding events saved by versions 1 and 2"
+    - "Accept that projections replayed from the log will now include quantities for new items"
+  answer: [0, 2, 3]
+  explain: "Old events are permanent, so they're read as they are (or upcast in memory) and tested. Rewriting the log in place defeats its immutability and risks losing history if the migration fails."
+- id: q5
+  type: truefalse
+  prompt: "SwiftData's history API makes a SwiftData store event-sourced."
+  answer: false
+  explain: "The stored rows stay the source of truth. History is a change log of what each transaction did, which other processes read from a token to catch up. Event sourcing makes the log itself the truth."

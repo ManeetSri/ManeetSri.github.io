@@ -1,0 +1,285 @@
+## Why it matters
+
+Every app fails all day long: requests time out, disks fill up, users type a date in the wrong format, and now and then a line of your own code is simply wrong. What separates a solid app from a fragile one isn't how often things fail, but whether each failure gets the right response: a silent retry, a clear message, or a bug report with enough context to fix it. Interviewers ask "how does your design handle errors?" to hear whether you have a taxonomy, or whether every failure ends in the same alert.
+
+## One question sorts them: who can act?
+
+[Error modelling and typed throws](/design/learn/sd-swift-design-errors) sorted failures into domain outcomes, transient failures, programmer errors and cancellation, and showed how to shape error types by what the caller can do. This module builds the whole app's error handling on that idea, so it starts by sharpening it into one question you ask of every failure: **who can do something about it, right now?**
+
+- **The code can.** A timeout can be retried, an expired token refreshed, a missing image fetched again, a failed save queued for later. These are **recoverable** errors. Done well, the user never knows they happened.
+- **The user can.** A declined card, a username that's taken, a full disk, a permission they refused. Code can't fix these, but the user can, if you tell them what happened and what to do. These are **user-facing** errors.
+- **Only a developer can.** An index out of range, a state the screen "can't" be in, a response your own server should never send. Nobody at run time can fix a bug, and retrying or explaining won't help. These are **programmer errors**.
+
+Two more outcomes look like failures but aren't, and confusing them with the three above causes some of the most common error bugs on iOS:
+
+- **Cancellation.** The user left the screen, or a newer search replaced an older one. Nobody wants the result any more, so the right response is to stop and say nothing.
+- **Expected absence.** A cache lookup that finds nothing, or a search with no results. That's an answer, not a failure: an optional or an empty state, not an error.
+
+<Callout kind="note">
+
+Swift's own design follows the same lines. The Swift team's error-handling rationale (in the Swift repository's docs) describes **simple domain errors**, where an optional is enough; **recoverable errors**, which is what `throws` is for; **universal errors** such as running out of memory, which no code can sensibly handle; and **logic failures**, which should stop the program. Optionals, `throws` and traps are three tools for three different jobs.
+
+</Callout>
+
+## Walking one failure through the question
+
+The order of the questions matters. Ask about cancellation first, because a cancelled request often surfaces as an ordinary error. Then try to recover in code, and only involve the user when recovery runs out. What's left is a bug.
+
+```visual flow
+title: Deciding what a failure needs
+nodes:
+  - { id: failed, label: Something failed, kind: plain, at: [0, 0] }
+  - { id: wanted, label: Still wanted?, kind: plain, at: [2, 0] }
+  - { id: quiet, label: Stop quietly, kind: plain, at: [4, 0] }
+  - { id: code, label: Can code recover?, kind: plain, at: [2, 2] }
+  - { id: recover, label: "Retry, refresh, queue", kind: plain, at: [4, 2] }
+  - { id: user, label: Can the user act?, kind: plain, at: [2, 4] }
+  - { id: tell, label: Message + action, kind: plain, at: [4, 4] }
+  - { id: bug, label: "Report a bug", kind: plain, at: [0, 4] }
+edges:
+  - [failed, wanted]
+  - [wanted, quiet, "no"]
+  - [wanted, code, "yes"]
+  - [code, recover, "yes"]
+  - [code, user, "no"]
+  - [recover, user, ran out]
+  - [user, tell, "yes"]
+  - [user, bug, "no"]
+steps:
+  - say: "A request to save a note fails. Before anything else: is anyone still waiting for the result?"
+    show: [failed, wanted]
+    send: failed->wanted
+  - say: "If the screen was closed or the task cancelled, the answer is no. Stop, show nothing, and log at most a `debug` line."
+    send: wanted->quiet
+    state: { quiet: ok }
+  - say: "Here someone is waiting, so ask whether code can fix it. A timeout or an offline phone can be retried or queued."
+    send: wanted->code
+    state: { quiet: null }
+  - say: "The note is saved locally and queued for upload. The user sees their note, and the error never reaches the screen."
+    send: code->recover
+    state: { recover: ok }
+  - say: "Recovery can **run out**: after several attempts, or when the disk is full. Now the question goes to the user."
+    send: recover->user
+    state: { recover: wait }
+  - say: "A full disk is something the user can fix. Say what happened and offer the action: *Free up space in Settings*."
+    send: user->tell
+    state: { tell: ok }
+  - say: "If nobody can act (the note's file is corrupt, or the server rejects a request the app built), it's a **bug**: apologise, keep the user's data safe, and report it with context."
+    send: user->bug
+    state: { bug: error, tell: null }
+```
+
+Two consequences of this order are worth saying out loud in a design review:
+
+1. **Recoverable errors often become user-facing ones.** A retry policy that gives up has to hand over to the screen, so every recoverable error needs an answer to "and when recovery fails?" The design decides how long to keep trying before the user hears about it.
+2. **The best error is one the design removes.** "Offline" is a user-facing error for an app that saves straight to the server, and no error at all for an app that saves locally and syncs later. Before designing the message, ask whether a different design makes the failure impossible.
+
+## The same failure, different kinds
+
+The kind isn't a property of the error value; it depends on where it happened and what the app was trying to do. A few cases that trip people up:
+
+| Failure | In this context | Kind |
+| --- | --- | --- |
+| HTTP `404` | Opening a product from an old link in an email | User-facing: "This product is no longer available" |
+| HTTP `404` | `GET /me`, which every signed-in user has | Programmer or config error: the app is calling the wrong URL |
+| `DecodingError` | Your own API's response | Programmer error: the app and server disagree about the contract |
+| `DecodingError` | A backup file the user picked in Files | User-facing: "This file isn't a backup from this app" |
+| `URLError(.timedOut)` | Loading the feed | Recoverable: retry with backoff, show the cache |
+| `URLError(.timedOut)` | After three retries | User-facing: "Couldn't refresh. Pull to try again" |
+| `CocoaError(.fileWriteOutOfSpace)` | Saving a downloaded episode | User-facing: the user can free space |
+| HTTP `401` | Any authenticated request | Recoverable: refresh the token once; if that fails, user-facing (sign in again) |
+
+That's why **classification belongs to the code that has the context**, usually the repository or use case that made the call. The API client knows a `404` happened; only the product repository knows a missing product is a normal outcome, while the profile repository knows a missing `/me` is a bug.
+
+## Writing the taxonomy down in Swift
+
+Make the kind explicit, so every layer above can read it instead of guessing from error codes. Each feature keeps its own error type, shaped by what its callers can do, and says which kind each case is. At the boundary with Foundation, a small classifier sorts the errors you didn't create:
+
+```swift run
+import Foundation
+
+enum FailureKind: String {
+    case cancelled = "stop quietly"
+    case recoverable = "recover in code"
+    case userFacing = "tell the user"
+    case bug = "report a bug"
+}
+
+// A feature's own errors, each with the kind its callers need
+enum NoteSaveError: Error {
+    case offline
+    case serverBusy(retryAfterSeconds: Int)
+    case storageFull
+    case titleTooLong(limit: Int)
+    case corruptDraft
+
+    var kind: FailureKind {
+        switch self {
+        case .offline, .serverBusy: .recoverable
+        case .storageFull, .titleTooLong: .userFacing
+        case .corruptDraft: .bug
+        }
+    }
+}
+
+// Errors from frameworks, sorted once at the edge
+func classify(_ error: any Error) -> FailureKind {
+    switch error {
+    case is CancellationError:
+        return .cancelled
+    case let error as NoteSaveError:
+        return error.kind
+    case let error as URLError:
+        switch error.code {
+        case .cancelled: return .cancelled
+        case .timedOut, .networkConnectionLost, .notConnectedToInternet, .cannotConnectToHost: return .recoverable
+        case .dataNotAllowed: return .userFacing    // mobile data is switched off
+        default: return .bug
+        }
+    case let error as CocoaError where error.code == .fileWriteOutOfSpace:
+        return .userFacing
+    case is DecodingError:
+        return .bug                                  // our own API broke its contract
+    default:
+        return .bug                                  // unknown: a gap in the taxonomy
+    }
+}
+
+let failures: [(String, any Error)] = [
+    ("left the screen", CancellationError()),
+    ("train tunnel", URLError(.notConnectedToInternet)),
+    ("mobile data off", URLError(.dataNotAllowed)),
+    ("disk full", CocoaError(.fileWriteOutOfSpace)),
+    ("title 300 chars", NoteSaveError.titleTooLong(limit: 200)),
+    ("draft unreadable", NoteSaveError.corruptDraft),
+]
+for (what, error) in failures {
+    print("\(what): \(classify(error).rawValue)")
+}
+```
+
+```output
+left the screen: stop quietly
+train tunnel: recover in code
+mobile data off: tell the user
+disk full: tell the user
+title 300 chars: tell the user
+draft unreadable: report a bug
+```
+
+Notice the two `default` branches. An error you didn't anticipate is, by definition, one your design has no answer for. Treating it as a bug means it gets reported, so you find out it exists, and the user gets a polite generic message instead of a cryptic one. Most teams discover their real taxonomy by reading those reports.
+
+## The taxonomy drives everything else
+
+Once every failure has a kind, most of the rest of the module follows from it. Each kind has a natural answer to four questions:
+
+| Kind | What the user sees | Log level | Report to crash service? | Retry? |
+| --- | --- | --- | --- | --- |
+| Cancelled | Nothing | `debug`, or nothing | No | No |
+| Recoverable | Nothing, or a quiet status ("Waiting for network") | `info` while recovering, `error` when recovery runs out | No, but count them | Yes, with backoff and a budget |
+| User-facing | A message that says what to do, with an action | `notice` | No | When the user asks, or after they fix it |
+| Programmer error | An apology and a safe fallback, or a crash | `fault` | Yes, as a non-fatal or a crash | No |
+
+The lessons that follow take the columns one at a time: programmer errors and when to crash, carrying the kind across layers, what the user sees, and then logging and reporting at the levels in the table.
+
+### Severity is a second axis
+
+"Who can act" says how to respond. **Severity** says how much it matters: how many users, how much money or data is at risk. A decoding bug in the settings screen and one in checkout are both programmer errors; only one should page someone. Keep the two axes separate. The kind is decided in code, at the point of failure. Severity is mostly decided later, by counting: how many sessions hit this error, on which screens, since which release. That's what the reporting and production-debugging lessons build.
+
+## Trade-offs
+
+Where does the classification live? Four common designs:
+
+| Approach | Exhaustive handling | Coupling between features | Server can add errors without a release | Testability |
+| --- | --- | --- | --- | --- |
+| Each feature's error enum declares its `kind` | Yes, per feature | Low: features share only `FailureKind` | Needs an `.unknown` case per feature | High: test each mapping as a pure function |
+| One app-wide `AppError` enum | Yes, but huge | High: every module imports it and every new case touches it | Same | Medium |
+| A classifier function over `any Error` at the edge | No: a `default` catches the rest | Low | Yes: unknown codes fall to `.bug` | High |
+| `NSError` domains and codes | No | Low | Yes | Low: magic numbers everywhere |
+
+Most apps combine the first and third: features own typed errors with a `kind`, and a single classifier at the edge sorts framework and unknown errors. The app-wide enum wins only in small apps, where one person can hold every case in their head.
+
+<Callout kind="interview">
+
+**Say:** "I classify every failure by who can act: code retries or recovers, the user gets a message with an action, and anything nobody can act on is a bug that gets reported with context. Cancellation is silent. The repository classifies, because it's the layer that knows whether a 404 is normal."
+
+**Ask:** which failures can the design remove altogether (save locally, sync later)? How long should the app try to recover before telling the user? Which errors does the server add without an app release?
+
+**Red flags:** one generic alert for every error; retrying errors that can't succeed, like a `400` or a decoding failure; showing an alert for cancellation; and no answer to "what happens when the retries run out?"
+
+</Callout>
+
+<Callout kind="gotcha" title="iOS gotcha: some offline errors are settings the user can change">
+
+`URLError(.dataNotAllowed)` means the phone isn't allowed to use mobile data right now, most often because the user switched it off for your app in Settings (or roaming is off abroad). That's user-facing: retrying won't help, but "Turn on Mobile Data for this app in Settings" will. Similarly, `URLError.networkUnavailableReason` tells you a request failed because the connection was `.expensive` or `.constrained` (Low Data Mode) and your request didn't allow it. Treating these as "no connection, retry later" leaves the user waiting for something that will never happen on its own.
+
+</Callout>
+
+## Practice
+
+The **error ladder** kata builds the mapping from transport errors to a feature's domain errors and then to what the screen shows, with a retry decision for each. The **account screen review** is a catalogue of what happens without a taxonomy: errors swallowed, crashes on bad input and one alert for everything.
+
+```cards
+- id: who-can-act
+  front: "What single question sorts a failure into recoverable, user-facing or programmer error?"
+  back: "Who can act on it right now: the code (recoverable), the user (user-facing), or only a developer (a bug). Cancellation and expected absence aren't failures at all."
+- id: kind-depends-on-context
+  front: "Why can't the API client decide whether a 404 is a bug?"
+  back: "The kind depends on context. A missing product from an old link is normal; a missing `/me` is a bug. The repository that made the call has that context, so it classifies."
+- id: unknown-is-bug
+  front: "How should an error you never anticipated be treated?"
+  back: "As a bug: report it with context and show a polite generic message. It's a gap in the taxonomy, and reports are how you find it."
+- id: recovery-runs-out
+  front: "What must every recoverable error's design also answer?"
+  back: "What happens when recovery runs out: after how many attempts, or how long, the failure becomes user-facing, and what the user sees then."
+```
+
+```quiz
+- id: q1
+  type: sort
+  prompt: "A podcast app. What does each failure need?"
+  buckets: [Stop quietly, Recover in code, Tell the user, Report a bug]
+  items:
+    - [The user scrolled past an episode before its artwork loaded, 0]
+    - [An episode download timed out on the train, 1]
+    - [The access token expired during a sync, 1]
+    - [Not enough free space to download the episode, 2]
+    - [The server's episode JSON has no required id field, 3]
+    - [The player was asked to play episode 12 of a 10-episode queue, 3]
+  explain: "Scrolling past cancels the artwork load. Timeouts and expired tokens can be handled by retrying and refreshing. Free space is the user's to fix. A broken contract and an impossible index are bugs: nobody at run time can act on them."
+- id: q2
+  type: mcq
+  prompt: "A shopping app gets `404` when opening a product. Which layer should decide whether to show \"This product is no longer available\" or report a bug?"
+  options:
+    - "The API client, because it saw the status code"
+    - "The product repository or use case, because it knows a missing product is a normal outcome for links"
+    - "The view, because it shows the message"
+    - "The crash-reporting SDK, by grouping similar errors"
+  answer: 1
+  explain: "The API client knows only that a 404 happened. The repository knows what the call meant: products disappear, so a 404 there is an expected, user-facing outcome. The same status from `/me` would be a bug."
+- id: q3
+  type: multi
+  prompt: "A notes app saves straight to the server and shows an alert when the phone is offline. Which changes remove or soften the failure rather than just reword it? Choose all that apply."
+  options:
+    - "Save the note locally first and sync it when the network returns"
+    - "Change the alert text to \"Please check your connection\""
+    - "Show a small \"Waiting to sync\" badge on unsynced notes"
+    - "Retry the upload every second until it works"
+  answer: [0, 2]
+  explain: "Saving locally turns offline from a user-facing error into a recoverable one the user barely notices, and the badge keeps them informed. Rewording leaves the failure in place. Retrying every second wastes battery while offline; wait for connectivity instead."
+- id: q4
+  type: truefalse
+  prompt: "A recoverable error never needs a user-facing design, because code handles it."
+  answer: false
+  explain: "Recovery can run out: retries hit their budget, refresh tokens expire too. Every recoverable error needs an answer to what the user sees when that happens."
+- id: q5
+  type: mcq
+  prompt: "Your classifier receives an error type it has never seen. What should it return?"
+  options:
+    - "Cancelled, so the user isn't bothered"
+    - "Recoverable, and retry it a few times"
+    - "Bug: show a polite generic message and report it with context"
+    - "Crash the app, so it's noticed"
+  answer: 2
+  explain: "An unanticipated error is a gap in the taxonomy. Reporting it is how you learn it exists; a generic message keeps the user informed. Retrying blindly may repeat something that can't succeed, and crashing punishes the user for your gap."
+```

@@ -1,0 +1,348 @@
+## Why it matters
+
+Every unidirectional architecture you'll meet on iOS, from a forty-line homemade store to TCA, borrows its vocabulary from two JavaScript designs: Flux and Redux. Store, action, reducer, dispatch, middleware and selector all come from there, and so do the arguments about one store or many. [Unidirectional data flow: the core ideas](/design/learn/sd-functional-unidirectional) gave you the four rules and [Reducers: state changes as pure functions](/design/learn/sd-functional-reducers) the reducer. This lesson is about the architecture built around them: what problem Flux solved, what Redux changed, and what each choice costs once you translate it to Swift. Interviewers ask "how does Redux (or TCA) work, and why?" because the answer shows whether you understand the trade-offs or only the API.
+
+## The bug that started it: Flux
+
+In 2014 Facebook's web app had a recurring bug: the chat badge said you had an unread message when you didn't. Engineers fixed it, and it came back. The unread count lived in one model, the threads in another, and the messages in a third; views and controllers updated each other in both directions, and an update to one model triggered updates to others in an order nobody could predict. At their F8 conference that year, Facebook described their answer and called it **Flux**.
+
+Flux has four parts, and data moves through them one way:
+
+- **Actions** are plain values that describe what happened: `threadOpened(id)`, `messageReceived(message)`.
+- **One dispatcher** receives every action and hands it to **every** store. It has no logic of its own.
+- **Stores** each own the state and the logic for one domain: a thread store, an unread-count store. A store updates *itself* in response to actions, then announces that it changed. Nothing outside a store can write to it.
+- **Views** read from stores, render, and create new actions when the user does something.
+
+Step through it to see the unread bug disappear:
+
+```visual flow
+title: "Flux: one dispatcher, many stores"
+nodes:
+  - { id: action, label: Action, kind: plain, at: [0, 0] }
+  - { id: dispatcher, label: Dispatcher, at: [2, 0] }
+  - { id: threads, label: Thread store, kind: store, at: [4, 0] }
+  - { id: unread, label: Unread store, kind: store, at: [4, 2] }
+  - { id: views, label: Views, kind: view, at: [2, 2] }
+edges:
+  - [action, dispatcher, dispatch]
+  - [dispatcher, threads, every action]
+  - [dispatcher, unread, every action]
+  - [unread, threads, waitFor, { style: data }]
+  - [threads, views, change]
+  - [unread, views, change]
+  - [views, action, user taps]
+steps:
+  - say: "The user opens a chat thread. The view doesn't change any state itself: it creates an **action**, `threadOpened(42)`."
+    show: [views, action]
+    send: views->action
+  - say: "The action goes to the one **dispatcher**. Every change in the app passes through this single point, one action at a time."
+    show: [dispatcher]
+    send: action->dispatcher
+  - say: "The dispatcher hands it to **every** store. Each store decides for itself whether it cares about `threadOpened`."
+    show: [threads, unread]
+    send: [dispatcher->threads, dispatcher->unread]
+  - say: "The unread store can only recount once the thread store has marked the messages read, so it calls `waitFor(threadStore)`. Ordering between stores is explicit, but it's a dependency you have to manage by hand."
+    send: unread->threads
+    state: { unread: wait }
+  - say: "Each store updates its own state and announces a change. The views re-read and render, and the badge can't disagree with the thread any more: both changed in response to the same action."
+    send: [threads->views, unread->views]
+    state: { unread: ok, threads: ok }
+```
+
+Two rules made it work. Stores could only change in response to an action, so there was one door into the state. And the dispatcher refused to dispatch an action while another was still being processed, throwing "Cannot dispatch in the middle of a dispatch". Cascades, where one update triggers another, became impossible by construction.
+
+The cost was the dispatcher itself and the `waitFor` graph between stores: with a dozen stores, knowing which store had to wait for which became its own source of bugs.
+
+## Redux: three principles
+
+A year later, Dan Abramov and Andrew Clark were preparing a talk on hot reloading and time-travel debugging, and found that Flux's many stores made both hard: there was no single value to save, restore or rewind. They kept Flux's one-way flow, borrowed ideas from the Elm architecture (you'll meet it two lessons from now), and released **Redux** in 2015. It rests on three principles:
+
+1. **A single source of truth.** The whole app's state is one value, held by one store.
+2. **State is read-only.** The only way to change it is to dispatch an action.
+3. **Changes are made with pure functions.** A **reducer** takes the current state and an action and returns the next state: `(state, action) -> state`.
+
+What changed from Flux:
+
+| Flux | Redux |
+| --- | --- |
+| Many stores, each with its own logic | One store holding one state value |
+| A dispatcher object that broadcasts | No dispatcher: `store.dispatch(action)` calls the reducer |
+| Stores mutate themselves | A pure reducer computes the next state |
+| `waitFor` orders stores | Reducers are composed explicitly, so order is just code |
+
+The big reducer is split into **slice reducers**, each owning one part of the state, and combined into a root reducer. Redux's `combineReducers` gives each slice reducer only its own slice, which keeps them independent, and which raises the question you'll see in the example below: where does logic that needs two slices go?
+
+## A Redux store in Swift
+
+Swift makes most of this pleasant. State is a struct, actions are an enum, and a reducer takes the state `inout`. Here's a reading app with a shelf and a profile, a store that notifies subscribers only when the part they read has changed, and a replay at the end:
+
+```swift run title="A Redux-style store: one state, slice reducers, subscriptions and replay"
+struct ShelfState: Equatable {
+    var titles: [Int: String] = [:]
+    var finished: Set<Int> = []
+}
+
+struct ProfileState: Equatable {
+    var finishedThisYear = 0
+}
+
+struct AppState: Equatable {
+    var shelf = ShelfState()
+    var profile = ProfileState()
+}
+
+/// Events, named after what happened, not after which property to set
+enum AppAction {
+    case bookAdded(id: Int, title: String)
+    case bookFinished(id: Int)
+    case bookRemoved(id: Int)
+}
+
+/// Each slice reducer sees only its own slice
+func shelfReducer(_ state: inout ShelfState, _ action: AppAction) {
+    switch action {
+    case .bookAdded(let id, let title): state.titles[id] = title
+    case .bookFinished(let id): state.finished.insert(id)
+    case .bookRemoved(let id):
+        state.titles[id] = nil
+        state.finished.remove(id)
+    }
+}
+
+func profileReducer(_ state: inout ProfileState, _ action: AppAction) {
+    if case .bookFinished = action { state.finishedThisYear += 1 }
+}
+
+/// The root reducer combines the slices, and holds the rules that need more than one of them
+func appReducer(_ state: inout AppState, _ action: AppAction) {
+    if case .bookFinished(let id) = action, state.shelf.finished.contains(id) || state.shelf.titles[id] == nil {
+        return   // already finished, or not on the shelf: the profile mustn't count it
+    }
+    shelfReducer(&state.shelf, action)
+    profileReducer(&state.profile, action)
+}
+
+final class Store<State: Equatable, Action> {
+    private(set) var state: State
+    private(set) var history: [Action] = []
+    private let reducer: (inout State, Action) -> Void
+    private var subscribers: [(_ old: State, _ new: State) -> Void] = []
+
+    init(_ state: State, reducer: @escaping (inout State, Action) -> Void) {
+        self.state = state
+        self.reducer = reducer
+    }
+
+    func dispatch(_ action: Action) {
+        let old = state
+        reducer(&state, action)
+        history.append(action)
+        guard state != old else { return }
+        for notify in subscribers { notify(old, state) }
+    }
+
+    /// Calls `onChange` only when the selected part of the state changes
+    func subscribe<Value: Equatable>(to select: @escaping (State) -> Value, _ onChange: @escaping (Value) -> Void) {
+        subscribers.append { old, new in
+            let value = select(new)
+            if select(old) != value { onChange(value) }
+        }
+    }
+}
+
+let store = Store(AppState(), reducer: appReducer)
+store.subscribe(to: { $0.shelf.titles.count }) { print("  → shelf badge shows \($0)") }
+store.subscribe(to: { $0.profile.finishedThisYear }) { print("  → profile shows \($0) finished") }
+
+let session: [AppAction] = [
+    .bookAdded(id: 1, title: "Dune"),
+    .bookAdded(id: 2, title: "Emma"),
+    .bookFinished(id: 1),
+    .bookFinished(id: 1),
+    .bookRemoved(id: 2),
+]
+for action in session {
+    print(action)
+    store.dispatch(action)
+}
+
+// The state is a fold of the actions, so replaying the log rebuilds it exactly
+var replayed = AppState()
+for action in store.history { appReducer(&replayed, action) }
+print("replay matches:", replayed == store.state)
+```
+
+```output
+bookAdded(id: 1, title: "Dune")
+  → shelf badge shows 1
+bookAdded(id: 2, title: "Emma")
+  → shelf badge shows 2
+bookFinished(id: 1)
+  → profile shows 1 finished
+bookFinished(id: 1)
+bookRemoved(id: 2)
+  → shelf badge shows 1
+replay matches: true
+```
+
+What to notice:
+
+- **One event, two reducers.** `bookFinished` changes the shelf *and* the profile. The view that sent it doesn't know or care how many parts of the app react.
+- **The cross-slice rule lives in the root.** Without the guard in `appReducer`, the second `bookFinished` would count twice: the profile reducer can't see that the shelf already had the book as finished. Redux's own advice is the same: when a rule needs two slices, handle it in a reducer that can see both, or put what's needed in the action.
+- **Subscribers select.** The shelf badge isn't told about the profile changing, and the duplicate `bookFinished` notifies no one, because no selected value changed.
+- **Replay is free.** Because the reducer is pure and the state is a value, the history of actions *is* a recording of the session.
+
+## Actions are events, not setters
+
+The most common way to get Redux wrong is to write actions as setters: `setFinishedCount(3)`, `setBadge(2)`. The view then has to work out the new value, so the logic moves back into the view, two views compute it differently, and the reducer becomes a dumb property bag. Redux's style guide puts it plainly: model actions as events, not setters.
+
+| Setter actions | Event actions |
+| --- | --- |
+| `setFinishedCount(state.count + 1)` | `bookFinished(id: 1)` |
+| The caller decides the new state | The reducer decides |
+| One reducer can respond | Any number of reducers can respond |
+| The log reads like a series of assignments | The log reads like what the user did |
+
+Name user actions after the gesture (`finishTapped`) or the event (`bookFinished`), and responses after what came back (`searchResponse`). Keep actions as values: enums with value payloads, ideally `Equatable`, so they can be logged, compared in tests and replayed. A closure or a reference type in an action can't be logged or replayed meaningfully, and comparing two of them tells you nothing.
+
+## Values, copies and change detection
+
+JavaScript reducers must return *new* objects instead of mutating, because Redux detects changes by reference: if the object is the same, nothing changed. Swift gives you that discipline for free. A struct passed `inout` is the reducer's own copy; arrays, dictionaries and sets copy their storage only when written to while shared (copy-on-write), so changing one book doesn't copy the shelf.
+
+Change detection is where you pay instead. A Redux store compares references in constant time; a Swift store compares values with `==`. Two arrays that share storage compare instantly, because the standard library checks identity first, but two arrays with separate storage are compared element by element. For a feature's state that's nothing. For one giant app-wide state compared after every action by every subscriber, it adds up, which is one reason the next lessons keep stores per feature and why SwiftUI-era libraries moved to observation instead of comparison.
+
+## Selectors and derived data
+
+Subscribers rarely want the whole state. A **selector** is a function from state to the part a view needs: `{ $0.shelf.titles.count }`, or "the five most recently finished books, sorted". The store notifies a subscriber only when its selection changes, and expensive selectors are memoised, so sorting a thousand books doesn't run on every keystroke. In Swift, a selector is a closure or a key path, and derived values are usually computed properties on the state ([Derived state: compute it, don't store it](/design/learn/sd-state-derived)).
+
+SwiftUI changes how this works. A view reading an `@Observable` store's `state` property depends on all of `state`, so any change re-evaluates it, even with a selector-shaped computed property. That's why the Redux pattern doesn't drop straight into SwiftUI, and why TCA made the state struct itself observable, field by field. You'll see how in [TCA: state, actions and reducers](/design/learn/sd-udf-tca-reducers).
+
+## Time travel and bug reports
+
+Redux's party trick was time travel: the DevTools show every action, the state after it and the difference, and let you jump back to any point. It works because state is a fold of actions over the initial state. The same property is useful on iOS in two practical ways:
+
+- **Tests** can replay a recorded sequence of actions and assert on the final state.
+- **Bug reports** can carry the last fifty actions as breadcrumbs. Replaying them in a debug build often reproduces the bug exactly.
+
+Mind what actions carry: an action with a search query, a message body or an email address is personal data. Redact payloads before they leave the device, or log only the case names.
+
+## Trade-offs
+
+| | Mutable models with two-way updates | Flux: one dispatcher, many stores | Redux: one store, pure reducers |
+| --- | --- | --- | --- |
+| Where logic lives | Anywhere: views, controllers, models | In each store | In reducers |
+| Consistency between screens | Fragile | Good: one door per store | Strong: one state |
+| Ordering of updates | Implicit, often surprising | Explicit with `waitFor` | Explicit in the reducer code |
+| Debugging | Hard to say who changed what | Action log per dispatch | Action log, state diffs, replay |
+| Boilerplate | Least | Dispatcher, stores, actions | Actions and reducers for every change |
+| Change detection | Delegates and notifications | Store change events | Comparing state, or selected parts of it |
+| Wins when | Small, isolated screens | Several independent domains with a few ordering rules | Many interacting features, and you want replay and pure tests |
+
+On iOS the honest default is between the two columns on the right: Redux's pure reducers and actions-as-events, but a store per feature rather than one for the whole app. [Unidirectional data flow: the core ideas](/design/learn/sd-functional-unidirectional) and [Global stores and their trade-offs](/design/learn/sd-state-global-stores) made that case; the TCA lessons show how a single tree can be split back into per-feature pieces.
+
+<Callout kind="interview">
+
+**Say** "Flux made data flow one way: actions go through one dispatcher to stores that update themselves. Redux simplified it to one store, read-only state and pure reducers, so the state is a fold of the actions, which makes it testable and replayable." Then translate to iOS: "In Swift that's a struct, an enum and an `inout` reducer; I'd keep a store per feature, not per app." **Ask** which state is truly shared across features, and whether the team needs replay or exhaustive tests, because that's what justifies the ceremony. **Red flags:** setter-style actions, a reducer that calls the network, and "one store for everything" with no word about how views avoid re-rendering on every change.
+
+</Callout>
+
+<Callout kind="gotcha" title="Swift gotcha: a class inside the state breaks every guarantee">
+
+Put a reference type in `AppState` (a view model, a `NSMutableArray`, an `@Observable` object) and anyone holding a reference can change it without an action. The reducer no longer sees every change, `==` may compare identity rather than contents, and a replay produces different state from the original run because the object was mutated in place. Keep state made of value types all the way down; if something must be a reference, keep it outside the state and refer to it by id.
+
+</Callout>
+
+<Callout kind="gotcha" title="Swift gotcha: dispatching from inside a reducer">
+
+A reducer that dispatches is no longer a function of its inputs, and the nested action runs halfway through the outer one. Redux throws "Reducers may not dispatch actions" if you try; a homemade Swift store will silently recurse. If one action should lead to another, return it as an effect or let middleware dispatch it after the reducer has finished, which is the next lesson.
+
+</Callout>
+
+## Practice
+
+- **[A Redux-style store with middleware](/design/practice/sd-kata-unidirectional-redux-store)** builds the store from this lesson properly: subscriptions, a middleware chain, and a queue so that an action dispatched in the middle of another waits its turn, as Flux's dispatcher insisted.
+- **[Review: one reducer for the whole app](/design/practice/sd-review-unidirectional-app-reducer)** is a Redux-style store that breaks most of this lesson's rules. Find the side effects, the hidden dependencies and the state that shouldn't be global.
+
+```cards
+- id: flux-parts
+  front: "What are Flux's four parts, and which way does data flow?"
+  back: "Actions describe what happened; one dispatcher hands every action to every store; stores update themselves and announce changes; views read stores and create new actions. Always in that direction."
+- id: redux-principles
+  front: "What are Redux's three principles?"
+  back: "A single source of truth (one state in one store); state is read-only (change it only by dispatching an action); changes are made by pure functions (reducers)."
+- id: events-not-setters
+  front: "Why should actions be events rather than setters?"
+  back: "An event (`bookFinished`) lets the reducer decide the new state and lets several reducers respond. A setter (`setCount(3)`) moves the logic into whoever computes the value."
+- id: cross-slice
+  front: "Where does a rule that needs two slices of state go?"
+  back: "In a reducer that can see both, usually the root reducer before it delegates to the slices, or into the action's payload. Slice reducers only see their own slice."
+```
+
+```quiz
+- id: q1
+  type: order
+  prompt: "Put one trip through Flux in order, for a user opening a chat thread."
+  lines:
+    - "The view creates a `threadOpened` action"
+    - "The dispatcher receives the action"
+    - "The dispatcher hands it to every store"
+    - "The unread store waits for the thread store to update"
+    - "The stores announce that they changed"
+    - "The views re-read the stores and render"
+  explain: "One door in (the dispatcher), stores that change only themselves, and views that only read: that's what stopped the badge disagreeing with the thread."
+- id: q2
+  type: sort
+  prompt: "Which design does each statement describe?"
+  buckets: [Flux, Redux, Both]
+  items:
+    - ["Several stores, each owning a domain's state and logic", 0]
+    - ["`waitFor` decides the order stores update in", 0]
+    - [One state value held by one store, 1]
+    - ["Pure functions compute the next state", 1]
+    - [Views change state only by sending actions, 2]
+    - [Data flows in one direction, 2]
+  explain: "Redux kept Flux's one-way flow and actions-only changes, but replaced many self-mutating stores and their ordering with one state and composed pure reducers."
+- id: q3
+  type: mcq
+  prompt: "A teammate adds `case setUnreadCount(Int)`, and three screens now compute the count before dispatching it. What's the best review comment?"
+  options:
+    - "Fine: setters are the simplest kind of action"
+    - "Dispatch an event such as `messageRead(id)` and let the reducer work out the count, so the rule lives in one place"
+    - "Move the count into each screen's own state"
+    - "Compute the count in a subscriber and write it back to the store"
+  answer: 1
+  explain: "Setter actions push the logic into whoever computes the value, so three screens can compute it three ways. An event names what happened, and the reducer owns what it means."
+- id: q4
+  type: output
+  prompt: "What does this print?"
+  code: |
+    enum Action { case add(Int), undo }
+    struct State { var total = 0; var last: [Int] = [] }
+
+    func reduce(_ state: inout State, _ action: Action) {
+        switch action {
+        case .add(let n):
+            state.total += n
+            state.last.append(n)
+        case .undo:
+            if let n = state.last.popLast() { state.total -= n }
+        }
+    }
+
+    let actions: [Action] = [.add(5), .add(3), .undo, .undo, .undo, .add(2)]
+    let final = actions.reduce(into: State()) { reduce(&$0, $1) }
+    print(final.total, final.last)
+  answer: "2 [2]"
+  explain: "The state is a fold of the actions: 5, then 8, back to 5, back to 0, a third undo with nothing left changes nothing, then 2. Replaying the same actions always gives the same answer."
+- id: q5
+  type: multi
+  prompt: "Which of these break Redux's guarantees? Choose all that apply."
+  options:
+    - "A reducer that calls `URLSession` and writes the response into the state"
+    - "An `@Observable` view model stored inside the app state"
+    - "Two slice reducers that both respond to `bookFinished`"
+    - "A subscriber that only reacts when the basket count changes"
+    - "A reducer that reads `Date()` to stamp when a book was finished"
+  answer: [0, 1, 4]
+  explain: "Network calls and the clock make the reducer impure, so replays and tests give different results. A reference type in the state can change without an action. Several reducers responding to one event, and selective subscribers, are the pattern working as designed."
+```

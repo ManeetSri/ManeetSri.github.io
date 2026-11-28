@@ -1,0 +1,284 @@
+## Why it matters
+
+Most apps don't suffer from too little design. They suffer from design for a future that never came: plugin systems with one plugin, generic repositories for two endpoints, a theming engine for one theme. Three old principles push back, and a senior engineer knows exactly where each one stops. Interviewers watch for both failures: gold-plating the whiteboard, and ignoring the decisions that can't be undone.
+
+## KISS: simple isn't the same as easy
+
+"Keep it simple" is usually traced to Kelly Johnson, the engineer who led Lockheed's Skunk Works. It sounds obvious until you ask what *simple* means.
+
+Rich Hickey's talk "Simple Made Easy" (2011) gives the most useful answer. **Simple** means not intertwined: each part does one thing, and you can understand it without understanding the others. **Easy** means near at hand: familiar, quick to type, already in your toolbox. They're different axes. A Combine pipeline may be *easy* for someone who writes Combine every day and still be *complex*: operators, schedulers and cancellation all interleaved.
+
+A practical measure: **how many things must a reader hold in their head to change this code safely?** Count concepts, not lines.
+
+### A search box, three ways
+
+The screen searches as the user types, waiting until they pause and dropping out-of-date requests.
+
+1. **Combine:** a `PassthroughSubject`, `debounce`, `removeDuplicates`, `map` to a publisher, `switchToLatest`, `receive(on:)`, `sink`, and a stored `AnyCancellable`. Seven operators and a lifetime to manage.
+2. **A hand-written debouncer:** a class holding a `Task` or `Timer`, cancelling the old one on each keystroke. Fewer concepts, but now you own the timing logic and its bugs.
+3. **Structured concurrency:**
+
+```swift check ios title="Debounced search with .task(id:)"
+import SwiftUI
+
+struct SearchView: View {
+    let search: (String) async throws -> [String]
+    @State private var query = ""
+    @State private var results: [String] = []
+
+    var body: some View {
+        List(results, id: \.self) { Text($0) }
+            .searchable(text: $query)
+            .task(id: query) {
+                do {
+                    try await Task.sleep(for: .milliseconds(300))   // a newer query cancels this task
+                    results = try await search(query)
+                } catch is CancellationError {
+                    // superseded by a newer query: nothing to do
+                } catch {
+                    results = []
+                }
+            }
+    }
+}
+```
+
+`.task(id:)` cancels the previous task whenever `query` changes, and cancellation interrupts `Task.sleep`. That gives you debouncing and dropping stale requests for free. It's the simplest of the three: one concept, the task's lifetime, does all the work.
+
+Simplicity is relative to the team, too. If the codebase is built on Combine and everyone reads it fluently, a fourth style for one screen adds a concept to the *codebase*, even if it removes some from the file.
+
+## YAGNI: build it when you need it
+
+"You aren't gonna need it" comes from Extreme Programming. Ron Jeffries put it bluntly: implement things when you actually need them, never when you only foresee that you will.
+
+Martin Fowler's 2015 essay on YAGNI makes the argument concrete. Call a capability you build for an imagined future a **presumptive feature**. It costs you four ways:
+
+- **Cost of build:** the days spent building it.
+- **Cost of delay:** what users didn't get in those days, because the team was building this instead.
+- **Cost of carry:** the extra complexity that slows every change to the code around it, for as long as it exists.
+- **Cost of repair:** when the need finally arrives, it's rarely the need you predicted, so the early version has to be reworked.
+
+Only the last scenario, "we needed exactly this, exactly then", repays the cost, and it's rarer than it feels. Try it with your own numbers:
+
+```visual estimator
+title: Should you build it now?
+inputs:
+  - { id: build, label: "Days to build it now", min: 1, max: 60, value: 10, unit: days }
+  - { id: carry, label: "Days a month it slows other work", min: 0, max: 5, step: 0.25, value: 1, unit: days }
+  - { id: months, label: "Months until it would be needed", min: 1, max: 24, value: 6, unit: months }
+  - { id: chance, label: "Chance it's ever needed (%)", min: 0, max: 100, step: 5, value: 30 }
+  - { id: later, label: "Days to build it later, when needed", min: 1, max: 120, value: 15, unit: days }
+outputs:
+  - { id: nowCost, label: "Cost of building it now, by the time it's needed", formula: build + carry * months, unit: days }
+  - { id: waitCost, label: "Expected cost of waiting", formula: chance / 100 * later, unit: days }
+  - { id: saved, label: "Days saved by waiting (negative: build it now)", formula: nowCost - waitCost, unit: days }
+```
+
+Waiting wins across most of the range. Building now wins only when the feature is very likely to be needed **and** much more expensive to add later. Push "chance" to 90% and "days to build later" to 90 to see that corner. The next section is about what lives there.
+
+### What YAGNI doesn't cover
+
+Fowler is explicit that YAGNI applies to **capabilities**, not to the work that keeps code easy to change. Tests, refactoring and clear structure aren't presumptive; they're what makes building later cheap, which is the assumption YAGNI depends on. "We'll add it when we need it" only works in code you can still change.
+
+Presumptive features you'll meet in iOS codebases:
+
+- An analytics "plugin architecture" when the app has one analytics vendor.
+- A generic `Repository<Entity, ID, Query>` with pluggable cache policies, used by two endpoints.
+- A theming engine for an app with one theme. (Dark mode isn't a theme engine; asset catalog colours already handle it.)
+- A protocol in front of every class "in case we swap it". A protocol you need *today* for a test double isn't speculative; one with a single implementation and no tests is.
+
+## Where YAGNI stops: decisions you can't take back
+
+Amazon's shareholder letters describe decisions as **one-way doors** (expensive or impossible to reverse) and **two-way doors** (cheap to undo). YAGNI is the right default for two-way doors. Mobile has an unusual number of one-way doors, because a shipped binary keeps running for months or years and you can't make everyone update.
+
+| Decision | Why it's hard to reverse on iOS | The cheap seam to leave now |
+| --- | --- | --- |
+| Server response shapes | Old app versions decode them for years | Tolerant decoding: optional new fields, unknown enum cases handled |
+| Data persisted on the device | Every install holds the old format | A schema version, and SwiftData or Core Data migrations planned in |
+| Deep-link and universal-link URLs | Links live on in emails, posts and other apps | A route format you'd be happy to support forever |
+| A minimum-version gate | Without one, you can never retire an old API | A server-driven "please update" check, shipped in v1 |
+| Where secrets are stored | Tokens in `UserDefaults` are already in backups | The Keychain from day one |
+| Accessibility and localisation | Retrofitting Dynamic Type and copy is a rewrite of every screen | Text styles and a String Catalog from the first screen |
+
+Notice that the right column is never "build the feature". It's a **seam**: a version field, a decoding rule, a gate. That's the honest middle ground between YAGNI and over-engineering.
+
+```swift check title="A versioned, tolerant format for a saved draft"
+import Foundation
+
+struct SavedDraft: Codable {
+    var schemaVersion = 2
+    var text: String
+    var attachmentIDs: [String] = []       // added in version 2
+
+    init(text: String) {
+        self.text = text
+    }
+
+    init(from decoder: any Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        schemaVersion = try container.decodeIfPresent(Int.self, forKey: .schemaVersion) ?? 1
+        text = try container.decode(String.self, forKey: .text)
+        attachmentIDs = try container.decodeIfPresent([String].self, forKey: .attachmentIDs) ?? []
+    }
+}
+```
+
+Drafts saved by version 1 of the app still open. Nothing about attachments was designed before it was needed; only the version number was.
+
+## Least astonishment: behave the way people expect
+
+The **principle of least astonishment** says a component should behave the way most of its users expect. For an API, the users are other developers; for a screen, they're people with an iPhone and years of habits.
+
+### In APIs
+
+Apple's [Swift API Design Guidelines](https://www.swift.org/documentation/api-design-guidelines/) are largely a least-astonishment document:
+
+- **Name by side effect.** Queries read as nouns (`distance(to:)`), commands as verbs (`print(_:)`). Mutating and non-mutating pairs are named so you can tell them apart: `sort()` and `sorted()`, `formUnion(_:)` and `union(_:)`.
+- **Properties look cheap.** The guidelines ask you to document any computed property that isn't O(1), because readers assume property access costs nothing. A `var items` that hits the disk astonishes.
+- **Clarity at the point of use.** `remove(at: index)` is unambiguous; `remove(index)` makes the reader check.
+
+The worst astonishment in Swift is a type that *looks* like a value but shares state, because every reader assumes copies are independent:
+
+```swift run title="An undo snapshot that changes behind your back"
+final class Selection {
+    var photoIDs: [String] = []
+}
+
+struct GalleryState {
+    var title: String
+    let selection = Selection()      // a reference hidden inside a value
+}
+
+var current = GalleryState(title: "Holiday")
+let undoSnapshot = current           // keep a copy for undo
+
+current.title = "Holiday 2026"
+current.selection.photoIDs.append("IMG_0042")
+
+print("Current: \(current.title), \(current.selection.photoIDs)")
+print("Undo:    \(undoSnapshot.title), \(undoSnapshot.selection.photoIDs)")
+```
+
+```output
+Current: Holiday 2026, ["IMG_0042"]
+Undo:    Holiday, ["IMG_0042"]
+```
+
+The title was copied; the selection wasn't. Undo restores the title and keeps the selection, and nobody reading `let undoSnapshot = current` would predict it. Make `Selection` a struct and the surprise disappears.
+
+### In the UI
+
+On iOS, least astonishment mostly means **following the platform**. People already know how iOS behaves:
+
+- Swipe from the left edge goes back. A custom back button that breaks the interactive pop gesture astonishes everyone.
+- Swiping a sheet down dismisses it. If that would lose a draft, use `.interactiveDismissDisabled(hasUnsavedChanges)` and offer a confirmation, rather than silently throwing the work away.
+- Destructive actions are red and confirm, or offer undo.
+- Text respects Dynamic Type; sharing uses the system share sheet.
+
+The Human Interface Guidelines are, among other things, a catalogue of what iPhone users expect.
+
+## Trade-offs
+
+When a teammate says "we might need X later", there are three honest responses:
+
+| Option | Cost now | Cost if X never comes | Cost if X comes | Wins when |
+| --- | --- | --- | --- | --- |
+| Build only today's feature | Lowest | None | Build X later, in code that's easy to change | The decision is a two-way door, which is most of the time |
+| Leave a seam (a version field, a protocol you need anyway, an enum case) | Small | Small carry | Low: the seam is where X plugs in | Reversing later is expensive: formats, contracts, links |
+| Build the general solution now | Highest | Build, delay and carry, all wasted | Repair: the guess is rarely exactly right | X is certain, imminent and well understood. Rare. |
+
+<Callout kind="interview">
+
+**What to say:** scope out loud. "For the first version I'd keep this to one data source. If we add a second, the repository protocol is where it plugs in." That shows you saw the future and chose not to pay for it yet.
+
+**What to ask:** "What's most likely to change in the next six months?" and "Which old app versions do we still support?" The first tells you where a seam earns its keep; the second tells you which contracts are one-way doors.
+
+**Red flags interviewers listen for:** over-engineering, such as a message queue, microservices or a plugin system for a feature with one use; and the opposite, a design with no API versioning, no pagination and no plan for old clients.
+
+</Callout>
+
+<Callout kind="gotcha" title="iOS gotcha: old app versions never fully leave">
+
+You can't force an App Store update. Some users stay on old versions for a very long time, so every endpoint, response shape, push payload and URL format an old binary uses is effectively public API. That's why a server-driven minimum-version check is one of the few features worth building before you need it: without it in v1, you can never switch an old API off.
+
+</Callout>
+
+## Practice
+
+The review [The generic list screen](/design/practice/sd-review-principles-generic-list) is full of presumptive features: a provider registry, unused plugin hooks and a getter that does work. The kata [One unread rule, three badges](/design/practice/sd-kata-principles-unread-badges) rewards the simplest structure that meets today's surfaces: a few small functions, not a configurable formatter.
+
+```cards
+- id: simple-vs-easy
+  front: "What's the difference between simple and easy?"
+  back: "Simple means not intertwined: parts you can understand separately. Easy means familiar or near at hand. Familiar code can still be complex."
+- id: yagni-costs
+  front: "What are Fowler's four costs of a presumptive feature?"
+  back: "Build, delay (what you didn't ship instead), carry (complexity slowing other changes) and repair (reworking it when the real need differs)."
+- id: yagni-limits
+  front: "Where does YAGNI stop on iOS?"
+  back: "At one-way doors: server contracts, persisted formats, URLs and secret storage. There, leave a cheap seam now, such as a version field, a tolerant decoder or a minimum-version gate."
+- id: pola-swift
+  front: "Name two ways Swift APIs avoid astonishing callers."
+  back: "Mutating and non-mutating pairs are named apart (`sort()` and `sorted()`), and computed properties that aren't O(1) are documented, because properties look cheap."
+```
+
+```quiz
+- id: q1
+  type: sort
+  prompt: "A teammate wants to prepare for each of these \"now, just in case\". Which deserve a seam today, and which can wait?"
+  buckets: [Leave a seam now, Wait until needed]
+  items:
+    - ["A version number in the drafts file saved on the device", 0]
+    - ["Support for a second analytics vendor", 1]
+    - ["A server-driven \"please update\" check", 0]
+    - ["A theming engine for future white-label customers", 1]
+    - ["Decoding a response's enum so an unknown case doesn't fail the whole payload", 0]
+  explain: "Persisted formats, the update gate and tolerant decoding are one-way doors: old installs and old binaries depend on them. A second vendor and a theme engine are two-way doors you can walk through when a real need arrives."
+- id: q2
+  type: estimate
+  prompt: "A presumptive feature takes 10 days to build and slows other work by about 1 day a month. If it's needed, that happens in 12 months. How many days has building it early cost by then?"
+  answer: 22
+  unit: days
+  within: { percent: 15 }
+  explain: "Build plus carry: 10 + 1 × 12 = 22 days. If there's only a 25% chance it's needed and it would take 12 days to build then, waiting costs 0.25 × 12 = 3 days on average."
+- id: q3
+  type: mcq
+  prompt: "Which version of a debounced search is simplest, in Hickey's sense?"
+  options:
+    - "A Combine pipeline with `debounce`, `removeDuplicates` and `switchToLatest`, for a team that uses Combine daily"
+    - "A view model that schedules a `Timer` and cancels it on each keystroke"
+    - "`.task(id: query)` that sleeps 300 ms and then searches, relying on cancellation"
+    - "A reusable `Debouncer<Input, Output>` generic type with configurable schedulers"
+  answer: 2
+  explain: "One concept, the task's lifetime, gives debouncing and dropping stale requests. The Combine version may be *easy* for that team but interleaves more concepts; the generic debouncer is presumptive."
+- id: q4
+  type: output
+  prompt: "What does this print?"
+  code: |
+    final class Cart {
+        var items: [String] = []
+    }
+
+    struct Checkout {
+        var step = 1
+        let cart = Cart()
+    }
+
+    var live = Checkout()
+    let saved = live
+    live.step = 2
+    live.cart.items.append("Tea")
+    print(saved.step, saved.cart.items)
+  answer: "1 [\"Tea\"]"
+  explain: "`step` is a value, so the copy keeps 1. `cart` is a class reference, so both copies share one cart and the saved copy sees the new item. That's the astonishment: it looks like a value type and isn't."
+- id: q5
+  type: multi
+  prompt: "Which of these would astonish a typical caller or user? Choose all that apply."
+  options:
+    - "A computed property `var unreadCount: Int` that queries the database on every read"
+    - "`sorted()` returning a new array and leaving the original alone"
+    - "Swiping down on a compose sheet discarding the draft without asking"
+    - "A completion handler that's called on a background queue without saying so"
+  answer: [0, 2, 3]
+  explain: "Properties look cheap, sheets with drafts should confirm, and threading surprises cause crashes. `sorted()` behaves exactly as its name promises, next to the mutating `sort()`."
+```

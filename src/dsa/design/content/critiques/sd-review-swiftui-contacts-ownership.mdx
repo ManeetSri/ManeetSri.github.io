@@ -1,0 +1,145 @@
+<Brief>
+
+A company directory app for iPad and iPhone: a split view with contacts on the left and the selected contact on the right, including a live presence status. QA's bug list: the list sometimes empties itself and reloads; on iPad, picking a second contact still shows the first; renaming a contact "doesn't stick"; and after a long session, the app is making presence requests every few seconds. Review it as you would a pull request: for every piece of state, ask who owns it and how long it lives.
+
+```swift check ios title="ContactsScreen.swift"
+import SwiftUI
+
+struct Contact: Identifiable, Hashable {
+    let id: UUID
+    var name: String
+}
+
+struct ContactsAPI: Sendable {
+    var contacts: @Sendable () async throws -> [Contact]
+    var presence: @Sendable (Contact.ID) async throws -> String
+    static let live = ContactsAPI(contacts: { [] }, presence: { _ in "Online" })
+}
+
+@MainActor
+final class ContactsStore: ObservableObject {
+    @Published var contacts: [Contact] = []
+    let api = ContactsAPI.live
+
+    func load() async {
+        contacts = (try? await api.contacts()) ?? []
+    }
+}
+
+@MainActor
+final class ContactDetailModel: ObservableObject {
+    @Published var contact: Contact
+    @Published var presence = "…"
+
+    init(contact: Contact, api: ContactsAPI) {
+        self.contact = contact
+        Task {
+            while !Task.isCancelled {
+                presence = (try? await api.presence(contact.id)) ?? "Unknown"
+                try? await Task.sleep(for: .seconds(30))
+            }
+        }
+    }
+}
+
+struct ContactsScreen: View {
+    @ObservedObject var store = ContactsStore()
+    @State private var selection: Contact?
+
+    var body: some View {
+        NavigationSplitView {
+            List(store.contacts, selection: $selection) { contact in
+                Text(contact.name).tag(contact)
+            }
+            .onAppear { Task { await store.load() } }
+        } detail: {
+            if let selection {
+                ContactDetail(contact: selection, api: store.api)
+            }
+        }
+    }
+}
+
+struct ContactDetail: View {
+    @StateObject private var model: ContactDetailModel
+    init(contact: Contact, api: ContactsAPI) {
+        _model = StateObject(wrappedValue: ContactDetailModel(contact: contact, api: api))
+    }
+
+    var body: some View {
+        Form {
+            TextField("Name", text: $model.contact.name)
+            LabeledContent("Status", value: model.presence)
+        }
+    }
+}
+```
+
+</Brief>
+
+```workspace
+template: critique
+minutes: 25
+```
+
+```findings
+- id: store-not-owned
+  title: The screen creates its store but doesn't own it
+  severity: high
+  lines: 41
+  detail: "`@ObservedObject` only observes; it doesn't keep an object across rebuilds. Each time the parent rebuilds `ContactsScreen`, the default value runs again and a new, empty store replaces the loaded one: the list empties, the selection points at a contact that's no longer there, and the load runs again. The view that creates the object owns it: `@StateObject private var store = ContactsStore()`, or better, a store created at the app root and passed in."
+- id: detail-keeps-first-contact
+  title: The detail pane keeps the first contact it was given
+  severity: high
+  lines: 51-61
+  detail: "When the selection changes from one contact to another, `ContactDetail` stays in the same structural position, so its identity, and its `@StateObject`, survive. `StateObject(wrappedValue:)` evaluates its autoclosure once per identity, so the model for the first contact stays, and on iPad (where both columns show) picking Grace still shows Ada. Give the pane an identity per contact with `.id(selection.id)`, or have the detail read the contact from the store by id."
+- id: polling-never-stops
+  title: Presence polling starts in an initialiser and is never cancelled
+  severity: high
+  lines: 31-36
+  detail: "The unstructured `Task` in `init` captures the model strongly and loops until cancelled, but nothing holds the task to cancel it. Every detail model ever created keeps polling every 30 seconds for the life of the process and is never freed. On iPhone, where each selection pushes a new detail, every contact the user opens adds another loop. Start the loop from the view's `.task(id: contact.id)`, which is cancelled when the pane disappears or the contact changes, and let `Task.sleep` throw so the loop ends."
+- id: load-on-every-appear
+  title: The list reloads on every appearance, in a task nobody cancels
+  severity: medium
+  lines: 49
+  detail: "`onAppear` runs again whenever the list reappears: on iPhone, every time the user goes back from a contact. Each run starts an unstructured task that isn't cancelled if the screen goes away. Use `.task { await store.load() }`, let the store skip a reload of fresh data, and add `.refreshable` for user-initiated reloads."
+- id: failure-wipes-list
+  title: A failed load silently empties the list
+  severity: medium
+  lines: 20
+  detail: "`try?` turns every failure into `[]`. A timeout on a refresh wipes a list that was showing fine, and the user sees an empty directory with no error and no retry. Keep the current contacts on failure and expose a loading, loaded or failed state the screen can show."
+- id: selection-by-value
+  title: Selection holds a whole contact, not its id
+  severity: medium
+  lines: 42-47
+  detail: "Rows are tagged with the full `Contact` value. As soon as a contact's fields change (a reload brings a corrected name, or an edit is finally saved), the selection matches no row: the highlight disappears and the detail keeps showing a stale copy. Select by `Contact.ID?`; `List` tags `Identifiable` rows with their id for you."
+- id: detail-edits-a-copy
+  title: Renaming edits a private copy that's never saved
+  severity: medium
+  lines: 26-30
+  detail: "The detail model copies the contact and the text field edits that copy. The list keeps the old name, nothing reaches the server, and the edit is lost when the pane goes away. That's two sources of truth. The store should own contacts; the detail should edit a draft that it commits through the store with an explicit save, or edit the store's contact through a binding."
+- id: hard-wired-api
+  title: The store builds its own API, and the screen builds its own store
+  severity: low
+  lines: 17
+  detail: "`ContactsAPI.live` is chosen inside the store and the store inside the view, so previews and tests can't supply a fake: every preview calls the real service. Create the store at the composition root with its API injected, and hand it to the screen."
+```
+
+<ReferenceReview>
+
+**Most important first.** Three ownership and lifetime problems cause every bug on QA's list. The screen **doesn't own the store it creates** (`@ObservedObject` with a default value), so any parent update throws away the loaded contacts. The detail pane **keeps its first model**, because a new selection doesn't give it a new identity. And each detail model **starts a polling loop nobody can cancel**, which is why the app ends up making presence requests every few seconds.
+
+**The pattern underneath:** state and work are attached to the wrong lifetimes. The contacts must outlive any one rebuild of the screen; presence polling must live exactly as long as a pane shows one contact; edits must end up in the one place that owns contacts.
+
+**How I'd fix it, in small steps:**
+
+1. Create `ContactsStore` at the app root with its API injected, and pass it in. Until that lands, `@StateObject private var store = ContactsStore()` stops the data loss on its own.
+2. Replace `.onAppear { Task { … } }` with `.task { await store.load() }`, add `.refreshable`, and make `load()` keep the existing contacts and set an error state when it fails.
+3. Select by `Contact.ID?`, and look the contact up in the store for the detail pane.
+4. Give the pane `.id(contactID)`, so each contact gets a fresh detail model, and move polling into `func pollPresence() async` on the model, started from `.task(id: contactID)` and using `try await Task.sleep` so cancellation ends it.
+5. Turn the detail into a draft with an explicit Save that calls `store.rename(_:to:)`, so the store stays the single source of truth.
+6. While there, migrate both models to `@Observable` with `@State`; the ownership rules are the same and invalidation gets finer.
+
+**Tests to add:** the store's load success, failure (contacts kept, error set) and rename, with a fake `ContactsAPI`; the detail model's polling ending when its task is cancelled; and a UI test that selects two contacts in turn on iPad and checks the second one's name is shown.
+
+</ReferenceReview>

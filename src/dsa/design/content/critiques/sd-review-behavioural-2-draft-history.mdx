@@ -1,0 +1,150 @@
+<Brief>
+
+This is the compose screen of a notes app that lets people attach photos. It has its own undo and redo, and it autosaves the draft so nothing is lost if iOS terminates the app. QA says undo "sometimes does nothing", typing feels sluggish once photos are attached, and a beta build crashed on launch for some testers after an update. Review it as you would a pull request.
+
+```swift check ios title="DraftHistory.swift"
+import UIKit
+
+final class Draft: Codable {
+    var body = ""
+    var photos: [Data] = []
+}
+
+final class DraftHistory {
+    private(set) var draft = Draft()
+    private var undoStack: [Draft] = []
+    private var redoStack: [Draft] = []
+
+    func setBody(_ body: String) {
+        undoStack.append(draft)
+        draft.body = body
+        save()
+    }
+
+    func addPhoto(_ image: UIImage) {
+        undoStack.append(draft)
+        draft.photos.append(image.jpegData(compressionQuality: 1)!)
+        save()
+    }
+
+    func undo() {
+        guard let previous = undoStack.popLast() else { return }
+        redoStack.append(draft)
+        draft = previous
+    }
+
+    func redo() {
+        guard let next = redoStack.popLast() else { return }
+        undoStack.append(draft)
+        draft = next
+    }
+
+    private func save() {
+        let data = try! JSONEncoder().encode(draft)
+        UserDefaults.standard.set(data, forKey: "draft")
+    }
+
+    static func restored() -> DraftHistory {
+        let history = DraftHistory()
+        if let data = UserDefaults.standard.data(forKey: "draft") {
+            history.draft = try! JSONDecoder().decode(Draft.self, from: data)
+        }
+        return history
+    }
+}
+
+final class ComposeViewController: UIViewController, UITextViewDelegate {
+    private let history = DraftHistory.restored()
+    private let textView = UITextView()
+
+    override func viewDidLoad() {
+        super.viewDidLoad()
+        textView.delegate = self
+        textView.text = history.draft.body
+        view.addSubview(textView)
+    }
+
+    func textViewDidChange(_ textView: UITextView) {
+        history.setBody(textView.text)
+    }
+
+    @objc func undoTapped() {
+        history.undo()
+        textView.text = history.draft.body
+    }
+}
+```
+
+</Brief>
+
+```workspace
+template: critique
+minutes: 25
+```
+
+```findings
+- id: shared-snapshots
+  title: Every undo snapshot is the same object, so undo does nothing
+  severity: high
+  lines: 3-6
+  detail: "`Draft` is a class, so `undoStack.append(draft)` (lines 14 and 20) stores a reference to the live draft, which is then mutated. Every entry in both stacks is that one object, so undo and redo swap it for itself. A memento has to be a copy: make `Draft` a struct of values."
+- id: restore-crash
+  title: Restoring with try! and no version crashes on every launch
+  severity: high
+  lines: 42-48
+  detail: "Whatever was saved is decoded with `try!`. Rename a field, add a non-optional one, or save a truncated value, and the app crashes at launch, then again on every launch, because the bad data is still there. That's the beta crash. Version the snapshot, decode with `try?`, and fall back to an empty draft (and log it)."
+- id: main-thread-autosave
+  title: Every keystroke re-encodes every photo on the main thread
+  severity: high
+  lines: 37-40
+  detail: "`textViewDidChange` calls `setBody`, which calls `save()`: the whole draft is JSON-encoded, photos included as base64 (JSONEncoder's default for `Data`), synchronously on the main thread, then written to UserDefaults, which is meant for small values and rewrites its whole property list. With a few photos that's megabytes per keystroke, which is the sluggish typing. Debounce autosave, encode off the main actor, write a file, and store photos as separate files referenced by id."
+- id: redo-branch
+  title: A new edit doesn't clear redo
+  severity: medium
+  lines: 13-23
+  detail: "`setBody` and `addPhoto` never empty `redoStack`. Undo twice, type a word, tap Redo: the draft jumps to the old branch and the word the user typed a moment ago is gone."
+- id: undo-not-saved
+  title: Undo and redo never save
+  severity: medium
+  lines: 25-35
+  detail: "`undo()` and `redo()` change `draft` without calling `save()`. Undo a paragraph, switch apps, come back after iOS has terminated the app: the restored draft has the paragraph again."
+- id: two-histories
+  title: Two undo histories that disagree
+  severity: medium
+  lines: 62-69
+  detail: "UITextView already records typing with the responder chain's `undoManager`, so shake to undo, ⌘Z on a keyboard and the three-finger undo gesture undo the text view's own edits, independently of this stack, while the Undo button walks a different history. Use one history: register snapshot undos with the `undoManager` and drop the custom stacks, or take over undo completely."
+- id: unbounded-history
+  title: One snapshot per keystroke, never trimmed
+  severity: medium
+  lines: 13-17
+  detail: "Each character typed is its own undo step, so undoing a sentence takes dozens of taps, and the stacks grow for as long as the screen is open. Once `Draft` is a value, every step holds a copy of the text. Group typing into one step per pause and cap the history (UndoManager's `levelsOfUndo`, or a limit on the stack)."
+- id: shared-key
+  title: Every window shares one saved draft
+  severity: medium
+  lines: 39
+  detail: "The draft is saved under one fixed key. On iPad with two compose windows open, each keystroke in one overwrites the other's saved draft, and both restore the same text. Give drafts ids, key the saved data by id, and keep each scene's draft id in its restoration activity."
+- id: jpeg-unwrap
+  title: Force-unwrapping a full-quality JPEG
+  severity: low
+  lines: 21
+  detail: "`jpegData(compressionQuality:)` returns nil when the image has no bitmap data it can encode (an image backed by a `CIImage`, for example), and the `!` crashes. Quality 1 also makes each photo several megabytes, which every problem above multiplies. Handle nil, and store the picked file (or a reference to it) rather than re-encoding."
+```
+
+<ReferenceReview>
+
+**Most important first.** Undo can't work at all: `Draft` is a class, so every "snapshot" is the live draft itself, and undo swaps the object for itself. Fixing that is a one-word change (`struct`) with a big effect. Then two problems users already feel: a decoding `try!` at launch that turns one bad saved value into a crash on every launch (the beta crash), and an autosave that re-encodes every photo as base64 on the main thread for each keystroke (the sluggish typing).
+
+**The design problem underneath** is that one type is three things at once: the originator (the draft), the caretaker (the stacks) and the persistence layer, and none of them follows the memento rules. Snapshots aren't copies, the history has no bounds or branch handling, and the persisted memento has no version, no per-window identity and no failure path.
+
+**How I'd fix it, in small steps:**
+
+1. Add tests for today's intended behaviour (undo, redo, undo-then-type) against `DraftHistory`. They fail now, which documents the bug.
+2. Make `Draft` a `struct` with value properties, and keep photos out of it: store each photo as a file once, and keep its identifier in the draft. Snapshots become small and cheap.
+3. Replace the hand-rolled stacks with snapshot undo through `UndoManager` (`registerUndo(withTarget:handler:)` capturing the previous `Draft`), grouping typing into one step per pause and setting `levelsOfUndo`. Shake to undo, ⌘Z and the Undo button then share one history, and redo is cleared on new edits for free.
+4. Move persistence behind a small `DraftStore`: a versioned, `Codable` snapshot per draft id, written to a file in Application Support from a debounced autosave, encoded off the main actor (a `Sendable` struct makes that easy). Save after undo and redo too.
+5. Restore with `try?` and a version check, falling back to an empty draft and logging the failure. Put the draft's id in the scene's restoration activity, so each iPad window restores its own draft.
+6. Handle a nil from `jpegData`, or better, keep the picked image file as it is.
+
+**Tests to add:** undo and redo sequences, including undo-then-edit clearing redo; history capped at the limit; decoding fixtures saved by the previous version, plus a corrupt one that must not crash; autosave debouncing with an injected clock; two draft ids saved and restored independently.
+
+</ReferenceReview>

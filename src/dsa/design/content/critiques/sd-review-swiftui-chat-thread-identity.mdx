@@ -1,0 +1,133 @@
+<Brief>
+
+The conversation screen of a messaging app. In testing it's fine, but real users have threads with thousands of messages, and they report that opening a long thread is slow, the thread jumps back to the top whenever a message arrives, "scroll to latest" does nothing, and the phone gets warm while a conversation is open. Review it as you would a pull request, with identity and update cost in mind.
+
+```swift check ios title="ChatThreadView.swift"
+import Combine
+import SwiftUI
+
+struct Message: Hashable {
+    var serverID: String?
+    var text: String
+    var sentAt: Date
+    var isPending: Bool
+}
+
+struct MessageRow: Identifiable {
+    let id = UUID()
+    let message: Message
+}
+
+struct ChatThreadView: View {
+    let messages: [Message]
+    @State private var now = Date()
+    private let ticker = Timer.publish(every: 1, on: .main, in: .common).autoconnect()
+
+    private var rows: [MessageRow] {
+        messages.sorted { $0.sentAt < $1.sentAt }.map { MessageRow(message: $0) }
+    }
+
+    var body: some View {
+        ScrollViewReader { proxy in
+            ScrollView {
+                VStack(alignment: .leading, spacing: 8) {
+                    ForEach(rows) { row in
+                        bubble(for: row.message)
+                    }
+                }
+                .padding()
+            }
+            .id(messages.count)
+            .onChange(of: messages.count) {
+                proxy.scrollTo(rows.last?.id, anchor: .bottom)
+            }
+        }
+        .onReceive(ticker) { now = $0 }
+    }
+
+    @ViewBuilder
+    private func bubble(for message: Message) -> some View {
+        VStack(alignment: .leading) {
+            if message.isPending {
+                Text(message.text)
+                    .padding(10)
+                    .background(.gray.opacity(0.3), in: .rect(cornerRadius: 12))
+            } else {
+                Text(message.text)
+                    .padding(10)
+                    .background(.blue.opacity(0.3), in: .rect(cornerRadius: 12))
+            }
+            Text(RelativeDateTimeFormatter().localizedString(for: message.sentAt, relativeTo: now))
+                .font(.caption2)
+                .foregroundStyle(.secondary)
+        }
+    }
+}
+```
+
+</Brief>
+
+```workspace
+template: critique
+minutes: 25
+```
+
+```findings
+- id: ids-made-while-mapping
+  title: Row ids are new UUIDs on every evaluation
+  severity: high
+  lines: 11-23
+  detail: "`rows` builds fresh `MessageRow` values, each with a new `UUID`, every time `body` reads it. To SwiftUI every update removes every bubble and inserts a whole new set: nothing animates in place, any state inside a row is lost, and every row's body runs. Give rows the message's own stable identity: its server id, or a client id assigned when the message is composed and echoed back by the server."
+- id: id-resets-scroll-view
+  title: "`.id(messages.count)` rebuilds the scroll view on every new message"
+  severity: high
+  lines: 35
+  detail: "Changing a view's `.id` makes it a new view. Each arriving message destroys the scroll view and builds another, so the position resets to the top and every row is rebuilt, which is the jump users see. Remove it; `.defaultScrollAnchor(.bottom)` (iOS 17) keeps a chat pinned to the latest message, and `scrollPosition(id:)` gives programmatic control."
+- id: ticker-reruns-everything
+  title: A once-a-second timer re-runs the whole thread
+  severity: high
+  lines: 18-19
+  detail: "`now` is state read by every bubble through `bubble(for:)`, and the ticker writes it every second (line 40). So every second the whole body runs again: it sorts every message, makes new ids (rebuilding every row) and formats every timestamp. That's the warm phone. Drop the screen-level timer and let each label update itself with `Text(message.sentAt, style: .relative)`, or wrap only the label in a `TimelineView`."
+- id: scroll-to-a-ghost
+  title: "`scrollTo` targets an id that no row has"
+  severity: medium
+  lines: 37
+  detail: "`rows.last?.id` builds the rows again, so it returns a brand-new `UUID` that belongs to no view on screen, and `scrollTo` silently does nothing. It also passes an optional. With stable ids, scroll to the last message's id."
+- id: eager-stack
+  title: A plain `VStack` builds every message up front
+  severity: medium
+  lines: 28
+  detail: "Inside a `ScrollView`, `VStack` creates every bubble when the thread opens, so a thread of 5,000 messages runs 5,000 bodies before the first frame and keeps them all in memory. Use `LazyVStack`, or a `List`, so only rows near the screen are built."
+- id: sort-in-body
+  title: The whole thread is sorted on every evaluation
+  severity: medium
+  lines: 22
+  detail: "Sorting is O(n log n) work on the main thread, repeated on every body run, which the ticker makes once a second. Keep messages sorted in the model as they arrive (an insert into a sorted array), and give the view the sorted list."
+- id: formatter-per-bubble
+  title: A new formatter for every bubble, every time
+  severity: low
+  lines: 55
+  detail: "`RelativeDateTimeFormatter()` is expensive to create, and this makes one per bubble per evaluation. `Text(message.sentAt, style: .relative)` formats with cached formatters and keeps itself current; `message.sentAt.formatted(.relative(presentation: .named))` also avoids creating a formatter, though it doesn't update on its own."
+- id: pending-branch
+  title: Pending and sent bubbles are different views
+  severity: low
+  lines: 46-54
+  detail: "The `if`/`else` gives the two looks different structural identities, so when a message is confirmed SwiftUI removes one `Text` and inserts another (a cross-fade, losing anything inside) rather than animating the colour. Use one `Text` with `.background(message.isPending ? Color.gray.opacity(0.3) : Color.blue.opacity(0.3), in: .rect(cornerRadius: 12))`."
+```
+
+<ReferenceReview>
+
+**Most important first.** Two identity bugs make the screen misbehave, and one dependency makes it expensive. **Row ids are invented while building rows**, so SwiftUI never sees the same bubble twice; **`.id(messages.count)`** throws the scroll view away on every message, which is the jump to the top; and **the ticker** re-runs the entire thread every second, multiplying the cost of everything else (sorting, new ids for every row, a formatter per bubble). "Scroll to latest" fails because of the first bug: the id it scrolls to was made a moment ago and belongs to nothing.
+
+**How I'd fix it, in small steps:**
+
+1. Make `Message` `Identifiable` with a stable id: the server id for synced messages and a client id, created when the user composes a message and echoed by the server, for sent ones. Delete `MessageRow` and iterate messages directly.
+2. Remove `.id(messages.count)` and the `ScrollViewReader`; add `.defaultScrollAnchor(.bottom)`, or `scrollPosition(id:)` if the screen needs to scroll on command.
+3. Delete the ticker and `now`. Show times with `Text(message.sentAt, style: .relative)`, which keeps itself current.
+4. Switch `VStack` to `LazyVStack`.
+5. Move sorting into the model: keep the thread sorted on insert, and hand the view a ready array.
+6. Turn the pending and sent branches into one bubble view with the look chosen by modifiers.
+
+**Tests to add:** a unit test that the row identity of a message doesn't change when it goes from pending to sent (the stable row ids kata is exactly this), a model test that new messages land in sorted order, and a performance check: open a 5,000-message fixture in a UI test, record with the SwiftUI instrument and confirm that a new message runs only the new row's body, and an idle thread runs no bodies at all.
+
+</ReferenceReview>

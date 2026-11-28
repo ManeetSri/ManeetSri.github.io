@@ -1,0 +1,304 @@
+## Why it matters
+
+Users and sensors produce events far faster than you want to act on them. Typing "swift" is five keystrokes but one search; a scroll produces 120 position changes a second but analytics needs a few; 30 change notifications from one database save need one table reload. **Debounce**, **throttle** and **coalesce** are three different answers to "too many events", and picking the wrong one gives you a search box that searches for "s", or a progress bar that never moves. Typeahead search is one of the most common mobile design prompts, and this is its core.
+
+## Three ways to say "not every time"
+
+- **Debounce:** wait until the events *stop*. Act once, a quiet period after the last event. Each new event restarts the wait.
+- **Throttle:** act *at most once per interval*, however many events arrive. The leading edge acts on the first event and ignores the rest of the interval; the trailing edge acts at the end of the interval with the latest value.
+- **Coalesce:** merge many requests for the *same work* into one run. There's no timer: requests that arrive while the work is pending or running are folded into it.
+
+Watch them handle the same typing. The user types "swift" at a steady pace, pauses, then adds a "y":
+
+```visual timeline
+title: The same keystrokes, debounced and throttled at 300 ms
+unit: ms
+lanes:
+  - { id: keys, label: Search box }
+  - { id: debounce, label: Debounce }
+  - { id: throttle, label: Throttle }
+spans:
+  - { lane: keys, from: 0, to: 120, label: s }
+  - { lane: keys, from: 120, to: 250, label: sw }
+  - { lane: keys, from: 250, to: 380, label: swi }
+  - { lane: keys, from: 380, to: 500, label: swif }
+  - { lane: keys, from: 500, to: 1400, label: swift }
+  - { lane: keys, from: 1400, to: 1700, label: swifty }
+  - { lane: debounce, from: 0, to: 120, label: reset, tone: wait }
+  - { lane: debounce, from: 120, to: 250, label: reset, tone: wait }
+  - { lane: debounce, from: 250, to: 380, label: reset, tone: wait }
+  - { lane: debounce, from: 380, to: 500, label: reset, tone: wait }
+  - { lane: debounce, from: 500, to: 800, label: 'search "swift"', tone: ok }
+  - { lane: debounce, from: 1400, to: 1700, label: 'search "swifty"', tone: ok }
+  - { lane: throttle, from: 0, to: 300, label: 'search "s"', tone: active }
+  - { lane: throttle, from: 380, to: 680, label: 'search "swif"', tone: active }
+  - { lane: throttle, from: 1400, to: 1700, label: 'search "swifty"', tone: active }
+steps:
+  - { at: 0, say: "The first key. Debounce starts a 300 ms timer. Throttle searches **at once** for \"s\", then ignores keys for 300 ms." }
+  - { at: 250, say: "Each new key **restarts** the debounce timer, so nothing has been searched yet. Throttle is still in its quiet interval." }
+  - { at: 380, say: "Throttle's interval is over, so the next key, \"swif\", is searched: a partial word nobody wanted results for." }
+  - { at: 800, say: "300 ms after the last key, the debounce timer finally fires and searches **\"swift\"**: the query the user meant." }
+  - { at: 1700, say: "The pause, then \"y\": one more debounced search. Debounce sent 2 searches, throttle 3, and every keystroke would have been 6." }
+```
+
+The same arithmetic in code, as pure functions over timestamps:
+
+```swift run title="DebounceVsThrottle.swift"
+typealias Keystroke = (at: Int, text: String)   // milliseconds since the first key
+
+// "swift" typed at a steady pace, a pause, then one more letter
+let typed: [Keystroke] = [(0, "s"), (120, "sw"), (250, "swi"), (380, "swif"), (500, "swift"), (1400, "swifty")]
+
+// Debounce: send a value once `quiet` ms pass with no newer one
+func debounce(_ events: [Keystroke], quiet: Int) -> [Keystroke] {
+    events.indices.compactMap { index in
+        let fireAt = events[index].at + quiet
+        let next = index + 1 < events.count ? events[index + 1].at : Int.max
+        return next < fireAt ? nil : (fireAt, events[index].text)
+    }
+}
+
+// Throttle (leading edge): send a value, then ignore everything for `interval` ms
+func throttle(_ events: [Keystroke], interval: Int) -> [Keystroke] {
+    var sent: [Keystroke] = []
+    for event in events {
+        if let last = sent.last, event.at - last.at < interval { continue }
+        sent.append(event)
+    }
+    return sent
+}
+
+func describe(_ events: [Keystroke]) -> String {
+    events.map { "\"\($0.text)\" at \($0.at) ms" }.joined(separator: ", ")
+}
+
+print("Every keystroke:", typed.count, "searches")
+print("Debounce 300 ms:", describe(debounce(typed, quiet: 300)))
+print("Throttle 300 ms:", describe(throttle(typed, interval: 300)))
+```
+
+```output
+Every keystroke: 6 searches
+Debounce 300 ms: "swift" at 800 ms, "swifty" at 1700 ms
+Throttle 300 ms: "s" at 0 ms, "swif" at 380 ms, "swifty" at 1400 ms
+```
+
+## Choosing one
+
+Ask what matters: the **final** value, **steady progress**, or **doing the work once**.
+
+| Situation | Pattern | Why |
+| --- | --- | --- |
+| Search as you type, form validation | Debounce, 250–400 ms | Only the value after the user pauses matters |
+| Autosaving a draft | Debounce with a maximum wait | Saves after a pause, but at least every 10 s while typing goes on |
+| Scroll-position analytics, map updates while panning | Throttle, trailing (latest) | Steady updates during a long gesture, each with the current value |
+| A Pay or Send button | Throttle, leading | The first tap acts at once; taps in the next second are ignored |
+| Download progress in the UI | Throttle, trailing | Ten updates a second look smooth; a thousand cost layout passes |
+| Reload after 30 change notifications from one save | Coalesce | The work is identical; once is enough |
+| Token refresh requested by five failed requests | Coalesce (single-flight) | Everyone needs the *same* result: the next lesson |
+
+Debounce has one trap: if events never stop, it never fires. A user typing continuously for ten minutes into a note that saves "2 seconds after they stop typing" has saved nothing when iOS terminates the app. A **maximum wait** (fire at least every N seconds) fixes it, and the save on entering the background is the backstop.
+
+## Debouncing a search in SwiftUI
+
+SwiftUI's `.task(id:)` cancels its task and starts a new one whenever the `id` changes. A sleep at the top of the task turns that into a debounce: each keystroke cancels the previous task mid-sleep, so only the task that survives 300 ms of quiet goes on to search.
+
+```swift check ios title="SearchView.swift"
+import SwiftUI
+
+struct SearchView: View {
+    @State private var query = ""
+    @State private var results: [String] = []
+    let search: @Sendable (String) async throws -> [String]
+
+    var body: some View {
+        List(results, id: \.self) { Text($0) }
+            .searchable(text: $query)
+            .task(id: query) {
+                // A new query cancels this task, which interrupts the sleep: that's the debounce
+                do {
+                    try await Task.sleep(for: .milliseconds(300))
+                } catch {
+                    return
+                }
+                let term = query.trimmingCharacters(in: .whitespaces)
+                guard term.count >= 2 else {
+                    results = []
+                    return
+                }
+                do {
+                    let found = try await search(term)
+                    // A newer query may have started while this one was in flight
+                    guard !Task.isCancelled else { return }
+                    results = found
+                } catch {
+                    // Keep the previous results; a cancelled search isn't an error to show
+                }
+            }
+    }
+}
+```
+
+Two details matter as much as the debounce. A minimum length (two characters here) stops single-letter searches that match everything. And the `Task.isCancelled` check before writing `results` handles **out-of-order responses**: a search for "swif" that's slow to answer must not overwrite the results for "swift" that arrived first. Debouncing makes that race rarer; it doesn't remove it. Cancellation, or tagging each response with its query and dropping stale ones, does.
+
+The same pipeline elsewhere:
+
+- **Combine:** `$query.debounce(for: .milliseconds(300), scheduler: DispatchQueue.main).removeDuplicates()`, then `map` to a search publisher and `switchToLatest()` so a new query cancels the old request. `throttle(for:scheduler:latest:)` is the throttle.
+- **Async sequences:** `debounce(for:)` and `throttle(for:)` in swift-async-algorithms.
+- **UIKit, older code:** a `DispatchWorkItem` that's cancelled and rescheduled on each change, or `NSObject.cancelPreviousPerformRequests(withTarget:)` followed by `perform(_:with:afterDelay:)`.
+
+## Coalescing
+
+UIKit coalesces for you all the time. `setNeedsLayout()` doesn't lay out: it marks the view, and the layout pass at the end of the run loop's turn does it once, however many times it was marked. `setNeedsDisplay()` works the same way for drawing, and SwiftUI folds several state changes in one event into one update of the view.
+
+You can apply the same idea to your own work. Here, a burst of push notifications each asks for the badge's unread count to be refreshed. Requests that arrive while idle become one fetch; requests that arrive *during* a fetch become exactly one more, because the count may have changed after the first fetch read it.
+
+```swift run title="Coalescer.swift"
+// Any number of requests while idle become one run; requests during a run become exactly one more
+@MainActor
+final class Coalescer {
+    private var needsRun = false
+    private var running: Task<Void, Never>?
+    private let work: @MainActor () async -> Void
+
+    init(_ work: @escaping @MainActor () async -> Void) {
+        self.work = work
+    }
+
+    func setNeedsRun() {
+        needsRun = true
+        guard running == nil else { return }
+        running = Task {
+            while needsRun {
+                needsRun = false
+                await work()
+            }
+            running = nil
+        }
+    }
+
+    func idle() async {
+        await running?.value
+    }
+}
+
+var fetches = 0
+var badge: Coalescer?
+badge = Coalescer {
+    fetches += 1
+    print("Fetching the unread count (fetch \(fetches))")
+    if fetches == 1 {
+        badge?.setNeedsRun() // another notification arrives while the first fetch runs
+    }
+}
+
+for _ in 1...20 {
+    badge?.setNeedsRun() // a burst of 20 push notifications
+}
+await badge?.idle()
+print("21 requests, \(fetches) fetches")
+```
+
+```output
+Fetching the unread count (fetch 1)
+Fetching the unread count (fetch 2)
+21 requests, 2 fetches
+```
+
+The `needsRun` flag is the whole trick, and it's the same "dirty flag" that `setNeedsLayout` sets. Dropping requests that arrive mid-run would be wrong: the second notification's message would never be counted.
+
+## Trade-offs
+
+| Pattern | Latency to the first action | Work saved | Risk | Typical interval |
+| --- | --- | --- | --- | --- |
+| Debounce | The quiet period after the *last* event | The most | Never fires if events never stop; add a maximum wait | 250–500 ms for input |
+| Throttle, leading | None | A lot | The final value can be lost unless a trailing edge is added | 0.5–1 s for taps |
+| Throttle, trailing (latest) | Up to one interval | A lot | Up to one interval of lag | 100 ms for UI, seconds for analytics |
+| Coalesce | Until the next turn, or the end of the current run | Duplicates only | Losing a request that arrives mid-run (use a dirty flag) | No timer |
+
+<Callout kind="interview">
+
+**Say** the whole typeahead pipeline, not only the debounce: "Debounce 300 ms, ignore queries under two characters and repeats of the same query, cancel the in-flight request when a new one starts, cache results per query, and show the last results while the next ones load." **Ask** whether results must be instant (local filtering needs no debounce at all) and what the search API's rate limit is. **Red flags:** believing debounce prevents out-of-order results, throttling search (it sends partial words), and a debounce with no maximum wait on autosave.
+
+</Callout>
+
+<Callout kind="gotcha" title="Swift gotcha: try? on the debounce sleep">
+
+`try? await Task.sleep(for: .milliseconds(300))` swallows the `CancellationError` that a newer keystroke causes, so the cancelled task carries straight on and searches anyway. Every keystroke still sends a request; the debounce does nothing. Catch the error and return, as in the example, or check `Task.isCancelled` after the sleep.
+
+</Callout>
+
+<Callout kind="gotcha" title="iOS gotcha: RunLoop.main pauses while the user scrolls">
+
+Combine's `debounce(for:scheduler:)` with `RunLoop.main` as the scheduler delivers in the run loop's default mode. While a finger is dragging a scroll view, the main run loop runs in tracking mode, so debounced values wait until the scroll ends. `DispatchQueue.main` doesn't have that restriction, and is the usual choice for UI pipelines.
+
+</Callout>
+
+## Practice
+
+The kata **"Debounce an async stream"** asks you to build the debounce operator itself, driven by a test clock: the timer restarts on each element, the waiting element is flushed when the input ends, and nothing leaks when the listener stops.
+
+```cards
+- id: three-patterns
+  front: "What's the difference between debounce, throttle and coalesce?"
+  back: "Debounce acts once after events stop. Throttle acts at most once per interval while they continue. Coalesce merges requests for the same work into one run, with no timer."
+- id: search-pipeline
+  front: "What does a typeahead search need besides a debounce?"
+  back: "A minimum length, dropping repeated queries, cancelling the in-flight request (or ignoring stale responses) and caching results per query."
+- id: max-wait
+  front: "Why does an autosave debounce need a maximum wait?"
+  back: "If the user never pauses, a plain debounce never fires, and the draft is lost when the app is terminated. Fire at least every N seconds, and save on backgrounding too."
+- id: dirty-flag
+  front: "When coalescing, what should happen to a request that arrives while the work is already running?"
+  back: "Set a dirty flag so the work runs exactly once more afterwards. Dropping it loses the change that triggered it."
+```
+
+```quiz
+- id: q1
+  type: sort
+  prompt: "Which pattern fits each?"
+  buckets: [Debounce, Throttle, Coalesce]
+  items:
+    - [Checking whether a username is taken as the user types, 0]
+    - [Sending scroll depth to analytics during a long scroll, 1]
+    - [Reloading a list after a sync writes 200 records, 2]
+    - [Ignoring repeat taps on a Place Order button, 1]
+    - [Saving a draft when the user pauses, 0]
+  explain: "The username check and draft save care about the value after a pause. Scroll depth needs steady samples during the gesture, and the order button needs the first tap acted on at once. The reload is the same work requested 200 times."
+- id: q2
+  type: trace
+  prompt: "Events arrive at 0, 100, 150, 600, 700 and 1000 ms. With a 200 ms debounce, at what times does it fire? Separate them with commas."
+  answer: "350, 900, 1200"
+  explain: "150 is followed by a 450 ms gap, so it fires at 150 + 200 = 350. 600 is cut off by 700, which has 300 ms of quiet and fires at 900. 1000 is the last event and fires at 1200."
+- id: q3
+  type: bug
+  prompt: "This search screen still sends a request for every keystroke. Which line is the bug?"
+  code: |
+    .task(id: query) {
+        try? await Task.sleep(for: .milliseconds(300))
+        let found = try? await search(query)
+        results = found ?? []
+    }
+  answer: 2
+  explain: "When a newer keystroke cancels this task, the sleep throws `CancellationError`, and `try?` turns that into `nil`. The cancelled task then searches anyway. Catch the error and return instead."
+- id: q4
+  type: mcq
+  prompt: "With a 300 ms debounce, the user types \"ca\", pauses, then types \"t\". The search for \"ca\" is slow and arrives after the results for \"cat\". What fixes the wrong results on screen?"
+  options:
+    - "Increase the debounce to one second"
+    - "Cancel the previous search when a new one starts, or drop responses for any query but the current one"
+    - "Throttle the searches instead of debouncing them"
+    - "Add `removeDuplicates()` to the pipeline"
+  answer: 1
+  explain: "Debounce reduces how many searches start, not the order they finish in. Cancelling the stale request, or tagging responses with their query and ignoring old ones, is what keeps results matched to the text."
+- id: q5
+  type: mcq
+  prompt: "Notes autosave 2 seconds after the user stops typing. A user types without pausing for ten minutes, switches apps, and iOS later terminates the app. What's the best fix?"
+  options:
+    - "Shorten the debounce to 200 ms"
+    - "Add a maximum wait so a save happens at least every 10 seconds, and save when the scene enters the background"
+    - "Save on every keystroke"
+    - "Throttle saves to once a minute"
+  answer: 1
+  explain: "A debounce that never sees a pause never fires. A maximum wait bounds the loss while typing continues, and the background transition is the last reliable moment before suspension. Saving every keystroke works but costs disk writes and battery."
+```

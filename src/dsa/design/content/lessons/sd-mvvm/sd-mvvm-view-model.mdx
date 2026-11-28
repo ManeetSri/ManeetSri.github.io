@@ -1,0 +1,276 @@
+## Why it matters
+
+"We use MVVM" is the most common architecture answer in iOS interviews, and it tells the interviewer almost nothing. Two teams can both say it while one has small, testable view models and the other has 2,000-line classes that import UIKit and push view controllers. The pattern itself is simple. The skill is the **boundary**: knowing what a view model owns, what it must hand to someone else, and why.
+
+## The arrow flips
+
+Model–View–ViewModel came from Microsoft's WPF team (John Gossman, 2005), built around data binding: the view declares which properties it shows, and the framework keeps it in step. The **view model** is a model *of the view*: the screen's state and behaviour, expressed without any UI types.
+
+Compared with MVP, one arrow turns round. A presenter holds a reference to its view and pushes commands at it. A view model holds **no reference to its view at all**. It exposes state; the view observes that state and re-renders, and calls the view model's methods when the user does something.
+
+```visual flow
+title: Who knows whom in MVVM
+nodes:
+  - { id: view, label: View, kind: view, at: [0, 0] }
+  - { id: vm, label: View model, kind: service, at: [2, 0] }
+  - { id: coordinator, label: Coordinator, kind: service, at: [4, 0] }
+  - { id: domain, label: Use cases and rules, kind: service, at: [1, 2] }
+  - { id: data, label: Repositories, kind: store, at: [3, 2] }
+edges:
+  - [view, vm, intents]
+  - [vm, view, state, { style: data }]
+  - [vm, coordinator, outcomes, { style: async }]
+  - [vm, domain, asks]
+  - [vm, data, loads]
+steps:
+  - say: "The view calls the view model's **intents**: `retryTapped()`, `select(order:)`. It holds the view model; the view model doesn't hold it back."
+    show: [view, vm]
+    send: view->vm
+  - say: "The view model loads through a **repository** and applies rules that live in the domain layer, not in itself."
+    show: [domain, data]
+    send: [vm->data, vm->domain]
+  - say: "It publishes new **state**. The dotted line is observation: SwiftUI, Observation or a closure tells the view, which re-renders. The view model never calls a view method."
+    send: vm->view
+    state: { vm: active }
+  - say: "When the user picks an order, the view model reports the **outcome**. Deciding what screen comes next is the coordinator's job."
+    show: [coordinator]
+    send: vm->coordinator
+    state: { vm: null }
+```
+
+That one change has big consequences. A view model can be created, driven and checked in a test with no view in existence. The same view model can sit under a UIKit screen today and a SwiftUI one after a migration. And because nothing in it refers to a screen, it can't navigate, present or lay anything out, which is exactly the discipline the pattern is for.
+
+## What a view model owns
+
+Five things, and each is specific to **this screen**:
+
+1. **Screen state.** What the screen shows right now: loading, the loaded rows, the empty or failed state, whether Save is enabled. [View-state enums](/design/learn/sd-state-view-state) shaped this; the view model is where it lives.
+2. **Presentation logic.** Turning domain values into display values: "3 items · £42.50", "Delivered", which of three error messages to show, whether a row is highlighted.
+3. **Intents.** Methods named after what the user did or wants: `retryTapped()`, `select(_:)`, `deleteConfirmed(_:)`. Not `setIsLoading(true)`, which is the view model's own business.
+4. **The screen's async work.** Starting the load, cancelling it when superseded, ignoring answers that arrive too late.
+5. **Outcomes.** "The user chose order 42", "sign-in succeeded", reported out through a closure or delegate.
+
+## What it doesn't own
+
+The list of things that *don't* belong is where real codebases go wrong:
+
+- **Views and UI types.** No `UIViewController`, `UIColor`, `UIImage`, SwiftUI `Color` or `some View`. The view model says "low on stock"; the view decides that means red.
+- **Business rules.** "Members may buy eight tickets, others four" applies to every screen that sells tickets, and to the server. It belongs in a domain type or use case the view model calls, or the rule will be copied and drift.
+- **Data access.** Building URLs, decoding JSON, caching: a repository's job. The view model asks for an `[Order]`, never for `Data`.
+- **Navigation decisions.** What comes after "order chosen" depends on the flow, the device and the experiment the user is in. A coordinator decides.
+- **State that outlives the screen.** The basket, the signed-in user, settings: shared stores passed in, not owned by one screen's view model.
+
+The quickest audit is the imports. A view model file should compile with `import Foundation` (and `Observation`, or `Combine`). If deleting `import UIKit` or `import SwiftUI` breaks it, something on the list above has crept in.
+
+## Display values
+
+Most presentation logic is mapping: domain types in, display values out. Make the output a plain `Equatable` struct, and inject everything the mapping depends on that isn't the data itself, so tests can fix it.
+
+```swift check title="OrderHistoryViewModel.swift"
+import Foundation
+import Observation
+
+struct Order: Sendable {
+    let id: String
+    let placedAt: Date
+    let total: Decimal
+    let currencyCode: String
+    let itemCount: Int
+    let isDelivered: Bool
+}
+
+protocol OrderHistory: Sendable {
+    func recentOrders() async throws -> [Order]
+}
+
+/// One row as the screen shows it: strings and flags, no domain types
+struct OrderRow: Identifiable, Equatable {
+    let id: String
+    let title: String           // "3 items · £42.50"
+    let subtitle: String        // "Delivered" or "Placed 2 Nov"
+    let isInProgress: Bool      // a fact; the view picks the colour
+}
+
+@MainActor
+@Observable
+final class OrderHistoryViewModel {
+    enum State: Equatable {
+        case loading
+        case loaded([OrderRow])
+        case empty
+        case failed(message: String)
+    }
+
+    private(set) var state: State = .loading
+
+    private let history: any OrderHistory
+    private let locale: Locale
+    private let timeZone: TimeZone
+    private let onSelect: (String) -> Void
+
+    init(history: any OrderHistory, locale: Locale = .autoupdatingCurrent, timeZone: TimeZone = .autoupdatingCurrent,
+         onSelect: @escaping (String) -> Void) {
+        self.history = history
+        self.locale = locale
+        self.timeZone = timeZone
+        self.onSelect = onSelect
+    }
+
+    func load() async {
+        do {
+            let orders = try await history.recentOrders()
+            state = orders.isEmpty ? .empty : .loaded(orders.map(row(for:)))
+        } catch is CancellationError {
+            // The screen went away; leave the state alone
+        } catch {
+            state = .failed(message: "We couldn't load your orders.")
+        }
+    }
+
+    func select(_ row: OrderRow) {
+        onSelect(row.id)                // what happens next is the coordinator's decision
+    }
+
+    private func row(for order: Order) -> OrderRow {
+        let items = order.itemCount == 1 ? "1 item" : "\(order.itemCount) items"
+        let total = order.total.formatted(.currency(code: order.currencyCode).locale(locale))
+        let placed = order.placedAt.formatted(Date.FormatStyle(locale: locale, timeZone: timeZone).day().month(.abbreviated))
+        return OrderRow(
+            id: order.id,
+            title: "\(items) · \(total)",
+            subtitle: order.isDelivered ? "Delivered" : "Placed \(placed)",
+            isInProgress: !order.isDelivered
+        )
+    }
+}
+```
+
+A few choices in there are deliberate:
+
+- **`isInProgress`, not a colour.** The design might show in-progress orders in orange today and with a badge tomorrow; the view model's job is the fact.
+- **The locale and time zone are injected,** defaulting to the user's. A test passes `Locale(identifier: "en_GB")` and a fixed time zone and gets "£42.50" and "2 Nov" on any Mac; without them, the test passes in London and fails on a CI machine set to the US, or for an order placed just before midnight.
+- **`onSelect` is a closure.** The view model reports that a row was chosen. It doesn't know whether that pushes a detail screen, opens a sheet on iPad, or starts a returns flow.
+- **The state holds rows, not orders.** The view can't reach past the display values to format something itself, so there's one place every string comes from.
+
+D25's [models per layer](/design/learn/sd-goals-models) covers the full chain from DTO to domain model to view state; this is its last link.
+
+## One per screen, and when to nest
+
+The default is **one view model per screen**: one owner of the screen's state, one place to test it. Two cases justify more:
+
+- **A region with its own behaviour.** A chat screen's composer (draft, attachments, send) changes for different reasons than the message list. Give it a child view model, held by the screen's view model and handed to the composer view.
+- **Rows with their own async work.** A podcast row with a download button that shows progress needs its own small observable object, or every progress tick re-renders the whole list. D18's [@Observable and @Bindable](/design/learn/sd-swiftui-observable) lesson covers that granularity.
+
+Rows that only display values don't need view models of their own. "A view model per cell" with nothing in it but forwarded properties is ceremony.
+
+## Who creates it, who keeps it
+
+A view model is **created** by whoever assembles the screen, usually a coordinator or a factory, because that's where its dependencies are known. It's **owned** by the view: a stored property of the view controller, or `@State` in a SwiftUI view. It lives exactly as long as the screen.
+
+Dependencies come in through `init` as protocols: the repository, the clock, the locale, the outcome closures. Nothing reaches for a singleton. That's what makes the test above possible:
+
+```swift
+let model = OrderHistoryViewModel(history: StubHistory(orders: [packing]), locale: Locale(identifier: "en_GB"),
+                                  timeZone: TimeZone(identifier: "Europe/London")!) { _ in }
+await model.load()
+#expect(model.state == .loaded([OrderRow(id: "A1", title: "3 items · £42.50", subtitle: "Placed 2 Nov", isInProgress: true)]))
+```
+
+## Trade-offs
+
+| | Apple MVC | MVP | MVVM | MV (views on shared models) |
+| --- | --- | --- | --- | --- |
+| Where screen logic lives | view controller | presenter | view model | shared models and services |
+| Knows the view | it is the view | yes, as a protocol | no | n/a |
+| Needs a binding mechanism | no | no | yes (built into SwiftUI) | yes (SwiftUI) |
+| Testable without UI | barely | yes | yes | the shared models are |
+| Per-screen boilerplate | none | protocol + presenter | state type + view model | least |
+| Wins for | small UIKit screens | UIKit screens with rules | screens with async state and rules, in either UI framework | SwiftUI screens that mostly show and edit shared data |
+
+The last column matters in SwiftUI. A settings screen of toggles bound to a shared `Settings` model gains nothing from a view model that forwards each property. [SwiftUI and the MV approach](/design/learn/sd-mvc-swiftui-mv) argued that case; the line is whether the screen has **state and rules of its own**.
+
+<Callout kind="interview">
+
+**What to say:** "Each screen has a view model on the main actor that owns its view state, turns domain values into display values, exposes intents, and reports outcomes to a coordinator. It doesn't import UIKit or SwiftUI, doesn't navigate, and doesn't hold business rules or networking: those are in use cases and repositories it gets through `init`."
+
+**What to ask:** "Which rules are shared with other screens or the server?" Those belong below the view model. "Is this screen likely to move to SwiftUI?" A UI-free view model survives the move.
+
+**Red flags:** a view model with `import UIKit`, `weak var viewController`, `UIColor` properties, `URLSession.shared` calls, or a method called `pushDetail()`. Also the opposite: a view model for a static screen that only forwards properties.
+
+</Callout>
+
+<Callout kind="gotcha" title="iOS gotcha: plurals in view models need string catalogs">
+
+`count == 1 ? "1 item" : "\(count) items"` is fine for an English-only prototype and wrong for Polish, Russian or Arabic, which have more than two plural forms. Use a string catalog (`.xcstrings`, Xcode 15 and later) with plural variants and `String(localized: "\(count) items")`. The view model still chooses the string; the catalog chooses the form.
+
+</Callout>
+
+<Callout kind="gotcha" title="Swift gotcha: `import SwiftUI` for `Color` couples every rule to one UI">
+
+`import SwiftUI` compiles fine in a view model, and `var statusColor: Color` looks harmless. But the view model now can't drive a UIKit screen or a widget built differently, and colour choices end up tested as if they were rules. Expose a small enum (`.inProgress`, `.done`, `.problem`) and map it to colours in the view.
+
+</Callout>
+
+## Practice
+
+**Review: the event view model that does everything** is a view model that crosses every boundary on the "doesn't own" list: it imports UIKit, holds its view controller, presents alerts, pushes screens, calls the network and applies a business rule. **MVVM and coordinators for a grocery checkout** asks you to design five step view models that each own only their screen's state.
+
+```cards
+- id: vm-owns
+  front: "What does a view model own?"
+  back: "The screen's state, presentation logic (display values and derived flags), intents, the screen's async work, and outcomes reported out for navigation."
+- id: vm-not
+  front: "What doesn't belong in a view model?"
+  back: "UI types and views, business rules shared beyond the screen, data access, navigation decisions, and state that outlives the screen."
+- id: vm-import-test
+  front: "What's the quickest check that a view model respects its boundary?"
+  back: "It compiles with Foundation (and Observation or Combine) only. If removing `import UIKit` or `import SwiftUI` breaks it, a UI concern has crept in."
+- id: vm-display
+  front: "Why give a view model's mapping an injected locale?"
+  back: "So tests produce the same strings on every machine. Formatting with the current locale and time zone makes tests depend on where, and when, they run."
+```
+
+```quiz
+- id: q1
+  type: sort
+  prompt: "Where does each belong in an MVVM app?"
+  buckets: [View, View model, Below the view model]
+  items:
+    - ["Showing in-progress orders in orange", 0]
+    - ["Turning 3 items and £42.50 into \"3 items · £42.50\"", 1]
+    - ["Ignoring a load that finished after a newer one started", 1]
+    - ["Members may buy up to eight tickets", 2]
+    - ["Decoding the orders JSON", 2]
+    - ["Laying out the row with a stack view", 0]
+  explain: "Styling and layout are the view's. Display values and the screen's async bookkeeping are the view model's. Business rules and data access belong in domain types and repositories, where every screen and test can share them."
+- id: q2
+  type: mcq
+  prompt: "An order row should look urgent when delivery is late. What should the row's display value carry?"
+  options:
+    - "`let tint: UIColor`, set to `.systemRed` when late"
+    - "`let isLate: Bool`, and the view decides how late looks"
+    - "Nothing: the view compares the order's ETA with the current time"
+    - "`let tint: Color`, since the app is SwiftUI"
+  answer: 1
+  explain: "The view model owns the fact (late) and the rule that computes it, so a test can check it. How lateness looks is a design choice the view makes. Computing it in the view would put a rule where tests can't reach it."
+- id: q3
+  type: multi
+  prompt: "Which make a view model easier to test? Choose all that apply."
+  options:
+    - "Injecting its repository as a protocol"
+    - "Injecting the locale and the clock"
+    - "Reading the signed-in user from a global singleton"
+    - "Reporting navigation through a closure"
+    - "Keeping a weak reference to its view controller to show alerts"
+  answer: [0, 1, 3]
+  explain: "Protocols, injected locale and time, and outcome closures can all be replaced by test values. A global singleton and a view controller reference drag the real app into every test."
+- id: q4
+  type: truefalse
+  prompt: "Every SwiftUI screen should have a view model, so the architecture is consistent."
+  answer: false
+  explain: "A screen with no state or rules of its own, such as toggles bound to a shared settings model, gains nothing from a view model that forwards properties. Consistency is worth something, but a layer that adds no behaviour is cost without benefit."
+- id: q5
+  type: recall
+  prompt: "In one or two sentences, explain how a view model differs from a presenter."
+  model: "A presenter holds a reference to its view (through a protocol) and pushes commands to it. A view model doesn't know its view exists: it exposes state that the view observes, so it can be tested, and reused under a different UI, without any view at all."
+```

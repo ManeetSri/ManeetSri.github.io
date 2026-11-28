@@ -1,0 +1,123 @@
+Build the small container a composition root might use: register a factory for each type, resolve a type and get everything it needs built for you, keep singletons for exactly as long as their scope, and give a signed-in session its own child container that disappears at sign-out. When the registrations loop back on themselves, say so clearly instead of recursing until the app crashes.
+
+`DIScopedContainer.Container`, with `register(_:lifetime:factory:)`, `resolve(_:) throws` and `makeChild()`
+
+- `register(T.self, lifetime:factory:)` stores how to build `T`. Registering `T` again replaces the factory and forgets any singleton built from the old one.
+- `resolve(T.self)` looks in this container first, then its parent, and so on up. A `.transient` is built on every resolve; a `.singleton` is built on its first resolve and kept by the container that registered it.
+- The factory receives the container to resolve its own dependencies from. For a **transient**, that's the container `resolve` was called on, so an app-level screen model can use a session's services. For a **singleton**, it's the container that **registered** it, so an app-wide singleton can never capture something from a shorter-lived session.
+- `makeChild()` returns a container for a narrower scope. It sees its ancestors' registrations, may override them for itself, and keeps its own singletons. Dropping the last reference to a child releases what it built.
+- Throw `ResolutionError.notRegistered("Type")` when no container in the chain has the type, and `ResolutionError.cycle(["A", "B", "A"])` when building a type leads back to itself. Use `String(describing:)` of the type for the names. Errors thrown by factories pass through unchanged.
+
+## Examples
+
+| Registrations | Call | Result |
+| --- | --- | --- |
+| `APIClient` transient | `resolve(APIClient.self)` twice | two different instances |
+| `APIClient` singleton | `resolve(APIClient.self)` twice | the same instance; the factory ran once |
+| app: `PushRegistrar` singleton needing `SessionStore`; session child: `SessionStore` | `session.resolve(PushRegistrar.self)` | throws `.notRegistered("SessionStore")` |
+| app: `CartModel` transient needing `SessionStore`; session child: `SessionStore` | `session.resolve(CartModel.self)` | a cart for the session's user |
+| `Checkout` needs `Payments`, `Payments` needs `Checkout` | `resolve(Checkout.self)` | throws `.cycle(["Checkout", "Payments", "Checkout"])` |
+| `Library` needs `BookStore` and `SearchIndex`, both need one `Database` singleton | `resolve(Library.self)` | works: a shared dependency isn't a cycle |
+
+## Constraints
+
+- One thread: the container is used from the composition root only, so it doesn't need locks or an actor.
+- The tests check that a session's singletons are released once its container is: a child may hold its parent, but a parent must not hold its children.
+- After any error, including a cycle, the container must still work for the next resolve.
+
+<Hints>
+<Hint>
+Key the registrations and the singletons by `ObjectIdentifier(type)`. That works for classes, structs and existentials such as `(any Logging).self`. Store the factory type-erased, as `(Container) throws -> Any`, and cast back with `as? Service`.
+</Hint>
+<Hint>
+Resolving starts by finding the nearest container that has a registration. That container is the **owner**: it caches the singleton, and for a singleton it's also the container you pass to the factory.
+</Hint>
+<Hint>
+For cycles, keep a stack of the types being built right now: push before calling the factory, pop with `defer`. A type that's already on the stack is a cycle; its path is the stack from that type onwards, plus the type again. A set of everything ever visited would wrongly reject the `Database` diamond.
+</Hint>
+<Hint>
+A cycle can cross containers (a child's transient asking for a parent's singleton that asks back), so the whole family needs one stack. Keeping it on the topmost container is enough.
+</Hint>
+</Hints>
+
+## Solutions
+
+<Approach title="Registrations per container, one resolution stack per family" time="O(d) per resolve, for d levels of containers and dependencies" space="O(r + s) for r registrations and s singletons">
+
+```swift
+public final class Container {
+    private struct Registration {
+        let lifetime: Lifetime
+        let make: (Container) throws -> Any
+    }
+
+    private let parent: Container?
+    private var registrations: [ObjectIdentifier: Registration] = [:]
+    private var singletons: [ObjectIdentifier: Any] = [:]
+    private var building: [(id: ObjectIdentifier, name: String)] = []
+
+    public convenience init() {
+        self.init(parent: nil)
+    }
+
+    private init(parent: Container?) {
+        self.parent = parent
+    }
+
+    public func makeChild() -> Container {
+        Container(parent: self)
+    }
+
+    public func register<Service>(_ type: Service.Type, lifetime: Lifetime = .transient, factory: @escaping (Container) throws -> Service) {
+        let id = ObjectIdentifier(type)
+        registrations[id] = Registration(lifetime: lifetime, make: { try factory($0) })
+        singletons[id] = nil
+    }
+
+    public func resolve<Service>(_ type: Service.Type) throws -> Service {
+        let id = ObjectIdentifier(type)
+        let name = String(describing: type)
+        guard let owner = registeringContainer(for: id), let registration = owner.registrations[id] else {
+            throw ResolutionError.notRegistered(name)
+        }
+        if registration.lifetime == .singleton, let existing = owner.singletons[id] as? Service {
+            return existing
+        }
+
+        let top = topContainer
+        if let start = top.building.firstIndex(where: { $0.id == id }) {
+            throw ResolutionError.cycle(top.building[start...].map(\.name) + [name])
+        }
+        top.building.append((id, name))
+        defer { top.building.removeLast() }
+
+        let scope = registration.lifetime == .singleton ? owner : self
+        guard let instance = try registration.make(scope) as? Service else {
+            throw ResolutionError.notRegistered(name)
+        }
+        if registration.lifetime == .singleton {
+            owner.singletons[id] = instance
+        }
+        return instance
+    }
+
+    private func registeringContainer(for id: ObjectIdentifier) -> Container? {
+        var container: Container? = self
+        while let current = container {
+            if current.registrations[id] != nil { return current }
+            container = current.parent
+        }
+        return nil
+    }
+
+    private var topContainer: Container {
+        parent?.topContainer ?? self
+    }
+}
+```
+
+Three decisions carry the whole design. **Singletons belong to their owner**, so a session's store dies with the session's container and an app singleton is shared by every child. **A singleton's factory resolves from its owner**, which turns the classic captive-dependency bug (an app-wide service holding a signed-out user) into an immediate `notRegistered` error. **Cycle detection uses the stack of types in progress**, not a visited set, so diamonds are fine and real cycles are reported with their path.
+
+Real containers make different choices. Swinject's default `.graph` scope shares instances within one top-level resolve, and it supports some cycles by injecting a property after both objects exist (`initCompleted`). Factory resolves through computed properties, so a missing registration is a compile error rather than a thrown one. A cycle in app code is usually a design smell, though: two services that need each other are often one service, or need a third that both depend on.
+
+</Approach>

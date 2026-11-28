@@ -1,0 +1,282 @@
+## Why it matters
+
+"Where does this model live, and for how long?" is the question behind a surprising number of SwiftUI bugs: a request that fires three times, a detail pane that keeps showing the previous item, an upload that dies when the sheet closes, a screen that reloads every time you come back to its tab. All of them come from mixing up how long a view **struct** lives with how long the view's **state** lives. Interviewers probe it with "where would you start loading data for this screen?", and the answer shows whether you know SwiftUI's lifetimes or are guessing.
+
+## Three lifetimes
+
+When you look at a screen, three different things have three different lifetimes:
+
+1. **The view value.** Your struct. SwiftUI creates a new one each time the parent's `body` runs, reads it, and throws it away. That can be many times a second, so **your `init` runs constantly**.
+2. **The view's identity.** The element on screen, which the previous lesson defined. It begins when SwiftUI first inserts the view and ends when the view is removed: a screen popped, a sheet dismissed, a branch switched, an `.id` changed.
+3. **The state.** `@State`, `@FocusState`, `@StateObject` and friends are stored by SwiftUI, outside your struct, and tied to the **identity**. They're created when the identity begins, survive every struct that comes and goes in between, and are destroyed when it ends.
+
+A fourth lifetime matters too: an object you pass *into* a view lives as long as whoever holds it strongly. The view doesn't own it.
+
+```visual timeline
+title: A detail screen, its values, its state and its work
+unit: s
+lanes:
+  - { id: value, label: View value }
+  - { id: identity, label: Identity }
+  - { id: state, label: "@State model" }
+  - { id: work, label: ".task" }
+spans:
+  - { lane: value, from: 0, to: 0.3, label: init }
+  - { lane: value, from: 2, to: 2.3, label: init }
+  - { lane: value, from: 3.5, to: 3.8, label: init }
+  - { lane: value, from: 5, to: 5.3, label: init }
+  - { lane: value, from: 7, to: 7.3, label: init }
+  - { lane: identity, from: 0, to: 5, label: order 41, tone: ok }
+  - { lane: identity, from: 5, to: 9, label: order 42, tone: ok }
+  - { lane: state, from: 0, to: 5, label: model A, tone: active }
+  - { lane: state, from: 5, to: 9, label: model B, tone: active }
+  - { lane: work, from: 0, to: 1.5, label: load 41, tone: wait }
+  - { lane: work, from: 5, to: 6.5, label: load 42, tone: wait }
+markers:
+  - { at: 5, label: ".id(order.id) changes" }
+  - { at: 9, label: popped }
+steps:
+  - { at: 0.2, say: "The screen is pushed. SwiftUI creates the struct, **inserts** the identity, allocates its `@State` and starts the `.task`." }
+  - { at: 1.6, say: "The load finishes and writes into model A." }
+  - { at: 3.7, say: "The parent's body runs twice more. Each time a **new struct** is made and `init` runs, but the identity, the state and the loaded data are untouched." }
+  - { at: 5.2, say: "The selection changes and the view's `.id` changes with it: a **new identity**. Model A is destroyed, model B is created, and the task starts again." }
+  - { at: 9, say: "The user pops the screen. The identity ends, and its state and any running task end with it." }
+```
+
+The struct is a message, not a home. Anything that must persist between updates lives in state, in a model the view is handed, or further up.
+
+## `init` runs all the time
+
+Because the struct is rebuilt on every parent update, a view's initialiser is the worst place for work:
+
+```swift
+struct OrderDetailScreen: View {
+    let orderID: Order.ID
+
+    init(orderID: Order.ID) {
+        self.orderID = orderID
+        Task { await OrderService.shared.prefetch(orderID) }   // fires on every parent update
+    }
+    // …
+}
+```
+
+That prefetch runs whenever the parent's body runs: when a badge count changes, when the keyboard appears, when the device rotates. Keep `init` to storing parameters.
+
+### `@State` with an object as its initial value
+
+`@State private var model = OrderDetailModel()` is the standard way for a screen to own an `@Observable` model, and it deserves care, because its behaviour changed recently.
+
+- **Up to the iOS 18 SDK (Xcode 16)**, `@State` was a plain property wrapper whose initialiser took the value itself. The `OrderDetailModel()` expression ran **every time the struct was created**; SwiftUI kept the first instance and threw the rest away. Apple's documentation warned against side effects and expensive work in that initial value.
+- **With the Xcode 27 SDK** this course builds against, `@State` is a macro that wraps the initial value in a closure, and for apps targeting iOS 17 or later SwiftUI calls it **once per identity**. A quick measurement: a child view rebuilt six times made six structs but one model.
+
+Write code that's correct under both: keep a model's `init` cheap and free of side effects, and start its work from `.task`. Then it doesn't matter how often the expression is evaluated.
+
+One form stays eager on every SDK, because you build the `State` yourself:
+
+```swift check ios group=detail title="OrderDetailScreen.swift"
+import SwiftUI
+
+struct Order: Identifiable, Sendable {
+    let id: Int
+    var status: String
+}
+
+@MainActor
+@Observable
+final class OrderDetailModel {
+    let orderID: Order.ID
+    private(set) var order: Order?
+
+    init(orderID: Order.ID) {
+        self.orderID = orderID      // cheap: no work here
+    }
+
+    func load() async {
+        try? await Task.sleep(for: .milliseconds(200))   // stands in for a request
+        order = Order(id: orderID, status: "Dispatched")
+    }
+}
+
+struct OrderDetailScreen: View {
+    @State private var model: OrderDetailModel
+
+    init(orderID: Order.ID) {
+        // Runs on every parent update, and only the FIRST model is ever used.
+        _model = State(initialValue: OrderDetailModel(orderID: orderID))
+    }
+
+    var body: some View {
+        Text(model.order?.status ?? "Loading…")
+            .task { await model.load() }
+    }
+}
+```
+
+The second bug in that code is worse than the wasted allocations. If the parent passes a **different** `orderID` while this screen's identity lives (a split view's detail pane, say), the new model is built and discarded, and the screen keeps showing the first order.
+
+## State seeded from a parameter keeps the first value
+
+The same rule applies to plain values. A rename sheet seeds its text field from the current name:
+
+```swift check ios group=detail
+struct RenameField: View {
+    let name: String
+    @State private var draft: String
+
+    init(name: String) {
+        self.name = name
+        _draft = State(initialValue: name)     // used once, when the identity begins
+    }
+
+    var body: some View {
+        TextField("Name", text: $draft)
+    }
+}
+```
+
+`@State` is initialised **once per identity**. Later values of `name` are ignored, which is exactly right for a draft that should start from the current name and then belong to the user. It's wrong when the input can legitimately change while the view is on screen. You have three honest options:
+
+- **Reset on change:** `RenameField(name: item.name).id(item.id)`. A new item is a new identity, so the draft starts again.
+- **Follow the input:** `.onChange(of: name) { _, newName in draft = newName }`, accepting that it overwrites anything the user has typed.
+- **Don't copy:** if the view should edit the source directly, take a `Binding` instead of owning a copy. That's the next-but-one lesson.
+
+## Work tied to a lifetime: `.task` and friends
+
+`.task` is the modifier that matches work to identity. SwiftUI starts the task when the view appears and **cancels it when the view disappears**. `.task(id:)` also cancels and restarts it whenever the id changes, which is how you reload when an input changes:
+
+```swift check ios group=detail
+struct OrderStatusView: View {
+    let orderID: Order.ID
+    @State private var model = OrderStatusModel()
+
+    var body: some View {
+        Text(model.status)
+            .task(id: orderID) {
+                await model.load(orderID)      // the previous load is cancelled first
+            }
+    }
+}
+
+@MainActor
+@Observable
+final class OrderStatusModel {
+    private(set) var status = "Loading…"
+
+    func load(_ id: Order.ID) async {
+        do {
+            try await Task.sleep(for: .milliseconds(200))
+            status = "Order \(id): dispatched"
+        } catch {
+            // Cancelled because the view went away or the id changed: nothing to show.
+        }
+    }
+}
+```
+
+Compare `onAppear { Task { await model.load() } }`. That creates an **unstructured** task nobody cancels: it keeps running after the view goes, finishes into a model the user has left, and a second one starts on every appearance.
+
+And appearances happen more often than people expect. `onAppear` isn't `viewDidLoad`:
+
+- In a `NavigationStack`, the root's `onAppear` runs again when you pop back to it.
+- In a `TabView`, a tab's content appears each time you switch to it.
+- In a `List` or lazy stack, rows appear and disappear as they scroll.
+
+If "load once" matters, put the guard in the model (`guard phase == .idle else { return }`) rather than trusting the view to appear once.
+
+## Who owns a model, and how long it lives
+
+| Owner | The model lives… | Good for |
+| --- | --- | --- |
+| `@State` in the screen | as long as the screen's identity: until it's popped, dismissed or its id changes | Screen-scoped data: a detail screen's loaded order, a form's draft |
+| A parent that passes it in | as long as the parent keeps it | Children that show or edit part of a screen's model |
+| The `App` struct or the composition root | the whole process | App-wide services: the signed-in session, a download queue, the player |
+
+The rule that follows: **work that must outlive a screen can't be owned by that screen**. If the user starts an upload from a compose sheet and dismisses it, an upload owned by the sheet's `@State` model goes with the sheet. Give it to an `UploadQueue` that the app owns, and let the sheet observe its progress.
+
+## Trade-offs
+
+| Where work starts | Cancelled when the view goes? | Runs again on reappear? | Follows an input? | When it wins |
+| --- | --- | --- | --- | --- |
+| `.task` | Yes | Yes | No | Loading screen-scoped data when it's shown |
+| `.task(id:)` | Yes | Yes | Yes: cancels, then restarts | Data that depends on a selection, a query or a page |
+| `onAppear` with `Task { }` | No | Yes | No | Almost never; if work must outlive the view, an owner that outlives it should start it |
+| A long-lived owner's method | Owner decides | No | Through method calls | Uploads, downloads, sync and playback |
+| The view's `init` | No | On every parent update | No | Never for work |
+
+<Callout kind="interview">
+
+**Say:** "The struct is recreated constantly, so I keep `init` cheap. State lives with the view's identity. Screen data loads in `.task(id:)` so it's cancelled when the screen goes or the input changes, and anything that must outlive the screen, like an upload, belongs to an app-level owner." **Ask:** "Should this keep going if the user leaves the screen?" That one question decides the owner. **Red flags:** network calls in `init`, `onAppear { Task { … } }` with no cancellation, and a long-running job held by a sheet's `@State`.
+
+</Callout>
+
+<Callout kind="gotcha" title="Swift gotcha: cancellation arrives as an error">
+
+When `.task` cancels your work, `Task.sleep` throws `CancellationError` and URLSession throws `URLError(.cancelled)`. A view model that turns every thrown error into an error message flashes "cancelled" at users who only typed fast or left the screen. Check `Task.isCancelled`, or catch those two errors, and leave the state alone.
+
+</Callout>
+
+## Practice
+
+The **contacts screen** review is a state-ownership hunt: a model the view doesn't own, a detail pane seeded once from its selection, loading that never cancels and edits made to a copy. Find what each costs the user before you fix it.
+
+```cards
+- id: lifetimes-three
+  front: "What are the three lifetimes behind one SwiftUI screen?"
+  back: "The view struct (rebuilt on every parent update, so `init` runs constantly), the view's identity (inserted to removed), and its state, which lives exactly as long as the identity."
+- id: lifetimes-seeded-state
+  front: "A view sets `_draft = State(initialValue: name)` in `init`. What happens when the parent passes a new name?"
+  back: "Nothing: state is initialised once per identity, so the first name sticks. Reset with `.id(…)`, follow it with `onChange`, or take a `Binding` instead of a copy."
+- id: lifetimes-task
+  front: "Why prefer `.task(id:)` over `onAppear { Task { … } }` for loading?"
+  back: "`.task` is cancelled when the view disappears, and `.task(id:)` restarts when the input changes. The `onAppear` version is never cancelled and starts again on every appearance."
+```
+
+```quiz
+- id: q1
+  type: order
+  prompt: "A user taps an order in a list, the detail screen loads, something in its parent changes, then the user goes back. Put the events in order."
+  lines:
+    - "The list's body builds an `OrderDetailScreen` value"
+    - "SwiftUI inserts the new identity and allocates its `@State`"
+    - "The `.task` starts loading the order"
+    - "The parent's body runs again, so a new `OrderDetailScreen` struct is made and `init` runs again"
+    - "The user pops the screen: its task is cancelled and its state destroyed"
+    - "The list's `onAppear` runs again"
+  explain: "State and tasks follow the identity, not the struct. The extra `init` in the middle changes nothing that's stored, and returning to the list is a new appearance for it."
+- id: q2
+  type: mcq
+  prompt: "A split view's detail pane shows `ContactEditor(contact: selected)`, and `ContactEditor` copies the contact into `@State` in its `init`. The user selects a different contact. What does the editor show?"
+  options:
+    - "The new contact, because the struct was rebuilt with it"
+    - "The first contact, because the pane's identity didn't change, so its state wasn't re-created"
+    - "An empty form, because state is reset when the parameter changes"
+    - "It crashes: state can't be set in `init`"
+  answer: 1
+  explain: "The pane sits in the same structural position, so it keeps its identity and its state. Add `.id(selected.id)` to start a fresh editor per contact, or edit the source through a binding."
+- id: q3
+  type: mcq
+  prompt: "From a compose sheet, the user posts a video that takes two minutes to upload, then dismisses the sheet. Where should the upload live?"
+  options:
+    - "In the sheet's `@State` view model, started from `.task`"
+    - "In `onAppear { Task { … } }`, so cancellation can't stop it"
+    - "In an app-level upload queue that the sheet hands the job to and then observes"
+    - "In the sheet's `init`, so it starts as early as possible"
+  answer: 2
+  explain: "Work that must outlive a screen needs an owner that outlives it. The sheet's state dies when it's dismissed, an unstructured task has no owner to report progress or retry, and `init` runs repeatedly."
+- id: q4
+  type: truefalse
+  prompt: "A `.task` attached to a `List` row is cancelled when that row scrolls off screen."
+  answer: true
+  explain: "Rows in lazy containers disappear as they scroll away, and `.task` is cancelled on disappear. That suits a thumbnail load; a download the user asked for must live in a model that outlives the row."
+- id: q5
+  type: blank
+  prompt: "Fill in the modifier argument so the search reloads, cancelling the previous request, whenever the query changes."
+  code: |
+    ResultsList(results: model.results)
+        .task(id: ___) {
+            await model.search(for: query)
+        }
+  answers: [["query", "self.query"]]
+  explain: "`.task(id:)` cancels the running task and starts a new one whenever the id's value changes."
+```

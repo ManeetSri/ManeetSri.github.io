@@ -1,0 +1,337 @@
+## Why it matters
+
+The simplest creational pattern is also the one you use most: a `static` method or property that returns a ready-made instance. Apple's APIs are full of them (`UIButton.Configuration.filled()`, `URLSessionConfiguration.ephemeral`, `.buttonStyle(.borderedProminent)`), and well-chosen ones make call sites read like sentences. Knowing when a static factory beats an initialiser, and when it doesn't, is a small decision you'll make every week.
+
+## Initialisers first
+
+Swift's initialisers already do a lot of creational work, so start there.
+
+- **Structs** get a free **memberwise initialiser**. If you write your own `init` inside the struct, you lose it. Write extra initialisers in an **extension** and you keep both.
+- **Classes** have **designated** initialisers, which set every stored property and call `super.init`, and **convenience** initialisers, which must call another initialiser of the same class through `self.init`. Convenience initialisers are how a class offers shortcuts without repeating its setup.
+- Any initialiser can be **failable** (`init?`), **throwing** (`init() throws`) or **asynchronous** (`init() async`).
+
+```swift check
+import Foundation
+
+struct Money: Equatable, Sendable {
+    let minorUnits: Int
+    let currency: String
+}
+
+// In an extension, so the memberwise init(minorUnits:currency:) still exists
+extension Money {
+    init(pounds: Double) {
+        self.init(minorUnits: Int((pounds * 100).rounded()), currency: "GBP")
+    }
+}
+
+final class Toast {
+    let message: String
+    let duration: Duration
+
+    init(message: String, duration: Duration) {
+        self.message = message
+        self.duration = duration
+    }
+
+    convenience init(error: any Error) {
+        self.init(message: error.localizedDescription, duration: .seconds(4))
+    }
+}
+```
+
+<Callout kind="note">
+
+Objective-C's class factory methods are imported into Swift as initialisers. `+[UIColor colorWithRed:green:blue:alpha:]` becomes `UIColor(red:green:blue:alpha:)`, and `+[UIAlertController alertControllerWithTitle:message:preferredStyle:]` becomes a convenience `init`. Class methods that don't follow that naming, such as `+[NSURLSessionConfiguration defaultSessionConfiguration]`, stay static: `URLSessionConfiguration.default`.
+
+</Callout>
+
+## Static factory methods
+
+A **static factory** is a `static func`, `static var` or `static let` that returns an instance. Joshua Bloch's *Effective Java* made the case for them in Java, where constructors can't have names. Swift's argument labels already let initialisers say a lot (`Money(pounds:)`), so the reasons to prefer a static factory in Swift are more specific:
+
+1. **Implicit member syntax.** When the type is known from context, you can drop it: `UIButton(configuration: .filled())`, `client.send(.profile(id: 42))`. The call site reads as intent.
+2. **A recipe, not just inputs.** `URLSessionConfiguration.ephemeral` is a whole set of decisions (no disk cache, no persistent cookies) behind one name. An initialiser describes *what you pass*; a factory can describe *what you get*.
+3. **A different return type.** A factory can return a protocol type, an opaque `some` type or a subclass, hiding the concrete type. An initialiser always returns exactly `Self`.
+4. **An existing instance.** An initialiser of a class always makes a new object. A factory can return a cached or shared one.
+5. **Generic contexts.** A static member in a constrained protocol extension makes `.toggleStyle(.switch)` work, as you'll see below.
+
+### Endpoints as static factories
+
+Here's a pattern you'll find in most well-organised networking layers. Each endpoint is a static factory on a generic `Endpoint` type, and the response type travels with it:
+
+```swift run
+import Foundation
+
+struct Profile: Decodable { let name: String }
+struct Order: Decodable { let id: Int }
+
+struct Endpoint<Response: Decodable> {
+    let method: String
+    let path: String
+    var query: [URLQueryItem] = []
+}
+
+extension Endpoint where Response == Profile {
+    static func profile(id: Int) -> Endpoint {
+        Endpoint(method: "GET", path: "/users/\(id)")
+    }
+}
+
+extension Endpoint where Response == [Order] {
+    static func orders(page: Int) -> Endpoint {
+        Endpoint(method: "GET", path: "/orders", query: [URLQueryItem(name: "page", value: String(page))])
+    }
+}
+
+// Stands in for an API client's send(_:): the endpoint carries its response type
+func describe<Response>(_ endpoint: Endpoint<Response>) -> String {
+    let query = endpoint.query.map { "\($0.name)=\($0.value ?? "")" }.joined(separator: "&")
+    return "\(endpoint.method) \(endpoint.path)\(query.isEmpty ? "" : "?" + query) -> \(Response.self)"
+}
+
+print(describe(.profile(id: 42)))
+print(describe(.orders(page: 2)))
+```
+
+```output
+GET /users/42 -> Profile
+GET /orders?page=2 -> Array<Order>
+```
+
+What to notice:
+
+- The call site `describe(.profile(id: 42))` never names `Endpoint` or `Profile`, yet the compiler knows the response is a `Profile`. A real `send(_:)` would decode into it, and asking for the wrong type is a compile error.
+- Every path and query rule lives in one place. Changing `/users/` to `/v2/users/` is a one-line edit.
+- Adding an endpoint is adding a factory, without touching the client.
+
+## Validated construction
+
+When some inputs are invalid, you have three ways to say so, and they differ in how much they tell the caller:
+
+| Shape | Caller sees | Use it when |
+| --- | --- | --- |
+| `init?(…)` | `nil`, with no reason | There's one obvious way to fail: `URL(string:)`, `Int("42")`, `UIImage(systemName:)` |
+| `init(…) throws(SomeError)` | A specific, typed reason | The caller will show or act on *why* it failed |
+| `static func make(…) -> Result<Self, SomeError>` | A value to store or pass on | You want to keep the failure as data, for example in a form's state |
+
+Typed throws, from Swift 6, let an initialiser say exactly which errors it throws (you met them in [Error modelling and typed throws](/design/learn/sd-swift-design-errors)). Combined with a domain type, they mean an invalid email address can't exist anywhere in the app: once you hold an `EmailAddress`, it's been checked.
+
+```swift run
+import Foundation
+
+struct EmailAddress: CustomStringConvertible {
+    enum Problem: Error {
+        case empty
+        case missingAt
+        case missingDomain
+    }
+
+    let value: String
+    var description: String { value }
+
+    init(_ raw: String) throws(Problem) {
+        let trimmed = raw.trimmingCharacters(in: .whitespaces).lowercased()
+        guard !trimmed.isEmpty else { throw .empty }
+        let parts = trimmed.split(separator: "@", omittingEmptySubsequences: false)
+        guard parts.count == 2, !parts[0].isEmpty else { throw .missingAt }
+        guard parts[1].contains("."), !parts[1].hasPrefix("."), !parts[1].hasSuffix(".") else { throw .missingDomain }
+        value = trimmed
+    }
+}
+
+for raw in ["  Maneet@Example.com ", "maneet.example.com", "maneet@localhost", ""] {
+    do {
+        print("ok:", try EmailAddress(raw))
+    } catch {
+        print("rejected \"\(raw)\":", error)
+    }
+}
+```
+
+```output
+ok: maneet@example.com
+rejected "maneet.example.com": missingAt
+rejected "maneet@localhost": missingDomain
+rejected "": empty
+```
+
+Here an initialiser is the right choice: there's one way to build an email address from a string, and the result is always exactly an `EmailAddress`. A static factory would add a name without adding meaning. That's the rule of thumb: **reach for a static factory when the name, the recipe or the return type adds something an initialiser can't.** This is the "from primitive obsession to domain types" idea from D02, with the constructor as the gatekeeper.
+
+## Apple's static factories
+
+UIKit and SwiftUI use static factories for **preconfigured variants**: a starting point you then adjust.
+
+```swift check ios
+import SwiftUI
+import UIKit
+
+@MainActor
+func makeButtons() -> [UIButton] {
+    var save = UIButton.Configuration.filled()
+    save.title = "Save"
+    save.image = UIImage(systemName: "checkmark")
+    save.imagePadding = 6
+
+    var cancel = UIButton.Configuration.plain()
+    cancel.title = "Cancel"
+
+    return [UIButton(configuration: save), UIButton(configuration: cancel)]
+}
+
+func header(for title: String) -> UIListContentConfiguration {
+    var content = UIListContentConfiguration.header()
+    content.text = title
+    return content
+}
+
+// Your own style, reachable as .bubble wherever a ButtonStyle is expected
+struct BubbleButtonStyle: ButtonStyle {
+    func makeBody(configuration: Configuration) -> some View {
+        configuration.label.padding(8).background(.tint, in: Capsule())
+    }
+}
+
+extension ButtonStyle where Self == BubbleButtonStyle {
+    static var bubble: BubbleButtonStyle { BubbleButtonStyle() }
+}
+
+struct FollowRow: View {
+    @State private var notify = true
+
+    var body: some View {
+        VStack {
+            Toggle("Notify me", isOn: $notify).toggleStyle(.switch)
+            Button("Follow") {}.buttonStyle(.bubble)
+        }
+    }
+}
+```
+
+Three things to notice:
+
+- `UIButton.Configuration` has `plain()`, `gray()`, `tinted()`, `filled()`, `bordered()`, `borderedTinted()` and `borderedProminent()`. Each returns a **value** you then customise. Because it's a struct, customising your copy can't affect anyone else's.
+- In iOS 18, `UIListContentConfiguration.header()` and `.footer()` replaced the style-specific `plainHeader()` and `groupedHeader()` family, and the cell configurations started adapting to the list they're in. Apple could change what you get without changing what you call. That freedom is a factory's main advantage over exposing the concrete details.
+- `extension ButtonStyle where Self == BubbleButtonStyle` is the trick SwiftUI uses for `.switch` and `.borderedProminent`. Swift 5.5 (SE-0299) allowed implicit member syntax to find static members declared on a protocol, as long as the extension pins `Self` to a concrete type. Your design system can offer `.bubble` the same way.
+
+## Trade-offs
+
+| | Memberwise or plain `init` | Convenience `init` | Static factory method | Static stored property |
+| --- | --- | --- | --- | --- |
+| Returns | A new `Self` | A new `Self` | Anything: `Self`, a protocol, a cached instance | The same instance or value every time |
+| Names the intent | Through labels only | Through labels only | Fully: `.ephemeral`, `.profile(id:)` | Fully: `.default`, `.standard` |
+| Implicit member syntax | `.init(…)` only | `.init(…)` only | Yes | Yes |
+| Can hide the concrete type | No | No | Yes | Yes |
+| Best for | Values built from their parts | Shortcuts on a class | Recipes, variants, endpoints | Shared constants and defaults |
+
+Initialisers win when the inputs fully describe the result. Static factories win when a recipe has a name worth knowing, or when callers shouldn't see the concrete type.
+
+<Callout kind="interview">
+
+**What to say:** "Each endpoint is a static factory on `Endpoint<Response>`, so call sites read `client.send(.orders(page: 2))` and the response type is checked at compile time." Concrete, and it shows you think about call sites.
+
+**What to ask:** "Should callers be able to build arbitrary values, or only the variants we support?" If only the variants, factories plus a `private` or `fileprivate` initialiser enforce it.
+
+**Red flags:** a `make` method that only forwards to the initialiser with the same arguments; failable initialisers for errors the user must see; a `static var` that silently returns a new object on every access.
+
+</Callout>
+
+<Callout kind="gotcha" title="Swift gotcha: static var vs static let">
+
+`static var standard: ImageCache { ImageCache() }` is a **computed** property: every access builds a new cache, so two screens that both use `ImageCache.standard` share nothing. `static let standard = ImageCache()` is **stored**: created once, on first use, then shared. For values the difference is only cost; for classes it changes behaviour.
+
+```swift run
+final class ImageCache: Sendable {
+    let name: String
+    init(name: String) { self.name = name }
+
+    static var computed: ImageCache { ImageCache(name: "computed") }
+    static let stored = ImageCache(name: "stored")
+}
+
+print(ImageCache.computed === ImageCache.computed)
+print(ImageCache.stored === ImageCache.stored)
+```
+
+```output
+false
+true
+```
+
+A **stored** `static var` is a mutable global, which Swift 6 rejects unless it's isolated to an actor. You'll see why in [Singleton and Apple's shared instances](/design/learn/sd-creational-singleton).
+
+</Callout>
+
+## Practice
+
+The **server-driven card factory** kata starts with a static factory, `Factory.standard()`, that returns a factory already set up for the card types the app ships with. You'll extend it in the next lesson.
+
+```cards
+- id: static-factory-why-swift
+  front: "Name three things a static factory can do that an initialiser can't."
+  back: "Return a different type (a protocol, an opaque type or a subclass), return an existing or cached instance, and give a recipe a name usable with implicit member syntax, such as `.ephemeral`."
+- id: memberwise-extension
+  front: "How do you add an initialiser to a struct without losing its memberwise initialiser?"
+  back: "Declare the new initialiser in an extension, not in the struct's body."
+- id: failable-vs-throwing
+  front: "When should construction throw instead of returning nil?"
+  back: "When the caller needs to know why it failed, for example to show which form field is wrong. `init?` gives no reason; typed throws give a specific one."
+- id: protocol-static-member
+  front: "How does `.buttonStyle(.bubble)` find your own style?"
+  back: "Declare `static var bubble` in `extension ButtonStyle where Self == BubbleButtonStyle`. Implicit member syntax then finds it wherever a `ButtonStyle` is expected."
+```
+
+```quiz
+- id: q1
+  type: mcq
+  prompt: "A sign-up form must show *which* rule a password breaks: too short, no digit, or a common password. How should `Password` be created from the text field's string?"
+  options:
+    - "`init?(_ raw: String)`, returning `nil` for any invalid password"
+    - "`init(_ raw: String) throws(PasswordProblem)`, with one case per rule"
+    - "A `static let` holding the last valid password"
+    - "The memberwise initialiser, validating later in the view controller"
+  answer: 1
+  explain: "The form needs the reason, so `nil` isn't enough. A typed throwing initialiser gives the caller an exhaustive set of reasons and guarantees no invalid `Password` value exists."
+- id: q2
+  type: output
+  prompt: "What does this print?"
+  code: |
+    final class Session: Sendable {
+        static var current: Session { Session() }
+        static let main = Session()
+    }
+
+    print(Session.current === Session.current, Session.main === Session.main)
+  answer: "false true"
+  explain: "`current` is a computed property, so each access builds a new object. `main` is stored, created once on first access, so both reads return the same object."
+- id: q3
+  type: multi
+  prompt: "Which of these are good reasons to add a static factory instead of another initialiser? Choose all that apply."
+  options:
+    - "Callers should get a protocol type and never see the concrete class"
+    - "You want call sites like `client.send(.orders(page: 2))`"
+    - "The factory would take the same arguments as the initialiser and do nothing else"
+    - "Some calls should return an existing shared instance rather than a new one"
+    - "A preconfigured variant, such as an ephemeral configuration, deserves a name"
+  answer: [0, 1, 3, 4]
+  explain: "Hiding the concrete type, implicit member syntax, returning existing instances and naming recipes are all things initialisers can't do. A factory that only forwards to the initialiser adds a name without adding meaning."
+- id: q4
+  type: blank
+  prompt: "Fill in the blank so a design system's style can be used as `.buttonStyle(.pill)`."
+  code: |
+    struct PillButtonStyle: ButtonStyle {
+        func makeBody(configuration: Configuration) -> some View {
+            configuration.label.padding(10).background(.tint, in: Capsule())
+        }
+    }
+
+    extension ButtonStyle where ___ {
+        static var pill: PillButtonStyle { PillButtonStyle() }
+    }
+  answers: [["Self == PillButtonStyle"]]
+  explain: "Implicit member lookup on a protocol only works when the extension pins `Self` to a concrete type (SE-0299). That's how SwiftUI offers `.borderedProminent` and `.switch`."
+- id: q5
+  type: truefalse
+  prompt: "Writing `init(pounds: Double)` inside a struct's body, rather than in an extension, removes its memberwise initialiser."
+  answer: true
+  explain: "Swift only synthesises the memberwise initialiser when the struct's body declares no initialisers. Put custom ones in an extension to keep it."

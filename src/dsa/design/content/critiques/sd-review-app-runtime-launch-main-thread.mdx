@@ -1,0 +1,140 @@
+<Brief>
+
+This is the launch path of a news app. Organizer shows its median cold launch at 2.4 seconds and rising, the crash list has a cluster of `0x8badf00d` terminations from users on poor connections, background refresh has never once run in production, and a handful of users write in to say the app "signed me out overnight". Review the app delegate and scene delegate: what blocks the first frame, what's broken outright, and how you'd restructure launch.
+
+```swift check ios title="AppDelegate.swift and SceneDelegate.swift"
+import BackgroundTasks
+import UIKit
+
+final class AppDelegate: UIResponder, UIApplicationDelegate {
+    private(set) var config: [String: String] = [:]
+
+    func application(_ application: UIApplication, didFinishLaunchingWithOptions launchOptions: [UIApplication.LaunchOptionsKey: Any]?) -> Bool {
+        let configURL = URL(string: "https://config.example.com/ios/v3.json")!
+        if let data = try? Data(contentsOf: configURL),
+           let decoded = try? JSONDecoder().decode([String: String].self, from: data) {
+            config = decoded
+        }
+        Database.shared.migrateToLatestSchema()
+        Analytics.start(apiKey: "an-key")
+        Ads.start(appID: "ads-id")
+        SupportChat.start(region: config["chatRegion"] ?? "eu")
+
+        let profileURL = URL.applicationSupportDirectory.appending(path: "profile.json")
+        if (try? Data(contentsOf: profileURL)) == nil {
+            Session.shared.signOut() // no profile on disk: treat as signed out
+        }
+
+        DispatchQueue.main.async {
+            BGTaskScheduler.shared.register(forTaskWithIdentifier: "com.example.feed.refresh", using: nil) { task in
+                task.setTaskCompleted(success: true)
+            }
+        }
+        return true
+    }
+}
+
+final class SceneDelegate: UIResponder, UIWindowSceneDelegate {
+    var window: UIWindow?
+
+    func scene(_ scene: UIScene, willConnectTo session: UISceneSession, options connectionOptions: UIScene.ConnectionOptions) {
+        guard let windowScene = scene as? UIWindowScene else { return }
+
+        let semaphore = DispatchSemaphore(value: 0)
+        Session.shared.refreshToken { semaphore.signal() }
+        semaphore.wait()
+
+        let cacheURL = URL.cachesDirectory.appending(path: "feed.json")
+        let cached = (try? Data(contentsOf: cacheURL)).flatMap { try? JSONDecoder().decode([FeedItem].self, from: $0) }
+
+        let tabs = UITabBarController()
+        tabs.viewControllers = [FeedViewController(items: cached ?? []), SearchViewController(), SettingsViewController()]
+        let window = UIWindow(windowScene: windowScene)
+        window.rootViewController = tabs
+        window.makeKeyAndVisible()
+        self.window = window
+    }
+}
+
+// Stand-ins for the app's own types, so the file compiles on its own
+struct FeedItem: Codable, Sendable { var id: String }
+final class Database: Sendable { static let shared = Database(); func migrateToLatestSchema() {} }
+enum Analytics { static func start(apiKey: String) {} }
+enum Ads { static func start(appID: String) {} }
+enum SupportChat { static func start(region: String) {} }
+final class Session: Sendable {
+    static let shared = Session()
+    func signOut() {}
+    func refreshToken(_ done: @escaping @Sendable () -> Void) {}
+}
+final class FeedViewController: UIViewController {
+    init(items: [FeedItem]) { super.init(nibName: nil, bundle: nil) }
+    required init?(coder: NSCoder) { nil }
+}
+final class SearchViewController: UIViewController {}
+final class SettingsViewController: UIViewController {}
+```
+
+</Brief>
+
+```workspace
+template: critique
+minutes: 25
+```
+
+```findings
+- id: sync-config
+  title: Fetches remote config over the network, synchronously, before the first frame
+  severity: high
+  lines: 8-12
+  detail: "`Data(contentsOf:)` with a remote URL blocks the main thread for the whole request. Launch time becomes network time; offline, it waits for the timeout; on a poor connection the launch watchdog kills the app with `0x8badf00d`. Ship defaults in the bundle, apply the last cached config at once, and fetch a new one asynchronously after the first frame."
+- id: semaphore-wait
+  title: Blocks the main thread on a token refresh with a semaphore
+  severity: high
+  lines: 38-40
+  detail: "Waiting on a semaphore puts the network on the critical path of the first frame, and if the session ever delivers its callback on the main queue, the app deadlocks for good. Show the UI with the stored session, and let the networking layer refresh the token when a request gets a 401."
+- id: bgtask-late
+  title: Registers the BGTask handler after launch has finished
+  severity: high
+  lines: 23-27
+  detail: "BGTaskScheduler requires every launch handler to be registered before `application(_:didFinishLaunchingWithOptions:)` returns. Deferring it with `DispatchQueue.main.async` makes the registration an error, and when iOS launches the app in the background for the task there's no handler waiting. That's why background refresh has never run. Register synchronously."
+- id: signout-when-locked
+  title: Signs the user out whenever the profile file can't be read
+  severity: high
+  lines: 18-21
+  detail: "\"Can't read\" isn't \"doesn't exist\". The app registers background refresh, so iOS launches it in the background, often overnight while the phone is locked; with the file protected, the read fails and the code signs the user out: the overnight sign-outs. Tell missing apart from unavailable (`isProtectedDataAvailable`, or the read error), never destroy state on a failed read, and keep the session in the Keychain with an after-first-unlock accessibility."
+- id: migration-on-main
+  title: Runs the database migration on the main thread at launch
+  severity: medium
+  lines: 13
+  detail: "Migration time grows with the user's data, so the most engaged users get the slowest launches, and a slow enough one trips the watchdog mid-migration. Keep schema migrations lightweight and run them off the main actor before the database is first used, with a progress state if they can be long; move heavy back-fills to a BGProcessingTask."
+- id: eager-sdks
+  title: Starts three SDKs before the first frame
+  severity: medium
+  lines: 14-16
+  detail: "Analytics, ads and support chat all sit on the critical path, and the chat SDK waits on the synchronous config. Only crash reporting needs to run first. Start analytics and ads after the first frame, and support chat on first use, when the user opens Help."
+- id: cache-on-main
+  title: Reads and decodes the cached feed synchronously while connecting the scene
+  severity: medium
+  lines: 42-43
+  detail: "The cache grows with use, and decoding it on the main thread delays the first frame in proportion. Show the feed's structure first, and load and decode the cache in the feed's view model off the main actor; the content appears a moment later."
+```
+
+<ReferenceReview>
+
+**Most important first.** Two problems are outright bugs rather than slowness. The BGTask handler is registered after launch finishes (lines 23–27), so background refresh can never run. And an unreadable profile is treated as a missing one (18–21), which signs users out whenever iOS launches the app in the background while the phone is locked. Then the two waits on the network, the synchronous config fetch (8–12) and the semaphore around the token refresh (38–40), which explain both the long tail of launch times and the watchdog kills on bad connections.
+
+**The design problem underneath** is that launch has no tiers: everything the app might need is done, synchronously and in sequence, before anything is shown. Launch work should be sorted into what the first frame truly needs, what can wait a frame, what can wait for idle time, and what waits for first use.
+
+**How I'd fix it, in small steps:**
+
+1. Move `BGTaskScheduler.register` to run synchronously in `didFinishLaunchingWithOptions`. One line, and it unblocks background refresh.
+2. Replace the profile check with a session read from the Keychain (after-first-unlock), and treat any read failure as "unavailable, try later", never as "signed out". Add a guard that destructive resets never run while `isProtectedDataAvailable` is false.
+3. Remove both network waits: load config from the bundle and the last cached copy, then refresh it in a task after the first frame; build the UI with the stored token and let the API client's 401 handling refresh it once (single-flight).
+4. Give the first screen placeholders and move cache loading into its view model, off the main actor.
+5. Introduce a small launch plan: crash reporting before the first frame; analytics, ads and the config refresh right after it (from the first screen's `viewDidAppear(_:)`); the database migration off the main actor before first use; support chat on first use.
+6. Add `OSSignposter` intervals around each launch step, and track the result with an `XCTApplicationLaunchMetric` test and MetricKit's `histogrammedTimeToFirstDraw`.
+
+**Tests to add:** a launch performance test in CI with a fixed budget; a unit test of the session loader that simulates protected data being unavailable and expects no sign-out; and an integration test that `BGTaskScheduler` registration happens inside `didFinishLaunchingWithOptions` (for example by asserting the handler is registered before the method returns, using an injected scheduler).
+
+</ReferenceReview>

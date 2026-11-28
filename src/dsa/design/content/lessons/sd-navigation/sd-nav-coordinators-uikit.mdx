@@ -1,0 +1,435 @@
+## Why it matters
+
+[Mediator: coordinators as mediators](/design/learn/sd-behavioural-mediator) introduced the idea: screens report what happened, and a coordinator decides what that means for the flow. One coordinator for one flow is easy. A real app has a tree of them (the app, each tab, checkout, returns, sign-in), and the hard parts are all about that tree: who keeps each coordinator alive, how a child tells its parent it's done, what happens when the user swipes back out of a flow without your code being asked, and where screens get their dependencies. Get those wrong and coordinators leak, vanish, or go out of step with what's on screen. Interviewers who hear "we use coordinators" will ask exactly these questions.
+
+## The tree
+
+A coordinator is an object that owns one **flow**: a sequence of screens with a purpose, such as checkout or returning an item. It creates the flow's screens, gives them their dependencies, listens to their outputs, and drives a navigation controller. Flows contain flows, so coordinators form a tree:
+
+- **The app coordinator**, owned by the scene delegate, decides between onboarding and the signed-in app, and connects the tabs.
+- **One coordinator per tab**, each owning that tab's `UINavigationController`.
+- **Child coordinators** for flows started from a tab: checkout presented from Basket, returns pushed inside Account, sign-in presented from anywhere.
+
+```visual flow
+title: A coordinator tree, and who keeps whom alive
+nodes:
+  - { id: scene, label: Scene delegate, kind: client, at: [2, 0] }
+  - { id: app, label: App coordinator, kind: service, at: [2, 1] }
+  - { id: home, label: Home, kind: service, at: [0, 2] }
+  - { id: basket, label: Basket, kind: service, at: [2, 2] }
+  - { id: account, label: Account, kind: service, at: [4, 2] }
+  - { id: checkout, label: Checkout, kind: service, at: [2, 3] }
+edges:
+  - [scene, app, owns]
+  - [app, home]
+  - [app, basket]
+  - [app, account]
+  - [basket, checkout, owns]
+  - [checkout, basket, onFinish, { style: async }]
+  - [basket, app, order placed, { style: async }]
+steps:
+  - say: "The scene delegate holds the **app coordinator** in a stored property. Nothing else keeps it alive: if it were a local constant, the whole tree would be freed when `scene(_:willConnectTo:options:)` returned."
+    show: [scene, app]
+    send: scene->app
+  - say: "The app coordinator starts one coordinator per tab and keeps them in its `children`. Each owns its tab's navigation controller."
+    show: [home, basket, account]
+    active: [app->home, app->basket, app->account]
+  - say: "The user taps Checkout. The basket coordinator creates a **child**, adds it to its own `children`, and starts it. The child presents its own navigation controller."
+    show: [checkout]
+    send: basket->checkout
+    state: { checkout: active }
+  - say: "An order is placed. The child reports it through `onFinish`. It doesn't know what should happen next, and it shouldn't."
+    send: checkout->basket
+    state: { checkout: ok }
+  - say: "The parent removes the child from `children`, so the checkout coordinator and its screens are freed."
+    hide: [checkout]
+  - say: "Showing the new order is a decision that spans two tabs, so it goes **up** to their common parent, which asks Account to show it."
+    send: basket->app
+    active: [app->account]
+    label: { app->account: show order }
+```
+
+Two rules come straight out of that picture:
+
+1. **Ownership points down.** The scene delegate owns the root; every parent owns its children in an array; nothing owns its parent. Children talk upwards through closures or delegates that capture the parent weakly.
+2. **Decisions go to the lowest coordinator that knows enough.** The checkout knows how to check out. The basket knows checkout happened. Only the app coordinator knows there's an Account tab to switch to.
+
+## A small base for lifetimes
+
+Every coordinator needs the same child bookkeeping, so it's worth a tiny base class. It inherits from `NSObject` because coordinators are often UIKit delegates, which must be.
+
+```swift check ios group=coordinators title="Coordinator.swift"
+import UIKit
+
+/// The base of every coordinator: it keeps its children alive while their flows run
+@MainActor
+class Coordinator: NSObject {
+    private(set) var children: [Coordinator] = []
+
+    func start() {}
+
+    func startChild(_ child: Coordinator) {
+        children.append(child)
+        child.start()
+    }
+
+    func childDidFinish(_ child: Coordinator) {
+        children.removeAll { $0 === child }
+    }
+}
+```
+
+That's the whole lifetime model: a child lives from `startChild` until its parent calls `childDidFinish`. If a flow can end in a way the parent never hears about, the child is never removed, and it leaks along with everything it holds, including its screens. The rest of this lesson is about making sure the parent always hears.
+
+## A modal child: checkout
+
+Checkout is a task the user finishes or abandons, so it's presented, in its own navigation controller. It can end three ways: an order is placed, the user taps Cancel, or the user swipes the sheet down. All three must reach the parent exactly once.
+
+```swift check ios group=coordinators title="CheckoutCoordinator.swift"
+// Services the flow needs. The coordinator hands them to screens; screens never reach for singletons.
+protocol AddressBook: Sendable {}
+protocol Payments: Sendable {}
+
+struct CheckoutServices {
+    let addresses: any AddressBook
+    let payments: any Payments
+}
+
+struct Address: Sendable {
+    let id: String
+}
+
+final class AddressViewController: UIViewController {
+    enum Output { case chose(Address), cancelled }
+    var onOutput: ((Output) -> Void)?
+    private let addresses: any AddressBook
+
+    init(addresses: any AddressBook) {
+        self.addresses = addresses
+        super.init(nibName: nil, bundle: nil)
+    }
+
+    required init?(coder: NSCoder) { nil }
+}
+
+final class PaymentViewController: UIViewController {
+    enum Output { case placed(orderID: String) }
+    var onOutput: ((Output) -> Void)?
+    private let payments: any Payments
+    private let address: Address
+
+    init(payments: any Payments, address: Address) {
+        self.payments = payments
+        self.address = address
+        super.init(nibName: nil, bundle: nil)
+    }
+
+    required init?(coder: NSCoder) { nil }
+}
+
+enum CheckoutOutcome {
+    case placed(orderID: String)
+    case cancelled
+}
+
+/// A modal child flow: it presents its own navigation controller and reports how it ended
+final class CheckoutCoordinator: Coordinator, UIAdaptivePresentationControllerDelegate {
+    var onFinish: ((CheckoutOutcome) -> Void)?
+    private let presenter: UIViewController
+    private let services: CheckoutServices
+    private let navigation = UINavigationController()
+
+    init(presenter: UIViewController, services: CheckoutServices) {
+        self.presenter = presenter
+        self.services = services
+    }
+
+    override func start() {
+        let address = AddressViewController(addresses: services.addresses)
+        address.onOutput = { [weak self] output in
+            switch output {
+            case .chose(let address): self?.showPayment(deliveringTo: address)
+            case .cancelled: self?.finish(.cancelled, dismissing: true)
+            }
+        }
+        navigation.setViewControllers([address], animated: false)
+        navigation.presentationController?.delegate = self   // so a swipe-down is noticed
+        presenter.present(navigation, animated: true)
+    }
+
+    private func showPayment(deliveringTo address: Address) {
+        let payment = PaymentViewController(payments: services.payments, address: address)
+        payment.onOutput = { [weak self] output in
+            switch output {
+            case .placed(let orderID): self?.finish(.placed(orderID: orderID), dismissing: true)
+            }
+        }
+        navigation.pushViewController(payment, animated: true)
+    }
+
+    // The user swiped the sheet away: the flow is over, and there's nothing left to dismiss
+    func presentationControllerDidDismiss(_ presentationController: UIPresentationController) {
+        finish(.cancelled, dismissing: false)
+    }
+
+    private func finish(_ outcome: CheckoutOutcome, dismissing: Bool) {
+        guard let onFinish else { return }   // finish once, however the flow ends
+        self.onFinish = nil
+        if dismissing { navigation.dismiss(animated: true) }
+        onFinish(outcome)
+    }
+}
+```
+
+Read it for what each screen knows. `AddressViewController` knows the address book and its two outputs; it doesn't know payment exists. `PaymentViewController` gets the address it needs as a parameter. Neither creates the other, neither touches a singleton, and either could appear in another flow. The coordinator is the only place that knows the order of the steps and where the services come from.
+
+`finish` is written to run **once**. Placing an order dismisses the sheet; a swipe has already dismissed it; and a stray second call (a double tap on Place order) does nothing, because `onFinish` is cleared on the first.
+
+## The parent: start, listen, release
+
+```swift check ios group=coordinators title="BasketCoordinator.swift"
+final class BasketViewController: UIViewController {
+    var onCheckout: (() -> Void)?
+}
+
+/// The Basket tab's coordinator: owns its stack and starts checkout as a child
+final class BasketCoordinator: Coordinator {
+    let navigation = UINavigationController()
+    /// Told when an order is placed; the parent decides what that means for the rest of the app
+    var onOrderPlaced: ((String) -> Void)?
+    private let services: CheckoutServices
+
+    init(services: CheckoutServices) {
+        self.services = services
+    }
+
+    override func start() {
+        let basket = BasketViewController()
+        basket.onCheckout = { [weak self] in self?.startCheckout() }
+        navigation.setViewControllers([basket], animated: false)
+    }
+
+    private func startCheckout() {
+        let checkout = CheckoutCoordinator(presenter: navigation, services: services)
+        // Weak on both: the child holds this closure, so a strong capture of it would be a cycle
+        checkout.onFinish = { [weak self, weak checkout] outcome in
+            guard let self, let checkout else { return }
+            childDidFinish(checkout)
+            if case .placed(let orderID) = outcome {
+                onOrderPlaced?(orderID)
+            }
+        }
+        startChild(checkout)
+    }
+}
+```
+
+The capture list is the subtle line. The checkout coordinator stores `onFinish`; if the closure captured `checkout` strongly, the coordinator would hold a closure that holds the coordinator, and `childDidFinish` would remove it from `children` without ever freeing it. `[weak checkout]` breaks that cycle; `[weak self]` keeps the child from keeping its parent alive.
+
+## The back button doesn't ask
+
+A pushed child flow shares its parent's navigation controller. Say the Account tab shows an order and the user starts a return: the returns flow pushes "Choose a reason" onto the Account stack. If the user changes their mind and swipes back to the order, UIKit pops the screen **without calling any of your code**. The returns coordinator is still in `children`, waiting for a reason that will never come.
+
+The fix is to listen to the navigation controller itself. Its delegate's `navigationController(_:didShow:animated:)` runs after every completed transition, whoever caused it. A small router can own that delegate and tell each flow when its screens leave the stack:
+
+```swift check ios group=coordinators title="StackRouter.swift"
+/// Wraps one navigation controller and tells whoever pushed a screen when it leaves the stack
+final class StackRouter: NSObject, UINavigationControllerDelegate {
+    let navigation: UINavigationController
+    private var onPop: [ObjectIdentifier: () -> Void] = [:]
+
+    init(navigation: UINavigationController) {
+        self.navigation = navigation
+        super.init()
+        navigation.delegate = self   // a weak reference: whoever owns the router must keep it alive
+    }
+
+    func push(_ screen: UIViewController, animated: Bool = true, onPop: (() -> Void)? = nil) {
+        if let onPop { self.onPop[ObjectIdentifier(screen)] = onPop }
+        navigation.pushViewController(screen, animated: animated)
+    }
+
+    // Called after every completed transition: Back, the swipe, the long-press menu, or code
+    func navigationController(_ navigationController: UINavigationController, didShow viewController: UIViewController, animated: Bool) {
+        let onStack = Set(navigationController.viewControllers.map(ObjectIdentifier.init))
+        for (screen, handler) in onPop where !onStack.contains(screen) {
+            onPop[screen] = nil
+            handler()
+        }
+    }
+}
+
+final class ReturnReasonViewController: UIViewController {
+    var onChoseReason: ((String) -> Void)?
+}
+
+/// A pushed child flow: its screens share the Account tab's stack
+final class ReturnsCoordinator: Coordinator {
+    var onFinish: ((Bool) -> Void)?
+    private let router: StackRouter
+    private let orderID: String
+
+    init(router: StackRouter, orderID: String) {
+        self.router = router
+        self.orderID = orderID
+    }
+
+    override func start() {
+        let reason = ReturnReasonViewController()
+        reason.onChoseReason = { [weak self] _ in self?.finish(returned: true) }
+        // If the user goes back past this flow's first screen, the flow is over
+        router.push(reason) { [weak self] in self?.finish(returned: false) }
+    }
+
+    private func finish(returned: Bool) {
+        guard let onFinish else { return }
+        self.onFinish = nil
+        onFinish(returned)
+    }
+}
+```
+
+Comparing the stack with the screens it's watching, rather than asking which single screen was on top, handles every way screens leave: one pop, a pop to the root, a jump several screens back from the long-press menu on the back button. A cancelled swipe leaves the stack unchanged, so it reports nothing. And because the delegate also hears about pops your own code makes, `finish` must tolerate being called after the flow has already ended, which the cleared `onFinish` takes care of.
+
+Here's the whole round trip:
+
+```visual sequence
+title: The user swipes back out of a child flow
+participants:
+  - { id: user, label: User }
+  - { id: nav, label: Navigation controller }
+  - { id: router, label: StackRouter }
+  - { id: returns, label: Returns flow }
+  - { id: account, label: Account coordinator }
+messages:
+  - { note: "Stack: Account, Order 42, Choose a reason", over: nav }
+  - [user, nav, swipe back, { say: "The user swipes back from the first screen of the returns flow. UIKit pops it without calling any of your code." }]
+  - [nav, router, "didShow(Order 42)", { say: "Once the transition completes, the navigation controller tells its delegate. A cancelled swipe would leave the stack as it was." }]
+  - [router, router, reason screen gone, { say: "The router compares the screens it's watching with the stack: Choose a reason is no longer on it." }]
+  - [router, returns, onPop, { say: "It runs the handler the returns flow registered when it pushed that screen." }]
+  - [returns, account, "onFinish(returned: false)", { reply: true, say: "The flow ends as cancelled and tells its parent." }]
+  - [account, account, childDidFinish, { say: "The parent drops it from `children`, and the returns coordinator is freed. Without this, every abandoned return would leak a coordinator." }]
+```
+
+Some teams avoid the delegate and have each screen report its own removal, from `viewDidDisappear` when `isMovingFromParent` is true. It works without a router, but it puts navigation bookkeeping back into the screens, and a flow whose first screen forgets to report never ends.
+
+## Deep links reach the tree from the top
+
+A notification for order 42 arrives while the user is in checkout. Whoever handles it must tear down the checkout child, dismiss its sheet, switch to Account and build the stack, and only the app coordinator can see all of that. So routes enter at the root and travel down: the app coordinator finishes any child that's in the way, selects the tab, and hands the rest of the route to that tab's coordinator, which builds its stack with `setViewControllers(_:animated:)`. Each coordinator handles the part of the route it owns. The next lesson, Routers and route enums, gives the route its type and the tree a single entry point.
+
+## Testing a coordinator
+
+Coordinators are worth testing because they hold the flow's rules: what follows what, when a flow ends, what the parent hears. Two approaches work:
+
+- **Behind a protocol.** The coordinator drives a small `Navigator` (or a router like the one above) instead of a `UINavigationController`. Tests pass a recording fake and assert on the commands: "after `.chose(address)`, it pushed the payment screen". That's the approach of the [mediated onboarding kata](/design/learn/sd-behavioural-mediator) in D13.
+- **With real UIKit.** A `UINavigationController` works in a unit test without a window if you push with `animated: false`. Assert on `viewControllers`. It's closer to reality and noisier.
+
+Either way, test **lifetimes** too: after each way a flow can end, the parent's `children` should be empty and a `weak` reference to the child should be `nil`.
+
+## Trade-offs
+
+| | Screens push each other | Storyboard segues | Coordinator per flow | Coordinator per screen |
+| --- | --- | --- | --- | --- |
+| Screens reusable in other flows | no | no | yes | yes |
+| Where flow rules live | scattered across screens | the storyboard plus `prepare(for:)` | one type per flow | spread thin across many types |
+| Dependencies for screens | each screen builds the next one's | set in `prepare(for:)` | handed out by the coordinator | handed out, at great length |
+| Deep links | each screen's problem | hard | routes travel down the tree | the same, through more layers |
+| Cost | none up front | low | a type per flow, lifetimes to manage | a lot of boilerplate for little gain |
+| Wins for | prototypes, two-screen apps | small storyboard apps | most production UIKit apps | rarely |
+
+<Callout kind="interview">
+
+**What to say:** "A tree of coordinators, one per flow. The scene delegate owns the root; parents own children in an array and release them when the child reports it finished. Screens get their dependencies from the coordinator and report outputs through closures. Pushed child flows learn about system pops through the navigation controller's delegate, so the back swipe can't leak a coordinator."
+
+**What to ask:** which flows are entered from outside (links, notifications)? Can a flow be abandoned midway? Is the app moving to SwiftUI (which changes what a coordinator should own)?
+
+**Red flags:** one `AppCoordinator` with every flow's methods; coordinators that nobody stores; `onFinish` closures that capture the child strongly; no answer for the back swipe; screens that receive the coordinator itself and call arbitrary methods on it.
+
+</Callout>
+
+<Callout kind="gotcha" title="iOS gotcha: one delegate per navigation controller">
+
+`UINavigationController.delegate` is a single weak property. If the tab coordinator, the returns flow and an interactive-transition animator each set themselves as the delegate, the last one wins and the others silently stop hearing about pops. Give each navigation controller one owner of its delegate, a router like the one above, and let flows register with it. Because the property is weak, that router must itself be retained by the coordinator that owns the stack.
+
+</Callout>
+
+## Practice
+
+[A coordinator tree that lets go](/design/practice/sd-kata-navigation-coordinator-tree) has you build this lesson's lifetime model and prove it with weak references: start child flows, deliver each result to the parent exactly once, finish grandchildren before their parents, cancel a flow when the user pops past its first screen, and free everything with no cycles. Then try [Review: screens that push each other](/design/practice/sd-review-navigation-pushy-screens), the code you'd be refactoring into coordinators.
+
+```cards
+- id: coordinator-ownership
+  front: "Who keeps a coordinator alive?"
+  back: "Its parent, in a `children` array, from the moment the child starts until the parent hears it finished. The scene delegate owns the root. Nothing owns its parent: children report up through weakly capturing closures."
+- id: finish-once
+  front: "What must be true of a child coordinator's finish?"
+  back: "Every way the flow can end (success, cancel, swipe-down, back swipe) reaches the parent exactly once, and the parent then removes the child so it's freed."
+- id: back-swipe
+  front: "How does a coordinator learn that the user swiped back out of its flow?"
+  back: "Through the navigation controller's delegate: after each transition, `didShow` lets a router compare the stack with the screens each flow pushed and tell a flow when its screens are gone."
+- id: weak-child-capture
+  front: "Why capture the child weakly in its own `onFinish` closure?"
+  back: "The child stores the closure. A strong capture means the child holds itself through the closure, so removing it from `children` never frees it."
+```
+
+```quiz
+- id: q1
+  type: bug
+  prompt: "Returning an item works, but memory grows each time a user starts a return and then swipes back to the order. Which line is the cause?"
+  code: |
+    final class AccountCoordinator: Coordinator {
+        let navigation: UINavigationController
+
+        init(navigation: UINavigationController) {
+            self.navigation = navigation
+        }
+
+        func startReturn(for orderID: String) {
+            let returns = ReturnsFlow(navigation: navigation, orderID: orderID)
+            returns.onFinish = { [weak self, weak returns] _ in
+                guard let self, let returns else { return }
+                childDidFinish(returns)
+            }
+            navigation.pushViewController(returns.firstScreen, animated: true)
+            startChild(returns)
+        }
+    }
+  answer: 14
+  explain: "The flow's first screen is pushed straight onto the navigation controller, so nothing notices when the back swipe pops it. `onFinish` never runs and the child stays in `children`. Push through a router that reports pops, and finish the flow when its first screen leaves."
+- id: q2
+  type: mcq
+  prompt: "After checkout places an order, the app must switch to the Account tab and show it. Which coordinator should decide that?"
+  options:
+    - "The checkout coordinator, since it knows the order id"
+    - "The basket coordinator, which started checkout"
+    - "The app coordinator, the lowest one that knows about both tabs"
+    - "The order confirmation screen"
+  answer: 2
+  explain: "Checkout reports that an order was placed; the basket passes it up; only the app coordinator knows there is an Account tab and can ask it to show the order. Decisions go to the lowest coordinator with enough knowledge."
+- id: q3
+  type: multi
+  prompt: "A modal checkout flow can end in several ways. Which must result in the parent's `childDidFinish` being called? Choose all that apply."
+  options:
+    - "The order is placed"
+    - "The user taps Cancel"
+    - "The user swipes the sheet down"
+    - "The user pushes from the address screen to the payment screen"
+    - "A deep link replaces the whole UI while checkout is up"
+  answer: [0, 1, 2, 4]
+  explain: "Every way the flow ends must reach the parent, including the swipe (via `presentationControllerDidDismiss`) and a deep link tearing the flow down. Moving between the flow's own screens isn't an end."
+- id: q4
+  type: truefalse
+  prompt: "`navigationController(_:didShow:animated:)` is called for pops made by your own code as well as by the back button and the swipe."
+  answer: true
+  explain: "It runs after every completed transition, whoever caused it. That's why a flow's finish must tolerate being called after the flow has already ended."
+- id: q5
+  type: mcq
+  prompt: "In `scene(_:willConnectTo:options:)`, the code creates `let app = AppCoordinator(window: window)` and calls `app.start()`. The first screen appears, but none of its buttons do anything. Why?"
+  options:
+    - "The window isn't key yet"
+    - "Nothing stores the coordinator, so it's freed when the method returns, and the screens' weak references to it are nil"
+    - "Coordinators must be created in the app delegate"
+    - "The buttons need `@objc` selectors"
+  answer: 1
+  explain: "Screens capture their coordinator weakly, as they should. If the root coordinator isn't stored in a property, it's freed at once, so every `self?.` call does nothing. The scene delegate must own it."
+```

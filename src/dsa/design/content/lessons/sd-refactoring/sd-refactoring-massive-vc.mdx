@@ -1,0 +1,278 @@
+## Why it matters
+
+Massive View Controller is the best-known iOS anti-pattern. Apple's MVC makes the view controller the default home for everything, and a few years of feature work turns it into the largest, most-changed and least-tested file in the app. The same shape outside the UI is a **god object**. When interviewers ask "how do you keep view controllers small?", they want a way to find what's inside one and take it out safely, not the name of an architecture.
+
+## How a view controller gets massive
+
+UIKit hands the view controller almost every hook a screen has: the lifecycle callbacks, the root view, the actions from its buttons, the delegate and data source of its lists, segues, and the outlets a storyboard connects. So when a feature needs something, the view controller is the nearest place to put it. Over time it collects jobs like these:
+
+- fetching and decoding data, and caching it;
+- formatting prices, dates and names for display;
+- validating what the user types;
+- being the data source and delegate of three lists;
+- deciding which screen comes next, and presenting it;
+- analytics, permission prompts and keyboard handling.
+
+None of these is wrong on its own, and each addition was a reasonable change on the day. Together they give one file a dozen reasons to change, which is the [single-responsibility principle](/design/learn/sd-solid-srp) seen from the other side. The costs are concrete: every pull request touches the file, so it conflicts; nothing in it can be tested without UIKit and the network; and a change for one feature breaks another that happens to share a property.
+
+## God objects beyond the screen
+
+A **god object** is a type that knows too much or does too much, and that much of the app depends on. Massive View Controller is the god object of the UI layer, but iOS codebases grow them elsewhere too:
+
+- an `AppDelegate` that registers for push, routes deep links, configures five SDKs, runs database migrations and holds global state;
+- an `AppManager`, `DataManager` or `Utils` that every screen calls;
+- a `User` model with sixty properties and methods that talk to the network;
+- a 1,500-line view model. Moving to SwiftUI or MVVM moves the smell into a new file unless the jobs themselves are split up.
+
+The signs are the same wherever it lives. Most pull requests touch it. It imports frameworks that have nothing to do with each other (UIKit, StoreKit, CoreLocation, AVFoundation). Its name is vaguer than anything it does. And you can't say what it's for without using the word "and".
+
+## Seeing the objects inside
+
+Line count tells you a type is big; it doesn't tell you how to split it. A better tool is a **cohesion map**: for each method, write down the stored properties it reads or writes. Methods that share properties belong together. Groups of methods and properties that never touch each other are separate objects that happen to share a file. (Metrics people call the lack of this sharing LCOM, lack of cohesion in methods.)
+
+Here's a slice of a profile screen's map. Step through it:
+
+```visual flow
+title: A cohesion map of ProfileViewController
+nodes:
+  - { id: user, label: user, kind: store, at: [0, 0] }
+  - { id: following, label: isFollowing, kind: store, at: [1, 0] }
+  - { id: posts, label: posts, kind: store, at: [3, 0] }
+  - { id: page, label: nextPage, kind: store, at: [4, 0] }
+  - { id: loadProfile, label: "loadProfile()", at: [0, 2] }
+  - { id: toggleFollow, label: "toggleFollow()", at: [1, 2] }
+  - { id: loadPage, label: "loadNextPage()", at: [3, 2] }
+  - { id: cell, label: "cellForRowAt", at: [4, 2] }
+  - { id: session, label: session, kind: external, at: [2, 4] }
+  - { id: formatter, label: dateFormatter, kind: store, at: [4, 4] }
+groups:
+  - { id: header, label: Profile header, nodes: [user, following, loadProfile, toggleFollow] }
+  - { id: feed, label: Posts feed, nodes: [posts, page, loadPage, cell, formatter] }
+edges:
+  - [loadProfile, user, { style: data }]
+  - [toggleFollow, user, { style: data }]
+  - [toggleFollow, following, { style: data }]
+  - [loadPage, posts, { style: data }]
+  - [loadPage, page, { style: data }]
+  - [cell, posts, { style: data }]
+  - [cell, formatter, { style: data }]
+  - [loadProfile, session, { style: data }]
+  - [toggleFollow, session, { style: data }]
+  - [loadPage, session, { style: data }]
+steps:
+  - say: "Start with the header's methods. `loadProfile()` and `toggleFollow()` use the `user` and the follow state."
+    show: [user, following, loadProfile, toggleFollow]
+  - say: "Now the feed's methods. They use `posts`, the next page and the date formatter, and nothing the header uses."
+    show: [posts, page, loadPage, cell, formatter]
+  - say: "Two clusters that never touch each other's state are **two objects** sharing one file. Each is a candidate to extract."
+    show: [header, feed]
+    active: [header, feed]
+  - say: "`session` is used by both. A property that everything uses is usually a **dependency to inject** into each extracted object, not a reason to keep them together."
+    show: [session]
+    active: [session]
+```
+
+You can draw the map on paper in ten minutes for a real 2,000-line screen, and it usually shows three to six clusters. They're your extraction plan, and their boundaries tell you what each new type needs passed in.
+
+## Where each job goes
+
+Once you know the clusters, each job has a usual destination:
+
+| Job in the view controller | Where it moves | What the screen keeps |
+| --- | --- | --- |
+| Fetching, decoding, caching | a repository or service behind a protocol | one injected dependency |
+| Formatting for display | a formatter or view model, as plain functions | the formatted strings |
+| Screen state and its rules | a view model or model object | bindings to it |
+| Validating input | a domain type, such as a failable `init?` | the result |
+| Navigation | a coordinator, or an output closure | a call like `onSelectPost(post)` |
+| List plumbing | a data-source object, a diffable data source, or a child view controller | ownership of it |
+| Analytics | an injected tracker | one call per event |
+| Keyboard avoidance | `view.keyboardLayoutGuide` (iOS 15 and later) | one constraint |
+
+Here's the profile screen after the first few moves. Each comment says where the code used to live.
+
+```swift check ios title="After: the screen and what came out of it"
+import Observation
+import UIKit
+
+struct Profile: Sendable {
+    let name: String
+    let isFollowing: Bool
+}
+
+struct Post: Sendable, Hashable {
+    let id: String
+    let text: String
+    let date: Date
+}
+
+// Was: URLSession calls, JSON decoding and an avatar cache inside the screen
+protocol ProfileRepository: Sendable {
+    func profile(id: String) async throws -> Profile
+    func setFollowing(_ following: Bool, userID: String) async throws
+}
+
+// Was: a DateFormatter property and string building in cellForRowAt
+enum PostFormatting {
+    static func subtitle(for post: Post) -> String {
+        post.date.formatted(date: .abbreviated, time: .omitted)
+    }
+}
+
+// Was: a handful of the screen's twenty stored properties. Now the header's state and its rules.
+@MainActor @Observable
+final class ProfileHeaderModel {
+    private(set) var profile: Profile?
+    private(set) var failed = false
+    private let userID: String
+    private let repository: any ProfileRepository
+
+    init(userID: String, repository: any ProfileRepository) {
+        self.userID = userID
+        self.repository = repository
+    }
+
+    func load() async {
+        do {
+            profile = try await repository.profile(id: userID)
+        } catch {
+            failed = true
+        }
+    }
+
+    func toggleFollow() async {
+        guard let current = profile else { return }
+        profile = Profile(name: current.name, isFollowing: !current.isFollowing)
+        do {
+            try await repository.setFollowing(!current.isFollowing, userID: userID)
+        } catch {
+            profile = current
+        }
+    }
+}
+
+// The screen lays out its parts and connects them. Navigation is decided outside.
+final class ProfileViewController: UIViewController {
+    private let header: ProfileHeaderModel
+    private let feed: UIViewController
+    private let onSelectPost: (Post) -> Void
+
+    init(header: ProfileHeaderModel, feed: UIViewController, onSelectPost: @escaping (Post) -> Void) {
+        self.header = header
+        self.feed = feed
+        self.onSelectPost = onSelectPost
+        super.init(nibName: nil, bundle: nil)
+    }
+
+    required init?(coder: NSCoder) { nil }
+}
+```
+
+Notice what changed besides size. The follow rule (update optimistically, roll back on failure) now lives in a type you can test with a stub repository and no UIKit. The screen's initialiser lists what it depends on. And the feed is a child view controller with its own state, so the two clusters from the map can't reach into each other any more. You'll do that extraction step by step later in this module.
+
+<Callout kind="note">
+
+Not every long view controller is massive. One that's long because of layout code for a dense screen, all changing together for the same reason, is cohesive. Judge by the cohesion map and the change history, not by the line count.
+
+</Callout>
+
+## Trade-offs
+
+The moves aren't equally expensive, and you rarely need all of them.
+
+| Move | Effort | What it buys | Risk | Wins when |
+| --- | --- | --- | --- | --- |
+| Extract a repository or service | low | testable data access; reuse across screens | low | the screen fetches or caches itself |
+| Extract a data-source object | low | a shorter controller | low | list code dominates but the state is simple |
+| Extract a child view controller | medium | a region with its own state and lifecycle | medium (layout, containment) | the screen has independent sections |
+| Introduce a view model | medium | screen state and rules testable without UIKit | medium | the state logic is the hard part |
+| Move navigation out | low to medium | flows change without editing screens | low | screens push each other directly |
+
+<Callout kind="interview">
+
+**What to say:** a view controller's job is the view's lifecycle, layout and binding; everything else has a better home, and you can name it. Then show *how* you'd find the pieces (a cohesion map, the change history) and move them one at a time with tests around them.
+
+**What to ask:** which parts of this screen change most, and for which teams? What tests exist? Is the plan to stay in UIKit or move parts to SwiftUI?
+
+**Red flags:** answering with an architecture name ("use VIPER") and no plan; moving all the logic into one 2,000-line view model; a `BaseViewController` superclass that every screen inherits shared behaviour from, which is a god object spread through inheritance.
+
+</Callout>
+
+<Callout kind="gotcha" title="iOS gotcha: extensions split files, not responsibilities">
+
+Moving the table view methods into `ProfileViewController+Table.swift` makes each file shorter and leaves the type exactly as big. Every extension shares the same stored properties, and every method can still call every other. Extensions are a fine way to organise a type, but they aren't a refactoring of its design.
+
+</Callout>
+
+<Callout kind="gotcha" title="iOS gotcha: storyboards break at run time, not compile time">
+
+If you move or rename a property that a storyboard connects as an `@IBOutlet`, the app still builds, then crashes when the scene loads with "this class is not key value coding-compliant for the key …". A moved `@IBAction` fails with "unrecognized selector sent to instance" on the first tap. Check the connections inspector, and open every affected screen (or run a UI test) before you merge.
+
+</Callout>
+
+## Practice
+
+Two reviews practise this lesson. **The orders screen** is a classic massive view controller: find what makes it fragile and plan the split. **The AppManager singleton** is the same disease outside the UI, a god object every screen depends on; it also practises the next lesson. When you've finished the module, **take apart a 3,800-line product page** asks you to plan the split of a far bigger screen, across four teams.
+
+```cards
+- id: cohesion-map
+  front: "How do you find the objects hiding inside a massive view controller?"
+  back: "Map each method to the stored properties it uses. Clusters of methods and properties that don't touch each other are separate objects; a property every cluster uses is a dependency to inject."
+- id: god-object-signs
+  front: "What are the signs of a god object?"
+  back: "Most changes touch it, it imports unrelated frameworks, its name is vaguer than anything it does, and you can't describe it without saying \"and\"."
+- id: smell-moves
+  front: "Does adopting MVVM or SwiftUI cure Massive View Controller?"
+  back: "Not by itself. If the jobs aren't split up, the same god object reappears as a massive view model or a massive view."
+```
+
+```quiz
+- id: q1
+  type: mcq
+  prompt: "In a cohesion map of a 2,000-line screen, the `apiClient` property is used by all four clusters. What does that tell you?"
+  options:
+    - "The clusters belong together after all, so leave the screen as it is"
+    - "It's a shared dependency: inject it into each object you extract"
+    - "Turn `apiClient` into a singleton so every cluster can reach it"
+    - "Extract `apiClient` first, before anything else"
+  answer: 1
+  explain: "A dependency that everything uses doesn't make the clusters one object; they'd still never touch each other's state. Pass it into each extracted type through its initialiser. Making it a global would hide the dependency instead."
+- id: q2
+  type: sort
+  prompt: "You're slimming a profile screen. Where does each job go?"
+  buckets: [Stays in the view controller, Repository or service, View model or formatter, Coordinator]
+  items:
+    - [Adding subviews and constraints, 0]
+    - [Decoding the posts JSON, 1]
+    - [Caching avatar images, 1]
+    - ["Turning a date into \"12 Mar 2026\"", 2]
+    - [Disabling the follow button while a request runs, 2]
+    - [Choosing which screen opens when a post is tapped, 3]
+  explain: "The controller keeps the view and its layout. Data access and caching go behind a repository; display formatting and screen state go to plain types you can test; the decision about where to go next belongs to whoever owns the flow."
+- id: q3
+  type: truefalse
+  prompt: "Moving a view controller's data source methods into an extension in another file reduces its responsibilities."
+  answer: false
+  explain: "The extension is part of the same type: it shares every stored property and can call every method. The file is shorter; the design is unchanged. Extracting a separate data-source object (or a child view controller) is what reduces responsibilities."
+- id: q4
+  type: multi
+  prompt: "Which of these are good evidence that a type is a god object?"
+  options:
+    - "Most pull requests this quarter touched it"
+    - "It imports UIKit, StoreKit, CoreLocation and AVFoundation"
+    - "It has exactly one public method"
+    - "Describing what it does takes three \"and\"s"
+    - "Its name ends in Manager"
+  answer: [0, 1, 3]
+  explain: "Constant change, unrelated dependencies and a description full of \"and\" are the symptoms. A vague name like `Manager` is a hint worth checking, but some managers do one thing well; judge by what the type does, not what it's called."
+- id: q5
+  type: mcq
+  prompt: "A teammate moved every line of logic from a 2,000-line view controller into one new view model. What's the main risk?"
+  options:
+    - "There isn't one: the controller is now small"
+    - "A massive view model: the same god object in a new file, now with bindings to keep in sync"
+    - "View models make the app slower to launch"
+    - "View models can't be unit tested"
+  answer: 1
+  explain: "Moving everything at once moves the smell rather than removing it. Split by the clusters the code actually has (header, feed, data access, navigation) so that each new type has one reason to change."
+```

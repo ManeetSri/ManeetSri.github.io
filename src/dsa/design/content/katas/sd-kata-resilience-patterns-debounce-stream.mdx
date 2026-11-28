@@ -1,0 +1,109 @@
+A search screen sends a request for every keystroke: typing "swift" costs five requests, four of them for results nobody will see. Write a debounce operator for async streams, so the screen can turn its stream of keystrokes into a stream of queries worth sending.
+
+`ResilienceDebounce.debounce(_:for:clock:) -> AsyncStream<Element>`
+
+- Each element from `upstream` waits until `quiet` has passed with no newer element, then comes out.
+- A newer element replaces the waiting one, which is dropped, and the quiet period starts again from the newer one.
+- When `upstream` finishes, the waiting element (if there is one) comes out at once, then the output finishes. A search box that's dismissed mid-word still saves its draft.
+- When whoever is reading the output stops (their task is cancelled, or they break out of the loop), stop reading `upstream` and cancel any timer that's waiting.
+- Measure time with the clock you're given.
+
+## Examples
+
+With a 300 ms quiet period:
+
+| Input, with times | Output, with times |
+| --- | --- |
+| `s` at 0, `sw` at 100, `swi` at 200 | `swi` at 500 |
+| `a` at 0, `ab` at 250 | `ab` at 550 |
+| `cat` at 0, `cats` at 300, `catsup` at 700 | `cat` at 300, `cats` at 600, `catsup` at 1000 |
+| `draft` at 0, then upstream finishes at 50 | `draft` at 50, then the output finishes |
+
+## Constraints
+
+- The tests drive a `TestClock` by hand, so sleep with `clock.sleep(for:)`, never `Task.sleep`.
+- Elements are `Sendable`, and the output must be safe to read from any task.
+- Every timer you start must end: either it fires, or you cancel it.
+
+<Hints>
+<Hint>
+`AsyncStream.makeStream(of:)` gives you the output stream and the continuation that feeds it. Start one task that reads `upstream` with `for await` and decides what to emit.
+</Hint>
+<Hint>
+For each element, cancel the previous timer task and start a new one that sleeps for `quiet` and then emits. A cancelled `clock.sleep` throws, which is your cue to emit nothing.
+</Hint>
+<Hint>
+A timer can wake at the same moment a newer element arrives. Keep the waiting element and a generation number in a small actor, and have each timer emit only if its generation is still the newest.
+</Hint>
+<Hint>
+`continuation.onTermination` runs when the reader goes away. Cancel the reading task there; when `for await` over an `AsyncStream` sees cancellation, it ends.
+</Hint>
+</Hints>
+
+## Solutions
+
+<Approach title="A reading task, and an actor holding the waiting element" time="O(1) per element" space="O(1)">
+
+```swift
+public static func debounce<Element: Sendable>(_ upstream: AsyncStream<Element>, for quiet: Duration, clock: some Clock<Duration>) -> AsyncStream<Element> {
+    let (output, continuation) = AsyncStream.makeStream(of: Element.self)
+    let pending = Pending(output: continuation)
+    let reader = Task {
+        for await element in upstream {
+            await pending.replace(with: element, after: quiet, on: clock)
+        }
+        // Upstream finished, or the consumer stopped and cancelled this task
+        await pending.flush()
+        continuation.finish()
+    }
+    continuation.onTermination = { _ in reader.cancel() }
+    return output
+}
+
+private actor Pending<Element: Sendable> {
+    private let output: AsyncStream<Element>.Continuation
+    private var element: Element?
+    private var generation = 0
+    private var timer: Task<Void, Never>?
+
+    init(output: AsyncStream<Element>.Continuation) {
+        self.output = output
+    }
+
+    func replace(with element: Element, after quiet: Duration, on clock: some Clock<Duration>) {
+        self.element = element
+        generation += 1
+        let mine = generation
+        timer?.cancel()
+        timer = Task {
+            do {
+                try await clock.sleep(for: quiet)
+            } catch {
+                return
+            }
+            self.emit(ifStill: mine)
+        }
+    }
+
+    func flush() {
+        timer?.cancel()
+        timer = nil
+        if let element {
+            self.element = nil
+            output.yield(element)
+        }
+    }
+
+    private func emit(ifStill generation: Int) {
+        guard generation == self.generation, let element else { return }
+        self.element = nil
+        output.yield(element)
+    }
+}
+```
+
+The generation check is what makes this correct rather than nearly correct. Cancelling a timer is a request: a timer whose sleep has already ended can still be on its way to `emit` when a newer element arrives. Checking the generation inside the actor, where nothing else can run at the same moment, turns that race into a no-op.
+
+The timer task is created inside the actor and captures `self`, so it inherits the actor's isolation and can call `emit` without an `await`. In an app you'd usually reach for `debounce(for:)` from Apple's open-source swift-async-algorithms package rather than your own. Writing it once shows you what that package handles for you, and which questions (what happens on finish? on cancellation?) to check in its documentation.
+
+</Approach>

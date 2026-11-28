@@ -1,0 +1,118 @@
+A shop's links arrive as custom-scheme URLs (`shop://product/42`), as universal links on two hosts (`https://shop.example.com/product/42`) and inside notification payloads. Write the one parser they all go through: it turns each into a typed `Route`, and rejects anything that isn't the shop's or isn't well formed, because links are untrusted input. Then write the reverse, a universal link for any route, so sharing and widgets can't produce a link the app won't open.
+
+`NavigationRouteParser.route(from:) -> Route?`, `NavigationRouteParser.route(fromNotification:) -> Route?` and `NavigationRouteParser.url(for:) -> URL`
+
+**Which URLs are ours.** A custom-scheme URL uses `shop` (in any case); remember that in `shop://product/42` the first segment is the URL's *host*, while `shop:///product/42` has no host. A universal link uses `https` and one of `hosts`, in any case. Anything else (`http`, another host, another scheme) gives `nil`. Ignore empty segments (so a trailing slash is fine), other query parameters, and the fragment.
+
+**The routes.** Literal segments (`product`, `orders`…) match in any case; parameters are checked exactly.
+
+| Path | Route | The parameter must be |
+| --- | --- | --- |
+| no segments | `.home` | |
+| `/category/<slug>` | `.category(slug:)` | 1–40 characters: lowercase `a`–`z`, `0`–`9`, `-` |
+| `/product/<id>` | `.product(id:)` | 1–9 ASCII digits, with a value above zero |
+| `/search?q=<query>` | `.search(query:)` | `q` with `+` read as a space, percent-decoded, trimmed of whitespace: 1–100 characters |
+| `/basket` | `.basket` | |
+| `/orders` | `.orders` | |
+| `/orders/<id>` | `.order(id:)` | 6–10 characters: uppercase `A`–`Z` and `0`–`9` |
+
+Any other path, including one with extra segments, gives `nil`.
+
+**Notifications.** If the payload has a `link`, the link decides: its route, or `nil` if it isn't a string or doesn't parse. Without one, read the older format by `type`: `order_shipped` and `order_delivered` use `orderID` (a valid order id); `price_drop` uses `productID`, a number or a string of digits (a valid product id); `basket_reminder` opens `.basket`. Anything else gives `nil`.
+
+**Links.** `url(for:)` builds `https://shop.example.com/…` for every route, so that `route(from: url(for: route)) == route`.
+
+## Examples
+
+| Input | Route |
+| --- | --- |
+| `shop://product/42`, `shop:///product/42`, `https://Shop.Example.com/product/42/` | `.product(id: 42)` |
+| `https://www.shop.example.com/orders/A1B2C3?utm_source=email` | `.order(id: "A1B2C3")` |
+| `https://shop.example.com/search?q=trail+shoes` | `.search(query: "trail shoes")` |
+| `https://shop.example.com/search?q=c%2B%2B` | `.search(query: "c++")` |
+| `https://shop.example.com/product/+42`, `…/product/0`, `…/orders/a1b2c3` | `nil` |
+| `http://shop.example.com/basket`, `https://shop.example.com.evil.example/basket` | `nil` |
+| `["type": "price_drop", "productID": 42]` | `.product(id: 42)` |
+| `["link": "https://shop.example.com/orders/nope", "type": "order_shipped", "orderID": "A1B2C3"]` | `nil` |
+| `url(for: .search(query: "c++"))` | `https://shop.example.com/search?q=c%2B%2B` |
+
+## Constraints
+
+- Foundation only. `URLComponents`, `URL.host()` and `URL.pathComponents` do most of the work, but none of them checks your parameters for you.
+- `Int("+42")` is `42`, so "is it a number" isn't the same question as "is it 1–9 digits".
+- Payloads come from `JSONSerialization` in some tests, so numbers arrive as `NSNumber`; `as? Int` handles that.
+- Don't trust anything in a link: never force-unwrap, never index past the end of the segments.
+
+<Hints>
+<Hint>
+Normalise first: turn any URL you accept into a list of path segments, prepending the host for the custom scheme, or return `nil` early. Then a single `switch (segments.first?.lowercased(), segments.count)` handles both forms.
+</Hint>
+<Hint>
+For the query, read `percentEncodedQueryItems`, replace `+` with `%20`, then call `removingPercentEncoding`. Doing it the other way round turns an encoded `%2B` into a space.
+</Hint>
+<Hint>
+When building the search link, `+` must be percent-encoded, or your own parser will read it back as a space. Start from `CharacterSet.urlQueryAllowed` and remove `+`, `&` and `=`.
+</Hint>
+</Hints>
+
+## Solutions
+
+<Approach title="Normalise to segments, match a table, validate each parameter" time="O(n) in the URL's length" space="O(n)">
+
+```swift
+public static func route(from url: URL) -> Route? {
+    guard let segments = segments(of: url) else { return nil }
+    switch (segments.first?.lowercased(), segments.count) {
+    case (nil, _): return .home
+    case ("category", 2): return isSlug(segments[1]) ? .category(slug: segments[1]) : nil
+    case ("product", 2): return productID(segments[1]).map { .product(id: $0) }
+    case ("search", 1): return searchQuery(in: url).map { .search(query: $0) }
+    case ("basket", 1): return .basket
+    case ("orders", 1): return .orders
+    case ("orders", 2): return isOrderID(segments[1]) ? .order(id: segments[1]) : nil
+    default: return nil
+    }
+}
+
+/// The URL's path segments, with a custom scheme's host as the first one; nil if the URL isn't ours
+private static func segments(of url: URL) -> [String]? {
+    var segments = url.pathComponents.filter { $0 != "/" && !$0.isEmpty }
+    switch url.scheme?.lowercased() {
+    case scheme:
+        if let host = url.host(), !host.isEmpty { segments.insert(host, at: 0) }
+    case "https":
+        guard let host = url.host()?.lowercased(), hosts.contains(host) else { return nil }
+    default:
+        return nil
+    }
+    return segments
+}
+
+private static func productID(_ text: String) -> Int? {
+    guard (1...9).contains(text.count), text.allSatisfy({ $0.isASCII && $0.isNumber }), let id = Int(text), id > 0 else { return nil }
+    return id
+}
+
+private static func searchQuery(in url: URL) -> String? {
+    let items = URLComponents(url: url, resolvingAgainstBaseURL: false)?.percentEncodedQueryItems ?? []
+    guard let raw = items.first(where: { $0.name == "q" })?.value,
+          let decoded = raw.replacingOccurrences(of: "+", with: "%20").removingPercentEncoding
+    else { return nil }
+    let query = decoded.trimmingCharacters(in: .whitespacesAndNewlines)
+    return (1...100).contains(query.count) ? query : nil
+}
+```
+
+Notifications reuse the URL parser through `link`, and fall back to the older typed fields only when there's no link at all, so a malformed link can't be rescued by stale fields. The reverse direction builds the URL with `URLComponents` and encodes the query itself:
+
+```swift
+case .search(let query):
+    components.path = "/search"
+    var allowed = CharacterSet.urlQueryAllowed
+    allowed.remove(charactersIn: "+&=")
+    components.percentEncodedQuery = "q=" + (query.addingPercentEncoding(withAllowedCharacters: allowed) ?? "")
+```
+
+The round-trip test is the one that earns its keep in a real app: it fails the moment someone adds a route, or changes a format, on only one side.
+
+</Approach>

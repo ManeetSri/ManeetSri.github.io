@@ -1,2 +1,36 @@
 // Katas for D02 · Abstraction & modelling
-export default [];
+export default [
+    {
+        id: 'sd-kata-modelling-ride-status',
+        kind: 'problem',
+        title: 'A ride’s status as an enum',
+        difficulty: 'easy',
+        patterns: ['state', 'swift', 'api'],
+        lessons: ['sd-modelling-illegal-states'],
+        swiftTest: 'ModellingRideTrackingTests',
+        lists: [],
+        minutes: 25,
+    },
+    {
+        id: 'sd-kata-modelling-money',
+        kind: 'problem',
+        title: 'A Money value object',
+        difficulty: 'medium',
+        patterns: ['swift', 'payments', 'principles'],
+        lessons: ['sd-modelling-domain-types', 'sd-modelling-entities-values'],
+        swiftTest: 'ModellingMoneyTests',
+        lists: [],
+        minutes: 35,
+    },
+    {
+        id: 'sd-kata-modelling-split-expense',
+        kind: 'problem',
+        title: 'An expense that always adds up',
+        difficulty: 'medium',
+        patterns: ['principles', 'state', 'swift'],
+        lessons: ['sd-modelling-aggregates', 'sd-modelling-contracts'],
+        swiftTest: 'ModellingSplitExpenseTests',
+        lists: [],
+        minutes: 35,
+    },
+];

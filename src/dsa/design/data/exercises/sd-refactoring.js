@@ -1,4 +1,4 @@
-// Architecture reviews for D15 · Anti-patterns & refactoring
+// Design exercises and architecture reviews for D15 · Anti-patterns & refactoring
 export default [
     {
         id: 'sd-review-orders-view-controller',
@@ -9,5 +9,48 @@ export default [
         lessons: ['sd-refactoring-massive-vc'],
         minutes: 25,
         summary: 'A view controller that fetches, parses, caches, formats and navigates. Find what makes it fragile.',
+    },
+    {
+        id: 'sd-review-refactoring-app-manager',
+        kind: 'critique',
+        title: 'Review: the AppManager singleton',
+        difficulty: 'medium',
+        patterns: ['architecture', 'concurrency', 'di'],
+        lessons: ['sd-refactoring-global-state', 'sd-refactoring-massive-vc'],
+        minutes: 25,
+        summary: 'One shared object holds the user, the basket, preferences, analytics and alerts. Find the race, the leak and the way out.',
+    },
+    {
+        id: 'sd-review-refactoring-family-plan',
+        kind: 'critique',
+        title: 'Review: adding a Family plan',
+        difficulty: 'medium',
+        patterns: ['principles', 'patterns'],
+        lessons: ['sd-refactoring-change-smells', 'sd-refactoring-smells-guide', 'sd-refactoring-replace-conditional'],
+        minutes: 20,
+        summary: 'A small pull request adds a subscription tier to every switch its author could find. Find the one it missed, and what the change says about the design.',
+    },
+    {
+        id: 'sd-review-refactoring-profile-sync',
+        kind: 'critique',
+        title: 'Review: the profile sync',
+        difficulty: 'medium',
+        patterns: ['api', 'networking', 'principles'],
+        lessons: ['sd-refactoring-api-smells', 'sd-refactoring-abstraction-smells'],
+        minutes: 25,
+        summary: 'Nested callbacks, untyped dictionaries and leaky protocols behind a spinner that never stops and settings that reset themselves.',
+    },
+    {
+        id: 'sd-design-refactoring-product-screen',
+        kind: 'design',
+        title: 'Plan: take apart a 3,800-line product page',
+        difficulty: 'hard',
+        patterns: ['architecture', 'testing', 'ui'],
+        lessons: ['sd-refactoring-characterisation-tests', 'sd-refactoring-extract-child-vc', 'sd-refactoring-massive-vc'],
+        minutes: 35,
+        template: 'migration',
+        mock: false,
+        lists: [],
+        summary: 'Four squads, a quarter of the crashes and the path to 40% of revenue: plan a refactor that ships every week.',
     },
 ];

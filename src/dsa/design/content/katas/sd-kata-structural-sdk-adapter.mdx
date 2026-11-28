@@ -1,0 +1,104 @@
+Your app searches for places through a third-party SDK, Atlas, whose geocoder speaks in completion handlers, millionths of a degree and numeric error codes. The rest of the app should never know Atlas exists. Write the adapter that makes Atlas look like the app's own `PlaceSearching` protocol.
+
+`AtlasGeocoderAdapter.AtlasPlaceSearch.places(matching:) async throws -> [Place]`
+
+- **Query.** Trim whitespace and newlines from the query and pass the trimmed text to `geocode(_:completion:)`. A query that's blank after trimming returns `[]` without calling the SDK.
+- **Results.** Turn each `AtlasPlacemark` into a `Place`, in the SDK's order: divide `latitudeE6` and `longitudeE6` by 1,000,000 to get degrees, and upper-case the country code (`nil` stays `nil`). Leave out placemarks whose name is `nil` or empty: the app has nothing to show for them.
+- **Errors.** Throw only `PlaceSearchError`. Map the SDK's codes as in the table below. If the SDK reports an error and results together, the error wins. If it reports neither, throw `.failed(code: 0)`.
+- **Callbacks.** The SDK may call back on any queue, and it has a known bug: it sometimes calls the completion handler a second time. Use the first callback and ignore any later ones.
+
+## Examples
+
+| The SDK calls back with | `places(matching:)` |
+| --- | --- |
+| Leeds at `53_800_755`, `-1_549_077`, `"gb"` | `[Place(name: "Leeds", latitude: 53.800755, longitude: -1.549077, countryCode: "GB")]` |
+| error 404, or an empty array | `[]`: nothing matched isn't a failure |
+| error 401 or 403 | throws `.misconfigured` (a bad API key) |
+| error 429 | throws `.rateLimited` |
+| error -1009 | throws `.offline` |
+| any other error code, such as 500 | throws `.failed(code: 500)` |
+| neither results nor an error | throws `.failed(code: 0)` |
+| `[Leeds]`, then later `[York]` | `[Leeds]`: the second callback is ignored |
+
+## Constraints
+
+- Don't change the SDK's types or the app's types: only the body of `places(matching:)` (and any private helpers you add).
+- The tests call back synchronously, twice, and from another queue. Your adapter must return the right answer in every case, and never crash or hang.
+- Foundation and Swift Concurrency only. `Mutex` from the `Synchronization` module is available.
+
+<Hints>
+<Hint>
+`withCheckedThrowingContinuation` turns a completion handler into `async throws`. Map the SDK's answer to a `Result<[AtlasPlacemark], PlaceSearchError>` first, then `continuation.resume(with:)` it.
+</Hint>
+<Hint>
+Resuming a checked continuation twice crashes the app with "tried to resume its continuation more than once". Keep the continuation somewhere you can take it out of exactly once, so the second callback finds nothing to resume.
+</Hint>
+<Hint>
+A small `final class` that holds `Mutex<CheckedContinuation<[AtlasPlacemark], any Error>?>` is `Sendable`, so the `@Sendable` completion closure can capture it. In `withLock`, read the value and set it to `nil` in the same step.
+</Hint>
+</Hints>
+
+## Solutions
+
+<Approach title="Translate the answer, then resume once" time="O(n) for n results" space="O(n)">
+
+```swift
+public func places(matching query: String) async throws -> [Place] {
+    let query = query.trimmingCharacters(in: .whitespacesAndNewlines)
+    guard !query.isEmpty else { return [] }
+    let placemarks: [AtlasPlacemark] = try await withCheckedThrowingContinuation { continuation in
+        let callback = FirstCallback(continuation)
+        geocoder.geocode(query) { placemarks, error in
+            callback.resume(with: Self.outcome(placemarks, error))
+        }
+    }
+    return placemarks.compactMap(Self.place(from:))
+}
+
+private static func outcome(_ placemarks: [AtlasPlacemark]?, _ error: AtlasError?) -> Result<[AtlasPlacemark], PlaceSearchError> {
+    if let error {
+        switch error.code {
+        case 404: return .success([])
+        case 401, 403: return .failure(.misconfigured)
+        case 429: return .failure(.rateLimited)
+        case -1009: return .failure(.offline)
+        default: return .failure(.failed(code: error.code))
+        }
+    }
+    guard let placemarks else { return .failure(.failed(code: 0)) }
+    return .success(placemarks)
+}
+
+private static func place(from placemark: AtlasPlacemark) -> Place? {
+    guard let name = placemark.name, !name.isEmpty else { return nil }
+    return Place(
+        name: name,
+        latitude: Double(placemark.latitudeE6) / 1_000_000,
+        longitude: Double(placemark.longitudeE6) / 1_000_000,
+        countryCode: placemark.isoCountryCode?.uppercased()
+    )
+}
+
+/// Resumes a continuation on the first callback and ignores the rest
+private final class FirstCallback: Sendable {
+    private let continuation: Mutex<CheckedContinuation<[AtlasPlacemark], any Error>?>
+
+    init(_ continuation: CheckedContinuation<[AtlasPlacemark], any Error>) {
+        self.continuation = Mutex(continuation)
+    }
+
+    func resume(with outcome: Result<[AtlasPlacemark], PlaceSearchError>) {
+        let pending = continuation.withLock { pending in
+            defer { pending = nil }
+            return pending
+        }
+        pending?.resume(with: outcome)
+    }
+}
+```
+
+The adapter does three translations, and each lives in one small function: the calling convention (callback to `async`), the data (microdegrees to degrees, optional names to a filtered list) and the errors (vendor codes to the app's cases). That's the whole value of an adapter: when Atlas changes a code, or you replace Atlas, one file changes.
+
+Notice the decision hidden in the 404 row. Atlas reports "nothing matched" in two different ways; the app's contract has one. Normalising the vendor's quirks at the boundary is what keeps them from leaking into every screen that searches. The `FirstCallback` guard is the other boundary job: the vendor's bug becomes a non-event instead of a crash.
+
+</Approach>

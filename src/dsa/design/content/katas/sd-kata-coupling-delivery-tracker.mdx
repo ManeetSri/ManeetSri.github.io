@@ -1,0 +1,130 @@
+A food-delivery app's order screen shows one line: "Being prepared", "Sam is 13 min away", "Delivered". The first version worked it out by reaching through four types:
+
+```swift
+// Before: the tracking card knows how orders, couriers and vehicles are built inside
+if case .onTheWay(let courier) = order.stage {
+    let metres = courier.location.distance(to: order.destination)
+    let speed = courier.vehicle.kind == .bicycle ? 250 : courier.vehicle.kind == .scooter ? 400 : 500
+    text = "\(courier.name) is \(Int((metres / Double(speed)).rounded(.up))) min away"
+}
+```
+
+The notification extension and the Live Activity copied the same chain. When couriers started switching vehicles mid-shift and the vehicle moved off the courier, all three broke.
+
+Rewrite it so each type answers only from its own data and talks only to the type directly below it. The stored properties are already `private`, so the compiler won't let you reach through: the tracking card can only ask the order.
+
+`Vehicle.minutes(toTravel:) -> Int`, `Courier.minutes(to:) -> Int`, `Order.eta() -> ETA` and `TrackingCard.text(for:) -> String`, all in `CouplingDeliveryTracker`
+
+- **`Vehicle.minutes(toTravel: metres)`**: whole minutes, rounded up, at 250 m a minute for a bicycle, 400 for a scooter and 500 for a car. No distance takes no time.
+- **`Courier.minutes(to: destination)`**: the minutes from the courier's own location to `destination`, on their own vehicle. `Point.distance(to:)` is written for you.
+- **`Order.eta()`**:
+  - preparing: `.preparing(readyInMinutes:)` with the same minutes;
+  - on the way: the courier's minutes to the order's destination; at **1 minute or less**, `.arrivingNow(courierName:)`, otherwise `.arriving(courierName:minutes:)`;
+  - delivered: `.delivered`.
+- **`TrackingCard.text(for: order)`**, from `order.eta()` alone:
+  - `"Being prepared, ready in 12 min"`, or `"Almost ready"` at 0 minutes or less;
+  - `"Sam is 13 min away"`;
+  - `"Sam is arriving now"`;
+  - `"Delivered"`.
+
+## Examples
+
+Destinations are at `(0, 0)`; positions are in metres.
+
+| Order | `eta()` | Card |
+| --- | --- | --- |
+| preparing, ready in 12 | `.preparing(readyInMinutes: 12)` | Being prepared, ready in 12 min |
+| Sam on a scooter at `(3000, 4000)`: 5,000 m | `.arriving(courierName: "Sam", minutes: 13)` | Sam is 13 min away |
+| Ana by car at `(600, 0)` | `.arriving(courierName: "Ana", minutes: 2)` | Ana is 2 min away |
+| Ana by car at `(500, 0)` | `.arrivingNow(courierName: "Ana")` | Ana is arriving now |
+| delivered | `.delivered` | Delivered |
+
+## Constraints
+
+- Don't make any stored property public, and don't add getters that hand out a courier, a vehicle or a location. If you find yourself wanting one, add a question to the type that owns the data instead.
+- `ETA` carries everything the card needs and nothing about how it was worked out, so the card, a notification and a Live Activity can all share it.
+- Distances are straight lines on a flat map. A real app would ask a routing service, and only `Courier.minutes(to:)` would change.
+
+<Hints>
+<Hint>
+Work from the bottom up. `Vehicle` needs a private speed for its kind: a `switch` over `kind` returning 250, 400 or 500.
+</Hint>
+<Hint>
+`Int((metres / metresPerMinute).rounded(.up))` gives whole minutes, rounded up, and 0 for no distance.
+</Hint>
+<Hint>
+`Courier.minutes(to:)` is one line: its vehicle's minutes for its location's distance to the destination.
+</Hint>
+<Hint>
+In `TrackingCard`, `case .preparing(let minutes) where minutes <= 0` must come before the general `.preparing` case.
+</Hint>
+</Hints>
+
+## Solutions
+
+<Approach title="Each type answers from its own data, one level down" time="O(1)" space="O(1)">
+
+```swift
+public struct Vehicle: Sendable {
+    private let kind: VehicleKind
+
+    private var metresPerMinute: Double {
+        switch kind {
+        case .bicycle: 250
+        case .scooter: 400
+        case .car: 500
+        }
+    }
+
+    public func minutes(toTravel metres: Double) -> Int {
+        Int((max(0, metres) / metresPerMinute).rounded(.up))
+    }
+}
+
+public struct Courier: Sendable {
+    public let name: String
+    private let vehicle: Vehicle
+    private let location: Point
+
+    public func minutes(to destination: Point) -> Int {
+        vehicle.minutes(toTravel: location.distance(to: destination))
+    }
+}
+
+public struct Order: Sendable {
+    private let stage: Stage
+    private let destination: Point
+
+    public func eta() -> ETA {
+        switch stage {
+        case .preparing(let minutes):
+            return .preparing(readyInMinutes: minutes)
+        case .onTheWay(let courier):
+            let minutes = courier.minutes(to: destination)
+            return minutes <= 1 ? .arrivingNow(courierName: courier.name) : .arriving(courierName: courier.name, minutes: minutes)
+        case .delivered:
+            return .delivered
+        }
+    }
+}
+
+public enum TrackingCard {
+    public static func text(for order: Order) -> String {
+        switch order.eta() {
+        case .preparing(let minutes) where minutes <= 0: "Almost ready"
+        case .preparing(let minutes): "Being prepared, ready in \(minutes) min"
+        case .arriving(let name, let minutes): "\(name) is \(minutes) min away"
+        case .arrivingNow(let name): "\(name) is arriving now"
+        case .delivered: "Delivered"
+        }
+    }
+}
+```
+
+**What the law bought.** Each method calls only its own stored properties and parameters: `Order` asks its courier, the courier asks its vehicle, and the card asks the order. When the vehicle moves off the courier, or ETAs start coming from the server with traffic included, exactly one method changes, and the card, the notification and the Live Activity don't notice.
+
+**Why `ETA` and not forwarding methods.** Obeying Demeter mechanically would give `Order` a `courierName()`, a `courierMinutes()` and so on: a middle man. Returning one value made for the screen keeps `Order` small, gives the presentation code plain data to read freely, and makes the card trivially testable with any `ETA`.
+
+**Where the knowledge sits now.** Speeds live in `Vehicle`, distances in `Courier`, the "1 minute or less" rule in `Order`, and wording in `TrackingCard`. Each changes for a different reason, which is the cohesion half of the same design.
+
+</Approach>

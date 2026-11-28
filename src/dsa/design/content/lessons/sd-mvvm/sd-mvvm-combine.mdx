@@ -1,0 +1,374 @@
+## Why it matters
+
+From 2019 until Observation arrived in 2023, Combine was Apple's answer to "how does the view find out", and a large share of production MVVM code is built on it: `ObservableObject` view models, `@Published` outputs, pipelines from inputs to outputs. You'll maintain these screens, extend them and eventually migrate them, so you need to read them fluently and know their failure modes. Interviews probe the same few things every time: where errors go, which thread values arrive on, and who keeps a subscription alive.
+
+D23 covered the mechanics of binding Combine to views in [Reactive MVVM bindings](/design/learn/sd-reactive-mvvm-bindings). This lesson is about the inside of the view model: how its outputs are built from its inputs.
+
+## The shape
+
+A Combine view model is an `ObservableObject` whose state is made of `@Published` properties. Two groups are worth keeping apart:
+
+- **Inputs** the view writes: the text in a field, a toggle. Often plain `@Published var` properties, so a SwiftUI `TextField` can bind to them, or methods that send into a subject.
+- **Outputs** the view reads: `@Published private(set) var`, assigned only by pipelines inside the view model.
+
+The view model's `init` wires inputs to outputs once, and from then on the pipelines run by themselves. That's the core idea: instead of writing "when the username changes, do this, then that", you describe each output as a function of the inputs over time.
+
+## A pipeline per output
+
+A sign-up step asks for a username and a display name. The username must be checked with the server as the user types, and Continue is enabled only when the name is available and the display name isn't empty.
+
+```swift check ios group=combine title="UsernameViewModel.swift"
+import Combine
+import UIKit
+
+protocol UsernameChecker: Sendable {
+    func isAvailable(_ username: String) -> AnyPublisher<Bool, any Error>
+}
+
+@MainActor
+final class UsernameViewModel: ObservableObject {
+    enum Availability: Equatable {
+        case unknown, invalid, checking, available, taken, failed
+    }
+
+    // Inputs: the view writes these
+    @Published var username = ""
+    @Published var displayName = ""
+
+    // Outputs: only the pipelines below write these
+    @Published private(set) var availability: Availability = .unknown
+    @Published private(set) var canContinue = false
+
+    init<S: Scheduler>(checker: any UsernameChecker, scheduler: S, debounce: S.SchedulerTimeType.Stride) {
+        $username
+            .map { $0.trimmingCharacters(in: .whitespaces).lowercased() }
+            .removeDuplicates()
+            .debounce(for: debounce, scheduler: scheduler)        // wait for a pause in typing
+            .map { name -> AnyPublisher<Availability, Never> in
+                guard UsernameViewModel.isWellFormed(name) else {
+                    return Just(.invalid).eraseToAnyPublisher()
+                }
+                return checker.isAvailable(name)
+                    .map { $0 ? Availability.available : .taken }
+                    .catch { _ in Just(.failed) }                // inside: one failure can't end the pipeline
+                    .prepend(.checking)
+                    .eraseToAnyPublisher()
+            }
+            .switchToLatest()                                     // a newer name cancels the older check
+            .receive(on: scheduler)
+            .assign(to: &$availability)
+
+        $availability
+            .combineLatest($displayName)
+            .map { availability, name in availability == .available && !name.isEmpty }
+            .removeDuplicates()
+            .assign(to: &$canContinue)
+    }
+
+    nonisolated static func isWellFormed(_ name: String) -> Bool {
+        (3...20).contains(name.count) && name.allSatisfy { $0.isLetter || $0.isNumber || $0 == "_" }
+    }
+}
+```
+
+Read the first pipeline top to bottom, as the values flow:
+
+1. **Normalise and deduplicate** before anything expensive, so "Ada" and "ada " don't cost two checks.
+2. **Debounce:** emit only after the input has been quiet for the given time. Typing "ada_lovelace" quickly makes one request, not twelve.
+3. **Map each name to a publisher** of availabilities: `.checking` straight away, then the answer. Malformed names never reach the network.
+4. **`switchToLatest`** subscribes to the newest inner publisher and cancels the previous one. Without it (with `flatMap`), a slow answer for "ada" could arrive after the answer for "ada_l" and overwrite it.
+5. **Deliver on the scheduler** that the view reads on, then `assign(to:)` the output.
+
+The second pipeline is a derived output: `combineLatest` emits whenever either input changes, with the latest of both.
+
+The scheduler and the debounce interval are injected. In the app that's `DispatchQueue.main` and `.milliseconds(400)`; in tests it's a test scheduler whose time only moves when the test says so, which is how a 400 ms debounce becomes a test that runs in a millisecond.
+
+```visual flow
+title: The username pipeline
+nodes:
+  - { id: field, label: Text field, kind: view, at: [0, 0] }
+  - { id: input, label: "$username", kind: plain, at: [2, 0] }
+  - { id: debounce, label: debounce 400 ms, kind: plain, at: [4, 0] }
+  - { id: checker, label: UsernameChecker, kind: external, at: [4, 2] }
+  - { id: latest, label: switchToLatest, kind: plain, at: [2, 2] }
+  - { id: output, label: "$availability", kind: plain, at: [0, 2] }
+edges:
+  - [field, input, types]
+  - [input, debounce]
+  - [debounce, checker, settled name]
+  - [checker, latest, answer]
+  - [latest, output, newest only]
+  - [output, field, render, { style: data }]
+steps:
+  - say: "The user types `a`, `ad`, `ada` in quick succession. Each keystroke reaches `$username`, and **debounce** holds them back."
+    send: field->input
+    state: { debounce: wait }
+    label: { debounce: holding }
+  - say: "After 400 ms of quiet, debounce lets `ada` through, and the view model starts a check. The output becomes `.checking` at once."
+    send: debounce->checker
+    state: { debounce: null, checker: active }
+    label: { debounce: null }
+  - say: "The user types `_` before the answer comes. After another pause the new name starts a new check, and **switchToLatest** cancels the one for `ada`."
+    send: [field->input, debounce->checker]
+    label: { latest: cancelled ada }
+  - say: "Only the answer for `ada_` reaches `$availability`. A late answer for the old name has nowhere to go."
+    send: [checker->latest, latest->output]
+    state: { checker: ok }
+    label: { latest: null }
+  - say: "The view re-renders from the output. It never sees the inputs' history, only the latest state."
+    send: output->field
+```
+
+## Errors end streams
+
+A Combine publisher that fails is **finished**: it sends no more values, ever. That's the most common Combine bug in view models. Put the `catch` after the `flatMap` (or `switchToLatest`) instead of inside it, and the first failed request replaces the whole pipeline with one fallback value and stops. The text field keeps working, and nothing listens to it any more. You can see the difference in a few lines:
+
+```swift run title="Where the catch goes"
+import Combine
+
+struct Offline: Error {}
+
+/// A check that fails for "bob" and succeeds for everyone else
+func check(_ name: String) -> AnyPublisher<String, any Error> {
+    name == "bob"
+        ? Fail(error: Offline()).eraseToAnyPublisher()
+        : Just("\(name) is available").setFailureType(to: (any Error).self).eraseToAnyPublisher()
+}
+
+func run(_ label: String, catchInside: Bool) {
+    let typed = PassthroughSubject<String, Never>()
+    let results: AnyPublisher<String, Never> = catchInside
+        ? typed.flatMap { name in check(name).catch { _ in Just("\(name) couldn't be checked") } }.eraseToAnyPublisher()
+        : typed.setFailureType(to: (any Error).self).flatMap { check($0) }.catch { _ in Just("check failed") }.eraseToAnyPublisher()
+    let subscription = results.sink { print("\(label): \($0)") }
+    for name in ["ada", "bob", "cy"] {
+        typed.send(name)
+    }
+    subscription.cancel()
+}
+
+run("inside", catchInside: true)
+run("outside", catchInside: false)
+```
+
+```output
+inside: ada is available
+inside: bob couldn't be checked
+inside: cy is available
+outside: ada is available
+outside: check failed
+```
+
+With the catch outside, "cy" is never checked: the pipeline ended at "bob". The rule is simple: **anything that can fail goes inside the `map` that creates it**, and the outer pipeline's failure type stays `Never`. The compiler helps if you let it: `assign(to:)` only accepts publishers that can't fail.
+
+## Threads and schedulers
+
+Combine knows nothing about actors. A publisher delivers values on whatever thread produced them, and a URLSession publisher produces them on a background queue. So:
+
+- **Hop before you touch state:** `.receive(on: DispatchQueue.main)` (or the injected scheduler) before `assign` or `sink`.
+- **Prefer `DispatchQueue.main` to `RunLoop.main`** for UI. `RunLoop.main` only runs in the default run-loop mode, so while the user is scrolling (tracking mode), values wait until the scroll ends. Updates during a scroll stall.
+- **The compiler can't check it.** Inside a `@MainActor` view model, a `sink` closure is treated as main-actor code, but nothing proves the publisher calls it there. In Swift 6 that mismatch can stop the app with a runtime isolation check; in older modes it's a silent data race. Either way, the fix is the `receive(on:)` line.
+
+## Who keeps the pipeline alive
+
+Every subscription needs an owner, or it's cancelled at once. Three ways to own one, with different risks:
+
+```swift
+// 1. assign(to:): owned by the @Published property itself. No cancellable, no cycle.
+$username.map(normalise).assign(to: &$normalisedName)
+
+// 2. sink + store: owned by a Set<AnyCancellable> on the view model. Capture self weakly.
+checker.events.sink { [weak self] event in self?.handle(event) }.store(in: &cancellables)
+
+// 3. assign(to:on:): retains its target strongly. On self, that's a cycle that never ends.
+$username.map(normalise).assign(to: \.normalisedName, on: self).store(in: &cancellables)   // leaks
+```
+
+`assign(to: &$property)` (iOS 14) is the right default inside a view model: it ties the subscription's lifetime to the property and holds no reference to `self`. The third form appears in a lot of older code, and every instance on `self` is a leaked view model.
+
+On the view side, a UIKit view controller subscribes to the outputs and keeps the cancellables:
+
+```swift check ios group=combine title="UsernameViewController.swift"
+final class UsernameViewController: UIViewController {
+    private let viewModel: UsernameViewModel
+    private var cancellables = Set<AnyCancellable>()
+    private let statusLabel = UILabel()
+    private let continueButton = UIButton(configuration: .filled())
+
+    init(viewModel: UsernameViewModel) {
+        self.viewModel = viewModel
+        super.init(nibName: nil, bundle: nil)
+    }
+
+    required init?(coder: NSCoder) { nil }
+
+    override func viewDidLoad() {
+        super.viewDidLoad()
+        viewModel.$availability
+            .sink { [weak self] availability in self?.show(availability) }
+            .store(in: &cancellables)
+        viewModel.$canContinue
+            .assign(to: \.isEnabled, on: continueButton)      // the button doesn't own the view controller
+            .store(in: &cancellables)
+    }
+
+    private func show(_ availability: UsernameViewModel.Availability) {
+        statusLabel.text = switch availability {
+        case .unknown, .invalid: "3 to 20 letters, numbers or underscores"
+        case .checking: "Checking…"
+        case .available: "Available"
+        case .taken: "Already taken"
+        case .failed: "Couldn't check. Keep typing to try again."
+        }
+    }
+}
+```
+
+`assign(to:on:)` is safe there because the target is a button, which holds no reference back to the view controller. In SwiftUI, `@StateObject private var model = UsernameViewModel(…)` owns the view model and `TextField("Username", text: $model.username)` writes the input directly.
+
+## Testing a Combine view model
+
+Two things make it testable: the injected scheduler, and outputs that are plain `@Published` values.
+
+- **Drive time explicitly.** With a test scheduler (Point-Free's CombineSchedulers is the common choice), the test sets `username`, advances the scheduler by 400 ms, and checks `availability`. Nothing sleeps.
+- **Record outputs.** Subscribe to `$availability` in the test and collect values into an array, then compare: `[.unknown, .checking, .available]`.
+- **Script the checker.** A stub returning a `PassthroughSubject` per name lets the test answer out of order and prove `switchToLatest` is doing its job.
+
+D23's [Testing reactive code](/design/learn/sd-reactive-testing) covers these tools in depth.
+
+## When to reach for Combine now
+
+For a new screen in an iOS 17+ app, an `@Observable` view model with `async` methods is simpler to read and to test, and the next lesson builds one. Combine still earns its place:
+
+- **Time-shaped inputs:** debounce, throttle and combining several live streams are one operator each. (The Swift Async Algorithms package offers `debounce` and `combineLatest` for async sequences, if the rest of the code is async.)
+- **An existing Combine codebase,** where consistency matters more than fashion.
+- **Framework publishers** you already depend on: `NotificationCenter.publisher(for:)`, KVO publishers, Core Data's change notifications.
+
+Moving a Combine codebase to Observation and `async`/`await` is a migration of its own; you'll meet it in D31.
+
+## Trade-offs
+
+| | Closures | Combine pipelines | `@Observable` + async/await |
+| --- | --- | --- | --- |
+| Reading the logic | imperative, top to bottom | declarative; operators must be learnt | imperative, top to bottom |
+| Debounce, throttle, combining streams | hand-written | one operator each | Async Algorithms, or by hand |
+| Errors | ordinary `do`/`catch` | end the stream unless caught inside | ordinary `do`/`catch` |
+| Threading | the caller's | `receive(on:)`, unchecked by the compiler | actor isolation, checked by the compiler |
+| Leak risks | strong captures | `assign(to:on: self)`, strong `sink` captures | unstructured tasks capturing `self` |
+| Wins for | small UIKit screens | input-heavy screens, existing Combine code | most new screens on iOS 17+ |
+
+<Callout kind="interview">
+
+**What to say:** "Inputs are `@Published` or subjects, outputs are `@Published private(set)`, and `init` wires them with pipelines that end in `assign(to: &$output)`. Requests go through `map` plus `switchToLatest`, with errors caught inside so the outer stream never fails. I inject the scheduler, deliver on the main queue, and test by advancing a test scheduler."
+
+**What to ask:** "Is the codebase already on Combine, and what's the minimum iOS?" That decides whether new screens should match it or move to Observation.
+
+**Red flags:** `catch` outside the `flatMap`; no `receive(on:)` before touching UI; `assign(to:on: self)`; `sink { self.… }` without `[weak self]`; `DispatchQueue.main` hard-coded so the debounce can't be tested.
+
+</Callout>
+
+<Callout kind="gotcha" title="Swift gotcha: @Published fires before the property changes">
+
+A `@Published` property's publisher emits in `willSet`. Inside a `sink` on `$name`, reading `self.name` still gives the **old** value:
+
+```swift run
+import Combine
+
+final class Form: ObservableObject {
+    @Published var name = ""
+}
+
+let form = Form()
+let subscription = form.$name.sink { newValue in
+    print("received \"\(newValue)\", property is \"\(form.name)\"")
+}
+form.name = "Ada"
+subscription.cancel()
+```
+
+```output
+received "", property is ""
+received "Ada", property is ""
+```
+
+Use the value the publisher hands you. Code that reads the property instead, or calls a method that does, works on one path and is one change behind on another.
+
+</Callout>
+
+## Practice
+
+This module's practice is async/await-based, so for Combine, look for D23's katas on a latest-only search pipeline, which builds the `switchToLatest` half of this lesson's username check, and on a test scheduler for Combine, which builds the tool that makes a debounce testable.
+
+```cards
+- id: combine-vm-shape
+  front: "How is a Combine view model put together?"
+  back: "Inputs are @Published properties or subjects the view writes; outputs are @Published private(set); init wires inputs to outputs with pipelines that end in assign(to: &$output)."
+- id: combine-catch-inside
+  front: "Where does the catch go in a request pipeline, and why?"
+  back: "Inside the map or flatMap that creates each request. A failure that reaches the outer pipeline finishes it, and it never emits again."
+- id: combine-switch-latest
+  front: "What does switchToLatest do for a view model?"
+  back: "It subscribes to the newest inner publisher and cancels the previous one, so a slow answer for an old input can't overwrite the answer for the current one."
+- id: combine-lifetimes
+  front: "Which Combine subscription can leak a view model, and which is the safe default?"
+  back: "assign(to:on: self) retains self, a cycle. assign(to: &$property) is tied to the property's lifetime and holds no reference to self."
+```
+
+```quiz
+- id: q1
+  type: mcq
+  prompt: "A search field works until the first network error, then stops responding to typing entirely. What's the likeliest cause?"
+  options:
+    - "The `debounce` interval is too short"
+    - "The `catch` is after the `flatMap`, so the first error finished the whole pipeline"
+    - "The view model was deallocated by the error"
+    - "`removeDuplicates` is filtering every new query"
+  answer: 1
+  explain: "A failed publisher never emits again. Catching after the `flatMap` replaces the pipeline with the fallback and completes. Catch inside, per request, so the outer stream's failure type is `Never`."
+- id: q2
+  type: output
+  prompt: "What does this print?"
+  code: |
+    import Combine
+
+    final class Counter: ObservableObject {
+        @Published var value = 0
+    }
+
+    let counter = Counter()
+    let subscription = counter.$value.dropFirst().sink { received in
+        print(received, counter.value)
+    }
+    counter.value = 1
+    counter.value = 2
+    subscription.cancel()
+  answer: |
+    1 0
+    2 1
+  explain: "`@Published` emits in `willSet`, so inside the sink the property still holds the previous value. `dropFirst()` skips the initial 0 that a new subscriber receives."
+- id: q3
+  type: multi
+  prompt: "Which of these keep a view model from leaking? Choose all that apply."
+  options:
+    - "`assign(to: &$status)`"
+    - "`assign(to: \\.status, on: self).store(in: &cancellables)`"
+    - "`sink { [weak self] in self?.update($0) }.store(in: &cancellables)`"
+    - "`sink { self.update($0) }.store(in: &cancellables)`"
+  answer: [0, 2]
+  explain: "`assign(to:on: self)` and a sink that captures `self` strongly are both stored in a set that `self` owns: cycles. `assign(to: &$status)` holds no reference to self, and the weak capture breaks the cycle."
+- id: q4
+  type: mcq
+  prompt: "Results arrive while the user is scrolling the list, but the rows only update when the scrolling stops. Which line is likely responsible?"
+  options:
+    - "`.receive(on: RunLoop.main)`"
+    - "`.receive(on: DispatchQueue.main)`"
+    - "`.removeDuplicates()`"
+    - "`.switchToLatest()`"
+  answer: 0
+  explain: "`RunLoop.main` schedules in the default run-loop mode, and scrolling runs the loop in tracking mode, so delivery waits until the scroll ends. `DispatchQueue.main` delivers during scrolling."
+- id: q5
+  type: truefalse
+  prompt: "In a `@MainActor` view model, Swift 6 guarantees that a Combine `sink` closure runs on the main thread."
+  answer: false
+  explain: "The compiler treats the closure as main-actor code, but Combine delivers on whatever thread the publisher uses. Add `receive(on:)`; without it you risk a runtime isolation trap in Swift 6 mode, or a silent data race in older modes."
+```

@@ -1,0 +1,371 @@
+## Why it matters
+
+MVP is the first pattern most UIKit teams reached for when their view controllers became unmanageable, and plenty of large apps still run on it. It moves every decision a screen makes out of the view controller into a plain object you can test without UIKit, while keeping UIKit's own lifecycle untouched. Interviewers ask "MVP or MVVM?" often, and the answer they want isn't a preference: it's the difference in **which way the arrows point** and what that costs.
+
+## From MVC to MVP
+
+In Apple MVC, which you met in [Apple MVC: the view controller as mediator](/design/learn/sd-mvc-apple), a view controller does two jobs. It's part of the view (it owns the labels, the layout, the table view) and it's the controller (it fetches, decides what to show, reacts to taps). Those jobs change for different reasons, and the second can't be tested without the first.
+
+**Model–View–Presenter** splits them:
+
+- **The model** is everything below the screen: domain types, repositories, services.
+- **The view** is the view controller and its views, demoted. It forwards user events and does what it's told. It implements a small **view protocol**.
+- **The presenter** is a plain Swift class. It receives the view's events, talks to the model, makes every decision, and tells the view what to show through that protocol.
+
+The view controller still exists, and UIKit still calls `viewDidLoad` on it. What changes is that it holds no logic: it's the screen's hands, and the presenter is its head.
+
+<Callout kind="analogy">
+
+A newsreader and an editor. The newsreader reads exactly what's on the autocue, in the order it appears, and decides nothing. The editor decides what goes on the autocue. To check the editor's choices, you don't need a studio: read the autocue script.
+
+</Callout>
+
+## A round trip
+
+Here's a recipe screen loading and then reacting to a tap on the servings stepper. Watch which way each message goes.
+
+```visual sequence
+title: "MVP: the view forwards, the presenter decides"
+participants:
+  - { id: user, label: User }
+  - { id: view, label: View controller }
+  - { id: presenter, label: Presenter }
+  - { id: service, label: RecipeService }
+messages:
+  - [view, presenter, viewDidLoad()]
+  - [presenter, view, setLoading(true)]
+  - [presenter, service, "recipe(id:)", { async: true }]
+  - [service, presenter, Recipe, { reply: true }]
+  - [presenter, view, "showHeader(title:duration:)"]
+  - { note: The view never reads the model. It's handed strings and flags., over: [view, presenter] }
+  - [user, view, taps +]
+  - [view, presenter, increaseServingsTapped()]
+  - [presenter, view, showServings("5 servings")]
+  - [presenter, view, "showIngredients([…])"]
+steps:
+  - { upTo: 0, say: "UIKit calls `viewDidLoad()` on the view controller, which tells its presenter and nothing more." }
+  - { upTo: 3, say: "The presenter turns on loading through the view protocol and asks the service for the recipe." }
+  - { upTo: 5, say: "With the recipe in hand, the presenter **formats** it: the view receives a title and `\"1 h 15 min\"`, never a `Recipe`." }
+  - { upTo: 7, say: "A tap is an event, not a decision. The view forwards it to the presenter, which knows the current servings and the limits." }
+  - { upTo: 9, say: "The presenter recalculates every quantity and pushes the results. The view could be replaced by a spy that records these calls." }
+```
+
+Two properties fall out of that picture. The presenter holds **all** the screen's state (the recipe, the current servings), so the view has nothing to remember. And every arrow from the presenter to the view is a **command** through a protocol, so a test can stand in for the view.
+
+## The view protocol and the presenter
+
+An order-tracking screen, in MVP. Start with the contract: everything the presenter may tell the screen.
+
+```swift check ios group=mvp title="OrderStatus.swift"
+import UIKit
+
+struct Order: Sendable {
+    enum Status: Sendable { case placed, packing, outForDelivery, delivered }
+    let id: String
+    let status: Status
+}
+
+protocol OrderService: Sendable {
+    func order(id: String) async throws -> Order
+    func cancel(orderID: String) async throws
+}
+
+/// What the presenter can tell the screen. Every method is a command; none returns anything.
+@MainActor
+protocol OrderStatusView: AnyObject {
+    func showStatus(title: String, detail: String)
+    func showProgress(step: Int, of steps: Int)
+    func setCancelHidden(_ hidden: Bool)
+    func showError(_ message: String)
+}
+
+@MainActor
+final class OrderStatusPresenter {
+    weak var view: (any OrderStatusView)?     // weak: the view controller owns the presenter
+    private let orderID: String
+    private let service: any OrderService
+    private var order: Order?
+
+    init(orderID: String, service: any OrderService) {
+        self.orderID = orderID
+        self.service = service
+    }
+
+    func viewDidLoad() async {
+        do {
+            let order = try await service.order(id: orderID)
+            self.order = order
+            show(order)
+        } catch {
+            view?.showError("We couldn't load your order. Pull to try again.")
+        }
+    }
+
+    func cancelTapped() async {
+        guard let order, order.status == .placed else { return }
+        do {
+            try await service.cancel(orderID: order.id)
+            view?.showStatus(title: "Order cancelled", detail: "You haven't been charged.")
+            view?.setCancelHidden(true)
+        } catch {
+            view?.showError("We couldn't cancel this order.")
+        }
+    }
+
+    private func show(_ order: Order) {
+        let (title, detail, step): (String, String, Int) = switch order.status {
+        case .placed: ("Order placed", "We'll start packing soon.", 1)
+        case .packing: ("Packing your order", "Your shopper is picking your items.", 2)
+        case .outForDelivery: ("On its way", "Your driver is nearby.", 3)
+        case .delivered: ("Delivered", "Enjoy your shopping.", 4)
+        }
+        view?.showStatus(title: title, detail: detail)
+        view?.showProgress(step: step, of: 4)
+        view?.setCancelHidden(order.status != .placed)     // a rule: only placed orders can be cancelled
+    }
+}
+```
+
+The presenter imports nothing from UIKit that it uses: it would compile against Foundation alone, which is what lets its tests run on a Mac. The view controller is the other half, and it's deliberately dull:
+
+```swift check ios group=mvp title="OrderStatusViewController.swift"
+final class OrderStatusViewController: UIViewController, OrderStatusView {
+    private let presenter: OrderStatusPresenter
+    private let titleLabel = UILabel()
+    private let detailLabel = UILabel()
+    private let progressView = UIProgressView(progressViewStyle: .default)
+    private let cancelButton = UIButton(configuration: .gray())
+
+    init(presenter: OrderStatusPresenter) {
+        self.presenter = presenter
+        super.init(nibName: nil, bundle: nil)
+    }
+
+    required init?(coder: NSCoder) { nil }
+
+    override func viewDidLoad() {
+        super.viewDidLoad()
+        // Layout omitted: a stack view with the labels, progress and button
+        presenter.view = self
+        cancelButton.addAction(UIAction { [presenter] _ in
+            Task { await presenter.cancelTapped() }
+        }, for: .primaryActionTriggered)
+        Task { await presenter.viewDidLoad() }
+    }
+
+    func showStatus(title: String, detail: String) {
+        titleLabel.text = title
+        detailLabel.text = detail
+    }
+
+    func showProgress(step: Int, of steps: Int) {
+        progressView.setProgress(Float(step) / Float(steps), animated: true)
+    }
+
+    func setCancelHidden(_ hidden: Bool) {
+        cancelButton.isHidden = hidden
+    }
+
+    func showError(_ message: String) {
+        let alert = UIAlertController(title: nil, message: message, preferredStyle: .alert)
+        alert.addAction(UIAlertAction(title: "OK", style: .default))
+        present(alert, animated: true)
+    }
+}
+```
+
+Each method is a line or two that maps a value onto a view. There's nothing in it worth a unit test, and that's the goal: whatever is left in the view controller should be so simple that a glance verifies it.
+
+### Who creates whom
+
+Something has to build both halves and connect them. Usually it's a coordinator or a small factory:
+
+```swift check ios group=mvp title="Assembling the screen"
+@MainActor
+enum OrderStatusScreen {
+    static func make(orderID: String, service: any OrderService) -> UIViewController {
+        let presenter = OrderStatusPresenter(orderID: orderID, service: service)
+        return OrderStatusViewController(presenter: presenter)
+    }
+}
+```
+
+The ownership is one-way: the view controller holds the presenter **strongly**, the presenter holds the view **weakly**. Make both strong and neither is ever freed. The button's action captures the presenter (not the view controller), which is safe for the same reason.
+
+## Passive view or supervising controller
+
+Martin Fowler named two flavours of MVP, and real codebases sit somewhere between them:
+
+- **Passive view:** the view has no logic at all. The presenter sets every label and every flag. Everything is testable; the cost is a wide view protocol and a lot of forwarding.
+- **Supervising controller:** the view handles simple mapping itself, for example given an `OrderSummary` it fills its own labels, while the presenter handles anything with rules. The protocol is smaller, but the view now holds a little logic that tests can't reach.
+
+A useful line: if getting it wrong would be a bug a product manager could file ("cancel shows for delivered orders"), it belongs in the presenter. If getting it wrong is a layout nit, the view can own it.
+
+## Many commands, or one render
+
+The protocol above sends many small commands. The alternative is one method that sends everything at once:
+
+```swift
+struct OrderStatusViewData: Equatable {
+    let title: String
+    let detail: String
+    let progress: Double
+    let isCancelHidden: Bool
+}
+
+protocol OrderStatusView: AnyObject {
+    func render(_ data: OrderStatusViewData)
+    func showError(_ message: String)
+}
+```
+
+Small commands make each change explicit and cheap, but they're order-sensitive: forget one call on one path and the screen shows a stale label next to a fresh one. A single `render` is **idempotent**: call it twice with the same value and nothing changes, and every path produces a complete screen. Tests compare one value instead of a call log. Many MVP teams drift towards `render(_:)`, and once the presenter only ever hands over a value describing the whole screen, it's one step from MVVM: let the view *observe* that value instead of being handed it. That's the next lesson.
+
+## Testing with a spy
+
+Because the view is a protocol, a test can implement it with a **spy**: an object that records each call.
+
+```swift check ios group=mvp title="OrderStatusPresenterTests.swift"
+import Testing
+
+@MainActor
+final class OrderStatusViewSpy: OrderStatusView {
+    enum Call: Equatable {
+        case status(String, String), progress(Int, Int), cancelHidden(Bool), error(String)
+    }
+    private(set) var calls: [Call] = []
+
+    func showStatus(title: String, detail: String) { calls.append(.status(title, detail)) }
+    func showProgress(step: Int, of steps: Int) { calls.append(.progress(step, steps)) }
+    func setCancelHidden(_ hidden: Bool) { calls.append(.cancelHidden(hidden)) }
+    func showError(_ message: String) { calls.append(.error(message)) }
+}
+
+struct StubOrderService: OrderService {
+    let status: Order.Status
+    func order(id: String) async throws -> Order { Order(id: id, status: status) }
+    func cancel(orderID: String) async throws {}
+}
+
+@Test @MainActor func aPackingOrderCanNoLongerBeCancelled() async {
+    let presenter = OrderStatusPresenter(orderID: "42", service: StubOrderService(status: .packing))
+    let spy = OrderStatusViewSpy()
+    presenter.view = spy
+
+    await presenter.viewDidLoad()
+
+    #expect(spy.calls == [
+        .status("Packing your order", "Your shopper is picking your items."),
+        .progress(2, 4),
+        .cancelHidden(true),
+    ])
+}
+```
+
+The test runs in milliseconds with no window, no simulator UI and no network. Notice what it pins down, though: the **order** of the calls. Swap `showProgress` and `showStatus` in the presenter, a change no user would notice, and this test fails. That brittleness is the main cost of testing MVP. Keep it in check by asserting on the calls an interaction *adds* (clear the log after loading), and by asserting on the last call of each kind when order genuinely doesn't matter.
+
+## MVP on other platforms
+
+Android leaned on MVP heavily before Jetpack, with a "contract" interface pairing each view with its presenter. Its biggest pain there was lifecycle: Android destroys and recreates activities on rotation, so presenters had to detach from a dying view and reattach to a new one without losing work. Google's answer was a lifecycle-aware `ViewModel` that outlives the view, plus observable state, which is a large part of why Android moved to MVVM. iOS doesn't recreate view controllers on rotation, so MVP's worst problem there is milder here, and the pattern remains a reasonable choice for UIKit screens.
+
+## Trade-offs
+
+| | Apple MVC | MVP, passive view | MVP, supervising controller | MVVM |
+| --- | --- | --- | --- | --- |
+| Where screen logic lives | the view controller | the presenter | mostly the presenter | the view model |
+| Testable without UIKit | barely | all of it | the presenter's part | all of it |
+| Who knows whom | VC knows everything | presenter → view protocol | presenter → view protocol | view → view model only |
+| Boilerplate | least | a protocol method per change | a smaller protocol | a state type and a binding |
+| Fits SwiftUI | n/a | poorly: views are values | poorly | naturally |
+| Wins for | simple screens | UIKit screens with real rules | UIKit screens where the view's mapping is trivial | most screens, especially SwiftUI |
+
+<Callout kind="interview">
+
+**What to say:** "In MVP the presenter holds the screen's state and logic and drives the view through a protocol, weakly referenced; the view controller just forwards events. In MVVM the arrow flips: the view model exposes state and doesn't know the view exists, and the view observes it. MVP is easy to retrofit into UIKit because it needs no binding; MVVM fits SwiftUI because binding is built in."
+
+**What to ask:** "Is this screen UIKit or SwiftUI? Do we have a binding mechanism already?" The answers usually settle it.
+
+**Red flags:** a presenter that imports UIKit to build alerts or push view controllers; a strong reference to the view; tests that assert on twenty ordered calls; calling MVP and MVVM "the same thing with different names".
+
+</Callout>
+
+<Callout kind="gotcha" title="Swift gotcha: a weak reference needs a class-only protocol">
+
+`weak var view: (any OrderStatusView)?` only compiles if the protocol is constrained to `AnyObject`, because `weak` needs a reference type. Leave the constraint off and the tempting "fix" is a strong reference, which makes the retain cycle. Mark the protocol `@MainActor` too, so the presenter (also main-actor) calls it without `await`.
+
+</Callout>
+
+<Callout kind="gotcha" title="iOS gotcha: don't call the view before it has loaded">
+
+A presenter that starts work in its `init`, or is told to load before `viewDidLoad`, can call `showStatus` while the view controller's views don't exist yet. With storyboard outlets declared as `UILabel!`, that's a crash. Start the presenter from `viewDidLoad`, and set `presenter.view = self` first.
+
+</Callout>
+
+## Practice
+
+**An MVP recipe presenter with a spy view** builds the screen from this lesson's diagram: loading, servings that scale every ingredient, an optimistic favourite that rolls back on failure, and a presenter that must not keep its view alive. The tests use a spy exactly like the one above.
+
+```cards
+- id: mvp-roles
+  front: "What does each part do in MVP?"
+  back: "The view (a view controller) forwards events and does what it's told through a protocol. The presenter holds the screen's state and every decision, and talks to the model. The model is the domain and data below."
+- id: mvp-ownership
+  front: "Which references are strong and which weak in MVP?"
+  back: "The view controller owns its presenter strongly; the presenter holds the view weakly, through an AnyObject-constrained protocol. Both strong is a retain cycle."
+- id: mvp-vs-mvvm
+  front: "What's the essential difference between MVP and MVVM?"
+  back: "Which way the arrow points. A presenter knows its view (as a protocol) and pushes commands to it; a view model doesn't know its view, which observes the state it exposes."
+- id: mvp-spy
+  front: "How do you test a presenter, and what's the catch?"
+  back: "Give it a spy view that records each call, and assert on the log. The catch: asserting on order makes tests brittle, so check only what an interaction adds."
+```
+
+```quiz
+- id: q1
+  type: mcq
+  prompt: "A presenter needs to show an alert when cancelling fails. Which design keeps MVP's benefits?"
+  options:
+    - "The presenter builds a `UIAlertController` and presents it on `view as? UIViewController`"
+    - "The presenter calls `view?.showError(message)`, and the view controller decides how an error looks"
+    - "The presenter posts a notification that the view controller observes"
+    - "The view controller checks the presenter's `lastError` property after every call"
+  answer: 1
+  explain: "The presenter decides *that* there's an error and *what* it says; the view decides how to display it. Building UIKit alerts in the presenter ties it to UIKit and makes the error path untestable."
+- id: q2
+  type: bug
+  prompt: "Users who open and close this screen many times see memory grow. Which line is the bug?"
+  code: |
+    final class ProfilePresenter {
+        var view: ProfileView?
+        private let service: ProfileService
+        init(service: ProfileService) { self.service = service }
+    }
+  answer: 2
+  explain: "The view controller owns the presenter, and this strong `view` property owns the view controller back: a retain cycle, so neither is freed. It should be `weak var view: (any ProfileView)?` with the protocol constrained to `AnyObject`."
+- id: q3
+  type: multi
+  prompt: "Which belong in the presenter of a passive view? Choose all that apply."
+  options:
+    - "Deciding that the Cancel button hides once an order is packing"
+    - "Formatting 75 minutes as \"1 h 15 min\""
+    - "Setting `titleLabel.text`"
+    - "Remembering the current number of servings"
+    - "Choosing the label's font"
+  answer: [0, 1, 3]
+  explain: "Rules, formatting and state are the presenter's. Setting a label's text and choosing a font are the view's: the first is mechanical, the second is styling."
+- id: q4
+  type: truefalse
+  prompt: "Switching a presenter's view protocol from many small commands to one `render(_ data:)` method makes its tests less sensitive to call order."
+  answer: true
+  explain: "With one idempotent `render`, the test compares the last rendered value; with many commands it compares a sequence, and reordering harmless calls breaks it."
+- id: q5
+  type: mcq
+  prompt: "Why did Android teams find MVP harder than iOS teams?"
+  options:
+    - "Kotlin has no protocols"
+    - "Activities are destroyed and recreated on rotation, so presenters had to detach from and reattach to views without losing work"
+    - "Android has no view controllers, so there's nothing to demote"
+    - "Presenters can't be unit-tested on the JVM"
+  answer: 1
+  explain: "Configuration changes recreate the view, so a presenter holding a view reference had to manage that lifecycle by hand. Android's lifecycle-aware ViewModel solved it, which pushed the platform towards MVVM."
+```

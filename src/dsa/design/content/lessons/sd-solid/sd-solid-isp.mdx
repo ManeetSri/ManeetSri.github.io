@@ -1,0 +1,292 @@
+## Why it matters
+
+Most iOS codebases have an `AccountService`, `APIClient` or `UserManager` protocol with twenty methods, and every screen depends on all of it. Each test needs a fake with twenty methods, most of them `fatalError("unused")`; a change to one method touches every screen; and a profile screen quietly holds the power to delete the account. The interface segregation principle is the fix, and Swift makes it unusually cheap: small role protocols, composed with `&` where a client needs more than one.
+
+## Clients shouldn't depend on what they don't use
+
+Robert C. Martin's statement is that no client should be forced to depend on methods it does not use. The story behind it comes from his consulting at Xerox: a printer system had one large `Job` class that every task used, so a change needed by one task (stapling, say) forced every other task's code to rebuild and redeploy too. The fix was a separate interface per kind of client, all implemented by the same class.
+
+In a Swift app the costs show up differently, but they're real:
+
+- **Test doubles grow with the protocol, not with the test.** A fake for the profile screen implements password changes, data export and account deletion it will never call.
+- **Unrelated changes ripple.** Change `deleteAccount`'s signature and every client and every fake must change, even the ones that never delete anything.
+- **Capabilities leak.** A screen that can call `deleteAccount()` might, and a reviewer can't tell from its dependencies what it actually does.
+- **Modules rebuild.** In a modular app, changing a protocol's requirements changes its module's interface, so every module that imports it rebuilds.
+
+Here's the fat version. It's what most apps have:
+
+```swift check title="One protocol for every client"
+struct Profile: Sendable {
+    var name: String
+    var avatarURL: String?
+}
+
+protocol AccountService: Sendable {
+    func profile() async throws -> Profile
+    func updateProfile(_ profile: Profile) async throws
+    func changePassword(from old: String, to new: String) async throws
+    func signOutEverywhere() async throws
+    func exportData() async throws -> String
+    func deleteAccount() async throws
+}
+```
+
+## Apple does it everywhere
+
+UIKit and the standard library are full of segregated interfaces, and seeing them helps you recognise the shape:
+
+- **Table views** split their clients' needs into `UITableViewDataSource` (what to show), `UITableViewDelegate` (how to react), `UITableViewDataSourcePrefetching` (warming data before it's needed), and `UITableViewDragDelegate` and `UITableViewDropDelegate`. A screen without drag and drop never sees those methods.
+- **`Codable`** is a type alias for `Encodable & Decodable`. A type that's only ever sent to the server adopts `Encodable` and promises nothing about decoding.
+- **`URLSession`'s delegates** form a family (`URLSessionTaskDelegate`, `URLSessionDataDelegate`, `URLSessionDownloadDelegate`, `URLSessionWebSocketDelegate`), so a download delegate doesn't implement data-task callbacks.
+- **The collection protocols** run from `Sequence` to `Collection`, `BidirectionalCollection` and `RandomAccessCollection`. Generic algorithms ask for the least they need: anything that can be walked backwards can be `reversed()`, without promising fast indexing.
+
+Older Objective-C protocols got a similar effect with `@optional` methods, which is why many `UITableViewDelegate` methods are optional. Swift-native protocols can't have optional requirements (only `@objc` ones can), so in Swift you segregate by splitting instead.
+
+## Splitting a fat service
+
+Look at who uses what. The profile screen reads and updates the profile. The security screen changes the password and signs out everywhere. The close-account flow exports data and deletes. Three clients, three **roles**:
+
+```swift check title="Role protocols, one implementation"
+struct Profile: Sendable {
+    var name: String
+    var avatarURL: String?
+}
+
+// Declared next to the screens that use them
+protocol ProfileEditing: Sendable {
+    func profile() async throws -> Profile
+    func updateProfile(_ profile: Profile) async throws
+}
+
+protocol CredentialManaging: Sendable {
+    func changePassword(from old: String, to new: String) async throws
+    func signOutEverywhere() async throws
+}
+
+protocol AccountClosing: Sendable {
+    func exportData() async throws -> String
+    func deleteAccount() async throws
+}
+
+// The implementation didn't need to change: it still does everything
+struct LiveAccountService: ProfileEditing, CredentialManaging, AccountClosing {
+    func profile() async throws -> Profile { Profile(name: "Maneet") }
+    func updateProfile(_ profile: Profile) async throws {}
+    func changePassword(from old: String, to new: String) async throws {}
+    func signOutEverywhere() async throws {}
+    func exportData() async throws -> String { "{}" }
+    func deleteAccount() async throws {}
+}
+```
+
+The point that's easy to miss: **segregation splits interfaces, not implementations.** One type can still do all six things; each client sees only the slice it needs. You don't need three services, three network stacks or three sets of tests for the implementation.
+
+```visual flow
+title: Each client depends on its own role
+nodes:
+  - { id: profile, label: Profile screen, kind: view, at: [0, 0] }
+  - { id: security, label: Security settings, kind: view, at: [0, 1] }
+  - { id: closing, label: Close account flow, kind: view, at: [0, 2] }
+  - { id: editing, label: ProfileEditing, at: [2, 0] }
+  - { id: creds, label: CredentialManaging, at: [2, 1] }
+  - { id: closer, label: AccountClosing, at: [2, 2] }
+  - { id: live, label: LiveAccountService, kind: external, at: [4, 1] }
+edges:
+  - [profile, editing, uses]
+  - [security, creds, uses]
+  - [closing, closer, uses]
+  - [live, editing, { style: data }]
+  - [live, creds, { style: data }]
+  - [live, closer, { style: data }]
+steps:
+  - say: Each screen depends on one **role protocol** with two methods, declared beside it.
+    show: [profile, security, closing, editing, creds, closer]
+  - say: "One type, `LiveAccountService`, conforms to all three. Interfaces were split; the implementation wasn't."
+    show: [live]
+    send: [live->editing, live->creds, live->closer]
+  - say: The profile screen's tests and previews need a fake of **ProfileEditing** only, two methods, and the screen visibly can't delete anything.
+    send: profile->editing
+    state: { profile: ok, editing: ok }
+  - say: When the close-account API changes, only **AccountClosing**, its flow and its fakes change. The other screens don't rebuild or notice.
+    send: closing->closer
+    state: { profile: null, editing: null, closer: active, closing: active }
+    label: { closer: changed }
+```
+
+## Composing roles
+
+A client that needs two roles asks for both. Protocol composition with `&` keeps the roles small without making clients juggle several parameters:
+
+```swift run title="A screen model that asks for exactly what it uses"
+struct Profile: Sendable {
+    var name: String
+}
+
+protocol ProfileLoading: Sendable {
+    func profile() async throws -> Profile
+}
+
+protocol ProfileSaving: Sendable {
+    func save(_ profile: Profile) async throws
+}
+
+@MainActor final class ProfileModel {
+    private let account: any ProfileLoading & ProfileSaving
+    private(set) var name = ""
+
+    init(account: any ProfileLoading & ProfileSaving) {
+        self.account = account
+    }
+
+    func load() async throws {
+        name = try await account.profile().name
+    }
+
+    func rename(to newName: String) async throws {
+        try await account.save(Profile(name: newName))
+        name = newName
+    }
+}
+
+// The whole fake a test or preview needs: two methods, no fatalError stubs
+actor FakeAccount: ProfileLoading, ProfileSaving {
+    private var stored = Profile(name: "Maneet")
+    func profile() -> Profile { stored }
+    func save(_ profile: Profile) { stored = profile }
+}
+
+let fake = FakeAccount()
+let model = ProfileModel(account: fake)
+try await model.load()
+print("Loaded:", model.name)
+try await model.rename(to: "Maneet S.")
+print("Saved:", await fake.profile().name)
+```
+
+```output
+Loaded: Maneet
+Saved: Maneet S.
+```
+
+`any ProfileLoading & ProfileSaving` works the same way with generics (`init(account: some ProfileLoading & ProfileSaving)`) when you'd rather avoid the existential; you'll weigh those two in D06. When a role has a single method, a closure is often the simplest role there is: `init(loadProfile: @escaping @Sendable () async throws -> Profile)`.
+
+## Who owns the role
+
+Martin Fowler distinguishes **header interfaces**, which mirror everything a class can do (the fat `AccountService`, written next to its implementation), from **role interfaces**, which describe what one kind of client needs (`ProfileEditing`, written next to the profile screen). Role interfaces are the ones that segregate, and they belong to the **client**, which is the dependency inversion principle you'll meet in the next lesson.
+
+Swift makes client-owned roles cheap. If the implementation already has methods with the right signatures, conformance is an empty extension, written wherever both types are visible, usually the composition root:
+
+```swift
+// In the app target, which sees both the Profile feature and the Account module
+extension LiveAccountService: ProfileLoading, ProfileSaving {}
+```
+
+The profile feature declares what it needs; the account module never hears about it.
+
+## How small is too small
+
+Segregation can go too far. A protocol per method for everything produces dozens of names, `init`s with six composed protocols, and fakes scattered across files. Size roles by **how clients use them**, not by counting methods:
+
+- methods that every client of the role calls together belong in one role (`profile()` and `updateProfile(_:)`);
+- if two roles always appear together in every client, they're really one role;
+- if one client uses a single method of a role, it may want a closure instead.
+
+## Trade-offs
+
+| Shape | Fake size | Change ripple | What a reader learns from the dependency | Wins when |
+| --- | --- | --- | --- | --- |
+| One fat protocol | Every method, every time | Every client | Nothing: it can do anything | One client, or a prototype |
+| Role protocols, one implementation | Only the role's methods | Only that role's clients | Exactly what the client may do | Several clients using different slices |
+| Composition (`A & B`) at the client | The roles it lists | Only those roles | The precise set it needs | A client that needs two or three roles |
+| Closures | One function | Only that client | One capability | A single operation |
+| Concrete type, no protocol | Can't fake it | Every client | Everything | Stable values and pure helpers (formatters, calculators) |
+
+<Callout kind="interview">
+
+**What to say:** "This screen only reads and updates the profile, so I'd give it a role protocol with those two methods, declared beside the screen. The existing service conforms with an empty extension, so nothing else changes." Point out that tests get smaller and the screen's dependencies now document what it can do.
+
+**What to ask:** which clients use which methods today. If every client uses everything, the protocol is already the right size.
+
+**Red flags:** fakes full of `fatalError("not used")`; a protocol extension that gives every method a no-op default so fakes compile; and splitting into one-method protocols that are always composed back together.
+
+</Callout>
+
+<Callout kind="gotcha" title="Swift gotcha: no-op defaults hide a fat protocol">
+
+A common shortcut is `extension AccountService { func deleteAccount() async throws {} }` so that fakes only implement what they use. It compiles, and it makes the problem worse: the screen still depends on all six methods, and now a *production* conformer that forgets `deleteAccount` silently gets a version that does nothing and reports success, a Liskov break waiting to happen. Defaults are right when they're correct behaviour for every conformer; they're wrong as a way to avoid splitting.
+
+</Callout>
+
+<Callout kind="gotcha" title="iOS gotcha: one `weak var delegate` with many methods">
+
+A fat delegate protocol (`uploadDidStart`, `didProgress`, `didFinish`, `didFail`, `pendingCountDidChange`) usually comes with a single `weak var delegate`. Every observer must implement every method, and the second screen to set itself as the delegate silently replaces the first. When several clients care about different events, segregate them: return results from the call, and publish ongoing state through an `@Observable` property or an `AsyncStream` that any number of clients can follow.
+
+</Callout>
+
+## Practice
+
+**Layered feature flags** splits a settings protocol into `SettingsReader` and `SettingsWriter`, so read-only sources stop pretending they can write; the debug screen depends on the writer, and anything that only displays values can take the reader. The **upload service review** has a five-method observer protocol, two of whose methods never fire.
+
+```cards
+- id: isp-rule
+  front: "What does the interface segregation principle say?"
+  back: "No client should be forced to depend on methods it doesn't use. Give each kind of client a role interface with only what it needs."
+- id: isp-split-interfaces
+  front: "Does interface segregation mean splitting the implementation?"
+  back: "No. One type can conform to several role protocols; each client sees only its slice. Interfaces are split, the implementation can stay whole."
+- id: isp-costs
+  front: "What does a fat protocol cost a Swift codebase?"
+  back: "Fakes that implement everything; changes that ripple to clients that don't use the changed method; screens that hold capabilities they shouldn't; and rebuilds of every module that imports it."
+- id: isp-role-header
+  front: "What's the difference between a header interface and a role interface?"
+  back: "A header interface mirrors everything an implementation can do and lives beside it. A role interface describes what one kind of client needs and belongs to that client."
+```
+
+```quiz
+- id: q1
+  type: sort
+  prompt: "A `PlayerService` has these methods. Group them into roles by the client that uses them: the mini player, the downloads screen and the settings screen."
+  buckets: [Mini player, Downloads screen, Settings screen]
+  items:
+    - ["`play()` and `pause()`", 0]
+    - ["`nowPlaying: Episode?`", 0]
+    - ["`download(_ episode:)`", 1]
+    - ["`deleteDownload(_ episode:)`", 1]
+    - ["`setStreamingQuality(_:)`", 2]
+    - ["`setDownloadOverCellular(_:)`", 2]
+  explain: "Each bucket becomes a role protocol declared beside its screen. One `LivePlayerService` can still conform to all three."
+- id: q2
+  type: mcq
+  prompt: "A teammate's test for the profile screen has a `FakeAccountService` with fourteen methods, twelve of them `fatalError(\"unused\")`. What's the best change?"
+  options:
+    - "Add default implementations for all fourteen methods in a protocol extension"
+    - "Declare a role protocol with the two methods the profile screen uses; the live service conforms in an empty extension; the fake implements two methods"
+    - "Make the profile screen create `LiveAccountService` itself and test against a staging server"
+    - "Split `LiveAccountService` into fourteen classes"
+  answer: 1
+  explain: "The screen should depend on its role. Defaults hide the problem and risk silent no-ops in production; a staging server makes tests slow and flaky; and the implementation doesn't need splitting at all."
+- id: q3
+  type: blank
+  prompt: "Complete the initialiser so the model depends on both roles through one parameter."
+  code: |
+    init(account: any ProfileLoading ___ ProfileSaving) {
+        self.account = account
+    }
+  answers: ["&"]
+  explain: "`&` composes protocols: the parameter accepts any type that conforms to both, and the model sees only their methods."
+- id: q4
+  type: truefalse
+  prompt: "A conformance to a protocol declared in the profile feature can be added to `LiveAccountService` with an empty extension, as long as its existing methods already match the requirements."
+  answer: true
+  explain: "Existing methods witness the requirements, so `extension LiveAccountService: ProfileLoading {}` is enough. That's what lets the client own its role without the implementation knowing about it."
+- id: q5
+  type: multi
+  prompt: "Which are signs that segregation has gone too far? Choose all that apply."
+  options:
+    - "Two role protocols that every client always composes together"
+    - "A role protocol whose clients use all of its methods"
+    - "Initialisers that take six composed one-method protocols"
+    - "A fake for one screen that implements only two methods"
+  answer: [0, 2]
+  explain: "Roles that always appear together are one role, and a six-way composition of single methods is protocol soup. A role used in full, and a two-method fake, are what segregation is for."
+```

@@ -1,0 +1,301 @@
+## Why it matters
+
+A SwiftUI screen rebuilds its views many times a second, yet a text field keeps what you typed, a toggle keeps its position and a list row slides into its new place. The rule that makes this work is **identity**: how SwiftUI decides that the view in this update is the same one as in the last. Most "my state reset", "the wrong row animated" and "the scroll position jumped" bugs are identity bugs. Interviewers ask "how does SwiftUI know two views are the same?" because every other SwiftUI architecture question rests on the answer.
+
+## A view is a description, not an object
+
+In UIKit, a `UILabel` is an object. You create it once, keep a reference, and change its `text` when something happens. The label on screen *is* that object, and it lives as long as the object does.
+
+In SwiftUI, `Text("Hello")` is a small struct that **describes** what should be on screen. Each time `body` runs it returns a fresh description. SwiftUI compares it with the previous one and updates the real rendering objects, which you never see, to match. The structs themselves are created, read and thrown away in microseconds.
+
+So "the view" you think of on screen isn't your struct. Apple's own model gives it three properties:
+
+- **Identity:** which element on screen this is, from one update to the next.
+- **Lifetime:** how long that element exists, from when it's inserted until it's removed.
+- **Dependencies:** what it reads, which decides when its `body` runs again.
+
+This lesson is about identity; the next two lessons cover lifetime and dependencies. The three are linked: `@State` lives exactly as long as its view's identity, so when identity changes, state is thrown away.
+
+<Callout kind="analogy">
+
+Think of a theatre that prints a new seating plan every night. The plan is your view struct: paper, cheap, binned in the morning. The usher matches seat 12A on tonight's plan to seat 12A on last night's, and the regular who sits there keeps their coat on the seat. That coat is your `@State`. Renumber the seats and every regular is shown out, coats and all.
+
+</Callout>
+
+## Structural identity: where a view sits
+
+Most views never get an explicit id. SwiftUI identifies them by **structure**: their position in the view tree and their type. "The second child of this `VStack`, which is a `Toggle`" is an identity.
+
+SwiftUI can do this because `@ViewBuilder` turns your `body` into a typed tree. A `VStack` holding a `Text` and an optional `Image` has a type like `VStack<TupleView<(Text, Image?)>>`. An `if`/`else` becomes a `_ConditionalContent` with a slot for each branch, and **each branch is a different identity**, even when both branches contain the same view type.
+
+That's the source of a classic bug. This card switches between a compact and an expanded layout:
+
+```swift check ios group=card title="DeliveryNoteCard.swift"
+import SwiftUI
+
+struct NoteEditor: View {
+    @State private var text = ""
+
+    var body: some View {
+        TextField("Gate code, safe place…", text: $text, axis: .vertical)
+            .padding()
+            .background(.quaternary, in: .rect(cornerRadius: 12))
+    }
+}
+
+struct DeliveryNoteCard: View {
+    @State private var isExpanded = false
+
+    var body: some View {
+        VStack(alignment: .leading) {
+            Button(isExpanded ? "Less room" : "More room") {
+                withAnimation { isExpanded.toggle() }
+            }
+            if isExpanded {
+                NoteEditor()
+                    .frame(height: 240)
+            } else {
+                NoteEditor()
+                    .frame(height: 80)
+            }
+        }
+    }
+}
+```
+
+Type a gate code, tap the button, and the note is gone. The expanded `NoteEditor` is in the `if` slot and the compact one is in the `else` slot: two identities, two separate `@State` storages. Toggling removes one view and inserts the other, so the animation is a cross-fade rather than a resize, and the typed text goes with the removed view.
+
+Step through what SwiftUI does:
+
+```visual flow
+title: Two branches, two identities
+nodes:
+  - { id: card, label: DeliveryNoteCard, kind: view, at: [0, 1] }
+  - { id: cond, label: if isExpanded, kind: service, at: [2, 1] }
+  - { id: compact, label: "NoteEditor (else)", kind: view, at: [4, 0] }
+  - { id: expanded, label: "NoteEditor (if)", kind: view, at: [4, 2] }
+edges:
+  - [card, cond, body]
+  - [cond, compact, "false"]
+  - [cond, expanded, "true"]
+steps:
+  - say: "`isExpanded` is false, so SwiftUI builds the **else** slot. Its `@State` storage is created with it."
+    show: [card, cond, compact]
+    send: cond->compact
+    state: { compact: ok }
+  - say: The user types a gate code. It's stored in the **else** view's state.
+    label: { compact: "text: 4721" }
+  - say: "`isExpanded` becomes true. The **if** slot is a different identity, so SwiftUI inserts a new view with fresh state..."
+    show: [expanded]
+    send: cond->expanded
+    state: { expanded: ok }
+    label: { expanded: "text: empty" }
+  - say: "...and removes the old one. Its state, the gate code, is destroyed with it."
+    state: { compact: error }
+    label: { compact: removed }
+```
+
+The fix is to keep **one** view and vary its modifiers:
+
+```swift check ios group=card
+struct DeliveryNoteCardFixed: View {
+    @State private var isExpanded = false
+
+    var body: some View {
+        VStack(alignment: .leading) {
+            Button(isExpanded ? "Less room" : "More room") {
+                withAnimation { isExpanded.toggle() }
+            }
+            NoteEditor()
+                .frame(height: isExpanded ? 240 : 80)
+        }
+    }
+}
+```
+
+Now there's one `NoteEditor` in one position. Its identity never changes, the text survives, and the frame animates smoothly between the two heights.
+
+The rule of thumb: **branch when the views are genuinely different things** (a loading spinner versus the loaded content), and **change modifiers when it's the same thing in a different state**. Many modifiers have an inert value for exactly this: `.opacity(1)`, `.disabled(false)`, `.offset(.zero)`, `.scaleEffect(1)`.
+
+### The conditional-modifier trap
+
+A helper like this circulates in many codebases:
+
+```swift check ios
+import SwiftUI
+
+extension View {
+    @ViewBuilder
+    func `if`<Transformed: View>(_ condition: Bool, transform: (Self) -> Transformed) -> some View {
+        if condition {
+            transform(self)
+        } else {
+            self
+        }
+    }
+}
+```
+
+`Text(title).if(isUnread) { $0.bold() }` reads nicely, but it hides an `if`/`else`. Every time `isUnread` flips, the view and everything inside it gets a new identity: state resets, `.task` restarts, and the change animates as a removal plus an insertion. Write the condition into the modifier's value instead: `.fontWeight(isUnread ? .bold : .regular)`.
+
+### AnyView erases the structure
+
+`AnyView` wraps any view and hides its type. SwiftUI can no longer read the structure from the type, so it checks at runtime what's inside: as long as the wrapped type stays the same, the identity holds; when it changes, the old view is removed and a new one inserted. You also lose some of the cheap, type-based comparisons SwiftUI makes on every update.
+
+`AnyView` has honest uses, such as a plug-in system where views arrive from modules that can't share a type. Inside your own features, `some View`, `@ViewBuilder`, `Group` and generics keep the structure visible at no cost.
+
+## Explicit identity: ids you choose
+
+When views come from data, structure isn't enough: "the third row" means a different message after a new one arrives at the top. So `ForEach`, `List` and friends use **explicit identity**: an id per element, from `Identifiable` or an `id:` key path. SwiftUI matches rows between updates by id, which is what makes insertions, deletions and moves animate correctly and keeps each row's state attached to the right item.
+
+A good id is:
+
+- **Unique** within the collection.
+- **Stable**: the same item has the same id in every update, and ideally across launches.
+- **Cheap** to hash and compare.
+
+```swift check ios title="ChecklistView.swift"
+import SwiftUI
+
+struct ChecklistItem: Identifiable, Equatable {
+    let id: UUID              // made once, when the user creates the item, and saved with it
+    var title: String
+    var isDone = false
+}
+
+struct ChecklistView: View {
+    @State private var items: [ChecklistItem] = [
+        ChecklistItem(id: UUID(), title: "Passport"),
+        ChecklistItem(id: UUID(), title: "Charger"),
+    ]
+
+    var body: some View {
+        List {
+            ForEach($items) { $item in
+                Toggle(item.title, isOn: $item.isDone)
+            }
+            .onDelete { items.remove(atOffsets: $0) }
+        }
+    }
+}
+```
+
+A `UUID` is a fine id **when it's created once and stored with the item**. The trouble starts when ids are invented while building the view:
+
+| Id choice | What goes wrong |
+| --- | --- |
+| `let id = UUID()` on a row struct built in `body` or a computed property | Every update makes new ids, so SwiftUI sees every row removed and a whole new set inserted. Row state is lost, animations go wrong, and every row is rebuilt. |
+| `ForEach(items.indices, id: \.self)` | Ids are positions. Delete the first item and every row's id shifts: state stays with the position rather than the item, the delete animation takes the last row, and a row closure that reads `items[index]` can crash. |
+| `id: \.self` on values that can repeat | Two "OK" messages share an id. SwiftUI warns that the ID occurs multiple times and the results are undefined: rows show each other's content. |
+| `id: \.self` on a large struct | Unique, maybe, but the id changes whenever any field changes (an edit looks like delete plus insert), and hashing the whole value costs time on every update. |
+| A server id, or a client id stored with the item | Correct. |
+
+### Resetting on purpose with `.id(_:)`
+
+The `.id(_:)` modifier gives any view an explicit identity. When the value changes, SwiftUI treats it as a **new view**: the subtree's state is reset, `onAppear` and `.task` run again, and transitions play.
+
+That makes it the right tool when you **want** a reset. A detail pane in a split view keeps its structural identity when the selection changes, so a form inside it would keep the previous contact's half-typed edits. `ContactForm(contact: contact).id(contact.id)` starts a clean form for each contact.
+
+It's the wrong tool for "the screen didn't update, so force it". `.id(UUID())` or `.id(refreshCount)` throws away and rebuilds the whole subtree: scroll position, focus, row state and running tasks all go, and on a long list it costs a frame or more. A view that doesn't update almost always has a dependency problem, such as a model SwiftUI can't observe. Two lessons on, you'll see how to find it.
+
+## Trade-offs
+
+| Technique | State kept? | How changes animate | Cost | When it wins |
+| --- | --- | --- | --- | --- |
+| Branch with `if` or `switch` | No: each branch has its own | Removal plus insertion (a transition) | Small | Genuinely different content: loading, empty, loaded |
+| One view, values in modifiers | Yes | Interpolated: frame, opacity, colour | Smallest | The same element in a different state |
+| `.id(value)` | Reset whenever the value changes | Transition | Rebuilds the subtree | Deliberately starting fresh: a new item in a reused editor |
+| `AnyView` | Only while the wrapped type stays the same | Usually a transition | Runtime type checks, fewer optimisations | Rare type-erased boundaries, such as plug-ins |
+| `ForEach` with stable ids | Follows the item | Per-row insert, remove and move | Hashing ids | Every list built from data |
+
+<Callout kind="interview">
+
+**Say:** "SwiftUI identifies a view by its structural position and type, or by an explicit id. State lives as long as the identity, so I keep identities stable on purpose: one view with changing modifiers rather than branches, and data ids that never change." **Ask:** "Do these items have server ids? What identifies a draft before the server has seen it?" That second question shows you know where list identity really comes from. **Red flags:** `UUID()` inside a row mapping, `.id(UUID())` to force a refresh, `AnyView` as a habit, and "SwiftUI recreates the views, so state resets", which confuses the struct with its identity.
+
+</Callout>
+
+<Callout kind="gotcha" title="iOS gotcha: index-based rows crash after a delete">
+
+`ForEach(items.indices, id: \.self) { index in Toggle(isOn: $items[index].isDone) … }` works until a deletion. Then a row whose index no longer exists can be asked for its binding during the update, and the app traps with "Index out of range". Iterate the collection's bindings instead, `ForEach($items) { $item in … }`, which keeps each row attached to its element by id.
+
+</Callout>
+
+## Practice
+
+The **stable row ids** kata asks you to build list identities the way a real feed needs them: server ids for synced items, client ids for drafts, no collisions between the two, one row per item when pages overlap, and an identity that survives a draft being confirmed. The **chat thread** review shows what unstable ids do to a real screen.
+
+```cards
+- id: identity-structural
+  front: "What is a SwiftUI view's structural identity?"
+  back: "Its position and type in the view tree, which `@ViewBuilder` encodes in the body's type. Each branch of an `if`/`else` is a different identity."
+- id: identity-state-link
+  front: "Why does a view's `@State` reset when it moves into the other branch of an `if`?"
+  back: "State lives as long as the view's identity. The other branch is a different identity, so SwiftUI removes the old view, with its state, and inserts a new one."
+- id: identity-good-ids
+  front: "What makes a good id for `ForEach`?"
+  back: "Unique within the collection, stable for the same item across updates (and launches), and cheap to hash: a server id or a client id stored with the item. Never `UUID()` made while building rows, and never an index."
+- id: identity-id-modifier
+  front: "When is `.id(_:)` the right tool?"
+  back: "When you want a fresh subtree whenever a value changes, such as a form for the newly selected item. Using it to force a refresh rebuilds everything and hides a dependency bug."
+```
+
+```quiz
+- id: q1
+  type: mcq
+  prompt: "A settings card shows `if showAdvanced { OptionsForm().padding(24) } else { OptionsForm() }`. Users complain that their choices reset when they open the advanced view. What's the best fix?"
+  options:
+    - "Give `OptionsForm` an `.id(\"options\")` in both branches"
+    - "Keep one `OptionsForm()` and write `.padding(showAdvanced ? 24 : 0)`"
+    - "Wrap both branches in `AnyView` so SwiftUI sees the same type"
+    - "Move the `if` into `OptionsForm`'s initialiser"
+  answer: 1
+  explain: "One view in one position keeps one identity, so its state survives and the padding animates. The same `.id` in two different branch slots doesn't merge them, and `AnyView` only keeps identity while the wrapped type stays the same, at the cost of type information."
+- id: q2
+  type: bug
+  prompt: "Messages lose their swipe state and the list jumps after every new message. Which line causes it?"
+  code: |
+    struct MessageRowModel: Identifiable {
+        let id = UUID()
+        let text: String
+    }
+
+    struct ThreadView: View {
+        let messages: [Message]
+        private var rows: [MessageRowModel] {
+            messages.map { MessageRowModel(text: $0.text) }
+        }
+        var body: some View {
+            List(rows) { row in Text(row.text) }
+        }
+    }
+  answer: 2
+  explain: "Every evaluation of `rows` builds new structs with new `UUID`s, so each update looks like every row was removed and new ones inserted. Use the message's own stable id: `let id: Message.ID`."
+- id: q3
+  type: sort
+  prompt: "For each change, does the view keep its identity (and state), or get a new one?"
+  buckets: [Keeps identity, New identity]
+  items:
+    - ["`.opacity(isHidden ? 0 : 1)` when `isHidden` flips", 0]
+    - ["`if isHidden { EmptyView() } else { Player() }` when `isHidden` flips", 1]
+    - ["`.frame(height: isOpen ? 300 : 100)` when `isOpen` flips", 0]
+    - ["`Editor().id(document.id)` when a different document is opened", 1]
+    - ["`.if(isUnread) { $0.bold() }` when `isUnread` flips", 1]
+    - ["A `ForEach` row whose item's title is edited, with ids from the server", 0]
+  explain: "Changing a modifier's value keeps the view in place. Branches, a changed `.id` value and the conditional-modifier helper (an `if`/`else` in disguise) all replace the view. An edit to an item with a stable id is an update to the same row."
+- id: q4
+  type: multi
+  prompt: "A chat app's messages arrive from the server with an `id`, but messages the user has sent exist only on the device until the server confirms them. Which identities work for `ForEach`? Choose all that apply."
+  options:
+    - "A client-generated id stored with each message when it's composed, which the server echoes back"
+    - "The array index"
+    - "`UUID()` generated each time the rows are built"
+    - "The server id for messages from other people, and the stored client id for messages sent from this device"
+    - "The message text, with `id: \\.self`"
+  answer: [0, 3]
+  explain: "Identity must be stable from the moment the row first appears. A client id made once at compose time (and echoed by the server) keeps a sent message's row in place when it's confirmed. Indexes shift, fresh `UUID`s change every update, and text repeats."
+- id: q5
+  type: truefalse
+  prompt: "If a view doesn't update when its data changes, adding `.id(refreshCount)` and bumping the count is a sound long-term fix."
+  answer: false
+  explain: "It rebuilds the whole subtree, losing scroll position, focus and state, and it hides the real problem: SwiftUI isn't seeing a dependency, often because the model isn't observable or the value is read somewhere SwiftUI doesn't track."
+```

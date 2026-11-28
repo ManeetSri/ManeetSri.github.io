@@ -1,0 +1,324 @@
+## Why it matters
+
+Something changes in one place, and several other parts of the app need to react: the cart changes and the tab badge, the checkout button and an analytics logger all care; the user signs out and three caches must empty. The **observer** pattern lets the thing that changed tell everyone interested without knowing who they are. Apple ships it in four flavours (NotificationCenter, KVO, Combine and Observation), and interviewers use it to find out whether you know who owns a subscription, which thread it runs on, and when a broadcast is the wrong tool.
+
+## One subject, many observers
+
+The pattern has two roles:
+
+- The **subject** owns some state and keeps a list of observers.
+- Each **observer** subscribes, is told when the state changes, and unsubscribes when it no longer cares.
+
+The important part is the direction of the dependency. Observers know the subject; the subject knows only "something that wants updates". You can add a widget reloader or an analytics logger to the cart without editing the cart. That's the open–closed idea from D04, applied at runtime.
+
+<Callout kind="analogy">
+A newsletter. The publisher doesn't know its readers personally; it keeps a mailing list. Readers sign up and can unsubscribe. And if you never unsubscribe, it keeps arriving long after you stopped reading, which is exactly how observers leak.
+</Callout>
+
+### Push or pull
+
+A notification can carry the news, or only announce it:
+
+- **Push:** the subject sends the new value (or a description of the change) with each notification. Convenient, but every observer gets the same payload, and changing it changes every observer.
+- **Pull:** the subject says only "something changed", and each observer reads what it needs. Notifications stay tiny, and observers can't be handed stale copies. SwiftUI works this way: `objectWillChange` says *will change*, and the view re-reads the model when it next runs `body`.
+
+## Subscriptions as tokens
+
+Here's a small subject written by hand. `observe` returns a **token**, and the subscription lasts exactly as long as the token does:
+
+```swift run title="A cart with cancellable observers"
+/// A subscription. Cancel it, or let go of it, to stop hearing about changes.
+final class CartObservation {
+    private var onCancel: (() -> Void)?
+
+    init(onCancel: @escaping () -> Void) {
+        self.onCancel = onCancel
+    }
+
+    func cancel() {
+        onCancel?()
+        onCancel = nil
+    }
+
+    deinit {
+        cancel()
+    }
+}
+
+final class CartStore {
+    private(set) var items: [String] = []
+    private var observers: [(id: Int, notify: ([String]) -> Void)] = []
+    private var nextID = 0
+
+    func observe(_ notify: @escaping ([String]) -> Void) -> CartObservation {
+        let id = nextID
+        nextID += 1
+        observers.append((id, notify))
+        return CartObservation { [weak self] in
+            self?.observers.removeAll { $0.id == id }
+        }
+    }
+
+    func add(_ item: String) {
+        items.append(item)
+        for observer in observers {
+            observer.notify(items)
+        }
+    }
+}
+
+let cart = CartStore()
+var tokens: [CartObservation] = []
+tokens.append(cart.observe { items in print("Badge shows \(items.count)") })
+tokens.append(cart.observe { items in print("Analytics: added \(items.last ?? "?")") })
+
+cart.add("Coffee beans")
+tokens.removeLast()
+cart.add("Grinder")
+tokens.removeAll()
+cart.add("Filters")
+print("Cart has \(cart.items.count) items, \(tokens.count) observers")
+```
+
+```output
+Badge shows 1
+Analytics: added Coffee beans
+Badge shows 2
+Cart has 3 items, 0 observers
+```
+
+Three design decisions are hiding in there:
+
+- **Why an id, not the closure?** Closures can't be compared with `==`, so the subject can't find "this closure" to remove it. An id can.
+- **Why a token?** It ties the subscription to something the observer owns. A view model keeps its tokens in a property; when the view model goes, its subscriptions go with it, with no `deinit` bookkeeping. This is exactly how Combine's `AnyCancellable` and KVO's `NSKeyValueObservation` work, as you'll see in the next lesson.
+- **Why `[weak self]` in the token?** So a token can outlive its subject without keeping it alive.
+
+`for observer in observers` also quietly protects you: arrays are values, so the loop walks a copy, and an observer that unsubscribes mid-notification can't corrupt it.
+
+<Callout kind="warning" title="The lapsed listener">
+The classic observer bug is an observer that never unsubscribes. It stays in memory, and it keeps reacting: a dismissed screen that still reloads its table, or logs analytics twice. Tokens make the safe thing the default; manual `addObserver` / `removeObserver` pairs make forgetting easy.
+</Callout>
+
+## NotificationCenter: observer as a broadcast
+
+`NotificationCenter.default` is a process-wide hub. A poster and its observers share only a `Notification.Name`; neither holds a reference to the other. Step through a sign-out:
+
+```visual sequence
+title: Signing out, as a broadcast
+participants:
+  - { id: session, label: Session }
+  - { id: center, label: NotificationCenter }
+  - { id: cache, label: Feed cache }
+  - { id: profile, label: Profile screen }
+messages:
+  - [cache, center, "addObserver(.userDidSignOut)"]
+  - [profile, center, "addObserver(.userDidSignOut)"]
+  - { note: "Session holds no reference to either observer.", over: session }
+  - [session, center, "post(.userDidSignOut)"]
+  - [center, cache, clear posts]
+  - [center, profile, pop to root]
+  - [center, session, post returns, { reply: true }]
+steps:
+  - { upTo: 1, say: "Two observers register for the same **name**. Neither knows who will post it." }
+  - { upTo: 3, say: "The user signs out. `Session` posts the name without knowing who, if anyone, is listening." }
+  - { upTo: 5, say: "The centre calls each observer in turn, **synchronously**, on the posting thread (neither asked for a queue). The order isn't documented, so don't depend on it." }
+  - { upTo: 6, say: "Only then does `post` return. A slow observer makes signing out slow, and a post from a background thread runs every queue-less observer on that thread." }
+```
+
+There are four ways to observe, from oldest to newest:
+
+| API | Since | Lifetime | Watch out for |
+| --- | --- | --- | --- |
+| `addObserver(_:selector:name:object:)` | iOS 2 | Removed automatically when the observer is freed (since iOS 9) | Needs an `@objc` method; runs on the posting thread |
+| `addObserver(forName:object:queue:using:)` | iOS 4 | Until you pass the returned token to `removeObserver(_:)` | The centre keeps the block, and the block keeps whatever it captures |
+| `notifications(named:object:)` | iOS 15 | As long as the `for await` loop's task runs | Must run inside a task you cancel (SwiftUI's `.task` does it for you) |
+| Typed messages (`addObserver(of:for:using:)`) | iOS 26 | Until you remove the `ObservationToken` | Only for messages declared as `MainActorMessage` or `AsyncMessage` |
+
+Here are the block, async-sequence and typed forms in a Swift 6 app:
+
+```swift check ios title="Three ways to observe"
+import SwiftUI
+import UIKit
+
+extension Notification.Name {
+    static let userDidSignOut = Notification.Name("userDidSignOut")
+}
+
+@MainActor
+final class FeedCache {
+    private(set) var posts: [String] = ["Welcome"]
+    private var token: (any NSObjectProtocol)?
+
+    func startObserving(_ center: NotificationCenter = .default) {
+        token = center.addObserver(forName: .userDidSignOut, object: nil, queue: .main) { [weak self] _ in
+            // The block is @Sendable, so the compiler can't see it runs on the main actor.
+            // queue: .main guarantees the main thread, which makes assumeIsolated safe here.
+            MainActor.assumeIsolated {
+                self?.posts.removeAll()
+            }
+        }
+    }
+
+    func stopObserving(_ center: NotificationCenter = .default) {
+        if let token {
+            center.removeObserver(token)
+        }
+        token = nil
+    }
+}
+
+struct BackgroundCounter: View {
+    @State private var count = 0
+
+    var body: some View {
+        Text("Sent to the background \(count) times")
+            .task {
+                // The loop ends when SwiftUI cancels the task, as the view disappears
+                for await _ in NotificationCenter.default.notifications(named: UIApplication.didEnterBackgroundNotification) {
+                    count += 1
+                }
+            }
+    }
+}
+
+@available(iOS 26, *)
+@MainActor
+final class KeyboardInset {
+    private var token: NotificationCenter.ObservationToken?
+    private(set) var bottom: CGFloat = 0
+
+    func start() {
+        // A typed message: real properties instead of userInfo, delivered on the main actor
+        token = NotificationCenter.default.addObserver(of: UIScreen.self, for: .keyboardWillShow) { [weak self] message in
+            self?.bottom = message.endFrame.height
+        }
+    }
+
+    func stop() {
+        if let token {
+            NotificationCenter.default.removeObserver(token)
+        }
+        token = nil
+    }
+}
+```
+
+Notice that `FeedCache` takes the centre as a parameter. `NotificationCenter()` creates a private centre, so a test can post to it without disturbing anything else in the process.
+
+The iOS 26 typed messages fix the oldest complaint about notifications. You declare a struct conforming to `NotificationCenter.MainActorMessage` (delivered on the main actor) or `AsyncMessage` (delivered asynchronously, from any context), with real properties, and post it with `post(_:subject:)`. UIKit already provides messages such as `UIResponder.KeyboardWillShowMessage`, so `message.endFrame` replaces digging a `CGRect` out of `userInfo`. If your app supports iOS 18, you'll use the older APIs for system notifications for a while yet.
+
+## When a broadcast is the right tool
+
+NotificationCenter is the right observer when there are **many listeners you don't know about**, or the event belongs to the system:
+
+- **System events:** the keyboard, app and scene lifecycle, `UIContentSizeCategory.didChangeNotification`, `AVAudioSession.interruptionNotification`, `NSPersistentStoreRemoteChange`.
+- **App-wide moments:** signed out, account switched, a purchase restored. Several unrelated features react, and the poster shouldn't import any of them.
+
+It's a poor fit for one object talking to another, or for state that a screen displays:
+
+- **Invisible coupling.** Nothing in the poster's code says who depends on it; you find listeners by searching for a string.
+- **Weak typing.** Before iOS 26, the payload is `[AnyHashable: Any]`, read with casts that fail at runtime.
+- **Global by default.** Every test shares `.default` unless you inject a centre.
+- **Delivery on the posting thread.** A post from a URLSession callback runs observers in the background, where UIKit must not be touched.
+
+If the cart screen needs to show the cart, give it the cart (or a view model that observes the cart). Reach for a notification when you'd otherwise have to tell the poster about listeners it has no business knowing.
+
+## Trade-offs
+
+| | Hand-rolled subject with tokens | NotificationCenter | Delegate (in a later lesson) |
+| --- | --- | --- | --- |
+| Listeners | Many, known to the code that subscribes | Many, unknown to the poster | Exactly one |
+| Types | Fully typed | Untyped `userInfo` (typed messages from iOS 26) | Fully typed protocol |
+| Finding who listens | Find references to the subject | Search for the name | Find conformances |
+| Lifetime | Token owned by the observer | Selector form: automatic; block form: manual token | `weak` reference, automatic |
+| Testing | Easy: create a subject | Inject a private centre | Easy: a fake delegate |
+| Wins when | A feature's own state has several watchers | System events and app-wide broadcasts | One object reports to, or asks, its owner |
+
+<Callout kind="interview">
+**Say:** "This is one-to-many, so it's an observer. I'd have the store hand out cancellable subscriptions, so each screen's lifetime ends its subscription." Then say which thread observers run on, and whether they get the value pushed or pull it.
+
+**Ask:** How many listeners are there, and are they known? Do they need the new value, or only to know something changed? Does anything need an answer back (then it's a delegate or a closure, not an observer)?
+
+**Red flags:** NotificationCenter as the app's main event bus; block observers with no `removeObserver`; updating UI straight from a notification posted on a background queue; not knowing that `post` is synchronous.
+</Callout>
+
+<Callout kind="gotcha" title="iOS gotcha: observers added in viewWillAppear">
+`viewWillAppear` runs every time a screen comes back, not once. Adding an observer there without removing it in `viewWillDisappear` means one more observer, and one more reaction, per visit. Register in `viewDidLoad` (or `init`), or pair every add with a remove.
+</Callout>
+
+<Callout kind="gotcha" title="Swift gotcha: MainActor.assumeIsolated is a promise, not a hop">
+Inside a block observer, `MainActor.assumeIsolated` compiles, but it traps if the block isn't actually running on the main thread. It's safe only with `queue: .main`. With `queue: nil`, hop explicitly with `Task { @MainActor in … }`, copying out any values you need first.
+</Callout>
+
+## Practice
+
+**Observers that cancel themselves** asks you to build the subject from this lesson properly: tokens that cancel on release, a channel and tokens that don't keep each other alive, and observers that subscribe or cancel in the middle of a delivery. The review **The episode player that never goes away** shows what happens when observer tokens are thrown away.
+
+```cards
+- id: observer-roles
+  front: "In the observer pattern, which side knows about the other?"
+  back: "Observers know the subject. The subject knows only that something wants updates, so new observers can be added without changing it."
+- id: token-subscriptions
+  front: "Why do good observer APIs return a token?"
+  back: "Closures can't be compared, so the subject needs a handle to remove one, and a token ties the subscription's lifetime to the observer that owns it (like AnyCancellable)."
+- id: post-is-synchronous
+  front: "When does NotificationCenter run an observer that didn't ask for a queue?"
+  back: "Synchronously, on the posting thread, before `post` returns. A slow observer slows the poster; a background post means background observers."
+- id: broadcast-fit
+  front: "When is NotificationCenter the right observer?"
+  back: "For system events and app-wide moments with many listeners the poster shouldn't know. Not for one object talking to another, or for state a screen displays."
+```
+
+```quiz
+- id: q1
+  type: mcq
+  prompt: "A view model calls `addObserver(forName:object:queue:using:)` in `init`, uses `self` inside the block, and ignores the return value. What happens after its screen is closed?"
+  options:
+    - "The view model is freed as usual, and the observer is removed with it"
+    - "NotificationCenter keeps the block, the block keeps the view model, and it goes on reacting to every post"
+    - "The app crashes the next time the notification is posted"
+    - "It doesn't compile: the token must be stored"
+  answer: 1
+  explain: "The block form is removed only by passing its token to `removeObserver(_:)`. Throw the token away and the centre holds the block forever; capturing `self` strongly keeps the view model alive too. Only the selector form is removed automatically."
+- id: q2
+  type: sort
+  prompt: "Which tool fits each situation?"
+  buckets: [NotificationCenter, "A direct observer, delegate or closure"]
+  items:
+    - [The keyboard is about to appear, 0]
+    - ["The user signed out: two caches, analytics and the profile screen react", 0]
+    - [A cell tells its table that its Buy button was tapped, 1]
+    - [The one screen showing a download's progress, 1]
+    - [The app moved to the background, 0]
+  explain: "Broadcasts suit system events and app-wide moments with many listeners the poster shouldn't know. When one known object talks to another, a direct reference is typed, discoverable and testable."
+- id: q3
+  type: truefalse
+  prompt: "`post(name:object:)` returns before observers run, so a slow observer doesn't delay the code that posted."
+  answer: false
+  explain: "Delivery is synchronous: each observer without a queue runs on the posting thread before `post` returns. Heavy work in an observer belongs on another task or queue."
+- id: q4
+  type: bug
+  prompt: "The download manager posts `.downloadFinished` from its URLSession delegate queue. Which line causes the bug?"
+  code: |
+    func startObserving() {
+        token = NotificationCenter.default.addObserver(
+            forName: .downloadFinished, object: nil, queue: nil
+        ) { [weak self] note in
+            let file = note.userInfo?["file"] as? String ?? ""
+            self?.statusLabel.text = "\(file) downloaded"
+        }
+    }
+  answer: 3
+  explain: "`queue: nil` runs the block on the posting thread, here URLSession's delegate queue, so line 6 sets a label off the main thread. Pass `queue: .main` (or hop to the main actor) so UI work happens on the main thread."
+- id: q5
+  type: multi
+  prompt: "You're writing a subject by hand. Which choices stop it leaking or misbehaving?"
+  options:
+    - "Return a token that unsubscribes when it's released"
+    - "Keep the observers in a static array so they're never lost"
+    - "Notify from a copy of the observer list, so observers can unsubscribe mid-notification"
+    - "Have the token refer to the subject weakly"
+    - "Rely on observers being called in the order they subscribed, and document it nowhere"
+  answer: [0, 2, 3]
+  explain: "Tokens tie a subscription to its owner, a copy makes re-entrant unsubscribes safe, and a weak back-reference lets a token outlive its subject. A static list keeps every observer alive forever, and undocumented ordering is a bug waiting for a refactor."
+```

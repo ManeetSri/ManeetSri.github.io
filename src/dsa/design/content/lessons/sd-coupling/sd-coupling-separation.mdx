@@ -1,0 +1,321 @@
+## Why it matters
+
+A checkout screen has to lay out a form, validate an address, price a basket, place an order, log, send analytics, add an auth token to requests, handle the keyboard, and announce errors to VoiceOver. Put all of that in one place and every change risks every other. Separation of concerns and orthogonality are the two ideas that keep those jobs apart, so you can change the analytics vendor without touching checkout, or add retries without touching anything else. They're also what an interviewer is probing when they ask, "Where would logging go?"
+
+## Separation of concerns
+
+Edsger Dijkstra coined the phrase in 1974. His point was about thinking: you can only reason well about one aspect of a problem at a time, so arrange the work so that each aspect can be studied on its own, without holding all the others in your head. A **concern** is any such aspect: what's on screen, how it looks, the business rules, where the data comes from, what's logged.
+
+**Separation of concerns** means giving each concern a place where it can be understood and changed without reading the others. Here's how the checkout screen's concerns might separate:
+
+| Concern | Where it lives | Who asks for changes |
+| --- | --- | --- |
+| Layout and styling | The SwiftUI view, design-system components | Designers |
+| What the screen shows and when | The view model's state | Product |
+| Pricing and validation rules | Domain types: `Basket`, `Address` | The business |
+| Placing the order | A repository or service | The backend team's API |
+| Moving between screens | A coordinator or the navigation path | Product |
+| Analytics, logging, auth headers | Wrappers and modifiers around the rest | Analytics, security |
+
+The right-hand column is the real reason for the split: each row changes at a different time, for a different person. That's the "keep apart what changes separately" rule from the start of this module, applied to a whole screen.
+
+## Cross-cutting concerns
+
+Most concerns fit in one place. Some don't: **logging, analytics, authentication, caching, error reporting, performance tracing** touch every feature. These are **cross-cutting concerns**, and handled carelessly they show two symptoms, named by the aspect-oriented programming researchers of the late 1990s:
+
+- **Scattering:** one concern spread over many places. An `analytics.track(…)` call in forty view models, each spelling the event slightly differently.
+- **Tangling:** many concerns mixed in one place. A `placeOrder()` that's half business logic and half logging, token handling and analytics.
+
+Swift and Apple's frameworks give you several ways to keep cross-cutting concerns in one place each:
+
+- **Decorators** around a protocol: a client that adds auth headers, wrapping one that logs, wrapping the real transport. You'll study the pattern itself in D11.
+- **SwiftUI view modifiers and the environment:** `.trackScreen("Checkout")` once per screen, instead of an `onAppear` in every view.
+- **Property wrappers and macros**, for behaviour attached to declarations (D06).
+
+Here's the decorator approach for networking. Each concern is one small type that wraps *any* client and adds exactly one thing:
+
+```swift run title="One concern per wrapper"
+struct Request: Sendable {
+    var path: String
+    var headers: [String: String] = [:]
+}
+
+struct Response: Sendable {
+    let status: Int
+}
+
+protocol HTTPClient: Sendable {
+    func send(_ request: Request) async throws -> Response
+}
+
+// The transport sends requests. It knows nothing about tokens or logs.
+struct StubTransport: HTTPClient {
+    func send(_ request: Request) async throws -> Response {
+        Response(status: request.headers["Authorization"] == nil ? 401 : 200)
+    }
+}
+
+// Each concern wraps any client and adds exactly one thing
+struct AuthenticatedClient: HTTPClient {
+    let wrapped: any HTTPClient
+    let token: @Sendable () async -> String
+
+    func send(_ request: Request) async throws -> Response {
+        var request = request
+        request.headers["Authorization"] = "Bearer \(await token())"
+        return try await wrapped.send(request)
+    }
+}
+
+struct LoggingClient: HTTPClient {
+    let wrapped: any HTTPClient
+    let log: @Sendable (String) -> Void
+
+    func send(_ request: Request) async throws -> Response {
+        let response = try await wrapped.send(request)
+        log("\(request.path) → \(response.status)")
+        return response
+    }
+}
+
+// The composition root decides which concerns apply, in one place
+let log: @Sendable (String) -> Void = { print($0) }
+let signedOut = LoggingClient(wrapped: StubTransport(), log: log)
+let signedIn = LoggingClient(wrapped: AuthenticatedClient(wrapped: StubTransport(), token: { "abc123" }), log: log)
+
+_ = try await signedOut.send(Request(path: "/me"))
+_ = try await signedIn.send(Request(path: "/me"))
+```
+
+```output
+/me → 401
+/me → 200
+```
+
+Step through one request on its way out and back:
+
+```visual flow
+title: A request through its concerns
+nodes:
+  - { id: vm, label: Profile view model, at: [0, 0] }
+  - { id: logging, label: Logging client, at: [1, 0] }
+  - { id: auth, label: Authenticated client, at: [2, 0] }
+  - { id: transport, label: Transport, at: [3, 0] }
+  - { id: server, label: API, kind: external, at: [4, 0] }
+edges:
+  - [vm, logging]
+  - [logging, auth]
+  - [auth, transport]
+  - [transport, server]
+steps:
+  - say: The view model asks for `/me`. It holds an `any HTTPClient` and has no idea how many wrappers sit behind it.
+    send: vm->logging
+  - say: Logging passes the request on unchanged, and waits to record the result.
+    send: logging->auth
+    state: { logging: wait }
+  - say: Auth adds the `Authorization` header. It's the only code in the app that knows the header or where the token comes from.
+    send: auth->transport
+    label: { auth: + token }
+  - say: The transport sends it. It knows nothing about tokens, logs or which screen asked.
+    send: transport->server
+  - say: The response travels back the same way, and logging records `/me → 200`.
+    send: [server->transport, transport->auth, auth->logging]
+    state: { server: ok, logging: ok }
+    label: { logging: /me → 200 }
+  - say: "Each concern is one wrapper. Leave logging out in tests, add retries for uploads, or change where tokens come from: **one line** where the client is composed, and no feature code changes."
+    active: [logging, auth]
+```
+
+## Orthogonality
+
+Andy Hunt and Dave Thomas borrowed **orthogonality** from geometry in *The Pragmatic Programmer* (1999). Two lines are orthogonal when moving along one doesn't move you along the other, like the x and y axes. Two parts of a design are orthogonal when **changing one has no effect on the other**.
+
+Their counter-example is a helicopter. Push the cyclic stick forward and the helicopter dips and turns, so you must correct with the pedals, which changes the lift, so you adjust the collective, which changes the torque… Every control affects every other. Their test for software follows directly: if one requirement changes dramatically, how many modules have to change? In an orthogonal design, the answer is one.
+
+### A non-orthogonal iOS classic: the base view controller
+
+```swift check ios title="BaseViewController.swift"
+import UIKit
+
+class BaseViewController: UIViewController {
+    var screenName: String { "Unknown" }
+    let spinner = UIActivityIndicatorView(style: .large)
+
+    override func viewDidAppear(_ animated: Bool) {
+        super.viewDidAppear(animated)
+        print("analytics: screen_view \(screenName)")   // analytics
+    }
+
+    override func viewDidLoad() {
+        super.viewDidLoad()
+        view.addSubview(spinner)                          // loading UI
+        NotificationCenter.default.addObserver(           // keyboard handling
+            self, selector: #selector(keyboardWillShow), name: UIResponder.keyboardWillShowNotification, object: nil)
+    }
+
+    @objc func keyboardWillShow(_ note: Notification) {
+        additionalSafeAreaInsets.bottom = 300
+    }
+
+    func showError(_ error: any Error) {                  // error presentation
+        present(UIAlertController(title: "Error", message: error.localizedDescription, preferredStyle: .alert), animated: true)
+    }
+}
+```
+
+Four concerns, welded together. A screen that wants analytics also gets a spinner and keyboard handling, whether or not it has a text field. A screen that needs its own keyboard behaviour fights the superclass. A modal sheet that mustn't be tracked overrides `screenName` to an empty string and hopes. Each new variant (tracked but no spinner, spinner but different keyboard handling) is another subclass or another flag: with four concerns that can each be on or off, there are sixteen combinations, and inheritance makes you build them.
+
+The orthogonal version gives each concern its own piece, and lets each screen combine just the pieces it needs. In SwiftUI those pieces are view modifiers; in UIKit they're small helper objects and `view.keyboardLayoutGuide` (iOS 15), which handles the keyboard without any notifications at all.
+
+```swift check ios title="Orthogonal pieces"
+import SwiftUI
+
+struct Analytics: Sendable {
+    var screenViewed: @Sendable (String) -> Void
+
+    static let disabled = Analytics(screenViewed: { _ in })
+}
+
+extension EnvironmentValues {
+    // A default means a view without an analytics client still works: it just records nothing
+    @Entry var analytics = Analytics.disabled
+}
+
+struct TrackScreen: ViewModifier {
+    @Environment(\.analytics) private var analytics
+    let name: String
+
+    func body(content: Content) -> some View {
+        content.onAppear { analytics.screenViewed(name) }
+    }
+}
+
+struct LoadingOverlay: ViewModifier {
+    let isLoading: Bool
+
+    func body(content: Content) -> some View {
+        content
+            .disabled(isLoading)
+            .overlay {
+                if isLoading { ProgressView() }
+            }
+    }
+}
+
+extension View {
+    func trackScreen(_ name: String) -> some View { modifier(TrackScreen(name: name)) }
+    func loadingOverlay(_ isLoading: Bool) -> some View { modifier(LoadingOverlay(isLoading: isLoading)) }
+}
+
+struct CheckoutView: View {
+    @State private var isPlacingOrder = false
+
+    var body: some View {
+        Form {
+            Button("Place order") { isPlacingOrder = true }
+        }
+        .loadingOverlay(isPlacingOrder)
+        .trackScreen("Checkout")
+    }
+}
+```
+
+Four concerns are now four pieces, not sixteen classes. Remove `.trackScreen` and nothing else changes; change the analytics vendor by giving the environment a different `Analytics` value at the app's root, and no screen changes.
+
+### Orthogonality you already use
+
+SwiftUI's own modifiers are mostly orthogonal: `.font`, `.padding` and `.foregroundStyle` combine in any order without interfering. Swift Concurrency's structured tasks are orthogonal to the code inside them: cancellation flows through any `async` function without that function mentioning it. When you design an API, aim for the same property: options that combine freely, rather than modes that interact.
+
+## When separation goes too far
+
+Separation has costs, and they grow quietly:
+
+- **Layers with no concern behind them.** A `ProfileService` that calls a `ProfileManager` that calls a `ProfileRepository` that calls a `ProfileDataSource`, each forwarding the same call. That's sometimes called lasagna code: every layer adds a hop, and none adds a reason. Separate along the lines where things *change*, not by a template of file types.
+- **A flow nobody can follow.** When analytics fires from a modifier, a decorator and an observer, a new teammate can't find where the "purchase" event comes from. Keep the composition visible in one place, the composition root or the root view, so the wiring can be read top to bottom.
+- **Premature generality.** A logging decorator for an app with one endpoint and no logs is a guess about the future. Inline is fine until the second or third use.
+
+## Trade-offs
+
+| Approach | Adding a concern to one screen | Changing a concern everywhere | Readability | Wins when |
+| --- | --- | --- | --- | --- |
+| Inline in each feature | Easy | Every feature changes (scattering) | High locally, low overall | One or two screens, early prototypes |
+| A base class bundling concerns | Free, whether you want it or not | One place | Medium: behaviour comes from above | Rarely; concerns that truly apply to every screen and never vary |
+| Decorators and modifiers, composed at the root | One line | One place | High, if the composition is in one visible place | Cross-cutting concerns in an app of any size |
+| Events observed by a separate layer | No feature change | One place | Low: the flow is indirect | Many independent consumers of the same events, such as analytics and logging |
+
+<Callout kind="interview">
+
+**Say** how cross-cutting concerns stay out of features: "Auth, logging and retries are wrappers around the HTTP client, composed at launch. Screens log a view with one modifier, and analytics is an environment value, so switching vendor touches only the app's root." **Ask** which concerns apply everywhere (auth, offline, accessibility, localisation), since those decide the wrappers you need. **Red flags:** a `BaseViewController` every screen inherits from, analytics calls in every view model method, and a networking layer that shows alerts or logs the user out by itself.
+
+</Callout>
+
+<Callout kind="gotcha" title="iOS gotcha: a missing environment object is a crash">
+
+`@Environment(Model.self)` separates wiring from use nicely, but it moves a check from compile time to run time. If no ancestor called `.environment(model)`, which is common in previews, sheets and new screens, the app stops with a fatal error saying no observable object of that type was found. Prefer environment values with a sensible default, like `Analytics.disabled` above, for optional concerns, and pass required dependencies through initialisers.
+
+</Callout>
+
+## Practice
+
+The review **the AppManager** has concerns tangled into one singleton: networking, caching, analytics, haptics and formatting. Plan how you'd separate them, and check that your plan doesn't just turn one tangled class into five tangled ones.
+
+```cards
+- id: separation-definition
+  front: "What does separation of concerns mean?"
+  back: "Each aspect of a problem (layout, rules, data access, logging…) gets a place where it can be understood and changed without reading the others. Split along what changes for different reasons."
+- id: scattering-tangling
+  front: "What are scattering and tangling?"
+  back: "Scattering: one concern spread over many places, like analytics calls in every view model. Tangling: many concerns mixed in one place, like a method that's half rules and half logging."
+- id: orthogonality
+  front: "When are two parts of a design orthogonal?"
+  back: "When changing one has no effect on the other. Test: if one requirement changes dramatically, only one module should change."
+- id: base-class-problem
+  front: "Why is a base view controller with analytics, a spinner and keyboard handling a poor design?"
+  back: "It welds independent concerns together, so screens get all of them or fight the superclass, and every combination needs another subclass. Composable pieces like view modifiers let each screen pick."
+```
+
+```quiz
+- id: q1
+  type: sort
+  prompt: "Which of these is a cross-cutting concern, and which belongs to one feature?"
+  buckets: [Cross-cutting, One feature]
+  items:
+    - [Adding the auth token to every request, 0]
+    - [The rule that orders over £40 ship free, 1]
+    - [Recording how long each request takes, 0]
+    - [The layout of the order confirmation screen, 1]
+    - [Reporting errors to the crash reporter, 0]
+  explain: "Auth, timing and error reporting apply to every feature, so each belongs in one wrapper or service. A shipping rule and a screen's layout belong to one feature."
+- id: q2
+  type: mcq
+  prompt: "Product asks for a \"purchase completed\" analytics event with the basket's value. Where should the vendor call go, so that switching analytics vendor later touches the least code?"
+  options:
+    - "In the checkout view model, calling the vendor's SDK directly"
+    - "In `BaseViewController.viewDidDisappear`"
+    - "The checkout emits a domain event, and one analytics layer translates events into vendor calls"
+    - "In the payment SDK's completion handler"
+  answer: 2
+  explain: "Checkout states what happened in its own words; one analytics layer owns the vendor and its naming. Switching vendor then changes that layer only. Calling the SDK from the view model scatters it, and a base class or the payment SDK tangles unrelated concerns."
+- id: q3
+  type: estimate
+  prompt: "A base view controller offers 5 independent concerns, each of which a screen may or may not want. How many combinations could a screen need, which subclasses or flags would have to cover?"
+  answer: 32
+  unit: combinations
+  within: { percent: 10 }
+  explain: "Each concern is on or off, so 2⁵ = 32 combinations. As composable pieces, it's 5 pieces, combined freely by each screen. That gap is what orthogonality buys."
+- id: q4
+  type: truefalse
+  prompt: "Adding a protocol and a separate layer for each step of a call (service, manager, repository, data source) always improves separation of concerns."
+  answer: false
+  explain: "A layer is only worth it if it holds a concern that changes for its own reasons. Layers that only forward calls add hops and hide the flow without separating anything."
+- id: q5
+  type: mcq
+  prompt: "A teammate's `APIClient` shows a login screen itself whenever a request returns `401`. What's the main problem?"
+  options:
+    - "It's slow to present a screen from a network callback"
+    - "Networking now depends on UI and navigation, so the client can't be used from a widget, a background task or tests, and the app's flow is decided in the wrong layer"
+    - "401 responses should be retried instead"
+    - "The login screen should be pushed rather than presented"
+  answer: 1
+  explain: "That tangles transport, session and navigation. The client should report \"unauthorised\" (or a session layer should try a token refresh), and whoever owns navigation decides to show sign-in. Then the same client works in a widget, a background task or a test."
+```

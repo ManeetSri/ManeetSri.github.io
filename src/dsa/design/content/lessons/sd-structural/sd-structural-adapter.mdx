@@ -1,0 +1,343 @@
+## Why it matters
+
+Every app leans on code whose shape it doesn't control: an analytics or payments SDK, a maps provider, an Objective-C class from 2014, a backend that names everything in snake_case. If that shape spreads through your screens and view models, the vendor's decisions become yours, and replacing it means touching every file that uses it. An **adapter** puts the translation in one place, so the rest of the app depends on an interface you designed. "How would you integrate this third-party SDK?" is one of the most common questions in mobile interviews, and the adapter is the heart of a good answer.
+
+## The problem: an interface that doesn't fit
+
+Picture a shopping app that adopts an analytics SDK called Beacon. Its API is one method, `logEvent(_:parameters:)`, taking an event name and a dictionary of strings. It's easy to call, so it gets called everywhere: the basket, the product page, checkout, search. A year later:
+
+- Forty files import Beacon, and each spells its event names by hand. One says `"add_to_cart"`, another `"addToCart"`, and the dashboards quietly split.
+- Tests for the checkout view model either send real events or can't run at all.
+- The company switches to another vendor, and the change touches every screen.
+
+None of this is Beacon's fault. The app let a vendor's interface become its own.
+
+## The pattern: target, adaptee, adapter
+
+An adapter has three roles:
+
+- **Target**: the interface your code wants to call. In Swift it's a protocol, and *your app owns it*: it's written in the app's vocabulary and lives next to the code that uses it.
+- **Adaptee**: the existing thing with the wrong interface, such as the SDK or the legacy class.
+- **Adapter**: a type that conforms to the target, holds the adaptee, and translates every call.
+
+<Callout kind="analogy">
+
+A travel plug adapter. Your charger has a UK plug and the hotel socket is European. You rewire neither: the adapter between them converts one shape into the other. Travel somewhere else and you swap the adapter, not the charger.
+
+</Callout>
+
+The word that matters is *owns*. This is [dependency inversion](/design/learn/sd-solid-dip) at the edge of your app: the policy (checkout) owns the abstraction (`AnalyticsTracking`), and the detail (Beacon) is plugged in behind it. The adapter is the only code that depends on both.
+
+```visual flow
+title: Only the adapter knows the SDK exists
+nodes:
+  - { id: vm, label: Checkout view model, kind: service, at: [0, 0] }
+  - { id: adapter, label: Beacon adapter, kind: service, at: [2, 0] }
+  - { id: sdk, label: Beacon SDK, kind: external, at: [4, 0] }
+  - { id: fake, label: Recording fake, kind: service, at: [0, 2] }
+groups:
+  - { id: app, label: Your app, nodes: [vm, adapter, fake] }
+edges:
+  - [vm, adapter, track(event)]
+  - [adapter, sdk, logEvent]
+  - [vm, fake, track(event)]
+steps:
+  - say: The view model calls `track(_:)` on `any AnalyticsTracking`, a protocol written in the app's words. In the running app, an adapter stands behind it.
+    show: [vm, adapter]
+    send: vm->adapter
+  - say: "The adapter is the only type that imports Beacon. It turns `.checkoutCompleted(totalPence: 2499)` into Beacon's `purchase` event with `value=24.99`."
+    send: adapter->sdk
+    label: { adapter->sdk: purchase }
+  - say: In tests and previews the same protocol is backed by a **recording fake**, so the view model is tested without sending a single real event.
+    hide: [adapter, sdk]
+    show: [fake]
+    send: vm->fake
+```
+
+## An adapter for an analytics SDK
+
+Here's the whole arrangement. The SDK is a stand-in that prints what it receives, so you can see the translation happen.
+
+```swift run
+import Foundation
+
+// The vendor's SDK. You can't change it.
+final class BeaconClient {
+    func logEvent(_ name: String, parameters: [String: String]) {
+        let pairs = parameters.sorted { $0.key < $1.key }.map { "\($0.key)=\($0.value)" }
+        print("Beacon: \(name) \(pairs.joined(separator: " "))")
+    }
+}
+
+// The target: shaped by what the app needs, not by Beacon
+enum AnalyticsEvent {
+    case screenViewed(String)
+    case addedToBasket(productID: String, quantity: Int)
+    case checkoutCompleted(totalPence: Int)
+}
+
+protocol AnalyticsTracking {
+    func track(_ event: AnalyticsEvent)
+}
+
+// The adapter: the only type that knows Beacon's names and formats
+struct BeaconAnalytics: AnalyticsTracking {
+    let client: BeaconClient
+
+    func track(_ event: AnalyticsEvent) {
+        switch event {
+        case .screenViewed(let name):
+            client.logEvent("screen_view", parameters: ["screen_name": name])
+        case .addedToBasket(let productID, let quantity):
+            client.logEvent("add_to_cart", parameters: ["item_id": productID, "quantity": String(quantity)])
+        case .checkoutCompleted(let totalPence):
+            let pounds = "\(totalPence / 100).\(String(format: "%02d", totalPence % 100))"
+            client.logEvent("purchase", parameters: ["value": pounds, "currency": "GBP"])
+        }
+    }
+}
+
+// A second implementation of the same target, for tests and previews
+final class RecordingAnalytics: AnalyticsTracking {
+    private(set) var events: [AnalyticsEvent] = []
+    func track(_ event: AnalyticsEvent) { events.append(event) }
+}
+
+let analytics: any AnalyticsTracking = BeaconAnalytics(client: BeaconClient())
+analytics.track(.screenViewed("Basket"))
+analytics.track(.addedToBasket(productID: "sku-42", quantity: 2))
+analytics.track(.checkoutCompleted(totalPence: 2499))
+
+let recorder = RecordingAnalytics()
+recorder.track(.checkoutCompleted(totalPence: 2499))
+print("The fake recorded \(recorder.events.count) event, and Beacon saw nothing")
+```
+
+```output
+Beacon: screen_view screen_name=Basket
+Beacon: add_to_cart item_id=sku-42 quantity=2
+Beacon: purchase currency=GBP value=24.99
+The fake recorded 1 event, and Beacon saw nothing
+```
+
+Look at what the adapter translates:
+
+- **Names.** The app says `.addedToBasket`; Beacon wants `add_to_cart`. The spelling lives in one `switch`, so it can't drift.
+- **Types.** The app keeps money as whole pence (an `Int`, so no floating-point rounding); Beacon wants a string with two decimal places.
+- **Vocabulary.** Beacon's parameter keys, its currency field, its idea of a "screen" all stay inside `BeaconAnalytics`.
+
+And notice what the target is *not*: a copy of `logEvent(_:parameters:)`. A protocol that mirrors the SDK method for method makes the SDK mockable, but not replaceable, and it lets every caller keep inventing event names. A target shaped by the app can say things the SDK can't, such as "there are exactly three events, with these fields". Adding the switch costs a few lines; the compiler then checks every event the app sends.
+
+## Adapting a callback API to async/await
+
+Adapters also translate *calling conventions*. Older SDKs, and older parts of your own app, report results through completion handlers or delegates. New code wants `async throws`. A checked continuation is the bridge:
+
+```swift check
+import Foundation
+
+struct Profile: Sendable {
+    let id: String
+    let name: String
+}
+
+enum ProfileError: Error {
+    case missing
+}
+
+// Legacy code you can't rewrite yet. It calls back on a queue of its own.
+final class LegacyProfileService: Sendable {
+    func fetchProfile(id: String, completion: @escaping @Sendable (Profile?, (any Error)?) -> Void) {
+        DispatchQueue.global().async {
+            completion(Profile(id: id, name: "Maneet"), nil)
+        }
+    }
+}
+
+// The target new code depends on
+protocol ProfileLoading: Sendable {
+    func profile(id: String) async throws -> Profile
+}
+
+struct LegacyProfileAdapter: ProfileLoading {
+    let service: LegacyProfileService
+
+    func profile(id: String) async throws -> Profile {
+        try await withCheckedThrowingContinuation { continuation in
+            service.fetchProfile(id: id) { profile, error in
+                if let profile {
+                    continuation.resume(returning: profile)
+                } else {
+                    continuation.resume(throwing: error ?? ProfileError.missing)
+                }
+            }
+        }
+    }
+}
+```
+
+The rule for continuations is strict: **resume exactly once, on every path.** The `if`/`else` covers all four combinations of `profile` and `error`, including the "neither" case that legacy APIs produce more often than their documentation admits. The awaiting task resumes on its own executor, so it doesn't matter which queue the SDK called back on.
+
+Two shortcuts are worth knowing before you write a continuation by hand:
+
+- **Objective-C SDKs may already have `async` methods.** Swift imports an Objective-C method whose last parameter is a completion handler twice: once as written, and once as an `async` method (SE-0297). Check the SDK's generated Swift interface first.
+- **Apple adapts its own delegate APIs.** Since iOS 17, `CLLocationUpdate.liveUpdates()` gives you location updates as an `AsyncSequence` instead of `CLLocationManagerDelegate` callbacks. For delegates nobody has adapted, an adapter that owns the delegate and feeds an `AsyncStream` does the same job.
+
+<Callout kind="gotcha" title="Swift gotcha: misusing a checked continuation">
+
+Resuming a `CheckedContinuation` twice is a runtime trap: the app crashes with a message that it "tried to resume its continuation more than once". Never resuming it is quieter and worse: the awaiting task hangs for ever, and you only get a console warning that the continuation leaked. SDKs that call back twice (a cached result, then a fresh one) or never (on some error paths) are exactly where adapters earn their keep: they turn the vendor's quirks into a contract that always holds.
+
+</Callout>
+
+## Translating errors and data at the boundary
+
+The third thing an adapter translates is meaning. Vendors report failure in their own terms: a numeric code, an `NSError` domain, a string. Map them onto your own error enum at the boundary:
+
+| The SDK says | The app's error | Why it matters to the app |
+| --- | --- | --- |
+| code 401 or 403 | `.misconfigured` | a bad API key: log it, don't show the user |
+| code 429 | `.rateLimited` | back off and try later |
+| `NSURLErrorNotConnectedToInternet` (-1009) | `.offline` | show the offline banner |
+| anything else | `.failed(code:)` | generic error, keep the code for diagnostics |
+
+Data gets the same treatment: the vendor's structs become your domain types, its units become yours (microdegrees to degrees, milliseconds to `Duration`), and its quirks are normalised. If one endpoint says "nothing found" with an empty array and another with error 404, the adapter decides that the app sees an empty array either way.
+
+Domain-driven design has a name for a boundary like this: an **anti-corruption layer**, which stops another system's model leaking into yours. An adapter is its smallest form. You'll meet it at the scale of whole modules in D30.
+
+## Retroactive conformance: the cheapest adapter
+
+Sometimes the adaptee already has almost the right shape. Then an extension can make it conform to your protocol, with no wrapper type at all. DesignKit, this course's Swift package, does it for `URLSession`:
+
+```swift check
+import Foundation
+
+protocol HTTPClient: Sendable {
+    func send(_ request: URLRequest) async throws -> (Data, HTTPURLResponse)
+}
+
+extension URLSession: HTTPClient {
+    func send(_ request: URLRequest) async throws -> (Data, HTTPURLResponse) {
+        let (data, response) = try await data(for: request)
+        guard let http = response as? HTTPURLResponse else { throw URLError(.badServerResponse) }
+        return (data, http)
+    }
+}
+```
+
+The extension still translates (it narrows `URLResponse` to `HTTPURLResponse`), but `URLSession` itself is the adapter. This is the protocol-based version of what the original *Design Patterns* book calls a class adapter.
+
+Swift 6 warns about a conformance like this only when *both* the type and the protocol come from other modules, because two libraries could add the same conformance and clash (SE-0364); you silence it with `@retroactive` once you've accepted that risk. When the protocol is yours, as here, there's no warning.
+
+The danger with retroactive conformance is the pull it exerts on the target. When the shapes don't quite match, it's tempting to change *your* protocol until the extension compiles, and then the vendor is designing your interface again. Use it when the shapes genuinely match; write a wrapper when there's real translation to do.
+
+## Wrapping legacy code in your own app
+
+The same pattern moves old code out of the way. Suppose half the app calls `NetworkManager.shared`, a singleton from years ago. Write the protocol new code should depend on, and an adapter that forwards to the singleton:
+
+1. New features take `any ProfileLoading` in their initialiser and never mention `NetworkManager`.
+2. The adapter is the one place the old singleton is used.
+3. Later, you replace the adapter's insides (or the adapter itself) and no feature notices.
+
+That's how you get the testable alternatives from [the singleton lesson](/design/learn/sd-creational-singleton-alternatives) into a codebase that can't be rewritten in one go.
+
+## Trade-offs
+
+| | Call the SDK directly | Retroactive conformance | Wrapper adapter | Adapter in its own module |
+| --- | --- | --- | --- | --- |
+| Code to write | none | a few lines | one small type | a module and its type |
+| Testability | poor: tests hit the SDK | good | good | good |
+| Cost of changing vendor | every call site | high if the protocol bent to fit | one type | one module |
+| Vendor types leak into the app | everywhere | through the protocol's shape | no | no, and imports enforce it |
+| Vendor-only features | all of them | all of them | only what you expose | only what you expose |
+
+Call the SDK directly in a prototype, or when the SDK *is* the feature (a screen built around `MKMapView` and nothing else). Use retroactive conformance when the shapes already match. A wrapper adapter is the right default for any third-party SDK that's called from more than one place. Give the adapter its own module when many features use the SDK and you want the build to guarantee that nothing else imports it (you'll set that up in D61).
+
+<Callout kind="interview">
+
+**What to say:** "I'd keep the SDK behind a protocol in our own terms, with one adapter that's the only code importing it, created in the composition root. Tests and previews get a fake. The adapter maps the vendor's errors and types into ours, and normalises its quirks."
+
+**What to ask:** what we actually need from the SDK (only events? identity? remote config?), whether it must be configured at launch or on the main thread, which queue its callbacks arrive on, what happens when it's slow or down, and what data we're allowed to send it.
+
+**Red flags:** vendor types in view models; a protocol that mirrors the SDK one to one "so we can mock it"; no answer for vendor-only features that the protocol hides.
+
+</Callout>
+
+<Callout kind="gotcha" title="iOS gotcha: SDKs that must start at launch">
+
+Many SDKs (crash reporters especially) must be configured in `application(_:didFinishLaunchingWithOptions:)`, often on the main thread, or they miss early crashes. Don't hide that configuration inside an adapter that's created lazily on first use. Create the adapter, and configure the SDK, in the composition root at launch.
+
+</Callout>
+
+<Callout kind="warning">
+
+An adapter that hides every vendor-specific feature leaves you with the lowest common denominator of all possible vendors. When the app genuinely needs something only this SDK does, such as its experiment assignments, add a second, narrow protocol for it (`ExperimentAssigning`) rather than handing out the SDK itself.
+
+</Callout>
+
+## Practice
+
+The kata adapts a geocoding SDK called Atlas: a completion handler to turn into `async throws`, coordinates in millionths of a degree, numeric error codes to map onto the app's own errors, and a vendor bug that sometimes calls back twice. It's every job from this lesson in one small type.
+
+```cards
+- id: adapter-roles
+  front: "What are the three roles in the adapter pattern?"
+  back: "The **target** (the interface your code calls, owned by your app), the **adaptee** (the SDK or legacy code with the wrong interface) and the **adapter** (conforms to the target and translates each call)."
+- id: adapter-target-shape
+  front: "Why shouldn't the target protocol mirror the SDK's methods one to one?"
+  back: "It makes the SDK mockable but not replaceable: the vendor's shape, names and types still leak into every caller. Shape the target by what the app needs, and translate in the adapter."
+- id: adapter-continuation
+  front: "What's the rule for a checked continuation in a callback adapter?"
+  back: "Resume it exactly once on every path. Twice crashes; never leaves the awaiting task suspended for ever."
+- id: adapter-translations
+  front: "What three things does an adapter typically translate?"
+  back: "The calling convention (callbacks or delegates to async), the data (vendor types and units to domain types) and the errors (vendor codes to the app's error enum)."
+```
+
+```quiz
+- id: q1
+  type: mcq
+  prompt: "Your app adds a payments SDK whose `PaymentSheet.present` reports a vendor `PSResult` with numeric codes. Which design makes a later switch to another payments provider cheapest?"
+  options:
+    - "Import the SDK in each checkout view model and switch on `PSResult` there"
+    - "A `PaymentProcessing` protocol that copies the SDK's methods and `PSResult`, so it can be mocked"
+    - "A `PaymentProcessing` protocol in the app's terms (an amount in, an outcome enum out), with one adapter that maps `PSResult`"
+    - "Subclass `PaymentSheet` and override the methods the app uses"
+  answer: 2
+  explain: "Only the third keeps the vendor in one place. The second is mockable, but `PSResult` and the vendor's method shapes still appear in every caller, so a new provider changes them all. Subclassing ties you to the vendor's class hierarchy, and often isn't allowed at all."
+- id: q2
+  type: bug
+  prompt: "This adapter crashes some of the time. Click the faulty line."
+  code: |
+    func profile(id: String) async throws -> Profile {
+        try await withCheckedThrowingContinuation { continuation in
+            service.fetchProfile(id: id) { profile, error in
+                if let profile {
+                    continuation.resume(returning: profile)
+                }
+                continuation.resume(throwing: error ?? ProfileError.missing)
+            }
+        }
+    }
+  answer: 7
+  explain: "After a success, line 7 still runs, so the continuation is resumed twice, which traps. It needs to be the `else` branch of the `if`, so every path resumes exactly once."
+- id: q3
+  type: sort
+  prompt: "Does each of these belong in the app's target protocol (and its types), or inside the adapter?"
+  buckets: [The app's target, Inside the adapter]
+  items:
+    - ["`func track(_ event: AnalyticsEvent)`", 0]
+    - ["Beacon's event name `add_to_cart`", 1]
+    - ["The `AnalyticsEvent.checkoutCompleted(totalPence:)` case", 0]
+    - ["Formatting 2499 pence as the string `\"24.99\"`", 1]
+    - ["A `.rateLimited` case in the app's error enum", 0]
+    - ["Knowing that the vendor's code 429 means rate limited", 1]
+  explain: "The target is written in the app's vocabulary: events, amounts and errors the app understands. Everything that is a fact about the vendor (its names, formats and codes) stays inside the adapter, so changing vendor changes only that file."
+- id: q4
+  type: truefalse
+  prompt: "In Swift 6, `extension BeaconClient: AnalyticsTracking {}` produces a retroactive-conformance warning even though `AnalyticsTracking` is declared in your own app."
+  answer: false
+  explain: "The warning (SE-0364) appears only when both the type and the protocol come from other modules, because two libraries could then add the same conformance. Conforming someone else's type to your own protocol is fine."
+- id: q5
+  type: recall
+  prompt: "In an interview: \"Why not call the analytics SDK directly? Wrapping it is extra code.\" Give a balanced answer."
+  model: "Calling it directly is fine for a prototype, or when the SDK is the whole feature. For an SDK used across many screens, a small adapter pays for itself: event names and formats live in one place so they can't drift, view models can be tested with a fake, the vendor can be replaced by changing one type, and the vendor's errors and quirks are normalised at the boundary. The cost is a protocol and one type, plus some lowest-common-denominator risk, which I'd handle with narrow extra protocols for vendor-only features."
+```

@@ -1,0 +1,277 @@
+## Why it matters
+
+Some data is needed by many views at many depths: the colour scheme, the locale, a theme, the signed-in session, a way to show a toast. Passing it through every initialiser buries the real parameters in noise; reaching for a singleton hides the dependency and breaks previews. SwiftUI gives you two channels instead: the **environment**, for values flowing **down** the tree, and **preferences**, for values flowing **up**. Interviewers ask "how would a deeply nested button get the analytics logger?", and the strong answer weighs explicit parameters against the environment rather than picking one by habit.
+
+## The environment flows down
+
+Every view has a set of `EnvironmentValues` that it inherits from its ancestors. A modifier like `.environment(\.locale, Locale(identifier: "de"))` changes a value **for that subtree only**: everything inside sees the new value, siblings and ancestors don't, and an inner override beats an outer one. A view reads a value with `@Environment(\.key)`.
+
+You use the environment constantly without naming it:
+
+- **System values** SwiftUI fills in: `colorScheme`, `dynamicTypeSize`, `locale`, `horizontalSizeClass`, `scenePhase`, `accessibilityReduceMotion`, `isEnabled`.
+- **Modifiers that write it:** `.font(_:)`, `.tint(_:)`, `.disabled(_:)`, `.redacted(reason:)`. `.disabled(true)` on a `Form` sets `isEnabled` to false, and every control inside reads it.
+- **Actions** SwiftUI provides as values: `dismiss`, `openURL`, `refresh`. They're structs you call like functions.
+
+Here's both channels on one screen; step through it, then the code shows each piece.
+
+```visual flow
+title: Values flow down, preferences flow up
+layers:
+  - { label: Ancestors, rows: [0, 0] }
+  - { label: Descendants, rows: [1, 2] }
+nodes:
+  - { id: sheet, label: EditProfileSheet, kind: view, at: [1, 0] }
+  - { id: form, label: Form, kind: view, at: [1, 1] }
+  - { id: name, label: NameSection, kind: view, at: [0, 2] }
+  - { id: address, label: AddressSection, kind: view, at: [2, 2] }
+edges:
+  - [sheet, form]
+  - [form, name]
+  - [form, address]
+steps:
+  - say: "The sheet sets `.environment(\\.cardDensity, .compact)`. The value is now part of its subtree's environment."
+    show: [sheet]
+    state: { sheet: active }
+    label: { sheet: "writes density" }
+  - say: "It flows down to every descendant. Neither section takes a parameter for it, and each reads it with `@Environment(\\.cardDensity)`."
+    show: [form, name, address]
+    send: [sheet->form, form->name, form->address]
+    state: { sheet: null }
+    label: { sheet: null, name: compact, address: compact }
+  - say: "The user edits the address. `AddressSection` sets a **preference**: it has unsaved changes. `NameSection` reports the default, false."
+    state: { address: active }
+    label: { name: "dirty: false", address: "dirty: true" }
+  - say: "SwiftUI combines the values on the way up with the key's `reduce` (here, OR) and the sheet reads `true`, so it blocks swipe-to-dismiss."
+    send: [address->form, form->sheet]
+    state: { address: null, sheet: ok }
+    label: { sheet: "dirty: true" }
+```
+
+## Your own environment values with `@Entry`
+
+Declare a value once, with a default, and it's available everywhere:
+
+```swift check ios group=env title="CardDensity.swift"
+import SwiftUI
+
+enum CardDensity: Sendable {
+    case regular, compact
+}
+
+extension EnvironmentValues {
+    @Entry var cardDensity: CardDensity = .regular
+}
+
+extension View {
+    /// Reads better at the call site than `.environment(\.cardDensity, …)`
+    func cardDensity(_ density: CardDensity) -> some View {
+        environment(\.cardDensity, density)
+    }
+}
+
+struct OrderCard: View {
+    let title: String
+    @Environment(\.cardDensity) private var density
+
+    var body: some View {
+        Text(title)
+            .padding(density == .compact ? 8 : 16)
+            .background(.quaternary, in: .rect(cornerRadius: 12))
+    }
+}
+```
+
+`@Entry` arrived with Xcode 16 and back-deploys to every iOS version SwiftUI supports. Older code writes the same thing by hand: a type conforming to `EnvironmentKey` with a `static let defaultValue`, plus a computed property on `EnvironmentValues`. Either way, **the default is a design decision**: a view that reads the value always gets something, so it never crashes and its previews work with no setup.
+
+Values can be actions too. A deep view that wants to show a toast shouldn't know who draws toasts; it should call one:
+
+```swift check ios group=env
+struct ShowToastAction {
+    private let handler: @MainActor (String) -> Void
+
+    init(_ handler: @escaping @MainActor (String) -> Void) {
+        self.handler = handler
+    }
+
+    @MainActor func callAsFunction(_ message: String) {
+        handler(message)
+    }
+}
+
+extension EnvironmentValues {
+    @Entry var showToast = ShowToastAction { _ in }      // default: do nothing
+}
+
+struct SaveAddressButton: View {
+    @Environment(\.showToast) private var showToast
+
+    var body: some View {
+        Button("Save address") { showToast("Address saved") }
+    }
+}
+
+struct AppRoot: View {
+    @State private var toast: String?
+
+    var body: some View {
+        SaveAddressButton()
+            .environment(\.showToast, ShowToastAction { message in toast = message })
+            .overlay(alignment: .bottom) {
+                if let toast {
+                    Text(toast).padding().background(.thinMaterial, in: .capsule)
+                }
+            }
+    }
+}
+```
+
+The button depends on a capability, not on the toast system. The root installs the real one; a preview or a test installs one that records the message. That's dependency injection through the environment, which D21 develops properly.
+
+## Objects in the environment
+
+`.environment(session)` puts an `@Observable` object into the environment, and `@Environment(Session.self) private var session` finds it, as the Observable lesson's `PayButton` did. Use it for **shared models** that many views at different depths need: the signed-in session, the cart, the audio player.
+
+The difference from a value: **an object has no default**. Reading one that no ancestor provided crashes with "No Observable object of type Session found". Inject such objects at the root of the app (and of every preview), or declare the property optional, `Session?`, when the view can do without it.
+
+### What a change in the environment costs
+
+Values and objects also differ in **what counts as a change**, and that decides how often readers update.
+
+- **A value** is compared with the one it replaces. Each time the ancestor that sets it runs its body, SwiftUI checks whether the new value differs, and invalidates every view that reads that key if it does. Small `Equatable` values such as `CardDensity` only trigger updates when they really change. A value holding a **closure** is the trap: `AppRoot` above builds a new `ShowToastAction` every time its body runs, and two closures can't be shown equal, so every reader of `showToast` is usually invalidated along with it. That's harmless while the root rarely re-runs, as here, but expensive if it sits high in a busy screen.
+- **An object** is the same reference every time, so injecting it never changes anything by itself. Readers update through Observation, only for the properties they read.
+
+So when an action needs state, such as a toast queue, it often reads better as an object: put a `@MainActor @Observable final class ToastCenter` in the environment with a `show(_:)` method, and let only the overlay that draws toasts read its `current` toast. Keep closure-based actions for stateless capabilities, created somewhere that rarely re-runs.
+
+## Preferences flow up
+
+Sometimes a child knows something its ancestor needs: the title it wants in the navigation bar, its size, whether it holds unsaved edits. A **preference** carries that upward. The child sets `.preference(key:value:)`, SwiftUI combines the values from every descendant with the key's `reduce`, and an ancestor reads the result with `.onPreferenceChange(_:perform:)`. `navigationTitle` and `toolbar` work this way: the pushed view declares them and the navigation stack reads them.
+
+```swift check ios group=env
+struct UnsavedChangesKey: PreferenceKey {
+    static let defaultValue = false
+
+    static func reduce(value: inout Bool, nextValue: () -> Bool) {
+        value = value || nextValue()           // dirty if any section is dirty
+    }
+}
+
+struct AddressSection: View {
+    let saved: String
+    @State private var draft: String
+
+    init(saved: String) {
+        self.saved = saved
+        _draft = State(initialValue: saved)     // a draft, seeded once on purpose
+    }
+
+    var body: some View {
+        Section("Address") {
+            TextField("Street", text: $draft)
+        }
+        .preference(key: UnsavedChangesKey.self, value: draft != saved)
+    }
+}
+
+struct EditProfileSheet: View {
+    @State private var hasUnsavedChanges = false
+
+    var body: some View {
+        Form {
+            AddressSection(saved: "1 Infinite Loop")
+        }
+        .cardDensity(.compact)
+        .onPreferenceChange(UnsavedChangesKey.self) { hasUnsavedChanges = $0 }
+        .interactiveDismissDisabled(hasUnsavedChanges)
+    }
+}
+```
+
+The sheet is a container that doesn't need to know which sections it holds. That's the strength of preferences, and their cost: the flow is implicit, values arrive after the children have been evaluated, and an ancestor that sets state which changes the preferences again can loop. When the parent already owns the data (here, it could own a draft model), plain data flow is clearer. Reach for preferences when the **child** is the only one that knows, as with titles, sizes and anchors.
+
+## Trade-offs
+
+| Mechanism | Direction | Visible at the call site? | If nothing provides it | Previews and tests | When it wins |
+| --- | --- | --- | --- | --- | --- |
+| Initialiser parameter | Down, one level | Yes | Compile error | Easiest | The default for most data |
+| Environment value (`@Entry`) | Down, any depth | No | The default value | Override per preview | Cross-cutting settings and actions: theme, density, toast, analytics |
+| Environment object | Down, any depth | No | Crash, unless optional | Inject a fake | Shared models: session, cart, player |
+| Preference | Up, combined | No | The default value | Read in the container | A child declaring facts: titles, sizes, dirty flags |
+| Singleton or global | Everywhere | No | n/a | Hard to replace | Rarely, and never reached from views |
+
+<Callout kind="interview">
+
+**Say:** "Parameters by default, because they're explicit and checked by the compiler. The environment when many views at different depths need the same thing, such as a theme, a logger or an action, with a safe default so previews work with no setup. Objects in the environment for shared models, injected at the root. Preferences when a child knows something its container needs." **Ask:** "How many views need this, and how deep are they?" **Red flags:** putting everything in the environment (dependencies nobody can see, crashes when one is missing), singletons called from views, and per-row data passed through the environment instead of parameters.
+
+</Callout>
+
+<Callout kind="gotcha" title="iOS gotcha: a hosting controller starts a new environment">
+
+A `UIHostingController` you create in UIKit begins its own SwiftUI tree. Values and objects set with `.environment` in another hierarchy don't reach it; only what the system derives from traits, such as the colour scheme and Dynamic Type, carries over. Inject at the root view you give the hosting controller, ideally from one helper that every hosting controller uses.
+
+</Callout>
+
+<Callout kind="gotcha" title="iOS gotcha: fast-changing values don't belong in the environment">
+
+Every view that reads an environment value is invalidated when it changes. A scroll offset or a progress value written into the environment re-runs every reader on every frame. Keep high-frequency values in an observable model read by a small leaf view.
+
+</Callout>
+
+## Practice
+
+The **podcast library** design exercise needs a now-playing bar on every tab and a shared library model. Decide what goes in the environment, what's passed as a parameter, and what default each environment value gets.
+
+```cards
+- id: env-down
+  front: "How does an environment value reach a view, and how far does an override reach?"
+  back: "Each view inherits its ancestors' environment. `.environment(\\.key, value)` changes it for that subtree only; inner overrides beat outer ones and siblings are unaffected."
+- id: env-entry
+  front: "Why does an `@Entry` environment value need a good default?"
+  back: "Every reader gets the default when no ancestor set one, so views never crash and previews work without setup. Environment objects have no default and crash when missing."
+- id: env-preferences
+  front: "What are preferences for?"
+  back: "Data flowing up: a child declares a value, SwiftUI combines descendants' values with the key's `reduce`, and an ancestor reads the result. Titles, sizes and unsaved-change flags are typical."
+```
+
+```quiz
+- id: q1
+  type: sort
+  prompt: "How should each reach the view that needs it?"
+  buckets: [Initialiser parameter, Environment value, Environment object, Preference]
+  items:
+    - ["The episode a row shows", 0]
+    - ["Compact or regular card density for a whole section", 1]
+    - ["An action that shows a toast from anywhere", 1]
+    - ["The signed-in session that 30 screens read", 2]
+    - ["A form section telling its sheet it has unsaved edits", 3]
+    - ["The title a pushed screen wants in the navigation bar", 3]
+  explain: "Per-view data is a parameter. Settings and actions many views share are environment values with defaults. Shared observable models are environment objects. Facts only a child knows travel up as preferences."
+- id: q2
+  type: mcq
+  prompt: "A preview of `ProfileHeader`, which declares `@Environment(Session.self) private var session`, crashes immediately. What's the best fix?"
+  options:
+    - "Replace the environment object with a singleton, `Session.shared`"
+    - "Inject a sample session in the preview with `.environment(Session.preview)`, and do the same at the app's root"
+    - "Wrap the header in `AnyView`"
+    - "Read the session inside `.task` instead of `body`"
+  answer: 1
+  explain: "Environment objects have no default, so whoever shows the view must provide one. The singleton hides the dependency and makes every preview share global state. If the header can genuinely work without a session, declare it `Session?`."
+- id: q3
+  type: mcq
+  prompt: "A `VStack` has `.cardDensity(.compact)`. Inside it, `CardA` has no modifier and `CardB` has `.cardDensity(.regular)`. A card inside `CardB` reads the density. What does each see?"
+  options:
+    - "`CardA` compact, the card inside `CardB` regular"
+    - "Both compact: the outer value wins"
+    - "Both regular: the default always wins"
+    - "`CardA` regular, the card inside `CardB` compact"
+  answer: 0
+  explain: "Values flow down and the nearest override wins, for its subtree only."
+- id: q4
+  type: truefalse
+  prompt: "Preference values flow from an ancestor down to its children, like environment values."
+  answer: false
+  explain: "Preferences go the other way: children set them, SwiftUI reduces them on the way up, and an ancestor reads the combined value."
+- id: q5
+  type: recall
+  prompt: "A `LikeButton` five levels deep must log an analytics event. Would you pass the logger through initialisers or the environment? Justify it, and say what you'd do for previews and tests."
+  model: "Through the environment, as an `@Entry` value (or action) with a no-op default: many views at many depths log, so threading a logger through five initialisers adds noise to every view in between. The app root installs the real logger. Previews get the no-op default for free, and a test or snapshot can install a recording logger. The cost is that the dependency isn't visible in the button's initialiser, so I'd keep the set of environment services small and documented."
+```

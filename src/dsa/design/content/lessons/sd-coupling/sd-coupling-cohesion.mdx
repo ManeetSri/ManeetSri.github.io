@@ -1,0 +1,322 @@
+## Why it matters
+
+Every app has a type that everybody edits and nobody owns: an `AppManager`, a `NetworkManager` with a case for every endpoint, an `application(_:didFinishLaunchingWithOptions:)` that has grown to two hundred lines. Those types have low cohesion, and the scale in this lesson tells you *which kind*, which in turn tells you how to split them. In interviews, a cohesive design is one where you can say in one sentence what each part does; interviewers notice when you can't.
+
+## A scale from coincidental to functional
+
+The same 1970s work that ranked coupling also ranked cohesion, by asking one question of a module: **why are these things together?** From weakest to strongest:
+
+| Kind | Grouped because… | iOS example |
+| --- | --- | --- |
+| **Coincidental** | No reason; it was convenient | `Helpers.swift`, `Constants.swift` |
+| **Logical** | They're the same *category* of thing, picked by a parameter | One `API` enum with a case per endpoint for every feature |
+| **Temporal** | They run at the same time | Everything in `didFinishLaunchingWithOptions` |
+| **Procedural** | They run one after another in a procedure | A `checkout()` that validates, logs, clears search and updates a badge |
+| **Communicational** | They work on the same data | A repository that loads, caches and exports one profile |
+| **Sequential** | One's output is the next one's input | Download → decode → downsample → cache |
+| **Functional** | They all contribute to one well-defined task | `PriceFormatter`, `ImageDownsampler` |
+
+The top three rows are the ones that hurt. Procedural is a warning. The bottom three are what you're aiming for, and the difference between them rarely matters in practice.
+
+## The weak kinds, and how to fix them
+
+### Coincidental: the junk drawer
+
+You met `Helpers.swift` in [What coupling and cohesion are](/design/learn/sd-coupling-basics): functions that share a file only because someone needed somewhere to put them. Its relatives are a `Constants.swift` holding every feature's numbers and an `extension UIViewController` with thirty unrelated conveniences. The fix is always the same: give each function a home named after its job, usually next to the code that uses it.
+
+### Logical: one switch per property
+
+**Logical cohesion** groups things that are the same *kind* of thing, and picks between them with a parameter. In iOS code it shows up most often as one enum describing every endpoint:
+
+```swift check title="APIEndpoint.swift: logical cohesion"
+import Foundation
+
+enum APIEndpoint {
+    case login(email: String, password: String)
+    case feed(page: Int)
+    case profile(userID: String)
+    case checkout(cartID: String)
+
+    var path: String {
+        switch self {
+        case .login: "/auth/login"
+        case .feed(let page): "/feed?page=\(page)"
+        case .profile(let userID): "/users/\(userID)"
+        case .checkout(let cartID): "/carts/\(cartID)/checkout"
+        }
+    }
+
+    var method: String {
+        switch self {
+        case .login, .checkout: "POST"
+        case .feed, .profile: "GET"
+        }
+    }
+}
+```
+
+Each property is a switch over every feature. Adding one checkout endpoint means editing every switch, in a file that the feed, profile and auth teams also edit, so changes collide in review and merges. One feature's knowledge is scattered across five switches, and five features' knowledge is packed into one type.
+
+The cohesive version groups by feature instead. Each request is a small value that knows everything about itself, and it lives with the feature that uses it:
+
+```swift check title="One request type per endpoint"
+import Foundation
+
+protocol APIRequest {
+    associatedtype Response: Decodable
+    var path: String { get }
+    var method: String { get }
+}
+
+// Lives in the Checkout feature, next to the code that calls it
+struct CheckoutRequest: APIRequest {
+    struct Response: Decodable {
+        let orderID: String
+    }
+
+    let cartID: String
+    var path: String { "/carts/\(cartID)/checkout" }
+    var method: String { "POST" }
+}
+```
+
+The enum has one real advantage: every endpoint is visible in one place. On a small team with a dozen endpoints that can be worth it. It stops being worth it when several teams add endpoints every week.
+
+Logical cohesion also hides in functions: `func handle(_ action: String, payload: [String: Any])` with a `switch action` inside is a dozen functions wearing one name.
+
+### Temporal: everything at launch
+
+**Temporal cohesion** groups things because they happen at the same moment. The app delegate is its natural home:
+
+```swift check ios title="AppDelegate.swift: temporal cohesion"
+import UIKit
+
+final class AppDelegate: NSObject, UIApplicationDelegate {
+    func application(_ application: UIApplication, didFinishLaunchingWithOptions launchOptions: [UIApplication.LaunchOptionsKey: Any]? = nil) -> Bool {
+        // Crash reporting, appearance, database migration, push, flags, analytics, audio…
+        UINavigationBar.appearance().tintColor = .systemIndigo
+        UserDefaults.standard.register(defaults: ["launchCount": 0])
+        UserDefaults.standard.set(UserDefaults.standard.integer(forKey: "launchCount") + 1, forKey: "launchCount")
+        application.registerForRemoteNotifications()
+        return true
+    }
+}
+```
+
+The lines belong to different features and change for different reasons; the only thing they share is the moment they run. That's better than coincidence (at least the timing is a real relationship), but it has a second problem: the order between the lines is hidden temporal coupling. Crash reporting must start first, or a crash in the migration goes unreported, and nothing in the code says so.
+
+Split it into one small type per concern, each with a name, and make the order an explicit list that the delegate runs:
+
+```swift check title="Launch steps with an explicit order"
+@MainActor
+protocol LaunchStep {
+    var name: String { get }
+    func run()
+}
+
+@MainActor
+struct Launcher {
+    // The order is data now: crash reporting first, everything else after
+    let steps: [any LaunchStep]
+
+    func launch() {
+        steps.forEach { $0.run() }
+    }
+}
+```
+
+The same shape fits a bloated `viewDidLoad` or `.onAppear`: each block of set-up becomes a named method or a separate object, and the lifecycle method only calls them.
+
+### Procedural: a recipe of unrelated steps
+
+**Procedural cohesion** groups steps that follow one another, but act on different data. A `completeCheckout()` that validates the address form, sends an analytics event, clears the search history and updates the tab badge is a procedure. Each step belongs to a different part of the app; the function is just the place where they meet. Keep the procedure as a short coordinator that *calls* each part, and move each step's details into the part that owns its data.
+
+## The strong kinds
+
+The bottom three rows are what good types look like, and you rarely need to tell them apart:
+
+- **Communicational:** a `ProfileRepository` that loads, caches and saves one profile. Everything touches the same data.
+- **Sequential:** an image pipeline, where each stage's output is the next stage's input. Each stage is often a functional unit of its own.
+- **Functional:** a `PriceFormatter` turns pence and a currency into text, and that's all. You can describe it in one sentence without "and".
+
+That last test is the most useful one you'll carry away: **describe the type in one sentence.** If the sentence needs "and" or "or", you've probably found two jobs.
+
+## Measuring cohesion inside a type
+
+For a class or view model, there's a more mechanical test. Draw each method, and connect it to the stored properties it uses and the methods it calls. If the drawing falls into separate islands, you have several types sharing one name. This is the idea behind the **LCOM** metrics (lack of cohesion in methods; the LCOM4 variant counts the islands directly).
+
+```swift check title="ProfileViewModel.swift"
+import Foundation
+import Observation
+
+struct Profile {
+    let name: String
+}
+
+@Observable @MainActor
+final class ProfileViewModel {
+    var profile: Profile?
+    var isLoading = false
+    var exportProgress = 0.0
+    var exportedFileURL: URL?
+
+    func load() async {
+        isLoading = true
+        profile = Profile(name: "Ada")
+        isLoading = false
+    }
+
+    func retry() async {
+        await load()
+    }
+
+    func exportPDF() async {
+        exportProgress = 1
+        exportedFileURL = URL.temporaryDirectory.appending(path: "profile.pdf")
+    }
+
+    func cancelExport() {
+        exportProgress = 0
+    }
+}
+```
+
+Step through its drawing:
+
+```visual flow
+title: Two islands in one view model
+nodes:
+  - { id: load, label: "load()", at: [0, 0] }
+  - { id: retry, label: "retry()", at: [0, 1] }
+  - { id: profile, label: profile, kind: store, at: [1.5, 0] }
+  - { id: loading, label: isLoading, kind: store, at: [1.5, 1] }
+  - { id: export, label: "exportPDF()", at: [3, 0] }
+  - { id: cancel, label: "cancelExport()", at: [3, 1] }
+  - { id: progress, label: exportProgress, kind: store, at: [4.5, 0] }
+  - { id: file, label: exportedFileURL, kind: store, at: [4.5, 1], w: 1.25 }
+groups:
+  - { id: showing, label: Showing the profile, nodes: [load, retry, profile, loading] }
+  - { id: exporting, label: Exporting it, nodes: [export, cancel, progress, file] }
+edges:
+  - [load, profile, { style: data }]
+  - [load, loading, { style: data }]
+  - [retry, load]
+  - [export, progress, { style: data }]
+  - [export, file, { style: data }]
+  - [cancel, progress, { style: data }]
+steps:
+  - say: Draw each method, and join it to the properties it uses and the methods it calls.
+    show: [load, retry, export, cancel, profile, loading, progress, file]
+  - say: "`load()` uses `profile` and `isLoading`, and `retry()` calls `load()`: one connected island."
+    active: [showing]
+  - say: "`exportPDF()` and `cancelExport()` share `exportProgress` and `exportedFileURL`: a second island."
+    active: [exporting]
+  - say: No line crosses from one island to the other. That's **two types sharing a name**, and LCOM4 for this class is 2.
+    state: { showing: ok, exporting: ok }
+  - say: "Split it along the gap: `ProfileViewModel` keeps the left island, and a new `ProfileExport` model owns the right one. Each now changes for its own reasons."
+    active: [showing, exporting]
+```
+
+Treat the islands as a strong hint, not a verdict. A view model that coordinates two islands for one screen can be fine while it's small. The signal to split is when the islands change for different reasons, or when one of them is needed on a second screen.
+
+## Cohesion in folders and modules
+
+The same scale applies one level up. Organising a project by **layer**, with folders called `Views`, `ViewModels`, `Services` and `Models`, is logical cohesion: each folder holds one category of thing from every feature, so changing checkout means opening four folders. Organising by **feature**, with `Checkout`, `Profile` and `Feed`, keeps what changes together in one place.
+
+Most real apps mix the two: features at the top, plus a few genuinely shared modules such as `DesignSystem` and `Networking` that every feature uses. You'll design that split properly in D61.
+
+## Trade-offs
+
+| Choice | Finding things | Cost of a feature change | Merge conflicts on big teams | Wins when |
+| --- | --- | --- | --- | --- |
+| One enum or type for all of a category (logical) | Everything in one place | Edits a shared file and every switch | Frequent | Small app, one team, few cases |
+| One type per job, grouped by feature (functional) | Search by feature name | Stays inside the feature | Rare | Several teams, or a category that grows weekly |
+| One big view model per screen | One file to read | Every change touches it | Moderate | Simple screens with one job |
+| A model per island | More types to wire up | Local to the island | Rare | Islands that change separately or are reused |
+
+<Callout kind="interview">
+
+**Say** what each part is for in one sentence as you draw it: "The `FeedRepository` loads and caches pages of the feed; that's all it does." **Ask** how many teams work in the codebase, since that changes how much a shared, logically cohesive file costs. **Red flags:** types named `Manager`, `Helper` or `Utils` with no noun saying what they manage, a single endpoint enum for a large app, and a launch method that sets up every feature inline.
+
+</Callout>
+
+<Callout kind="gotcha" title="iOS gotcha: ObservableObject makes poor cohesion slow, not just messy">
+
+With `ObservableObject`, a change to any `@Published` property notifies every view observing the object, so the export progress above would redraw the whole profile screen on every tick. The `@Observable` macro (iOS 17) tracks which properties each view actually reads, which removes most of that cost. It doesn't remove the design cost: the type still changes for two reasons.
+
+</Callout>
+
+<Callout kind="tip">
+
+Splitting a type across files with extensions organises it, but doesn't make it more cohesive. `ProfileViewModel+Export.swift` is still one type with two islands. Make it a separate type when the islands are truly separate.
+
+</Callout>
+
+## Practice
+
+The review **the AppManager** is a singleton with all three weak kinds of cohesion in one file. Name the kind of each section, then plan the split.
+
+```cards
+- id: cohesion-scale
+  front: "List the kinds of cohesion from weakest to strongest."
+  back: "Coincidental, logical, temporal, procedural, communicational, sequential, functional."
+- id: one-sentence-test
+  front: "What's the quickest test for a type's cohesion?"
+  back: "Describe what it does in one sentence. If the sentence needs \"and\" or \"or\", it probably has more than one job."
+- id: lcom-islands
+  front: "How do you spot two types hiding in one class?"
+  back: "Join each method to the properties it uses and the methods it calls. Separate islands with no connection between them (LCOM4 above 1) are separate types sharing a name."
+- id: layer-folders
+  front: "Why is organising folders by layer (Views, ViewModels, Services) a cohesion problem?"
+  back: "It's logical cohesion: each folder holds one category from every feature, so one feature's change spreads across all of them. Grouping by feature keeps it in one place."
+```
+
+```quiz
+- id: q1
+  type: order
+  prompt: "Put these kinds of cohesion in order, from weakest to strongest."
+  lines:
+    - "Coincidental: no reason beyond convenience"
+    - "Logical: the same category, chosen by a parameter"
+    - "Temporal: they run at the same moment"
+    - "Procedural: steps of one procedure on different data"
+    - "Communicational: they work on the same data"
+    - "Functional: one well-defined task"
+  explain: "The scale asks why things are together. Convenience and category are the weakest reasons, timing and procedure are a little better, and sharing data or a single purpose are the strong ones."
+- id: q2
+  type: sort
+  prompt: "Which kind of cohesion is each of these?"
+  buckets: [Coincidental, Logical, Temporal, Functional]
+  items:
+    - ["`StringUtils` with `slugify`, `isValidIBAN` and `emojiFlag(for:)`", 0]
+    - ["`func perform(_ action: AppAction)` with a switch over every feature's actions", 1]
+    - ["`sceneDidBecomeActive` that refreshes flags, resets the badge, resumes video and pings analytics", 2]
+    - ["`RelativeTimeFormatter` turning a date into \"5 min ago\"", 3]
+    - ["`enum Images` with a static property for every asset in the app", 1]
+  explain: "Unrelated string functions share a file by convenience. A switch over every action, or one enum for every asset, groups by category. Work that runs together on activation is temporal. A formatter with one job is functional."
+- id: q3
+  type: mcq
+  prompt: "A `SettingsViewModel` has 12 methods. Drawing which properties each one uses gives three islands: notifications, account deletion and theme. What should you do?"
+  options:
+    - "Nothing: one screen should have one view model"
+    - "Move each island into its own extension file"
+    - "Consider a model per island, especially if they change separately or are needed elsewhere, with the screen composing them"
+    - "Merge the properties so every method uses all of them"
+  answer: 2
+  explain: "Three islands are three jobs sharing a name. Extensions only spread the same type over more files. Separate models, composed by the screen, give each job a home; keep them together only while they're small and stable."
+- id: q4
+  type: truefalse
+  prompt: "Switching a view model from `ObservableObject` to `@Observable` fixes its low cohesion."
+  answer: false
+  explain: "`@Observable` removes the performance cost, because views only redraw for properties they read. The type still changes for several unrelated reasons, which is the design cost."
+- id: q5
+  type: mcq
+  prompt: "Your app has one `APIEndpoint` enum with 140 cases, edited by five teams. Pull requests often conflict in it. What's the cohesive alternative?"
+  options:
+    - "Split the enum into five files with extensions"
+    - "One small request type per endpoint, kept in the feature that uses it, conforming to a shared `APIRequest` protocol"
+    - "Generate the enum from the server's schema"
+    - "Sort the cases alphabetically to reduce conflicts"
+  answer: 1
+  explain: "The enum is logically cohesive: every switch holds a piece of every feature. Request types per endpoint keep each feature's knowledge together and stop teams editing the same switches. Extensions can't add enum cases, and sorting doesn't change the structure."
+```

@@ -1,0 +1,80 @@
+A feature flag's value can come from three places: an override someone set in the debug menu, the remote config fetched at launch, and the defaults bundled with the app. The first version had one `Settings` protocol with `value(for:)` and `set(_:for:)`, and the bundled defaults "conformed" with a `set` that did nothing. The debug menu's toggle called `set`, read the value back, and showed the old value, and QA lost a day to it.
+
+Build it so **no type promises what it can't do**, and so the layered settings honour the full writer contract and can be used anywhere a writer is expected.
+
+`SolidFlagLayers.LayeredSettings(overrides:fallbacks:)` with `value(for:)`, `set(_:for:)` and `layer(for:)`; `FixedValues`; `LocalOverrides`; `SolidFlagLayers.toggle(_:in:)`
+
+- **`SettingsReader`** only reads. **`SettingsWriter`** refines it with `set`, and its contract (in the stub's comments) says what every writer guarantees: a value you set reads back, the latest set wins, other keys don't change, and `set(nil, for:)` removes **this writer's own** value, so a read then returns whatever lies underneath (or `nil`).
+- **`FixedValues`** is a reader: the bundled defaults, or the last fetched remote config. It has no `set`, so nothing can call one by mistake.
+- **`LocalOverrides`** is a writer backed by a dictionary.
+- **`LayeredSettings`** reads its overrides first, then each fallback in order, and returns the first value found. Writes go to the overrides only. Because removing an override reveals the fallback's value, it keeps the writer contract exactly as written. `layer(for:)` says which layer a read would come from: `.overrides`, `.fallback(index)` or `nil`.
+- **`toggle`** flips a flag through the contract alone: `"on"` becomes `"off"`; anything else, including no value, becomes `"on"`. It's generic over `SettingsWriter`, so it must work on overrides and layered settings alike.
+
+The tests run **one contract check** against every writer, including a layered settings nested inside another. That's what Liskov substitution means in practice: one set of expectations, every conforming type.
+
+## Examples
+
+Bundled: `checkout.newFlow = off`, `feed.pageSize = 20`, `search.enabled = on`. Remote: `checkout.newFlow = on`, `feed.pageSize = 50`. Layered with fallbacks `[remote, bundled]`:
+
+| Call | Result |
+| --- | --- |
+| `value(for: "checkout.newFlow")` | `"on"`, from `.fallback(0)` (remote wins over bundled) |
+| `value(for: "search.enabled")` | `"on"`, from `.fallback(1)` |
+| `value(for: "missing")` | `nil`, and `layer(for:)` is `nil` |
+| `set("off", for: "checkout.newFlow")`, then read | `"off"`, from `.overrides`; the remote values are untouched |
+| then `set(nil, for: "checkout.newFlow")`, then read | `"on"` again, from `.fallback(0)` |
+| `toggle("checkout.newFlow", in: &settings)` on a fresh one | `"off"`, stored as an override |
+
+## Constraints
+
+- Values are strings; flags use `"on"` and `"off"`, but other settings (`feed.pageSize`) use other text.
+- `LayeredSettings` is generic over its overrides, so it can wrap any writer, including another `LayeredSettings`.
+- Everything is a value type: `set` is `mutating`, and copying a settings value copies its overrides.
+
+<Hints>
+<Hint>
+`FixedValues` and `LocalOverrides` are each a dictionary lookup; `LocalOverrides.set` is `values[key] = value`, which also removes the key when `value` is `nil`.
+</Hint>
+<Hint>
+`LayeredSettings.value(for:)`: try the overrides, then loop over the fallbacks and return the first non-nil value.
+</Hint>
+<Hint>
+`set` forwards to `overrides.set`. That one line is why the contract holds: removing the override is exactly "this writer's own value", and the fallbacks show through.
+</Hint>
+<Hint>
+`fallbacks.firstIndex { $0.value(for: key) != nil }` finds the fallback for `layer(for:)`.
+</Hint>
+</Hints>
+
+## Solutions
+
+<Approach title="Split read from write, and keep the writer's contract exactly" time="O(layers) per read" space="O(keys)">
+
+```swift
+public func value(for key: String) -> String? {
+    if let value = overrides.value(for: key) { return value }
+    for fallback in fallbacks {
+        if let value = fallback.value(for: key) { return value }
+    }
+    return nil
+}
+
+public mutating func set(_ value: String?, for key: String) {
+    overrides.set(value, for: key)
+}
+
+public func layer(for key: String) -> Layer? {
+    if overrides.value(for: key) != nil { return .overrides }
+    return fallbacks.firstIndex { $0.value(for: key) != nil }.map(Layer.fallback)
+}
+
+public static func toggle<Settings: SettingsWriter>(_ key: String, in settings: inout Settings) {
+    settings.set(settings.value(for: key) == "on" ? "off" : "on", for: key)
+}
+```
+
+The design decision came before the code. The old protocol forced read-only sources to pretend they could write, so their `set` **weakened the postcondition** every caller relied on ("what I set, I can read back"). Splitting `SettingsReader` from `SettingsWriter` means a bundled default *is not* a writer, and the compiler stops anyone from calling `set` on it.
+
+The subtle part is the `set(nil)` clause. "After removing, the value is `nil`" sounds natural, but a layered store can't keep it, because the fallback shows through. Writing the contract as "removes this writer's own value" keeps it true for every conformer, so `toggle`, the debug menu and any future generic code can rely on it. When a subtype can't keep a contract, choose between fixing the subtype and fixing the contract, deliberately, and test the result against every conformer, as these tests do.
+
+</Approach>

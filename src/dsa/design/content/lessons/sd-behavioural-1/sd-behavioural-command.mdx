@@ -1,0 +1,324 @@
+## Why it matters
+
+Undo and redo, a queue of edits made offline, a menu item with a keyboard shortcut, an action Siri can run for you: each treats "a request to do something" as a **value** that can be stored, passed around, reversed or replayed. That's the command pattern. On Apple platforms you meet it as `UndoManager`, `UICommand`, App Intents and `Operation`. "How would you add undo to this editor?" and "How would you keep the user's offline actions?" are both command questions.
+
+## A request as a value
+
+A **command** packages one request (what to do, to what, with which arguments) behind a common interface, so the code that triggers it doesn't need to know what it does. The classic roles:
+
+- **Command:** the packaged request, with a method to carry it out.
+- **Receiver:** the object that does the real work: the document, the list, the model.
+- **Invoker:** whatever triggers commands without understanding them: a button, a menu, an undo stack, a queue.
+
+Once a request is a value, you can do things to it that you can't do to a method call: keep a history of them, send them later, merge two that cancel out, write them to disk, log them for support, or replay them in a test.
+
+In Swift the smallest command is a closure, `() -> Void`. It's often enough, and it's what `UndoManager` stores. But a closure is opaque: you can't compare it, inspect it, encode it or merge it. When you need those, make the command an `enum` or `struct`.
+
+## Undo: commands that know their inverse
+
+There are two ways to undo a change:
+
+- **Record the inverse** of each change: "the title was Draft; set it back". That's the command pattern. Each step costs only what changed.
+- **Record a snapshot** of the whole state before each change, and restore it. That's the memento pattern, which you'll meet in D13. Simpler and always exact, but each step costs a copy.
+
+With inverses, undo and redo become two stacks. Undo pops a change, runs its inverse, and the inverse's own inverse goes on the redo stack:
+
+```visual flow
+title: Undo and redo as two stacks of inverses
+nodes:
+  - { id: undo, label: Undo stack, kind: store, at: [0, 0] }
+  - { id: note, label: Note, kind: store, at: [2, 2] }
+  - { id: redo, label: Redo stack, kind: store, at: [4, 0] }
+edges:
+  - [note, undo, inverse]
+  - [undo, note, undo]
+  - [note, redo, inverse]
+  - [redo, note, redo]
+steps:
+  - say: "The user renames the note. `rename` changes the title and pushes its inverse, *set the title back to Draft*, onto the undo stack."
+    send: note->undo
+    label: { undo: Rename, note: Shopping }
+  - say: "They add two tags in one action. Both inverses go on the stack as **one group**, so one Undo removes both."
+    send: note->undo
+    label: { undo: "Rename · Add Tags", note: "Shopping + 2 tags" }
+  - say: "Undo pops the top group and runs it. Running an inverse registers *its* inverse, and the undo manager files that on the **redo** stack, under the same name."
+    send: [undo->note, note->redo]
+    label: { undo: Rename, redo: Add Tags, note: Shopping }
+  - say: "Redo pops it again and runs it; the inverses it registers go back on the undo stack. Nobody wrote any redo code."
+    send: [redo->note, note->undo]
+    label: { undo: "Rename · Add Tags", redo: null, note: "Shopping + 2 tags" }
+  - say: "Undo once more, then make a **new** change. The redo stack is cleared: it described a future that no longer follows from this state."
+    send: note->undo
+    state: { redo: error }
+    label: { undo: "Rename · Add Tag", redo: cleared, note: "Shopping + urgent" }
+```
+
+## UndoManager
+
+`UndoManager` is exactly those two stacks. You register an inverse **when you make a change**, and the undo manager takes care of redo by noticing what you register while it's undoing:
+
+```swift run title="Undo and redo with UndoManager"
+import Foundation
+
+@MainActor
+final class Note {
+    let undoManager = UndoManager()
+    private(set) var title: String
+    private(set) var tags: [String] = []
+
+    init(title: String) {
+        self.title = title
+        // An app's run loop closes an undo group after each event; a script has none, so group by hand
+        undoManager.groupsByEvent = false
+    }
+
+    func rename(to newTitle: String) {
+        let oldTitle = title
+        // Register the inverse. When undo runs it, rename registers *its* inverse, which becomes redo.
+        undoManager.registerUndo(withTarget: self) { note in
+            note.rename(to: oldTitle)
+        }
+        title = newTitle
+    }
+
+    func addTag(_ tag: String) {
+        undoManager.registerUndo(withTarget: self) { note in
+            note.removeTag(tag)
+        }
+        tags.append(tag)
+    }
+
+    func removeTag(_ tag: String) {
+        guard let index = tags.firstIndex(of: tag) else { return }
+        undoManager.registerUndo(withTarget: self) { note in
+            note.addTag(tag)
+        }
+        tags.remove(at: index)
+    }
+
+    /// One user action: everything inside undoes as one step, under one name
+    func edit(_ name: String, _ change: (Note) -> Void) {
+        undoManager.beginUndoGrouping()
+        change(self)
+        undoManager.setActionName(name)
+        undoManager.endUndoGrouping()
+    }
+
+    func show(_ label: String) {
+        let undo = undoManager.canUndo ? undoManager.undoActionName : "–"
+        let redo = undoManager.canRedo ? undoManager.redoActionName : "–"
+        print("\(label) → \(title) \(tags) | Undo: \(undo) | Redo: \(redo)")
+    }
+}
+
+let note = Note(title: "Draft")
+note.edit("Rename") { $0.rename(to: "Shopping") }
+note.edit("Add Tags") { note in
+    note.addTag("home")
+    note.addTag("weekly")
+}
+note.show("edited")
+note.undoManager.undo()
+note.show("undo")
+note.undoManager.undo()
+note.show("undo")
+note.undoManager.redo()
+note.show("redo")
+note.edit("Add Tag") { $0.addTag("urgent") }
+note.show("edited")
+```
+
+```output
+edited → Shopping ["home", "weekly"] | Undo: Add Tags | Redo: –
+undo → Shopping [] | Undo: Rename | Redo: Add Tags
+undo → Draft [] | Undo: – | Redo: Rename
+redo → Shopping [] | Undo: Rename | Redo: Add Tags
+edited → Shopping ["urgent"] | Undo: Add Tag | Redo: –
+```
+
+What to notice:
+
+- **`registerUndo(withTarget:handler:)` takes the inverse.** The handler receives the target as its argument. `UndoManager` doesn't retain the target, so use that argument rather than capturing `self`.
+- **Redo is free.** Undoing runs `note.removeTag(tag)`, which registers `addTag(tag)`; because the manager is undoing, that registration becomes redo.
+- **Name the user's action, not the primitive.** `edit` sets "Add Tags" once for the group. Had `addTag` and `removeTag` each set their own name, redoing would read "Redo Remove Tag", the name of the inverse.
+- **Groups are undo steps.** In an app, `groupsByEvent` is `true` by default, so everything registered while handling one event (a tap, a keystroke) becomes one step; the script turns it off because it has no run loop to close groups. `beginUndoGrouping()` and `endUndoGrouping()` make a step span several events, such as a whole drag.
+- **`levelsOfUndo`** caps the history (0, the default, means no limit).
+
+Where an undo manager comes from:
+
+- **UIKit:** every `UIResponder` has an `undoManager` property; by default it finds the window's through the responder chain. Text fields and text views register their own typing undo. Users undo with ⌘Z on a keyboard, a three-finger swipe or double-tap, or by shaking (`applicationSupportsShakeToEdit` is on by default).
+- **SwiftUI:** `@Environment(\.undoManager)`.
+- **Core Data and SwiftData:** give the context an undo manager (Core Data's is `nil` by default on iOS; for SwiftData, pass `isUndoEnabled: true` to the `.modelContainer` modifier or set `ModelContext.undoManager`), and model changes register themselves.
+
+`UndoManager` is main-actor isolated in current SDKs, and its handlers run on the main actor, which suits UI edits.
+
+<Callout kind="gotcha" title="iOS gotcha: delete the history with the object">
+When an object can no longer be edited (the note is deleted, the document closed), call `undoManager.removeAllActions(withTarget:)`. Otherwise Undo offers to change something that no longer exists, or quietly does nothing, and the user is left wondering what the menu item meant.
+</Callout>
+
+## Commands you can keep
+
+When a command must outlive the moment, an `enum` beats a closure. Actions a reading app takes offline are kept as values, so the outbox can drop pairs that cancel out and save the rest to disk until the network is back:
+
+```swift run title="Commands as Codable values"
+import Foundation
+
+enum ReadingAction: Codable, Equatable {
+    case save(articleID: String)
+    case unsave(articleID: String)
+    case highlight(articleID: String, text: String)
+}
+
+/// Actions taken offline, kept to send later. Because they're values, the outbox can inspect them.
+struct Outbox {
+    private(set) var pending: [ReadingAction] = []
+
+    mutating func add(_ action: ReadingAction) {
+        // Saving then unsaving the same article cancels out: neither needs sending
+        if case .unsave(let id) = action, let index = pending.lastIndex(of: .save(articleID: id)) {
+            pending.remove(at: index)
+        } else {
+            pending.append(action)
+        }
+    }
+}
+
+var outbox = Outbox()
+outbox.add(.save(articleID: "a1"))
+outbox.add(.highlight(articleID: "a1", text: "Make it work"))
+outbox.add(.save(articleID: "a2"))
+outbox.add(.unsave(articleID: "a2"))
+
+let encoder = JSONEncoder()
+encoder.outputFormatting = .sortedKeys
+let saved = try encoder.encode(outbox.pending)
+print(String(decoding: saved, as: UTF8.self))
+let restored = try JSONDecoder().decode([ReadingAction].self, from: saved)
+print(restored == outbox.pending ? "Restored \(restored.count) actions" : "Mismatch")
+```
+
+```output
+[{"save":{"articleID":"a1"}},{"highlight":{"articleID":"a1","text":"Make it work"}}]
+Restored 2 actions
+```
+
+None of that is possible with closures: you can't ask a closure whether it's a "save", or write it to a file. D39 builds full offline queues and their conflicts on this idea.
+
+## Apple's other command objects
+
+- **`UICommand` and `UIKeyCommand`** are menu items and shortcuts as objects: title, image, selector, attributes such as `.destructive`. They have no target, and travel the responder chain from the last lesson.
+- **App Intents** are commands the system runs for you. Each intent is a struct holding its parameters, with a `perform()` method; Siri, Shortcuts, Spotlight, interactive widgets and Control Center controls can all invoke it without knowing anything about your screens.
+
+```swift check ios title="An App Intent is a command the system can run"
+import AppIntents
+
+struct AddToShoppingListIntent: AppIntent {
+    static let title: LocalizedStringResource = "Add to Shopping List"
+
+    @Parameter(title: "Item")
+    var item: String
+
+    func perform() async throws -> some IntentResult & ProvidesDialog {
+        // A real app calls its model here; the intent is only the request, packaged
+        return .result(dialog: "Added \(item)")
+    }
+}
+```
+
+- **`Operation`** is a command with a lifecycle: it can be queued, cancelled and made to depend on other operations in an `OperationQueue`. Swift concurrency's tasks cover most of its uses today.
+
+## Trade-offs
+
+| | A closure | A command value (`enum` or `struct`) | A snapshot (memento, D13) |
+| --- | --- | --- | --- |
+| How undo works | Register an inverse closure | Applying returns the inverse | Restore the previous state |
+| Save it or send it | No | Yes, `Codable` | Yes, but it's the whole state |
+| Inspect, merge, coalesce | No | Yes | Only by diffing |
+| Memory per step | Small | Small | A copy of everything |
+| Risk | The inverse must be exactly right | The inverse must be exactly right | Low: a copy is always exact |
+| Wins when | Undo in a UIKit or SwiftUI app with `UndoManager` | Offline queues, sync, audit logs, replay in tests | Small documents, or changes that are hard to invert |
+
+<Callout kind="interview">
+**"Add undo and redo to this editor."** Say: every edit goes through one place that registers its inverse with `UndoManager` (or applies a command that returns its inverse); one user action is one group, named for the menu; a new edit clears redo; `levelsOfUndo` bounds memory.
+
+**Ask:** Is undo per document or app-wide? Must it survive relaunching the app? Can undone changes already have reached the server? (Then undo needs a *compensating* command sent to the server, not only a local rollback.)
+
+**Red flags:** snapshotting a large document on every keystroke; setting action names inside the primitive operations; forgetting that redo must be cleared; registering an undo for every `touchesMoved` of a drag.
+</Callout>
+
+## Practice
+
+**Commands that undo themselves** has you build the two-stack history from this lesson with commands that return their inverses, including a batch that must unwind in reverse order.
+
+```cards
+- id: command-pattern
+  front: "What does the command pattern buy you over calling a method?"
+  back: "The request becomes a value: you can keep a history of it, undo it, queue it, merge it, save it or replay it, and the invoker doesn't need to know what it does."
+- id: undo-redo-free
+  front: "Why does UndoManager give you redo without extra code?"
+  back: "Undoing runs your inverse, which registers its own inverse. Because the manager is undoing, it files that registration as redo."
+- id: inverse-vs-snapshot
+  front: "Inverse commands or snapshots for undo?"
+  back: "Inverses cost little memory and can be saved or merged, but must be exactly right. Snapshots are exact and simple, but cost a copy of the state per step."
+- id: group-steps
+  front: "What counts as one undo step in UIKit by default?"
+  back: "Everything registered while handling one event, because `groupsByEvent` is true. Use begin and end grouping for a step that spans events, such as a drag."
+```
+
+```quiz
+- id: q1
+  type: mcq
+  prompt: "A drawing app registers an undo action in every `touchesMoved` while the user draws a stroke. What does pressing Undo do?"
+  options:
+    - "Removes the whole stroke"
+    - "Removes one tiny segment of the stroke, because each touch event became its own undo group"
+    - "Nothing: undo isn't allowed during touch handling"
+    - "Crashes, because groups can't be nested"
+  answer: 1
+  explain: "With `groupsByEvent`, each event is one step, so a stroke made of 80 events needs 80 undos. Register once when the stroke ends, or wrap the whole gesture in `beginUndoGrouping()` and `endUndoGrouping()`."
+- id: q2
+  type: output
+  prompt: "This undo list has a bug. What does it print?"
+  code: |
+    var items = ["a", "b", "c"]
+    var undoActions: [() -> Void] = []
+
+    @MainActor
+    func remove(at index: Int) {
+        let item = items.remove(at: index)
+        undoActions.append { items.insert(item, at: index) }
+    }
+
+    remove(at: 0)
+    remove(at: 0)
+    undoActions.first?()
+    print(items)
+  answer: '["a", "c"]'
+  explain: "Undo must run the *latest* inverse first: it's a stack. Running the first one inserts \"a\" while \"b\" is still missing. `undoActions.popLast()?()` would restore \"b\", then \"a\"."
+- id: q3
+  type: truefalse
+  prompt: "With UndoManager, you write the redo code separately from the undo code."
+  answer: false
+  explain: "The inverse you register on undo is itself an edit that registers its inverse. UndoManager files registrations made while undoing as redo, so a correct undo gives you redo."
+- id: q4
+  type: sort
+  prompt: "Which representation fits?"
+  buckets: [A closure, A command value, A snapshot]
+  items:
+    - [Edits made offline that must be sent when the network returns, 1]
+    - [Undo for renaming a note in a UIKit app, 0]
+    - ["A small settings form, where undo restores the form as it was", 2]
+    - [An audit trail the support team can read, 1]
+    - [An action Siri can run from a shortcut, 1]
+  explain: "Closures are enough for in-memory undo. Anything kept, sent, read or run by the system must be a value. Snapshots suit small state where inverses would be fiddly."
+- id: q5
+  type: multi
+  prompt: "Undoing a change the server has already accepted needs more than a local rollback. Which are reasonable designs?"
+  options:
+    - "Send a compensating command (delete what was created, restore the old value) and treat it as a new change"
+    - "Roll back locally and hope the next sync overwrites the server"
+    - "Offer undo only until the change has been sent"
+    - "Disable undo for the whole app"
+  answer: [0, 2]
+  explain: "A shared server can't be rewound by one client. Either undo becomes a new, explicit change the server sees, or undo is limited to changes still in the local queue. Silently diverging from the server is a sync bug."
+```

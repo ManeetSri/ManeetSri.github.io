@@ -1,0 +1,142 @@
+<Brief>
+
+This view model applies a promo code at checkout in a shopping app. Support tickets say people are told valid codes are invalid, that the total sometimes doesn't match the basket, and that some customers can't use any code at all. Nobody has written a test for it, because nobody can. Review it as you would a pull request.
+
+```swift check ios title="CartViewModel.swift"
+import SwiftUI
+import UIKit
+
+struct CartItem: Identifiable {
+    let id: String
+    let price: Decimal
+    var quantity: Int
+}
+
+struct Promo: Decodable {
+    let code: String
+    let percentOff: Int
+    let minimumSpend: Decimal
+    let expiresAt: Date
+}
+
+@MainActor
+@Observable
+final class CartViewModel {
+    var items: [CartItem] = []
+    var promo: Promo?
+    var total: Decimal = 0
+    var message: String?
+
+    func applyPromo(_ input: String) async {
+        let code = input.trimmingCharacters(in: .whitespaces).uppercased()
+        Analytics.shared.track("promo_entered", ["code": code])
+        let attempts = UserDefaults.standard.integer(forKey: "promoAttempts")
+        if attempts >= 5 {
+            message = "Too many attempts. Try again later."
+            return
+        }
+        UserDefaults.standard.set(attempts + 1, forKey: "promoAttempts")
+
+        let url = URL(string: "https://api.shop.example/promos/\(code)")!
+        let decoder = JSONDecoder()
+        decoder.dateDecodingStrategy = .iso8601
+        guard let (data, _) = try? await URLSession.shared.data(from: url),
+              let promo = try? decoder.decode(Promo.self, from: data) else {
+            message = "That code isn't valid."
+            return
+        }
+        if promo.expiresAt < Date() {
+            message = "That code has expired."
+            return
+        }
+        let subtotal = items.reduce(Decimal(0)) { $0 + $1.price * Decimal($1.quantity) }
+        if subtotal < promo.minimumSpend {
+            message = "Spend \(promo.minimumSpend) or more to use this code."
+            return
+        }
+        self.promo = promo
+        total = subtotal - subtotal * Decimal(promo.percentOff) / 100
+        message = "\(promo.percentOff)% off applied."
+        UINotificationFeedbackGenerator().notificationOccurred(.success)
+        Analytics.shared.track("promo_applied", ["code": code, "total": "\(total)"])
+    }
+
+    func setQuantity(_ quantity: Int, of id: CartItem.ID) {
+        guard let index = items.firstIndex(where: { $0.id == id }) else { return }
+        items[index].quantity = quantity
+    }
+}
+
+final class Analytics: Sendable {
+    static let shared = Analytics()
+    func track(_ event: String, _ properties: [String: String]) {}
+}
+```
+
+</Brief>
+
+```workspace
+template: critique
+minutes: 25
+```
+
+```findings
+- id: rules-buried
+  title: The pricing rules are buried between side effects, so none of them can be tested
+  severity: high
+  lines: 43-53
+  detail: Expiry, minimum spend and the discount maths are the only decisions in this method, and they sit between a network call, UserDefaults, the clock and a haptic. Testing "a code below the minimum spend is refused" needs a server, a clean UserDefaults and real time. Pulled out as a pure function of the promo, the items and the current time, each rule is a one-line test.
+- id: stale-total
+  title: The total is stored, so it goes stale when the basket changes
+  severity: high
+  lines: "22"
+  detail: "`total` is written once, on line 53, and is 0 until a promo is applied. `setQuantity` (lines 59–62) changes the items but not the total, so after a promo the screen shows the discount on the old basket. It's derived data: compute it from `items` and `promo` instead of storing it."
+- id: failures-collapsed
+  title: Every failure is reported as an invalid code
+  severity: high
+  lines: 38-42
+  detail: "`try?` turns being offline, a timeout, a 500 and a decoding change into the same nil, so a customer on a train is told their real code is invalid. The status code is never checked either. Keep the error: map transport errors, 404 and decoding failures to distinct cases (a typed error or `Result` with `mapError`) and give each its own message."
+- id: attempt-limit
+  title: The attempt limit counts the wrong things and never resets
+  severity: medium
+  lines: 28-33
+  detail: The counter goes up before the request, so network failures and even successful codes count, and nothing ever resets it. After five promo attempts in the app's lifetime, the customer can never use a code again. A limit, if the client needs one at all, is a rule with a time window; the server is where guessing is really stopped.
+- id: hidden-clock
+  title: The expiry check reads the device clock directly
+  severity: medium
+  lines: "43"
+  detail: "`Date()` is a hidden input: no test can check a code that expires at midnight, and a user who sets their clock back makes an expired code look valid. Pass `now` in as a parameter, and treat the server's answer as the authority on expiry."
+- id: url-from-input
+  title: User input is interpolated straight into the URL path
+  severity: medium
+  lines: "35"
+  detail: "A code containing `/`, `?` or `#` changes which endpoint is called or silently drops part of the code. Since iOS 17 `URL(string:)` percent-encodes spaces and other invalid characters, but not these: they're legal URL syntax. Build the URL with `appending(component:)`, which encodes the code as one path segment, or send it as a query item, and drop the force unwrap."
+- id: rounding
+  title: The discount isn't rounded, and the client is deciding the price
+  severity: medium
+  lines: "53"
+  detail: 15% of £19.99 is £2.9985; this keeps all four decimal places, so the total shown, the one in analytics and the one the server charges can disagree by a penny. Round to the currency's minor unit with an explicit rule, and better, show the server's quoted total rather than computing a price on the device.
+- id: effects-interleaved
+  title: Analytics and haptics are woven into the logic
+  severity: low
+  lines: 55-56
+  detail: "`Analytics.shared` is a hidden global dependency that tests can't observe, and the haptic ties the view model to UIKit. Both are reactions to an outcome: return the outcome, let the view play the haptic (`sensoryFeedback(.success, trigger:)` in SwiftUI), and pass analytics in as a dependency."
+```
+
+<ReferenceReview>
+
+**Most important first.** Two bugs cost money and trust today. The **stored total** goes stale as soon as the basket changes after a promo, so the price on screen is wrong. And **`try?` collapses every failure** into "That code isn't valid", which is the support ticket about valid codes being refused: those customers were offline. The third ticket, customers who can't use any code, is the **attempt counter** that never resets.
+
+**The design problem underneath** is that `applyPromo` is one long tangle of decisions and effects: it reads UserDefaults, the clock and the network, decides, and writes UserDefaults, analytics and haptics, all in one method. The rules that matter (expiry, minimum spend, the discount) are a handful of lines in the middle, and they can't run without everything around them.
+
+**How I'd fix it, in small steps:**
+
+1. **Make the total derived.** Replace `var total` with a computed property over `items` and `promo`. That fixes the stale price on its own, and it's a one-line change to review.
+2. **Extract the functional core.** A pure `PromoRules.evaluate(_ promo: Promo, items: [CartItem], now: Date) -> PromoDecision`, where `PromoDecision` is an enum: `.applied(discount:)`, `.expired`, `.belowMinimum(Decimal)`. Rounding lives here too, with one stated rule.
+3. **Give failures a type.** A small `PromoClient` with a `fetch` closure that returns or throws a `PromoError` (`.notFound`, `.offline`, `.server(status:)`, `.unreadable`), built with `appending(component:)` and a status check. The view model maps each case to a message.
+4. **Thin the shell.** `applyPromo` becomes: fetch, call `evaluate` with `now` from an injected clock, set state. Analytics arrives as a dependency; the haptic moves to the view, triggered by the state change.
+5. **Decide whether the attempt limit belongs on the client.** If product wants it, make it a pure rule over timestamped attempts (five in ten minutes), counting only "not found" answers.
+
+**Tests to add:** table-driven tests of `PromoRules.evaluate` (expired a second ago, exactly at the minimum spend, a percentage that needs rounding); the view model with stubbed `fetch` closures for each `PromoError`, checking the message; and a test that changing a quantity after applying a promo updates the total.
+
+</ReferenceReview>

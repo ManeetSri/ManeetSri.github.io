@@ -1,0 +1,345 @@
+## Why it matters
+
+Links are how most people arrive in an app that isn't already open: a product shared in Messages, a "your order has shipped" email, a password-reset link, a QR code on a poster, a search result. When they work, the user lands exactly where the link promised. When they don't, the app opens on its home screen, or Safari opens instead, and the campaign that paid for the click is wasted. iOS offers two mechanisms, custom URL schemes and universal links, with very different guarantees, and the system decides which app opens a link before your code runs. "Design deep linking" is a staple mobile interview question, and it rewards knowing exactly where iOS's part ends and yours begins.
+
+## Two kinds of link
+
+| | Custom URL scheme | Universal link |
+| --- | --- | --- |
+| Looks like | `shop://product/42` | `https://shop.example.com/product/42` |
+| Who can claim it | any app that lists the scheme | only an app the domain's owner names in a file on the domain |
+| App not installed | the link fails | the web page opens, so it always goes somewhere |
+| From Safari | a prompt: "Open in Shop?" | opens the app directly when tapped |
+| Set up | one Info.plist entry | an entitlement plus a file on your web server |
+| Good for | links between your own apps, testing, a fallback | everything users see: email, social, sharing, marketing |
+
+A **custom URL scheme** is a prefix you declare in the Info.plist under `CFBundleURLTypes`. It's easy and it proves nothing: any app can declare `shop:`, and if two do, iOS doesn't define which one opens. That makes schemes wrong for anything sensitive, such as an OAuth callback carrying a code (use `ASWebAuthenticationSession`, which returns the callback to the session that started it). It also means a scheme link pasted into an email or a tweet does nothing for anyone without the app.
+
+A **universal link** is an ordinary `https` URL on a domain you control. You prove you control it by publishing a file there that names your app; iOS checks that file, and only then opens your app for matching links. Without the app, the same URL opens your website. That's why every link a user might see should be a universal link, with the website as the fallback.
+
+## How a universal link reaches your app
+
+Two moments matter: when the app is installed, and when the link is tapped.
+
+```visual sequence
+title: A universal link, from install to route
+participants:
+  - { id: site, label: Your website }
+  - { id: cdn, label: Apple CDN }
+  - { id: ios, label: iOS }
+  - { id: app, label: Shop app }
+messages:
+  - { note: "When the app is installed or updated", over: [cdn, ios] }
+  - [ios, cdn, "applinks for shop.example.com?", { say: "For each domain in the app's associated domains entitlement, iOS asks Apple's CDN for the domain's association file." }]
+  - [cdn, site, "GET /.well-known/apple-app-site-association", { say: "The CDN fetches the file from your server and caches it. Your server never sees the user's device." }]
+  - [site, cdn, JSON, { reply: true }]
+  - [cdn, ios, patterns, { reply: true, say: "iOS stores the patterns. From now on it decides about links to this domain without asking anyone." }]
+  - { note: "Later: the user taps https://shop.example.com/product/42 in Mail", over: [ios, app] }
+  - [ios, ios, match the patterns, { say: "iOS checks the URL against the stored patterns, in order. Your app hasn't run yet." }]
+  - [ios, app, "NSUserActivity(webpageURL)", { say: "It matches, so iOS opens the app and hands it the URL in a browsing-web user activity." }]
+  - [app, app, parse → route → router, { say: "From here it's the app's job: parse the URL into a route and let the router show it." }]
+  - [ios, site, open in Safari, { say: "If nothing matches, or the app isn't installed, Safari opens the page. Your website must handle every link the app does." }]
+fragments:
+  - { kind: alt, label: a pattern matches, from: 7, to: 9, else: 9, elseLabel: no match }
+```
+
+Three consequences of that picture surprise people:
+
+- **Changes to the file take time.** Devices read the file through Apple's CDN, which caches it, and they don't fetch it on every tap, so a new path you add today reaches users over the following hours or days, not instantly. Plan link launches around that. For development, add `?mode=developer` to the entitlement's domain and enable associated domains development in the device's Developer settings, and the device fetches from your server directly.
+- **The decision is made before your code runs.** If a link opens Safari instead of the app, no amount of app code can fix it; the cause is in the file, the entitlement, or how the link was tapped.
+- **The website is half of the feature.** Every universal link must work as a web page too, because some users don't have the app and some taps go to Safari anyway.
+
+## Setting it up
+
+**The entitlement.** In the app's Signing & Capabilities, add Associated Domains with one entry per domain:
+
+```text title="Shop.entitlements"
+com.apple.developer.associated-domains
+    applinks:shop.example.com
+    applinks:www.shop.example.com
+    webcredentials:shop.example.com
+```
+
+**The file.** Serve it at `https://shop.example.com/.well-known/apple-app-site-association`: HTTPS with a valid certificate, no redirects, no file extension, as JSON, and under 128 KB.
+
+```json
+{
+  "applinks": {
+    "details": [
+      {
+        "appIDs": ["ABCDE12345.com.example.shop"],
+        "components": [
+          { "/": "/help/*", "exclude": true, "comment": "Help pages stay on the web" },
+          { "/": "/product/*" },
+          { "/": "/category/*" },
+          { "/": "/search", "?": { "q": "?*" } },
+          { "/": "/orders/*" },
+          { "/": "/basket" }
+        ]
+      }
+    ]
+  },
+  "webcredentials": {
+    "apps": ["ABCDE12345.com.example.shop"]
+  }
+}
+```
+
+- **`appIDs`** are your Team ID plus bundle ID. List every app (and every environment's bundle ID) that should open these links.
+- **`components`** are checked in order, and the first match decides, so `exclude` rules go before the patterns they carve out of. `*` matches any run of characters and `?` exactly one; `"q": "?*"` requires a non-empty query parameter. [Interpreter: mini DSLs and route grammars](/design/learn/sd-behavioural-interpreter) treats this file as the small language it is.
+- **`webcredentials`** in the same file lets Password AutoFill offer the website's saved passwords in the app. It's the same proof of ownership, reused.
+
+A universal link opens the app only for paths the file lists, and the app can only show paths it can parse. Keep the two in step: generate the file from the app's route table, or test one against the other in CI.
+
+## When a universal link doesn't open the app
+
+Even with a perfect file, iOS deliberately leaves some taps in Safari. Know them, because each one is a support ticket that says "links are broken":
+
+- **Typed or pasted** into Safari's address bar. Typing a URL means "I want the website".
+- **A link to the same domain, from a page on that domain.** If the user is browsing your site in Safari and taps a link to another page of it, iOS assumes they want to stay on the web. Links to your domain from *other* domains open the app.
+- **The user chose Safari.** Long-press a universal link and pick "Open in Safari", or tap the breadcrumb that iOS shows in the corner after opening your app, and iOS remembers that choice for your domain until the user reverses it (through the same menu, or a Smart App Banner on your site).
+- **Redirects.** The tap must be on a URL the file covers. A link that points at another domain and *redirects* to yours opens Safari, because iOS decided on the first URL.
+- **Some in-app browsers and web views** load links themselves instead of handing them to the system.
+
+The redirect case catches nearly every marketing team. Email services rewrite links for click tracking, so `https://shop.example.com/product/42` becomes `https://click.mailer.example/ls/abc123`, which redirects to the product. The tap lands on the mailer's domain, which isn't in your file, so Safari opens. The fix is to give tracking its own subdomain of yours, such as `click.shop.example.com` pointed at the email provider, serve your association file there too (providers that support this host it for you), add `applinks:click.shop.example.com`, and have the app resolve the tracked URL to its real destination before parsing it.
+
+## Handling links in the app
+
+Once iOS opens the app, links arrive through different doors depending on whether the app was already running, and missing the cold-start door is the most common deep-linking bug in UIKit apps.
+
+| | SwiftUI | UIKit, app already running | UIKit, app launched by the link |
+| --- | --- | --- | --- |
+| Custom scheme | `onOpenURL` | `scene(_:openURLContexts:)` | `connectionOptions.urlContexts` |
+| Universal link | `onOpenURL` (or `onContinueUserActivity` for the browsing-web type) | `scene(_:continue:)` | `connectionOptions.userActivities` |
+
+In UIKit, `scene(_:openURLContexts:)` and `scene(_:continue:)` are **not** called when the link launches the app; the link is in the connection options of `scene(_:willConnectTo:options:)`, and only there. In SwiftUI, `onOpenURL` receives both kinds, cold or warm, as long as the view it's attached to exists, so attach it at the root of the window.
+
+Either way, the app often isn't ready to navigate when the link arrives: the window is still being built, the session is being restored, or the user must sign in first. So links go into a small handler that parses them and **holds the route** until the UI says it's ready:
+
+```swift check ios title="Links from every door, held until the UI is ready"
+import SwiftUI
+import UIKit
+
+enum AppRoute: Equatable, Sendable {
+    case product(id: Int)
+    case basket
+
+    /// Accepts shop://product/42 and https://shop.example.com/product/42; anything else is nil
+    init?(url: URL) {
+        var segments = url.pathComponents.filter { $0 != "/" }
+        switch url.scheme?.lowercased() {
+        case "shop": if let host = url.host() { segments.insert(host, at: 0) }
+        case "https" where url.host()?.lowercased() == "shop.example.com": break
+        default: return nil
+        }
+        switch (segments.first, segments.count) {
+        case ("product", 2):
+            guard let id = Int(segments[1]), id > 0 else { return nil }
+            self = .product(id: id)
+        case ("basket", 1):
+            self = .basket
+        default:
+            return nil
+        }
+    }
+}
+
+/// Turns links into routes, and holds one until the UI can show it
+@MainActor
+final class LinkHandler {
+    var perform: ((AppRoute) -> Void)?
+    private var pending: AppRoute?
+    private var isReady = false
+
+    func receive(_ url: URL) {
+        guard let route = AppRoute(url: url) else { return }   // not ours, or malformed: ignore it
+        if isReady { perform?(route) } else { pending = route }  // the latest link wins
+    }
+
+    /// Called once the window, the tabs and the signed-in state are in place
+    func uiIsReady() {
+        isReady = true
+        if let route = pending {
+            pending = nil
+            perform?(route)
+        }
+    }
+}
+
+final class SceneDelegate: UIResponder, UIWindowSceneDelegate {
+    var window: UIWindow?
+    private let links = LinkHandler()
+
+    func scene(_ scene: UIScene, willConnectTo session: UISceneSession, options connectionOptions: UIScene.ConnectionOptions) {
+        guard let windowScene = scene as? UIWindowScene else { return }
+        let window = UIWindow(windowScene: windowScene)
+        window.rootViewController = UITabBarController()
+        window.makeKeyAndVisible()
+        self.window = window
+        links.perform = { route in print("route to", route) }   // the router, in a real app
+
+        // Cold start: the link that launched the app arrives here, and only here
+        if let url = connectionOptions.urlContexts.first?.url {
+            links.receive(url)
+        }
+        if let activity = connectionOptions.userActivities.first(where: { $0.activityType == NSUserActivityTypeBrowsingWeb }),
+           let url = activity.webpageURL {
+            links.receive(url)
+        }
+        links.uiIsReady()
+    }
+
+    // Warm start, custom scheme: the app was already running
+    func scene(_ scene: UIScene, openURLContexts URLContexts: Set<UIOpenURLContext>) {
+        if let url = URLContexts.first?.url { links.receive(url) }
+    }
+
+    // Warm start, universal link
+    func scene(_ scene: UIScene, continue userActivity: NSUserActivity) {
+        guard userActivity.activityType == NSUserActivityTypeBrowsingWeb, let url = userActivity.webpageURL else { return }
+        links.receive(url)
+    }
+}
+
+struct ShopWindow: View {
+    @State private var links = LinkHandler()
+    @State private var opened: AppRoute?
+
+    var body: some View {
+        Text(opened.map { String(describing: $0) } ?? "Home")
+            // Both custom-scheme URLs and universal links arrive here, cold or warm
+            .onOpenURL { url in links.receive(url) }
+            .onAppear {
+                links.perform = { route in opened = route }
+                links.uiIsReady()
+            }
+    }
+}
+```
+
+"The latest link wins" is a policy, not an accident: if two links arrive before the UI is ready (rare, but a cold launch plus a quick second tap does it), the user's most recent intent is the one to honour. The same buffer is where a route that needs sign-in waits while the user signs in. The next lesson brings every other entry point into the same handler.
+
+## Links are untrusted input
+
+Anyone can create a link to your app and get a user to tap it: in an email, on a web page, in a QR code. Treat every link the way a server treats a request from the internet.
+
+- **Validate everything.** Ids must have the right format, numbers the right range, and anything unexpected must be rejected, not force-unwrapped. A malformed link that crashes the app is a crash anyone can trigger.
+- **Navigate, don't act.** A link may *show* the checkout with an item; it must never *place* the order, follow someone, delete something or change a setting without the user confirming in the UI. `shop://basket/add?product=42&quantity=99` should open a screen that asks.
+- **No open redirects.** A route like `shop://web?url=…` that loads any URL in an in-app web view, with the user's session cookies, is a phishing kit. Allow only your own hosts.
+- **Secrets in links are short-lived and single-use.** Magic sign-in and password-reset links carry a token; the server must expire it within minutes, accept it once, and bind it to the request that asked for it.
+
+## Deferred deep links
+
+A link tapped by someone without the app opens the website, and they may then install the app. Can the app open on the product they tapped, on first launch? iOS has no built-in mechanism for this "deferred" deep link. The workable options are honest ones: the website carries the context into the App Store via a Smart App Banner's `app-argument` (which reaches the app only if it's already installed, so it helps returning users), the user signs in on first launch and the server remembers what they were looking at, or an attribution service provides a best guess, subject to Apple's privacy rules. Promising exact deferred deep links in an interview is a red flag; naming the trade-offs is not.
+
+## Testing links
+
+- **Simulator:** `xcrun simctl openurl booted "shop://product/42"` and `xcrun simctl openurl booted "https://shop.example.com/product/42"` exercise both paths, cold (after quitting the app) and warm.
+- **Device:** tap links from Notes or Messages, not from Safari's address bar, which never opens the app. The Developer settings include a universal links diagnostics screen that tells you whether a URL matches your app.
+- **Unit tests:** the parser, with good and bad URLs for every route, and a round trip from route to URL and back.
+- **The file:** a CI check that it's valid JSON, served without redirects, and covers every route the app accepts.
+
+## Trade-offs
+
+| | Universal links | Custom scheme | Both |
+| --- | --- | --- | --- |
+| Works without the app | yes, the website | no | yes, for the links users see |
+| Can be hijacked by another app | no | yes | only the scheme |
+| Opens from every tap | no: same-domain taps, typed URLs, redirects and user choice go to Safari | yes, after a prompt from Safari | best coverage |
+| Set-up and upkeep | the file, the entitlement, the CDN delay, the website | one plist entry | both |
+| Wins for | everything shared, emailed or published | internal links, testing, apps without a website | most production apps: universal links outside, the scheme as a fallback and for tools |
+
+<Callout kind="interview">
+
+**What to say:** "Universal links on our domain for everything users see, with the website as the fallback; a custom scheme only for internal use. The association file lists our routes in order, generated from the app's route table. In the app, every link (cold start included) goes into one handler that parses it into a typed route, validates it, holds it until the UI and session are ready, then hands it to the router. Links navigate; they never perform actions without confirmation."
+
+**What to ask:** do links come through email click tracking or other redirects? What must happen for users without the app? Which routes need sign-in? Do old links from past campaigns have to keep working?
+
+**Red flags:** custom schemes in marketing links; OAuth callbacks on a custom scheme handled by `openURL`; handling only the warm-start callbacks; force-unwrapping link parameters; links that perform actions.
+
+</Callout>
+
+<Callout kind="gotcha" title="iOS gotcha: the link that launched the app isn't sent to openURLContexts">
+
+In a scene-based UIKit app, a link that cold-launches the app is delivered once, in `scene(_:willConnectTo:options:)`, through `connectionOptions.urlContexts` (schemes) and `connectionOptions.userActivities` (universal links). `scene(_:openURLContexts:)` and `scene(_:continue:)` only handle links that arrive while the scene is already connected. Code that handles only those two works perfectly in development, where the app is usually running, and opens on the home screen for every user who taps a link with the app closed.
+
+</Callout>
+
+## Practice
+
+[Parse every entry point into a route](/design/practice/sd-kata-navigation-route-parsing) is the parser this lesson relies on: both URL forms, two hosts, strict validation of every id, and URL generation that round-trips. [Routing for a tabbed shopping app](/design/practice/sd-design-navigation-shop-routing) then asks you to design the whole system around it: the association file, email click tracking, sign-in gating, cold starts and the website fallback.
+
+```cards
+- id: scheme-vs-universal
+  front: "Why use universal links rather than a custom scheme for links users see?"
+  back: "Only the domain's owner can claim them, they open the website when the app isn't installed, and Safari doesn't show a prompt. A custom scheme can be claimed by any app and fails without the app."
+- id: aasa-basics
+  front: "Where does the apple-app-site-association file live, and how do devices get it?"
+  back: "At https://your.domain/.well-known/apple-app-site-association, as JSON with no redirects. Devices fetch it through Apple's CDN at install and update, so changes take time to reach users."
+- id: not-opening
+  front: "Name three ways a valid universal link still opens Safari."
+  back: "It was typed into the address bar; it was tapped on a page of the same domain in Safari; it went through a redirect (such as email click tracking); or the user previously chose to open it in Safari."
+- id: cold-start-links
+  front: "Where does a UIKit scene receive the link that launched the app?"
+  back: "In `scene(_:willConnectTo:options:)`, through `connectionOptions.urlContexts` and `connectionOptions.userActivities`. The openURLContexts and continue callbacks are only for links that arrive while the scene is running."
+```
+
+```quiz
+- id: q1
+  type: mcq
+  prompt: "Links in your marketing emails open Safari instead of the app, though the same links work from Notes. What's the most likely cause?"
+  options:
+    - "The association file isn't valid JSON"
+    - "The email service rewrites links through its own click-tracking domain, which redirects to yours"
+    - "Universal links don't work in Mail"
+    - "The app's custom scheme isn't registered"
+  answer: 1
+  explain: "iOS decides on the URL that was tapped. A tracking domain that isn't in your entitlement opens Safari, which then follows the redirect. Use a tracking subdomain of your own, serve the association file there and add it to the entitlement."
+- id: q2
+  type: bug
+  prompt: "Universal links to products work while the app is open, but when the app was closed they open it on the home screen. Which line is the problem?"
+  code: |
+    final class SceneDelegate: UIResponder, UIWindowSceneDelegate {
+        var window: UIWindow?
+        let links = LinkHandler()
+
+        func scene(_ scene: UIScene, willConnectTo session: UISceneSession, options connectionOptions: UIScene.ConnectionOptions) {
+            window = makeWindow(for: scene)
+            if let url = connectionOptions.urlContexts.first?.url { links.receive(url) }
+            links.uiIsReady()
+        }
+
+        func scene(_ scene: UIScene, continue userActivity: NSUserActivity) {
+            if let url = userActivity.webpageURL { links.receive(url) }
+        }
+    }
+  answer: 7
+  explain: "On a cold start, a universal link arrives in `connectionOptions.userActivities`, not `urlContexts`, which only carries custom-scheme URLs. And `scene(_:continue:)` isn't called for the link that launched the app, so this one is dropped."
+- id: q3
+  type: sort
+  prompt: "Custom scheme or universal link?"
+  buckets: [Custom scheme, Universal link]
+  items:
+    - ["A product link in a newsletter", 1]
+    - ["A link from your companion app into your main app", 0]
+    - ["A shared link that must work for people without the app", 1]
+    - ["A link in a QR code on a shop window", 1]
+    - ["A link your internal test tool opens", 0]
+  explain: "Anything a user might see, share or scan should be a universal link, because it falls back to the website. Schemes suit links between your own apps and tooling, where you control both ends."
+- id: q4
+  type: multi
+  prompt: "A link arrives: `shop://basket/add?product=42&quantity=99`. Which are sound ways to handle it? Choose all that apply."
+  options:
+    - "Validate that the product id and quantity are well formed and in range"
+    - "Add 99 of the product to the basket immediately, as the link asks"
+    - "Open the product with an Add to basket confirmation, quantity prefilled within limits"
+    - "Force-unwrap the parameters, since your own website generated the link"
+    - "Ignore it if the parameters are malformed, and open the basket instead"
+  answer: [0, 2, 4]
+  explain: "Links are untrusted input that anyone can craft. Validate, navigate to a screen where the user confirms, and fall back safely on bad input. Acting without confirmation or trusting the parameters invites abuse and crashes."
+- id: q5
+  type: truefalse
+  prompt: "When you add a new path to your apple-app-site-association file, every installed copy of the app starts opening it within a minute."
+  answer: false
+  explain: "Devices get the file through Apple's CDN, which caches it, and they fetch it at install, on updates and occasionally after that, never on each tap. New paths reach users over hours or days, so ship file changes before the links that need them."
+```

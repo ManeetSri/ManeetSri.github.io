@@ -1,0 +1,350 @@
+## Why it matters
+
+These two smells live in APIs, so they spread to every caller. Most iOS codebases older than Swift concurrency have completion handlers nested four deep somewhere, and strings standing in for types everywhere: notification names, analytics events, `[String: Any]` payloads, `UserDefaults` keys. Each is cheap to write and expensive to call correctly. Modernising them is everyday senior work, and "how would you modernise this API?" is a common interview conversation.
+
+## The callback pyramid
+
+A **callback pyramid** (or pyramid of doom) is what happens when each step can only start inside the previous step's completion handler. You met closure callbacks in [Closure callbacks, and choosing a callback style](/design/learn/sd-behavioural-closure-callbacks), and how async/await replaced futures in [Futures and promises vs async/await](/design/learn/sd-resilience-futures-async). Here is the smell in legacy code:
+
+```swift check title="Before: three levels deep"
+import Foundation
+
+struct User {
+    let id: String
+}
+
+struct Order {
+    let pence: Int
+}
+
+protocol AccountAPI {
+    func fetchUser(completion: @escaping (User?, Error?) -> Void)
+    func fetchOrders(userID: String, completion: @escaping ([Order]?, Error?) -> Void)
+}
+
+protocol OrdersCache {
+    func save(_ orders: [Order], completion: @escaping (Error?) -> Void)
+}
+
+final class OrderHistoryLoader {
+    private let api: AccountAPI
+    private let cache: OrdersCache
+
+    init(api: AccountAPI, cache: OrdersCache) {
+        self.api = api
+        self.cache = cache
+    }
+
+    func load(completion: @escaping ([Order]?, Error?) -> Void) {
+        api.fetchUser { [weak self] user, error in
+            guard let self else { return }
+            guard let user else {
+                completion(nil, error)
+                return
+            }
+            self.api.fetchOrders(userID: user.id) { [weak self] orders, error in
+                guard let self, let orders else { return }
+                self.cache.save(orders) { error in
+                    if let error {
+                        print("Cache failed: \(error)")
+                    }
+                    completion(orders, nil)
+                }
+            }
+        }
+    }
+}
+```
+
+It compiles and mostly works. Its problems are all of the "mostly" kind:
+
+- **Every path has to call `completion` by hand.** The `guard let self, let orders else { return }` returns without calling it when the orders request fails, so the screen's spinner never stops. Nothing warns you. Calling it twice is as easy, and as silent.
+- **Errors get dropped.** The cache error is printed and swallowed, and the `([Order]?, Error?)` pair allows four combinations when only two make sense.
+- **Which thread?** `completion` runs on whatever queue the cache's callback used. A caller that updates its UI there is touching UIKit off the main thread.
+- **No cancellation.** If the user leaves the screen, every request still runs to the end.
+- **Sequential by accident.** Nesting is the only way to wait, so steps run one after another even where they needn't.
+
+Step through the calls and watch where it goes wrong:
+
+```visual sequence
+title: OrderHistoryLoader.load, as it runs
+participants:
+  - { id: screen, label: Screen }
+  - { id: loader, label: Loader }
+  - { id: api, label: API }
+  - { id: cache, label: Cache }
+messages:
+  - [screen, loader, "load(completion:)"]
+  - [loader, api, fetchUser]
+  - [api, loader, user, { reply: true }]
+  - [loader, api, fetchOrders]
+  - [api, loader, orders, { reply: true }]
+  - [loader, cache, save]
+  - [cache, loader, done, { reply: true }]
+  - [loader, screen, "completion(orders)", { reply: true }]
+  - { note: "Runs on the cache's queue, not the main thread", over: screen }
+  - [api, loader, "error: offline", { reply: true }]
+  - { note: "returns early: completion is never called", over: loader }
+fragments:
+  - { kind: alt, label: orders arrive, from: 4, to: 10, else: 9, elseLabel: orders fail }
+steps:
+  - { upTo: 2, say: "The loader can't ask for orders until the user arrives, so the first callback is the only place to start the next step." }
+  - { upTo: 4, say: "Inside it, the orders request starts: one level deeper. Every step after this is nested inside the one before." }
+  - { upTo: 8, say: "After the cache's callback, it finally completes, on the **cache's queue**. The screen must remember to hop to the main thread." }
+  - { upTo: 10, say: "On the failure path, `guard … else { return }` leaves without calling completion. The screen waits **forever**, and nothing warns anyone." }
+```
+
+## Flattening it with async/await
+
+The way out takes three steps, and the app keeps working after each.
+
+1. **Wrap each callback at the bottom, once.** If you can't change an API (an SDK, or code another team owns), give it an async version with `withCheckedThrowingContinuation`. The continuation is resumed in exactly one place.
+2. **Write the logic as straight-line `async throws` code.** Every path has to return or throw, so "forgot to complete" can't happen. Independent work runs together with `async let`, errors propagate with `try`, and cancellation flows from the caller's task.
+3. **Keep the old signature as a thin wrapper** for existing callers, mark it `@available(*, deprecated, renamed:)`, migrate the callers, then delete it.
+
+```swift run
+struct User: Sendable {
+    let name: String
+}
+
+struct Order: Sendable {
+    let pence: Int
+}
+
+struct Profile: Sendable {
+    let user: User
+    let orders: [Order]
+}
+
+enum APIError: Error {
+    case offline
+}
+
+// The legacy API: completion handlers, which here call back straight away
+final class LegacyAPI: Sendable {
+    let online: Bool
+
+    init(online: Bool) {
+        self.online = online
+    }
+
+    func fetchUser(completion: @escaping @Sendable (Result<User, APIError>) -> Void) {
+        completion(online ? .success(User(name: "Ada")) : .failure(.offline))
+    }
+
+    func fetchOrders(completion: @escaping @Sendable (Result<[Order], APIError>) -> Void) {
+        completion(online ? .success([Order(pence: 1299), Order(pence: 450)]) : .failure(.offline))
+    }
+}
+
+// Step 1: wrap each callback once, at the bottom. Every path resumes exactly once.
+extension LegacyAPI {
+    func user() async throws -> User {
+        try await withCheckedThrowingContinuation { continuation in
+            fetchUser { continuation.resume(with: $0) }
+        }
+    }
+
+    func orders() async throws -> [Order] {
+        try await withCheckedThrowingContinuation { continuation in
+            fetchOrders { continuation.resume(with: $0) }
+        }
+    }
+}
+
+// Step 2: the logic, as straight-line code. Neither request needs the other's result, so they run at the same time.
+func loadProfile(from api: LegacyAPI) async throws -> Profile {
+    async let user = api.user()
+    async let orders = api.orders()
+    return try await Profile(user: user, orders: orders)
+}
+
+for online in [true, false] {
+    do {
+        let profile = try await loadProfile(from: LegacyAPI(online: online))
+        print("\(profile.user.name): \(profile.orders.count) orders")
+    } catch {
+        print("Failed: \(error)")
+    }
+}
+```
+
+```output
+Ada: 2 orders
+Failed: offline
+```
+
+Notice what `loadProfile` no longer has to think about: no `[weak self]`, no completion to forget, no thread to guess. The caller's actor decides where the result lands: a `@MainActor` view model that awaits it gets the profile on the main actor.
+
+Before you write a wrapper, check the SDK. Swift imports Objective-C methods that take a completion handler as `async` automatically, so `UNUserNotificationCenter`'s `requestAuthorization(options:)`, for example, already exists as `async throws -> Bool`. For your own Swift code, Xcode's Refactor menu offers **Add Async Wrapper**, **Add Async Alternative** and **Convert Function to Async**.
+
+## Stringly-typed APIs
+
+An API is **stringly typed** when it uses `String` (or `[String: Any]`) where the set of valid values is known, or where the data has a structure. Strings compile whatever you type, so typos ship, renames miss some uses, autocompletion can't help, and `as?` casts fail silently when a key or shape changes.
+
+| Stringly typed | Typed |
+| --- | --- |
+| `Notification.Name("cartChanged")` at every use | a constant in `extension Notification.Name`, or better, an observable model or `AsyncStream` |
+| `userInfo["userId"] as? String` | a typed value passed directly, instead of a dictionary |
+| `analytics.track("add_to_cart", ["price": price])` | an `AnalyticsEvent` enum with associated values |
+| `UserDefaults.standard.bool(forKey: "hasSeenOnboarding")` | one settings type that owns its keys |
+| `[String: Any]` from JSON | `Codable` structs |
+| `UIImage(named: "logo")` | the asset symbols Xcode 15 generates: `UIImage(resource: .logo)` |
+| `dequeueReusableCell(withIdentifier: "Cell")` | `UICollectionView.CellRegistration` (iOS 14) |
+| `"GET"`, `"/users/" + id` | an `Endpoint` type |
+
+Strings don't disappear: analytics SDKs, the network and `UserDefaults` all speak strings in the end. The point is to spell each one **once**, at the boundary, and let the rest of the code use types. Analytics is the classic case:
+
+```swift run
+enum AnalyticsEvent {
+    case viewedProduct(id: String)
+    case addedToBasket(productID: String, pence: Int)
+    case checkoutFailed(reason: CheckoutFailure)
+
+    enum CheckoutFailure: String {
+        case cardDeclined = "card_declined"
+        case outOfStock = "out_of_stock"
+    }
+
+    // The one place the analytics names and keys are spelled out: the boundary with the SDK
+    var name: String {
+        switch self {
+        case .viewedProduct: "product_viewed"
+        case .addedToBasket: "basket_added"
+        case .checkoutFailed: "checkout_failed"
+        }
+    }
+
+    var parameters: [String: String] {
+        switch self {
+        case .viewedProduct(let id): ["product_id": id]
+        case .addedToBasket(let id, let pence): ["product_id": id, "value_pence": String(pence)]
+        case .checkoutFailed(let reason): ["reason": reason.rawValue]
+        }
+    }
+}
+
+protocol AnalyticsTracking {
+    func track(_ event: AnalyticsEvent)
+}
+
+// Stands in for the SDK adapter: it's the only code that sees the strings
+struct PrintingTracker: AnalyticsTracking {
+    func track(_ event: AnalyticsEvent) {
+        let parameters = event.parameters.sorted { $0.key < $1.key }.map { "\($0.key)=\($0.value)" }
+        print(event.name, parameters.joined(separator: " "))
+    }
+}
+
+let tracker = PrintingTracker()
+tracker.track(.viewedProduct(id: "sku-42"))
+tracker.track(.addedToBasket(productID: "sku-42", pence: 1999))
+tracker.track(.checkoutFailed(reason: .cardDeclined))
+```
+
+```output
+product_viewed product_id=sku-42
+basket_added product_id=sku-42 value_pence=1999
+checkout_failed reason=card_declined
+```
+
+A misspelt case doesn't compile. Adding a parameter to an event forces every call site to supply it. And the data team can read every event the app sends in one file, which also makes a good reviewer's checklist for privacy.
+
+## Trade-offs
+
+| Style | Errors | Cancellation | Threading | Wins when |
+| --- | --- | --- | --- | --- |
+| Completion handlers | by convention; easy to drop | build it yourself | whatever queue calls back | an old API you can't change yet; Objective-C callers |
+| Combine publishers | in the type, `Failure` | `AnyCancellable` | explicit with `receive(on:)` | streams of values with operators, existing Combine code |
+| `async`/`await` | `throws`, typed if you like | automatic, through tasks | the caller's actor | one result per call: most networking and storage |
+| `AsyncStream` | `throws` on iteration | ends when the task is cancelled | the consumer's actor | many values over time: progress, live updates |
+
+For strings, the options run from **constants** (cheap; stops typos, not invalid values) to **enums** (the compiler knows every valid value) to **generated code** (asset symbols, SwiftGen) for resources.
+
+<Callout kind="interview">
+
+**What to say:** name the concrete risks of callbacks (a forgotten completion, dropped errors, the unknown thread, no cancellation) and the migration that keeps the app working: wrap at the bottom with a checked continuation, write the logic as `async throws`, deprecate the old signature. For strings: spell each one once, at the boundary.
+
+**What to ask:** Who calls this API, and can they all move to async now? Does it need cancellation? Are there Objective-C callers that need the completion-handler version?
+
+**Red flags:** a continuation that can be resumed twice, or not at all; wrapping every call in `Task { }` inside synchronous code, which throws away cancellation and ordering; replacing strings with an enum that has a `default:` case or a `case other(String)` used everywhere; new code passing `[String: Any]`.
+
+</Callout>
+
+<Callout kind="gotcha" title="Swift gotcha: resume a continuation exactly once">
+
+A checked continuation traps if it's resumed twice ("tried to resume its continuation more than once"), and logs that it "leaked its continuation" if it's never resumed, leaving the awaiting task suspended forever. When wrapping a callback API, check every path through the callback, including error paths and callbacks that can fire more than once (those want an `AsyncStream` instead).
+
+</Callout>
+
+## Practice
+
+**The profile sync** review is a pyramid with real consequences: a path that never completes, a failure that deletes the user's settings, and strings for methods, paths, notification names and keys. Plan its move to `async throws`.
+
+```cards
+- id: pyramid-risks
+  front: "What goes wrong in callback pyramids?"
+  back: "Paths that never call completion (or call it twice), dropped errors, completion on an unknown thread, no cancellation, and independent work run one after another."
+- id: async-migration
+  front: "How do you move a completion-handler API to async without breaking callers?"
+  back: "Wrap the callbacks at the bottom with a checked continuation, write the logic as `async throws` (with `async let` for parallel work), and keep a deprecated completion wrapper until callers have moved."
+- id: strings-once
+  front: "How should a typed codebase handle the strings an SDK needs?"
+  back: "Spell each one once, at the boundary (an enum's `name`, a constant, an endpoint type), and use types everywhere else."
+```
+
+```quiz
+- id: q1
+  type: bug
+  prompt: "This completion-handler method has a path that never calls `completion`. Click it."
+  code: |
+    func refresh(completion: @escaping (Bool) -> Void) {
+        api.fetchFeed { items, error in
+            if let error {
+                completion(false)
+                return
+            }
+            guard let items, !items.isEmpty else { return }
+            self.store.replace(with: items)
+            completion(true)
+        }
+    }
+  answer: 7
+  explain: "An empty or missing feed returns without completing, so whoever is waiting (a pull-to-refresh, a background task) waits forever. An `async` version would have to return or throw on that path, so the compiler would catch it."
+- id: q2
+  type: mcq
+  prompt: "A screen needs the user's profile and their notification settings, from two independent endpoints. Which async version is best?"
+  options:
+    - "`let profile = try await api.profile()` then `let settings = try await api.settings()`"
+    - "`async let profile = api.profile()` and `async let settings = api.settings()`, then `try await` both"
+    - "Start each request in its own `Task { }` and store the results in properties"
+    - "Use `Task.detached` for both so they leave the main actor"
+  answer: 1
+  explain: "`async let` runs both at once as child tasks: if one fails, the other is cancelled, and cancelling the caller cancels both. Two sequential awaits are correct but slower. Unstructured or detached tasks lose cancellation and error propagation, and need their own synchronisation."
+- id: q3
+  type: multi
+  prompt: "Which of these are stringly-typed smells worth fixing?"
+  options:
+    - "`NotificationCenter.default.post(name: Notification.Name(\"cartChanged\"), object: nil)` in five files"
+    - "`\"product_viewed\"` spelled once, inside an `AnalyticsEvent.name` property"
+    - "`func load(_ json: [String: Any])` in a new feature"
+    - "`UserDefaults.standard.string(forKey: \"apiEnvironment\")` read in several screens"
+    - "A `Codable` struct with a `CodingKeys` enum that maps `user_id` to `userID`"
+  answer: [0, 2, 3]
+  explain: "A name retyped in five files, an untyped dictionary in new code, and a defaults key read in several places all let typos compile. One spelling at the boundary, like the analytics name or `CodingKeys`, is exactly how strings should be handled."
+- id: q4
+  type: order
+  prompt: "Put the migration of a completion-handler API to async/await in order."
+  lines:
+    - "Wrap the lowest-level callback API with `withCheckedThrowingContinuation`"
+    - "Write the logic as an `async throws` function on top of it"
+    - "Re-implement the old completion-handler method as a deprecated wrapper around the new one"
+    - "Move callers to the async version, one at a time"
+    - "Delete the deprecated wrapper"
+  explain: "Bottom up, then callers, then cleanup. The deprecated wrapper keeps every existing caller working, and its deprecation warnings list the call sites still to move."
+- id: q5
+  type: truefalse
+  prompt: "Once analytics events are an enum, the SDK's string event names should no longer appear anywhere in the codebase."
+  answer: false
+  explain: "The SDK still needs strings, so they live in exactly one place: the enum's `name` and `parameters`, or the adapter that talks to the SDK. Typing the code that *uses* events is the goal, not removing the wire format."
+```

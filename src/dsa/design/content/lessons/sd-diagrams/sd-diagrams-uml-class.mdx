@@ -1,0 +1,370 @@
+## Why it matters
+
+A class diagram is the shared language for object models. You'll draw one in a low-level design interview ("design the classes for a parking garage", "design an image cache"), in a design doc for an intricate feature, and on a whiteboard when two engineers disagree about who owns what. For Swift it matters most for one reason: the arrows say who holds a reference to whom, and ownership is where Swift object graphs go wrong.
+
+## Anatomy of a class box
+
+UML draws a type as a box with up to three compartments:
+
+```text title="A class box"
+┌──────────────────────────────────┐
+│          «class»                 │   stereotype (optional)
+│          EditSession             │   name
+├──────────────────────────────────┤
+│ + original: Bitmap               │   attributes: visibility name: Type
+│ - filters: [any PhotoFilter]     │
+├──────────────────────────────────┤
+│ + add(filter: any PhotoFilter)   │   operations: visibility name(params): Return
+│ + render(): Bitmap               │
+└──────────────────────────────────┘
+```
+
+- **Stereotypes** in guillemets name the kind of type. UML has «interface» and «enumeration»; for Swift, write «protocol», «struct», «enum» and «actor», and add a line to the legend saying so. Abstract types are in *italics*, static members are underlined.
+- **Attributes** are `name: Type`, optionally with a multiplicity and a default: `tags: String [0..*] = []`.
+- **Operations** are `name(parameter: Type): ReturnType`. Leave out initialisers, getters and setters unless they say something about the design.
+- **Visibility** is one character, and it maps onto Swift almost exactly:
+
+| UML | Meaning | Swift |
+| --- | --- | --- |
+| `+` | Public | `public` or `open` (or `internal`, on a diagram of one module) |
+| `-` | Private | `private` or `fileprivate` |
+| `~` | Package | `package`, added in Swift 5.9 |
+| `#` | Protected | No equivalent: Swift has no protected access |
+
+You rarely need every compartment. A diagram about relationships can show bare names; one about an interface shows its operations and nothing else.
+
+## Six relationships
+
+The arrowheads are what make UML precise, and the six worth knowing each have a Swift reading:
+
+```text title="UML relationships, and what each means in Swift"
+Generalisation   Subclass ──────────────▷ Superclass   class Subclass: Superclass
+Realisation      Type     ┄┄┄┄┄┄┄┄┄┄┄┄┄┄▷ Protocol     struct Type: Protocol
+Composition      Whole    ◆────────────── Part         a stored value, or an object only the whole holds
+Aggregation      Whole    ◇────────────── Part         a part that's shared; most teams skip this one
+Association      Holder   ──────────────> Held         a stored reference: mark weak or unowned on the end
+Dependency       User     ┄┄┄┄┄┄┄┄┄┄┄┄┄┄> Used         a parameter, a local variable, a return type
+```
+
+- **Generalisation** (solid line, hollow triangle) is class inheritance. In Swift you'll draw it less than in Java, because most variation goes through protocols.
+- **Realisation** (dashed line, hollow triangle) is protocol conformance. It's the commonest arrow on a Swift class diagram.
+- **Composition** (filled diamond at the whole) means the part lives and dies with the whole. A stored struct or enum value is composition by construction: it's copied with its owner and freed with it.
+- **Aggregation** (hollow diamond) means "has a, but shares it". Its meaning is vague enough that Jim Rumbaugh, one of UML's authors, called it a "modelling placebo", and Martin Fowler advises leaving it out. Draw an association instead and say who else holds the part.
+- **Association** (solid line, optional open arrowhead for the direction you can navigate) is a stored reference to another object. Put the property name and multiplicity on the far end, and `weak` or `unowned` when it's not a strong reference.
+- **Dependency** (dashed line, open arrowhead) means "uses, briefly": a parameter, a return type, a type it creates. No reference is kept, so it can't be part of a retain cycle.
+
+### Multiplicity
+
+Numbers on the ends of a line say how many:
+
+| Notation | Meaning | Swift |
+| --- | --- | --- |
+| `1` | Exactly one | A non-optional stored property |
+| `0..1` | Zero or one | An optional |
+| `*` or `0..*` | Any number | An array, set or dictionary |
+| `1..*` | At least one | No built-in type: a non-empty wrapper, or an invariant you check |
+
+A `1..*` you can't express in a type is a hint worth acting on: either make illegal states unrepresentable, as in [Making illegal states unrepresentable with enums](/design/learn/sd-modelling-illegal-states), or write the invariant down.
+
+## A worked example: a photo editor
+
+Here's the model behind a photo editor's editing screen. A session holds the original image and a list of filters; the screen is its delegate; exporting takes an exporter for the chosen format:
+
+```swift check group=editor title="EditSession.swift"
+import Foundation
+
+struct Bitmap: Sendable {
+    var width: Int
+    var height: Int
+}
+
+struct PixelRect: Hashable, Sendable {
+    var x: Int
+    var y: Int
+    var width: Int
+    var height: Int
+}
+
+protocol PhotoFilter: Sendable {
+    var name: String { get }
+    func apply(to image: Bitmap) -> Bitmap
+}
+
+struct Exposure: PhotoFilter {
+    var stops: Double
+    var name: String { "Exposure" }
+    func apply(to image: Bitmap) -> Bitmap { image } // the pixel maths is left out
+}
+
+struct Crop: PhotoFilter {
+    var rect: PixelRect
+    var name: String { "Crop" }
+    func apply(to image: Bitmap) -> Bitmap { Bitmap(width: rect.width, height: rect.height) }
+}
+
+enum ExportFormat: Sendable {
+    case heic
+    case jpeg(quality: Double)
+}
+
+protocol PhotoExporter: Sendable {
+    func export(_ image: Bitmap, as format: ExportFormat) async throws -> Data
+}
+```
+
+```swift check group=editor title="EditSession.swift (continued)"
+@MainActor
+protocol EditSessionDelegate: AnyObject {
+    func sessionDidChange(_ session: EditSession)
+}
+
+@MainActor
+final class EditSession {
+    let original: Bitmap
+    private(set) var filters: [any PhotoFilter] = []
+    weak var delegate: (any EditSessionDelegate)?
+
+    init(original: Bitmap) {
+        self.original = original
+    }
+
+    func add(_ filter: any PhotoFilter) {
+        filters.append(filter)
+        delegate?.sessionDidChange(self)
+    }
+
+    func render() -> Bitmap {
+        filters.reduce(original) { image, filter in filter.apply(to: image) }
+    }
+
+    func export(as format: ExportFormat, using exporter: any PhotoExporter) async throws -> Data {
+        try await exporter.export(render(), as: format)
+    }
+}
+```
+
+The same model as a class diagram, in Mermaid. Read each relationship line against the code above:
+
+```text title="edit-session.mmd"
+classDiagram
+    direction LR
+    class PhotoFilter {
+        <<protocol>>
+        +name: String
+        +apply(to: Bitmap) Bitmap
+    }
+    class Exposure {
+        <<struct>>
+        +stops: Double
+    }
+    class Crop {
+        <<struct>>
+        +rect: PixelRect
+    }
+    class EditSession {
+        +original: Bitmap
+        -filters: [any PhotoFilter]
+        +add(filter: any PhotoFilter)
+        +render() Bitmap
+        +export(as: ExportFormat, using: PhotoExporter) Data
+    }
+    class EditSessionDelegate {
+        <<protocol>>
+        +sessionDidChange(session: EditSession)
+    }
+    class PhotoExporter {
+        <<protocol>>
+        +export(image: Bitmap, as: ExportFormat) Data
+    }
+    PhotoFilter <|.. Exposure
+    PhotoFilter <|.. Crop
+    EditSession "1" *-- "0..*" PhotoFilter : filters
+    EditSession --> "0..1" EditSessionDelegate : weak delegate
+    EditSession ..> PhotoExporter : uses
+```
+
+- `<|..` is realisation: `Exposure` and `Crop` conform to `PhotoFilter`.
+- `*--` with `0..*` is composition: the filters are values stored in the session, copied and freed with it.
+- `-->` with `0..1` is an association to an optional: the delegate. The label says `weak`, because that's the decision a reviewer must check.
+- `..>` is a dependency: the exporter is only a parameter of `export(as:using:)`.
+
+Notice what's missing. `Bitmap`, `PixelRect`, `ExportFormat` and the initialiser are left off, because they don't explain anything about this design. A class diagram that shows every type is a printout of the code, and the code is easier to read.
+
+## Ownership is the point
+
+Composition and association aren't pedantry in Swift: they're the difference between value semantics and shared references. Copy a struct that **composes** its parts and you get independent parts; copy a struct that **associates** with an object and both copies share it:
+
+```swift run title="A diamond and an arrow, in Swift"
+struct Adjustment {
+    var name: String
+    var amount: Double
+}
+
+// Composition: the adjustments are values, copied with the recipe
+struct Recipe {
+    var adjustments: [Adjustment]
+}
+
+// Association: the look refers to a shared lookup table
+final class LookupTable {
+    var name: String
+    init(name: String) { self.name = name }
+}
+
+struct Look {
+    var table: LookupTable
+}
+
+let original = Recipe(adjustments: [Adjustment(name: "Exposure", amount: 0.5)])
+var edited = original
+edited.adjustments[0].amount = 1.0
+print("Recipe: original \(original.adjustments[0].amount), edited \(edited.adjustments[0].amount)")
+
+let film = LookupTable(name: "Film")
+let warm = Look(table: film)
+let copy = warm
+warm.table.name = "Warm film"
+print("Look: the copy now uses \"\(copy.table.name)\"")
+```
+
+```output
+Recipe: original 0.5, edited 1.0
+Look: the copy now uses "Warm film"
+```
+
+Retain cycles are the other half. A class diagram shows them, if you draw the references honestly. Step through the editor's objects at runtime, an *object diagram*, which is a class diagram of instances:
+
+```visual flow
+title: "The editor's objects at runtime: who keeps whom alive"
+nodes:
+  - { id: screen, label: EditorScreen, kind: view, at: [0, 0] }
+  - { id: session, label: EditSession, kind: service, at: [2, 0] }
+  - { id: filters, label: Filter values, kind: store, at: [4, 0] }
+  - { id: exporter, label: HEICExporter, kind: service, at: [2, 2] }
+edges:
+  - [screen, session, owns]
+  - [session, screen, weak delegate, { style: async }]
+  - [session, filters, contains, { style: data }]
+  - [session, exporter, uses]
+steps:
+  - say: "The screen creates the session and keeps it in a stored property: a **strong** association, drawn solid."
+    show: [screen, session]
+    send: screen->session
+  - say: "The session calls back through its delegate, which is the screen. That reference is `weak`, drawn dashed here, so the session never keeps the screen alive."
+    send: session->screen
+    label: { session->screen: weak delegate }
+  - say: "Delete the word `weak` and both references are strong: screen → session → screen. When the user leaves the editor, **neither is freed**. On a class diagram, that cycle is two solid association arrows pointing at each other."
+    state: { screen: error, session: error }
+    label: { session->screen: strong delegate }
+  - say: "Put `weak` back. The filters are **values inside** the session: composition. They can't form a cycle, because nothing else can point at them."
+    show: [filters]
+    send: session->filters
+    state: { screen: ok, session: ok }
+    label: { session->screen: weak delegate }
+  - say: "The exporter is a **dependency**: a parameter of `export(as:using:)` that the session uses and forgets. Dependencies never keep anything alive, which is one reason to prefer them over stored references."
+    show: [exporter]
+    send: session->exporter
+```
+
+## Class diagrams in a low-level design interview
+
+Object-oriented design rounds ("design a parking garage", "design the classes behind a chat screen", "design an LRU image cache") are scored on the model you draw. A routine that works:
+
+1. **List the nouns** in the requirements. Each is a candidate type; merge synonyms and drop the ones with no behaviour.
+2. **List the verbs.** Each is an operation; give it to the type that has the data it needs.
+3. **Draw the relationships** with multiplicities: does a level hold `1..*` spaces, does a ticket refer to exactly one space?
+4. **Find the variation** the interviewer hinted at (two kinds of vehicle, two pricing rules) and put a protocol there, with realisations under it.
+5. **Mark ownership**: which references are strong, which are weak, which are values.
+6. **Walk one use case** through the diagram out loud, to check every operation has somewhere to live.
+
+Keep it to the types that carry the design, usually five to ten. Then offer to write the key protocol in Swift, because it proves the diagram compiles in your head.
+
+## Trade-offs
+
+| Way to show an object model | Precision | Readers who can follow it | Goes stale | When it wins |
+| --- | --- | --- | --- | --- |
+| UML class diagram, hand-drawn | High: every arrowhead means something | Engineers who know UML | Quickly | Interviews, design reviews of a tricky model |
+| Class diagram as code (Mermaid, PlantUML) | High | Same | Slower: reviewed with the code | Design docs, module READMEs |
+| Generated from source | Exact, but shows everything | Same | Never, if regenerated | Exploring an unfamiliar codebase |
+| The Swift code itself | Exact | Every Swift developer | Never | Small models, where a diagram adds nothing |
+| Boxes and labelled lines, no UML | Medium | Everyone | Quickly | Mixed audiences who won't learn the arrowheads |
+
+<Callout kind="interview">
+
+**Say** what each relationship means as you draw it: "a level has one or more spaces, composition, because spaces don't exist without their level"; "the ticket holds a weak reference back to the session". **Ask** which variation matters before adding protocols: "will we add more vehicle types, or is it always cars and motorbikes?" **Red flags:** inheritance trees five levels deep where a protocol would do, every relationship drawn the same way, getters and setters filling the boxes, and no multiplicities, so nobody can tell an optional from a list.
+
+</Callout>
+
+<Callout kind="gotcha" title="Swift gotcha: closures are associations nobody draws">
+
+A stored closure that captures `self` is a strong reference, exactly like a stored property, but it never appears as an arrow on a class diagram. A view model that stores `onChange: () -> Void` set by its screen, where the closure captures the screen, is the cycle from the walkthrough without a delegate in sight. When a type stores closures, draw them as associations to whatever they capture, and write `[weak self]` on that arrow.
+
+</Callout>
+
+## Practice
+
+**Component view of a podcast app** asks for one class diagram: the types inside its Downloads component. Draw the protocols and what conforms to them, mark every relationship as composition, association or dependency, and look hard at who keeps whom alive: `URLSession` has an ownership rule that belongs on the diagram.
+
+```cards
+- id: uml-realisation
+  front: "Which UML relationship is Swift protocol conformance, and how is it drawn?"
+  back: "Realisation: a dashed line with a hollow triangle pointing at the protocol."
+- id: uml-composition-swift
+  front: "What does composition (a filled diamond) mean, and what's its natural Swift form?"
+  back: "The part lives and dies with the whole. A stored struct or enum value is composition by construction: copied and freed with its owner."
+- id: uml-association-dependency
+  front: "What's the difference between an association and a dependency?"
+  back: "An association is a stored reference (it can keep things alive and form cycles); a dependency is a brief use, such as a parameter or return type, and keeps nothing alive."
+- id: uml-multiplicity
+  front: "What do the multiplicities 1, 0..1, * and 1..* map to in Swift?"
+  back: "A non-optional property, an optional, a collection, and a non-empty collection (which Swift can't express without a wrapper or an invariant)."
+```
+
+```quiz
+- id: q1
+  type: match
+  prompt: "Match each piece of Swift to the UML relationship it's drawn as."
+  pairs:
+    - ["`struct Crop: PhotoFilter`", "Realisation"]
+    - ["`final class AdminUser: User`", "Generalisation"]
+    - ["`var filters: [any PhotoFilter]` holding struct values", "Composition"]
+    - ["`weak var delegate: (any EditSessionDelegate)?`", "Association"]
+    - ["`func export(using exporter: any PhotoExporter)`", "Dependency"]
+  explain: "Conformance is realisation, subclassing is generalisation, stored values are composition, a stored reference is an association (marked weak), and a parameter is a dependency."
+- id: q2
+  type: mcq
+  prompt: "A class diagram shows `Playlist \"1\" *-- \"0..*\" Episode`. Which Swift model matches it best?"
+  options:
+    - "`struct Playlist { var episodes: [Episode] }` with `Episode` a struct"
+    - "`final class Playlist { weak var episode: Episode? }`"
+    - "`final class Playlist { var episode: Episode }` with `Episode` a class shared across playlists"
+    - "`func play(_ episode: Episode)` on `Playlist`"
+  answer: 0
+  explain: "A filled diamond with 0..* means the playlist contains any number of episodes that live and die with it. An array of struct values is exactly that. A weak optional is a 0..1 association, a shared class is association or aggregation, and a parameter is a dependency."
+- id: q3
+  type: multi
+  prompt: "You're drawing a class diagram for a design review of a new checkout model. What should you leave out? Choose all that apply."
+  options:
+    - "Initialisers, and getters that only return a property"
+    - "The protocol that both payment methods conform to"
+    - "Private helper types that don't affect the design"
+    - "Which references are weak"
+    - "Multiplicities on the relationships"
+  answer: [0, 2]
+  explain: "Leave out what explains nothing: boilerplate members and private helpers. Keep the protocol (it's where the variation lives), the weak references (ownership is the review's main risk) and the multiplicities (they distinguish an optional from a list)."
+- id: q4
+  type: truefalse
+  prompt: "A dependency arrow (dashed, open arrowhead) can be part of a retain cycle."
+  answer: false
+  explain: "A dependency is a brief use, such as a parameter or a return type, and no reference is kept. Only stored references, which are associations (including captured closures), can form cycles."
+- id: q5
+  type: mcq
+  prompt: "In a low-level design interview for a parking garage, the interviewer mentions cars, motorbikes and vans, and pricing that may change by time of day. Where do protocols earn their place?"
+  options:
+    - "Everywhere: every type should sit behind a protocol"
+    - "At the vehicle kinds and the pricing rule, the two places the interviewer said would vary"
+    - "Nowhere: protocols make the diagram harder to read"
+    - "Only on the `Garage` type, since it's the entry point"
+  answer: 1
+  explain: "Put abstraction where variation is expected: the vehicle kinds and the pricing rule, each with realisations under it. Protocols everywhere add indirection with no benefit, and none at all leaves the hinted-at changes with nowhere to go."
+```

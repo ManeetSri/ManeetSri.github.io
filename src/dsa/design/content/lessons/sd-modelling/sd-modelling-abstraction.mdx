@@ -1,0 +1,289 @@
+## Why it matters
+
+Every type, function and module you write is an abstraction: a simpler story about something complicated. A good one lets you think about checkout without thinking about TLS handshakes, and lets a teammate change how images are cached without touching the profile screen. Interviewers test the same skill from the other side. "Walk me through your design" is a check that you can talk at the right level, and move down a level when asked.
+
+## What an abstraction is
+
+An abstraction is a simplified view of something that keeps what matters for one purpose and leaves the rest out. It has two halves: what it shows you (its interface) and what it hides (its implementation). Both are deliberate choices.
+
+`URLSession.shared.data(from: url)` is a good example. You hand it a URL; it hands back bytes and a response, or throws. It hides DNS lookups, TCP and QUIC connections, TLS, HTTP/2 and HTTP/3 multiplexing, redirects, cookies, proxies, the shared `URLCache` and the cellular radio. You use all of that every day and name none of it.
+
+<Callout kind="analogy">
+
+The London Underground map is one of the most famous abstractions in design. Harry Beck's 1933 map threw away real distances and geography, and kept only what a passenger needs: the order of stations, the lines and where they meet. It's useless for walking and perfect for riding. An abstraction is only good *for a purpose*: say what yours is for, and what it's allowed to ignore.
+
+</Callout>
+
+So abstraction isn't vagueness. A good abstraction is *more* precise than the detail it hides, because it talks in the terms its callers care about. "Place this order" is a precise sentence. "POST these bytes to this URL with this header" is a precise sentence at a different level, about a different concern.
+
+## Levels of abstraction
+
+Abstractions stack. Each level is built from the one below it and speaks its own vocabulary. Step through what happens when a profile screen shows someone's photo:
+
+```visual flow
+title: One avatar, five levels
+layers:
+  - { label: Product, rows: 0 }
+  - { label: UI, rows: 1 }
+  - { label: Component, rows: 2 }
+  - { label: Frameworks, rows: 3 }
+  - { label: System, rows: 4 }
+nodes:
+  - { id: profile, label: Profile screen, kind: view, at: [1, 0] }
+  - { id: avatar, label: AvatarView, kind: view, at: [1, 1] }
+  - { id: pipeline, label: ImagePipeline, kind: service, at: [1, 2] }
+  - { id: cache, label: Memory cache, kind: cache, at: [3, 2] }
+  - { id: session, label: URLSession, kind: service, at: [0, 3] }
+  - { id: imageio, label: ImageIO, kind: service, at: [2, 3] }
+  - { id: network, label: "DNS, TLS, QUIC, radio", kind: external, at: [0, 4], w: 2 }
+edges:
+  - [profile, avatar, url]
+  - [avatar, pipeline, "image(for:)"]
+  - [pipeline, cache, lookup, { style: data }]
+  - [pipeline, session, fetch]
+  - [pipeline, imageio, decode]
+  - [session, network]
+steps:
+  - say: "The product asks for one thing: the profile screen shows **Sam's avatar**. The words at this level are *user*, *profile* and *avatar*."
+    show: [profile]
+  - say: "`AvatarView` turns that into UI: a circle, a placeholder while it waits. It asks for an image by URL and knows nothing about how one arrives."
+    send: profile->avatar
+  - say: "The **image pipeline** holds the hard decisions: check the memory cache, join a request that's already in flight, decode and downsample off the main thread. Its callers see one `async` method."
+    send: [avatar->pipeline, pipeline->cache]
+  - say: "Below it are Apple's frameworks. `URLSession` fetches bytes and `ImageIO` decodes them. Their vocabulary is requests, status codes and pixel buffers."
+    send: [pipeline->session, pipeline->imageio]
+  - say: "At the bottom: DNS, TLS, HTTP/3 over QUIC and the cellular radio. Years of other people's work, and your code never names any of it."
+    send: session->network
+  - say: "Each level is built from the one below and talks in its own terms. A bug report at the top (*the avatar flickers*) becomes a question at each level in turn, until one of them owns the answer."
+    active: [pipeline]
+```
+
+Two things make a level useful.
+
+- **It has a vocabulary of its own.** `ImagePipeline` talks about images, sizes and caches. If its interface starts mentioning `URLRequest` or HTTP headers, the level below is showing through.
+- **You can reason about it without opening the levels below.** You can predict what `AvatarView` does from its interface alone. When you can't, and you have to read the implementation to use it safely, the abstraction has failed at its main job.
+
+## One level per function
+
+The same idea works at the smallest scale. A function reads well when every line in it sits at the same level of abstraction. Kent Beck called this the *composed method*: a function made of steps that each say *what* happens, with the *how* pushed into functions of their own.
+
+Here's a checkout that mixes levels. The first line is about baskets; the rest is about URLs, header fields, JSON dictionaries, status codes and preference keys:
+
+```swift check title="CheckoutModel.swift, before"
+import Foundation
+
+struct Basket {
+    struct Line { let sku: String; let quantity: Int }
+    var lines: [Line]
+}
+
+enum CheckoutError: Error { case emptyBasket, rejected }
+
+final class CheckoutModel {
+    func placeOrder(_ basket: Basket) async throws -> String {
+        guard !basket.lines.isEmpty else { throw CheckoutError.emptyBasket }
+        var request = URLRequest(url: URL(string: "https://api.example.com/v2/orders")!)
+        request.httpMethod = "POST"
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        let lines = basket.lines.map { ["sku": $0.sku, "qty": $0.quantity] as [String: Any] }
+        request.httpBody = try JSONSerialization.data(withJSONObject: ["lines": lines])
+        let (data, response) = try await URLSession.shared.data(for: request)
+        guard (response as? HTTPURLResponse)?.statusCode == 201 else { throw CheckoutError.rejected }
+        let json = try JSONSerialization.jsonObject(with: data) as? [String: Any]
+        UserDefaults.standard.set(Date(), forKey: "lastOrderDate")
+        return json?["order_id"] as? String ?? ""
+    }
+}
+```
+
+To understand *what checkout does*, you have to read *how HTTP works*. To change the endpoint, you edit the checkout. Now push each concern down a level, behind a name that says what it does:
+
+```swift run title="Checkout at one level"
+import Foundation
+
+struct Basket {
+    struct Line { let sku: String; let quantity: Int }
+    let lines: [Line]
+}
+
+struct Order: Identifiable {
+    let id: String
+    let lineCount: Int
+}
+
+enum CheckoutError: Error { case emptyBasket }
+
+protocol OrderPlacing: Sendable {
+    func place(_ basket: Basket) async throws -> Order
+}
+
+protocol ReceiptStoring: Sendable {
+    func save(_ order: Order) async throws
+}
+
+struct Checkout {
+    let orders: any OrderPlacing
+    let receipts: any ReceiptStoring
+
+    // One level: the steps of checking out, in the product's words
+    func placeOrder(_ basket: Basket) async throws -> Order.ID {
+        guard !basket.lines.isEmpty else { throw CheckoutError.emptyBasket }
+        let order = try await orders.place(basket)
+        try await receipts.save(order)
+        return order.id
+    }
+}
+
+// The level below lives in its own types: how an order travels, where receipts go
+struct FakeOrdersAPI: OrderPlacing {
+    func place(_ basket: Basket) async throws -> Order {
+        print("POST /v2/orders with \(basket.lines.count) lines")
+        return Order(id: "ord_812", lineCount: basket.lines.count)
+    }
+}
+
+actor InMemoryReceipts: ReceiptStoring {
+    private(set) var saved: [Order.ID] = []
+    func save(_ order: Order) { saved.append(order.id) }
+}
+
+let receipts = InMemoryReceipts()
+let checkout = Checkout(orders: FakeOrdersAPI(), receipts: receipts)
+let basket = Basket(lines: [.init(sku: "TEE-M-BLUE", quantity: 2), .init(sku: "SOCK-3PK", quantity: 1)])
+let id = try await checkout.placeOrder(basket)
+print("Placed \(id)")
+print("Receipts: \(await receipts.saved)")
+
+do {
+    _ = try await checkout.placeOrder(Basket(lines: []))
+} catch {
+    print("Empty basket: \(error)")
+}
+```
+
+```output
+POST /v2/orders with 2 lines
+Placed ord_812
+Receipts: ["ord_812"]
+Empty basket: emptyBasket
+```
+
+`placeOrder` now reads like the product spec, and the HTTP details live in one type you can replace in tests (as here) or change when the API moves to `/v3`. The work didn't disappear: the real `OrdersAPI` still builds the request. It just lives at its own level, where every line is about HTTP.
+
+How to spot a function that mixes levels:
+
+- It talks about the domain (*basket*, *order*) and about mechanisms (*header*, *key*, *status code*) in the same few lines.
+- It has comments that label sections: `// build the request`, `// parse the response`. Each label is a function waiting to be named.
+- Its tests need the network, the file system or `UserDefaults` to check a business rule.
+
+## The domain level is the one that pays
+
+Most apps have one level that deserves the most care: the one that speaks the product's language. `Order`, `Basket`, `Booking`, `Waitlist`. Everything below it (Core Data, JSON, URLSession, the Keychain) is plumbing that serves it. The rest of this module is about building that level well: hiding the plumbing, writing contracts, and choosing types (entities, values, aggregates, enums) that make the product's rules hard to break.
+
+## Leaky abstractions
+
+In 2002 Joel Spolsky wrote that "all non-trivial abstractions, to some degree, are leaky". Some detail you hid will eventually matter to a caller. iOS is full of examples:
+
+- **Core Data faults.** A managed object looks like an ordinary object, but reading a property on a fault fires a fetch. Loop over a thousand of them in a table view and the database leaks through as a stutter.
+- **`AsyncImage`.** It hides fetching and decoding, but it also hides the cache, so you can't tell it to keep images in memory between screens. A feed that scrolls fast shows the leak as flicker and repeated downloads.
+- **A repository that looks local.** `profile()` returns cached data instantly, except on first launch, when it quietly blocks for two seconds on the network.
+
+You can't stop abstractions leaking. You can choose which leaks show up *in the interface*, where callers can plan for them. Swift helps: `async` says "this can take a while", `throws` says "this can fail", `AsyncSequence` says "values arrive over time", and `@MainActor` says "only call me from the main thread". A repository whose method is `func profile() async throws -> Profile` is honest about the two leaks that matter. One that returns `Profile` synchronously is lying about both.
+
+## Choosing the level
+
+The hard part isn't building abstractions; it's choosing where to draw them.
+
+- **Too low**, and every caller repeats the same details. Five screens each build their own `URLRequest` and decode their own errors.
+- **Too high or too general**, and you build a framework for cases you'll never meet: a "universal data layer" with plug-in caching policies, used by one screen.
+- **Too early**, and you guess the wrong concepts. A common rule of thumb is to wait until you've written something three times before abstracting it, so you've seen what actually varies. You'll weigh this properly in D05, with DRY and the wrong abstraction.
+
+Every abstraction also has a running cost: one more name to learn, one more file to jump through when debugging, one more place a bug can hide. It earns its keep when it hides a decision that's likely to change, or a lot of complexity behind a small interface. The next two lessons make those two tests precise.
+
+## Trade-offs
+
+| Option | Reads well at the call site | When the hidden detail changes | Testability | Cost to build | Main risk |
+| --- | --- | --- | --- | --- | --- |
+| Concrete code, no abstraction | Fine while it's small | Every caller changes | Needs the real network or disk | None | Duplication spreads quietly |
+| Thin wrapper over a framework | Barely better | The wrapper changes, and often its callers | A seam for fakes | Low | Leaks the framework's shape |
+| Domain-level abstraction (`OrdersAPI.place(_:)`) | Reads like the spec | One type changes | Easy to fake | Medium | Choosing the wrong concepts |
+| General framework for every case | Hard for newcomers | Cheap in theory | Hard | High | Built for cases that never come |
+
+Concrete code wins for a prototype or a one-off screen. A domain-level abstraction wins once a concept is used in several places, or the detail behind it is likely to change. A general framework only wins when you're building an SDK for many teams, and even then it should grow out of real uses.
+
+<Callout kind="interview">
+
+**Say** what level you're at, and offer to go down: "At the top level there's a feed screen, a feed repository and an image pipeline. I'll treat the pipeline as a black box for now and come back to caching." Name each box by what it hides. **Ask** where the interviewer wants depth before diving in. **Red flags:** jumping into Codable keys or table view cells in the first five minutes, boxes you can't explain without describing their internals, and one box that does everything ("the Manager handles it").
+
+</Callout>
+
+<Callout kind="gotcha" title="iOS gotcha: you can't choose the level of an abstraction you don't own">
+
+`AsyncImage` takes a URL and nothing else: no session, no cache, no downsampling size. That's the right level for a settings screen with one icon and the wrong level for a photo feed. When an Apple abstraction sits at the wrong level for your problem, don't fight it with workarounds around every call: put your own abstraction (an `ImagePipeline` with the API you need) in front, and use the framework inside it.
+
+</Callout>
+
+```cards
+- id: abstraction-definition
+  front: "What is an abstraction, in two halves?"
+  back: "A simplified view for a purpose: an interface that shows what callers need, and an implementation that hides the rest. Both halves are deliberate choices."
+- id: one-level
+  front: "What's the composed method rule?"
+  back: "Every line in a function sits at the same level of abstraction. Steps say what happens; how each step works lives in a function or type of its own."
+- id: leaks-in-interface
+  front: "Abstractions leak. What can you do about it?"
+  back: "Choose which leaks show in the interface so callers can plan for them: `async` for waiting, `throws` for failure, `AsyncSequence` for values over time, `@MainActor` for threading."
+```
+
+```quiz
+- id: q1
+  type: bug
+  prompt: "This view model method should read at one level. Click the line that drops to a lower one."
+  code: |
+    func refreshFeed() async {
+        let posts = await feed.latestPosts()
+        let visible = posts.filter { !blockList.contains($0.author) }
+        UserDefaults.standard.set(Date().timeIntervalSince1970, forKey: "feed.lastRefresh")
+        state = .loaded(visible)
+    }
+  answer: 4
+  explain: "The other lines talk about posts, blocked authors and screen state. Line 4 is about a preference key and a timestamp format. Hide it behind something like `await feed.recordRefresh()`, so the storage choice can change without touching this method."
+- id: q2
+  type: sort
+  prompt: "Which level of abstraction is each statement about?"
+  buckets: [Product, Component, Framework]
+  items:
+    - [The basket badge shows how many items are in the basket, 0]
+    - [People can save a draft and finish it offline, 0]
+    - [The image pipeline joins two requests for the same URL, 1]
+    - [The draft store writes each draft to its own file atomically, 1]
+    - [URLCache keeps HTTP responses according to their Cache-Control headers, 2]
+    - [JSONDecoder reports a missing key with a DecodingError, 2]
+  explain: "Product statements are in the users' words. Component statements are about your own building blocks and the decisions they hide. Framework statements are about Apple's machinery, which your components are built from."
+- id: q3
+  type: mcq
+  prompt: "`ProfileRepository.profile() -> Profile` returns cached data instantly, but on first launch it blocks the calling thread for up to two seconds while it hits the network, and returns an empty profile if that fails. What's the best fix?"
+  options:
+    - "Document the two-second wait in a comment"
+    - "Change it to `func profile() async throws -> Profile`, so waiting and failure are part of the interface"
+    - "Move the network call into the view controller"
+    - "Return the cached profile and never fetch"
+  answer: 1
+  explain: "The leaks (it can wait, it can fail) are real, so make them visible where callers can't miss them. `async` stops it blocking a thread, and `throws` replaces a fake empty profile with an error the screen can show."
+- id: q4
+  type: truefalse
+  prompt: "A good abstraction hides everything about how it works, including whether it can fail."
+  answer: false
+  explain: "Callers have to plan for failure, waiting and threading, so those belong in the interface. A good abstraction hides the decisions callers don't need, not the ones they do."
+- id: q5
+  type: multi
+  prompt: "You find a `DataLayer` framework with pluggable caching, retry and storage strategies. Which are signs it was abstracted too early? Choose all that apply."
+  options:
+    - "Only one screen uses it, with the default strategies"
+    - "Its interface talks about orders and products"
+    - "Every new feature needs a change inside the framework anyway"
+    - "Tests replace its network layer with a fake"
+    - "Nobody on the team can explain why some options exist"
+  answer: [0, 2, 4]
+  explain: "Flexibility nobody uses, changes that still land inside it, and options without a reason all say it was designed for imagined cases. Domain vocabulary and fakeable seams are signs of a healthy abstraction."
+```

@@ -1,0 +1,353 @@
+## Why it matters
+
+TCA isn't the only unidirectional architecture you'll meet. Android teams speak **MVI**, and if your company ships both platforms, design reviews will use its vocabulary: intents, view state, one-off events. Older iOS codebases often run on **ReSwift**, a direct port of Redux, and RxSwift codebases on **ReactorKit**. Knowing them lets you work in those apps, compare them fairly with TCA, and answer the interview question "what's the difference between MVI, Redux and TCA?" with substance rather than slogans. This lesson also settles a debate every unidirectional design hits sooner or later: how to model events that should happen exactly once.
+
+## MVI: model, view, intent
+
+MVI comes from André Staltz's Cycle.js, a JavaScript framework from 2015 that described an app as a cycle of three functions: **intent** turns user input into actions, **model** turns actions into state, **view** turns state into UI. Android developers adopted it around 2016, and it's now the mainstream there: Google's own architecture guidance describes a view model that exposes immutable UI state and receives events from the UI, with libraries such as Orbit and MVIKotlin formalising it.
+
+The parts:
+
+- **Intent:** what the user wants, as a value: `refreshPulled`, `loadMoreReached`, `articleTapped(id)`. The same idea as an action, named from the user's side.
+- **Model:** a screen's single, immutable **view state**, the only thing the view renders.
+- **View:** renders the view state and emits intents. Nothing else.
+- **Results** (also called partial state changes or mutations): what the model's async work reports, which a pure **reducer** folds into the view state.
+
+Compared with Redux, MVI is usually **per screen**, with the view model as the store, and its effects usually run inside the view model as coroutines or streams rather than being returned from the reducer. It's Redux's discipline at the scale of a view model, which makes it an easy step for a team that already uses MVVM.
+
+## MVI in Swift
+
+Here's a reading list in MVI style: one `ViewState`, an `Intent` enum, effects in the model, and every change going through `reduce`:
+
+```swift check ios title="MVI: intents in, one view state out"
+import SwiftUI
+
+struct Article: Identifiable, Equatable, Sendable {
+    let id: Int
+    let title: String
+}
+
+protocol ArticlesLoading: Sendable {
+    func articles(page: Int) async throws -> [Article]
+}
+
+@MainActor
+@Observable
+final class ReadingListModel {
+    enum Intent {
+        case appeared
+        case refreshPulled
+        case loadMoreReached
+        case messageDismissed
+    }
+
+    struct ViewState: Equatable {
+        var articles: [Article] = []
+        var isLoading = false
+        var page = 0
+        /// A one-off message, modelled as state the view acknowledges
+        var message: String?
+    }
+
+    /// What work reports back. Only `reduce` turns results into state.
+    enum Result {
+        case loadStarted
+        case pageLoaded(page: Int, [Article])
+        case loadFailed
+        case messageCleared
+    }
+
+    private(set) var state = ViewState()
+    @ObservationIgnored private let loader: any ArticlesLoading
+    @ObservationIgnored private var loading: Task<Void, Never>?
+
+    init(loader: any ArticlesLoading) {
+        self.loader = loader
+    }
+
+    func send(_ intent: Intent) {
+        switch intent {
+        case .appeared where state.articles.isEmpty, .refreshPulled:
+            load(page: 1)
+        case .loadMoreReached where !state.isLoading:
+            load(page: state.page + 1)
+        case .messageDismissed:
+            apply(.messageCleared)
+        case .appeared, .loadMoreReached:
+            break
+        }
+    }
+
+    private func load(page: Int) {
+        loading?.cancel()   // a refresh supersedes a load-more still in flight
+        apply(.loadStarted)
+        loading = Task {
+            do {
+                let articles = try await loader.articles(page: page)
+                guard !Task.isCancelled else { return }
+                apply(.pageLoaded(page: page, articles))
+            } catch {
+                guard !Task.isCancelled else { return }
+                apply(.loadFailed)
+            }
+        }
+    }
+
+    private func apply(_ result: Result) {
+        state = Self.reduce(state, result)
+    }
+
+    static func reduce(_ state: ViewState, _ result: Result) -> ViewState {
+        var state = state
+        switch result {
+        case .loadStarted:
+            state.isLoading = true
+        case .pageLoaded(let page, let articles):
+            state.isLoading = false
+            state.page = page
+            state.articles = page == 1 ? articles : state.articles + articles
+        case .loadFailed:
+            state.isLoading = false
+            state.message = "Couldn't load articles. Pull to try again."
+        case .messageCleared:
+            state.message = nil
+        }
+        return state
+    }
+}
+
+struct ReadingListView: View {
+    let model: ReadingListModel
+
+    var body: some View {
+        List(model.state.articles) { article in
+            Text(article.title)
+                .onAppear {
+                    if article == model.state.articles.last { model.send(.loadMoreReached) }
+                }
+        }
+        .overlay {
+            if model.state.isLoading && model.state.articles.isEmpty { ProgressView() }
+        }
+        .task { model.send(.appeared) }
+        .alert(model.state.message ?? "", isPresented: Binding(
+            get: { model.state.message != nil },
+            set: { if !$0 { model.send(.messageDismissed) } }
+        )) {
+            Button("OK") {}
+        }
+    }
+}
+```
+
+What it shares with the Redux family, and where it differs:
+
+- **One door in, one state out.** The view sends intents and renders `state`, which is `private(set)`. Every change passes through `reduce`, a pure static function you can test with values.
+- **Effects live in the model.** `load(page:)` starts a `Task` and turns its outcome into a `Result`. That's simpler than an effect runtime, and it puts cancellation on you: without `loading?.cancel()`, a slow page 2 arriving after a refresh would be appended to the fresh page 1.
+- **Testing needs a fake loader.** The reducer is pure, but the intent-to-effect logic lives in a class that starts tasks, so its tests inject an `ArticlesLoading` stub and wait for state to change, as in [Testing view models](/design/learn/sd-mvvm-testing).
+- **One `state` property.** The view reads `model.state`, so any change re-evaluates every view that reads it. For a screen-sized state that's fine; it's the price of the single view state.
+
+Step through a failed refresh, and watch how the error message is handled:
+
+```visual flow
+title: MVI, with a one-off message as state
+nodes:
+  - { id: view, label: View, kind: view, at: [0, 0] }
+  - { id: model, label: View model, at: [2, 0] }
+  - { id: api, label: Articles API, kind: external, at: [4, 0] }
+  - { id: state, label: ViewState, kind: store, at: [0, 2] }
+  - { id: reduce, label: reduce, at: [2, 2] }
+edges:
+  - [view, model, intent]
+  - [model, api, load, { style: async }]
+  - [api, model, outcome]
+  - [model, reduce, result]
+  - [reduce, state, new state]
+  - [state, view, render, { style: data }]
+steps:
+  - say: "The user pulls to refresh. The view sends an **intent**, `refreshPulled`, and nothing else."
+    show: [view, model]
+    send: view->model
+  - say: "The model reports `loadStarted`; `reduce` sets `isLoading`, and the view shows the spinner."
+    show: [reduce, state]
+    send: [model->reduce, reduce->state, state->view]
+  - say: "The model starts the request. Effects live in the view model in MVI, not in the reducer's return value."
+    show: [api]
+    send: model->api
+    state: { model: wait }
+  - say: "The request fails. The model turns that into a **result**, `loadFailed`."
+    send: api->model
+    state: { api: error, model: null }
+  - say: "`reduce` stops loading and sets `message`. The one-off message is **state**, so it can't be lost if the view isn't listening at that instant."
+    send: [model->reduce, reduce->state]
+    label: { state: message set }
+  - say: "The view shows the alert. Dismissing it sends `messageDismissed`, which clears `message`: the event is consumed by an acknowledgement, through the same loop."
+    send: [state->view, view->model]
+    label: { state: null }
+    state: { api: null }
+```
+
+## One-off events: state, not streams
+
+Navigation after a save, a toast, a haptic: things that should happen once. The tempting design is a second output alongside the state, a Combine `PassthroughSubject` or an `AsyncStream` of events the view listens to. It has a nasty failure mode: an event emitted while nobody is subscribed is dropped. That happens when the app is in the background, during a rotation or scene reconnection, or in the gap before the view's subscription starts.
+
+Android hit this hard, and in 2022 Google's guidance (Manuel Vivo's *ViewModel: One-off event antipatterns*) came down on the side of modelling such events as **state that the UI consumes and acknowledges**: the view model sets `message`, the UI shows it and reports back, the view model clears it. SwiftUI makes this natural: `alert(item:)`, `sheet(item:)` and navigation paths are already driven by optional state that SwiftUI sets back to `nil` when dismissed. It's the same answer TCA reaches with `@Presents`: if it matters whether it happened, it's state.
+
+## ReSwift: Redux, ported to Swift
+
+ReSwift, from 2015, is a faithful Swift port of Redux, and still runs in many apps written before SwiftUI. Its core API, from its README:
+
+```swift
+import ReSwift
+
+struct AppState {
+    var shelf = ShelfState()
+}
+
+struct BookFinished: Action {
+    let id: Int
+}
+
+func appReducer(action: Action, state: AppState?) -> AppState {
+    var state = state ?? AppState()
+    switch action {
+    case let action as BookFinished:
+        state.shelf.finished.insert(action.id)
+    default:
+        break
+    }
+    return state
+}
+
+let mainStore = Store<AppState>(reducer: appReducer, state: nil)
+
+final class ShelfViewController: UIViewController, StoreSubscriber {
+    override func viewWillAppear(_ animated: Bool) {
+        super.viewWillAppear(animated)
+        mainStore.subscribe(self) { $0.select { $0.shelf } }
+    }
+
+    override func viewWillDisappear(_ animated: Bool) {
+        super.viewWillDisappear(animated)
+        mainStore.unsubscribe(self)
+    }
+
+    func newState(state: ShelfState) {
+        // Render the shelf
+    }
+}
+```
+
+It's Redux, line for line: one store (usually global), actions dispatched with `mainStore.dispatch(BookFinished(id: 1))`, a reducer that takes optional state and returns new state, subscribers that select a slice and skip repeats when it's `Equatable`, and middleware for logging and async work, with ReSwift-Thunk for thunks.
+
+What that means in practice:
+
+- **Actions are a protocol, not an enum.** Any type can be an action, and reducers match with `as` casts. The compiler can't tell you a reducer forgot an action: `default: break` swallows it silently.
+- **No effects model, no dependency system, no test store.** Async work lives in middleware or thunks, and testing it is up to you.
+- **One global store** is the default shape, with every trade-off from [Global stores and their trade-offs](/design/learn/sd-state-global-stores).
+- **It predates Swift concurrency.** Dispatch from the main thread; dispatching while another action is being reduced, including from two threads at once, stops the app with a `ConcurrentMutationError`. Expect to add main-actor annotations, or `@preconcurrency import`, to use it under Swift 6's strict checking.
+- **It's small and stable, and changes slowly.** That's reassuring for a library you already depend on, and worth checking before adopting it for something new.
+
+**ReactorKit**, popular in RxSwift codebases, is a close cousin: a view sends `Action`s to a `Reactor`, whose `mutate()` returns an observable stream of `Mutation`s (the effects), and whose `reduce(state:mutation:)` folds them into `State`. It's MVI with Rx streams, per screen.
+
+## How the families compare
+
+| | Redux / ReSwift | Elm | TCA | MVI | ReactorKit |
+| --- | --- | --- | --- | --- | --- |
+| Store | One, app-wide | One program | One root, scoped per feature | One view model per screen | One reactor per screen |
+| Actions | Values; a protocol in ReSwift | Messages: a union type | Enums, case-pathable | Intent enums | Action enums |
+| Effects | Middleware, thunks | Commands and subscriptions | Returned `Effect`s with ids | Inside the view model | `mutate()` streams |
+| Composition | Combined reducers | By hand | `Scope`, `forEach`, `ifLet` | Usually none: screens stand alone | Usually none |
+| Dependencies | Up to you | Through commands | `@Dependency` | Injected into the view model | Injected into the reactor |
+| Testing | Reducers; effects by hand | Pure functions | `TestStore` | Reducer, plus view model tests | Reactor tests with Rx |
+| Fits | Existing Redux-shaped apps | Elm itself | Large SwiftUI apps wanting one style | Teams moving from MVVM; shared vocabulary with Android | RxSwift codebases |
+
+## Trade-offs
+
+The table above compares shapes. The decision usually comes down to three questions. **How far does state need to reach?** Screen-sized state suits MVI or a reactor; state shared across features suits a composed tree like TCA's. **Who must understand it?** MVI is a small step from MVVM, and matches what an Android team already does; TCA and Elm ask more of everyone. **What do you already have?** A working ReSwift or ReactorKit app is better extended consistently, or migrated feature by feature, than rewritten.
+
+<Callout kind="interview">
+
+**Say** "MVI is Redux's discipline at screen scale: intents in, one immutable view state out, results from async work folded in by a pure reducer. ReSwift is Redux ported directly: one global store, protocol actions, middleware. TCA adds composition, effects as returned values with cancellation, dependencies and exhaustive tests." On one-off events: "I model them as state the UI acknowledges, because a fire-and-forget stream drops events nobody's listening to." **Ask** whether an Android team uses MVI, since shared vocabulary and state shapes make cross-platform design reviews easier. **Red flags:** a `PassthroughSubject` for navigation, a reducer that silently ignores unknown actions, and "MVI" that is really a view model with public mutable properties.
+
+</Callout>
+
+<Callout kind="gotcha" title="iOS gotcha: events sent to nobody are lost">
+
+A view model that emits "show the saved toast" through a `PassthroughSubject` loses it if the view hasn't subscribed yet or is off screen, for example when the save finishes while the app is in the background. Put the toast in state, and clear it when the view reports it's been shown or dismissed.
+
+</Callout>
+
+<Callout kind="gotcha" title="Swift gotcha: protocol actions lose exhaustiveness">
+
+With ReSwift's `Action` protocol, adding a new action compiles even if no reducer handles it, and a reducer that matches the wrong type does nothing. If you maintain a ReSwift app, consider defining your actions as one enum per feature that conforms to `Action`, so each reducer can `switch` over it exhaustively.
+
+</Callout>
+
+## Practice
+
+**[A Redux-style store with middleware](/design/practice/sd-kata-unidirectional-redux-store)** is ReSwift's core in miniature: a store with subscribers that hear only real changes, a middleware chain, and the rule ReSwift enforces with a crash, made safe instead: an action dispatched while another is being processed waits its turn.
+
+```cards
+- id: mvi-parts
+  front: "What are MVI's parts?"
+  back: "Intents (what the user wants, as values), one immutable view state (the model), a view that renders state and emits intents, and results from async work that a pure reducer folds into the state."
+- id: mvi-vs-redux
+  front: "How does MVI usually differ from Redux?"
+  back: "It's per screen, with the view model as the store, and effects run inside the view model rather than in middleware or as returned effects."
+- id: one-off-events
+  front: "How should a unidirectional design model one-off events like a toast or a navigation?"
+  back: "As state the UI consumes and acknowledges (set it, show it, clear it on dismissal), not as a fire-and-forget stream, which drops events nobody is subscribed to."
+- id: reswift-shape
+  front: "What is ReSwift?"
+  back: "A direct Swift port of Redux: one store, `Action` as a protocol, reducers `(Action, State?) -> State`, subscribers that select slices, and middleware. No effect model, dependency system or test store."
+```
+
+```quiz
+- id: q1
+  type: mcq
+  prompt: "A save finishes while the app is in the background, and the \"Saved\" toast, sent through a `PassthroughSubject` on the view model, never appears. What's the best fix?"
+  options:
+    - "Switch to a `CurrentValueSubject`"
+    - "Make the toast part of the view state, and clear it when the view reports it was shown"
+    - "Send the toast twice"
+    - "Delay the save until the app is in the foreground"
+  answer: 1
+  explain: "A subject only delivers to current subscribers. State persists until it's acknowledged, so the toast shows when the view next renders. A `CurrentValueSubject` would replay the last toast to every new subscriber, including after it was already shown."
+- id: q2
+  type: sort
+  prompt: "Which architecture does each describe?"
+  buckets: [MVI, ReSwift, Both]
+  items:
+    - [Usually one store per screen, 0]
+    - [Effects often run inside the view model, 0]
+    - [Actions conform to a protocol and are matched with casts, 1]
+    - [One global store selected by subscribers, 1]
+    - [A pure reducer folds changes into state, 2]
+    - [The view only renders state and sends values describing what happened, 2]
+  explain: "Both are unidirectional with pure reducers. MVI scopes the store to a screen and keeps effects in it; ReSwift follows Redux: one store, protocol actions, middleware."
+- id: q3
+  type: multi
+  prompt: "In the MVI reading list, what would break if `load(page:)` didn't cancel the previous task? Choose all that apply."
+  options:
+    - "A slow page 2 could arrive after a refresh and be appended to the new page 1"
+    - "`reduce` would stop being pure"
+    - "`isLoading` could be cleared by an old request while a newer one is still running"
+    - "The view could no longer send intents"
+  answer: [0, 2]
+  explain: "With effects inside the view model, cancellation is your job. Out-of-order results corrupt the list and the loading flag. The reducer stays pure either way; it just receives results it shouldn't."
+- id: q4
+  type: match
+  prompt: "Match each library to its shape."
+  pairs:
+    - ["ReSwift", "Redux ported to Swift: one store, protocol actions, middleware"]
+    - ["ReactorKit", "Action, then mutate() as an Rx stream, then reduce into State"]
+    - ["TCA", "Composed reducers returning effects, with dependencies and a test store"]
+    - ["Orbit", "MVI for Kotlin: a container of state with side effects"]
+  explain: "They're all unidirectional. What differs is where effects live, how features compose and how much tooling comes with them."
+- id: q5
+  type: truefalse
+  prompt: "MVI requires a single store for the whole app."
+  answer: false
+  explain: "MVI is usually per screen: each view model holds its own view state. A single app-wide store is Redux's choice, and ReSwift's."
+```

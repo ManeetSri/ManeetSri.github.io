@@ -1,0 +1,140 @@
+<Brief>
+
+This is the checkout model for an event-ticketing app. People pick up to six seats, the seats are held for ten minutes, they pay, and they can get a refund until a day before the event. It shipped last month. Support now reports that refunds "do nothing", finance has found totals a penny out, and the team building the order history screen is copying rules out of this file. Review it as you would a pull request: what's wrong with the model, what matters most, and how you'd fix it.
+
+```swift check ios title="TicketCheckout.swift"
+import Foundation
+import Observation
+
+struct TicketOrder: Codable {
+    var id: String
+    var eventID: String
+    var buyerEmail: String
+    var seats: [String]
+    var pricePerSeat: Double
+    var currency: String
+    var status: String // "reserved", "paid", "cancelled", "refunded"
+    var reservedUntil: Date?
+    var paymentID: String?
+    var refundedAmount: Double?
+}
+
+@MainActor @Observable
+final class TicketCheckoutViewModel {
+    var order: TicketOrder
+    var errorMessage: String?
+
+    init(order: TicketOrder) {
+        self.order = order
+    }
+
+    var total: Double {
+        order.pricePerSeat * Double(order.seats.count)
+    }
+
+    var totalText: String {
+        order.currency + " " + String(format: "%.2f", total)
+    }
+
+    func addSeat(_ seat: String) {
+        if order.seats.count < 6 {
+            order.seats.append(seat)
+        }
+    }
+
+    func pay(email: String, paymentID: String) {
+        guard email.contains("@") else {
+            errorMessage = "Enter a valid email"
+            return
+        }
+        if let until = order.reservedUntil, until < Date() {
+            order.status = "cancelled"
+            return
+        }
+        order.buyerEmail = email
+        order.paymentID = paymentID
+        order.status = "payed"
+    }
+
+    var canRefund: Bool {
+        order.status == "paid" && order.paymentID != nil
+    }
+
+    func refund(eventStart: Date) {
+        guard canRefund else { return }
+        if eventStart.timeIntervalSinceNow > 86_400 {
+            order.refundedAmount = total
+            order.status = "refunded"
+        }
+    }
+}
+```
+
+</Brief>
+
+```workspace
+template: critique
+minutes: 25
+```
+
+```findings
+- id: status-typo
+  title: A misspelt status string means no order can ever be refunded
+  severity: high
+  lines: 51-55
+  detail: "`pay` sets the status to `\"payed\"`, but `canRefund` checks for `\"paid\"`, so every paid order fails `canRefund` and `refund` silently returns. The compiler can't help, because the status is a free-form `String`: it can't check spelling, and no `switch` over it is ever exhaustive. This is the support team's \"refunds do nothing\" bug."
+- id: money-as-double
+  title: Money is a Double, and the currency is a free-form string
+  severity: high
+  lines: 26-31
+  detail: "`pricePerSeat`, `total` and `refundedAmount` are binary floating point, so sums and conversions to pence drift (`Int(19.99 * 100)` is 1998), which is finance's penny. `%.2f` shows yen with two decimals and Kuwaiti dinars with too few, `currency` can hold any string, and nothing stops a price in one currency being refunded in another. Use integer minor units with a currency type, and format with `FormatStyle` in the view."
+- id: illegal-states
+  title: The order can hold states the business never allows
+  severity: medium
+  lines: 11-14
+  detail: "A status string plus three optionals allows \"paid\" with no `paymentID`, a `refundedAmount` on an order that was never paid, and a `reservedUntil` on a paid order. That's why `canRefund` has to check `paymentID != nil` defensively. An enum with associated values (`.reserved(until:)`, `.paid(PaymentID)`, `.refunded(PaymentID, amount:)`, `.cancelled`) makes those combinations impossible to build."
+- id: anaemic-model
+  title: The rules live in one screen's view model, and anyone can bypass them
+  severity: medium
+  lines: 17-20
+  detail: "`TicketOrder` is a bag of `var`s with no behaviour, and the six-seat limit, the hold expiry and the refund window exist only in this view model. The order history screen, a push handler or a widget must copy them (the other team already is), and the copies will drift. `order` is also settable from outside, so any code can write `viewModel.order.status = \"paid\"`. Move the rules into `TicketOrder` as methods, with `private(set)` state."
+- id: silent-refusals
+  title: Refused actions fail silently
+  severity: medium
+  lines: 34-38
+  detail: "A seventh seat is ignored without a word, the same seat can be added twice, an expired hold quietly cancels the order inside `pay` (lines 45-47), and a refund outside the window just returns (line 60). Callers and users can't tell success from refusal. Each refusal should be an error the screen can explain."
+- id: hidden-clock
+  title: Rules read the device clock directly, with an unnamed 24 hours
+  severity: medium
+  lines: 58-63
+  detail: "`Date()` and `timeIntervalSinceNow` make the hold and refund rules impossible to test without waiting, and they trust a clock the user can change. `86_400` is the refund policy with no name. Pass `now` in (or inject a clock), name the window, and treat the device's check as a courtesy: the server must enforce refunds."
+- id: stringly-email
+  title: The email is a String, checked with contains("@") at one call site
+  severity: low
+  lines: 41-44
+  detail: "`\"@\"` passes this check, `buyerEmail` can be set to anything elsewhere, and other ways in (a saved profile, Apple Pay's contact details) skip it entirely. Parse it once into an `EmailAddress` type at the boundary, so holding one means it was checked."
+- id: interchangeable-ids
+  title: Every id is an interchangeable String
+  severity: low
+  lines: 5-6
+  detail: "`id`, `eventID`, `paymentID` and the seats are all `String`, so `pay(email:paymentID:)` compiles just as happily with an order id or a seat. Typed ids such as `ID<TicketOrder>` and a `SeatID` turn those mix-ups into compile errors at no runtime cost."
+```
+
+<ReferenceReview>
+
+**Most important first.** Two problems are costing money today. The status typo (`"payed"` against `"paid"`) means **no refund can ever happen**, and the `Double` arithmetic is why **finance sees totals a penny out**. Both come from the same root cause: domain ideas held in primitives the compiler can't check. A one-line fix to the typo would stop the bleeding, but the next typo is one string away.
+
+**The design problem underneath** is an anaemic model. `TicketOrder` has no rules of its own, its fields can combine in ways the business never allows, and every rule lives in one screen's view model. That's why another team is copying code out of this file.
+
+**How I'd fix it, in small steps:**
+
+1. **Pin today's behaviour with tests** around the view model (total, the seat limit, paying, refunding), injecting the clock so they run instantly. Fix the typo first, with a test that pays and then refunds.
+2. **Introduce domain types** at the edges: `Money` (integer minor units and a currency), `EmailAddress`, `SeatID` and typed ids. Keep the JSON shape unchanged by decoding a DTO and converting it in one place.
+3. **Replace the status string and its optionals with an enum:** `.reserved(until: Date)`, `.paid(PaymentID)`, `.refunded(PaymentID, amount: Money)`, `.cancelled(Reason)`. Write `init(from:)` to read the old fields, so stored orders and the API still decode.
+4. **Move the rules into the model.** `TicketOrder` becomes an aggregate root with `private(set)` state and methods that check before they change: `addSeat(_:) throws`, `pay(paymentID:email:at:) throws`, `refund(at:eventStart:) throws`. The limits get names (`maxSeats`, `holdDuration`, `refundWindow`).
+5. **Slim the view model** to holding the order, calling those methods and turning their errors into messages. Make `order` `private(set)`. The order history screen now reuses the model instead of copying rules.
+6. **Keep the server authoritative.** The app's checks give instant feedback; the payment and refund endpoints check the same rules against their own clock.
+
+**Tests to add:** the aggregate's rules (a seventh seat, a duplicate seat, paying after the hold expires, refunding just inside and just outside the window, refunding twice), each asserting the order is unchanged when refused; `Money` arithmetic and formatting for GBP, JPY and KWD; decoding stored orders from the previous release into the new enum.
+
+</ReferenceReview>

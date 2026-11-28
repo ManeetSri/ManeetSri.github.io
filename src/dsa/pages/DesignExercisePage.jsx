@@ -72,7 +72,7 @@ const FindingsChecklist = ({ findings, marks, onChange }) => (
                 <legend className="sr-only">{finding.title}</legend>
                 <div className="flex flex-wrap items-center gap-2">
                     <Chip tone={SEVERITY_TONE[finding.severity]}>{finding.severity}</Chip>
-                    {finding.lines && <span className="font-mono text-[11px] text-muted">line{finding.lines.includes('-') ? 's' : ''} {finding.lines.replace('-', '–')}</span>}
+                    {finding.lines && <span className="font-mono text-[11px] text-muted">line{/[-,]/.test(finding.lines) ? 's' : ''} {finding.lines.replaceAll('-', '–')}</span>}
                 </div>
                 <p className="mt-1.5 font-medium">{finding.title}</p>
                 <p className="mb-2.5 mt-1 text-sm text-muted">{finding.detail}</p>

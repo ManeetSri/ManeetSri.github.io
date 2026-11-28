@@ -1,0 +1,104 @@
+A stocks app has one source of live prices and many things that watch it: the watchlist, a price alert, a widget's timeline. Write the subject they subscribe to. Each subscription returns a token, and the observer stops hearing values the moment that token is cancelled or released, the way `AnyCancellable` and `NSKeyValueObservation` behave.
+
+`TickerBroadcast.Channel<Value>.subscribe(_:) -> Subscription`, `send(_:)`, `subscriberCount`, and `Subscription.cancel()`
+
+- `send(_:)` calls every live subscriber's handler with the value, in the order they subscribed.
+- `cancel()` stops delivery at once. Calling it a second time does nothing.
+- Releasing the last reference to a `Subscription` cancels it.
+- Once cancelled, the channel lets go of the handler, so nothing the handler captured stays alive.
+- A subscription doesn't keep the channel alive, and cancelling after the channel has gone is harmless.
+- Handlers may subscribe and cancel while a value is being delivered. A subscriber cancelled mid-send isn't called again, even later in that same send. A subscriber added mid-send hears values from the next send onwards.
+
+## Examples
+
+| Steps | Handlers called |
+| --- | --- |
+| subscribe A, subscribe B, send 1 | A(1), B(1) |
+| subscribe A, send 1, `a.cancel()`, send 2 | A(1) |
+| `var s = subscribe(A)`, send 1, `s = nil`, send 2 | A(1) |
+| send 1, subscribe A, send 2 | A(2) (no replay) |
+| A cancels B whenever it runs; subscribe A, subscribe B, send 1 | A(1) only |
+| A subscribes C the first time it runs; subscribe A, send 1, send 2 | A(1), A(2), C(2) |
+
+## Constraints
+
+- Everything runs on one thread; no locks or actors are needed.
+- `Subscription`'s initialiser is internal, so `Channel` is the only thing that makes one. You choose what it stores.
+- The channel must not hold a subscription strongly, and a subscription must not hold the channel strongly.
+
+<Hints>
+<Hint>
+Give the subscription a closure to run on cancel, and make that closure capture the channel `weak`ly. `deinit` can call `cancel()`.
+</Hint>
+<Hint>
+Store handlers in a dictionary keyed by an id that only goes up, plus an array of ids for the order. Removing an id is then easy, and closures don't need to be compared (they can't be).
+</Hint>
+<Hint>
+In `send`, loop over a copy of the ids and look each handler up again as you reach it. A handler removed by an earlier one is gone from the dictionary, and an id added mid-send isn't in your copy.
+</Hint>
+</Hints>
+
+## Solutions
+
+<Approach title="Ids, a weak back-reference, and a snapshot in send" time="O(n) per send" space="O(n)">
+
+```swift
+public final class Channel<Value> {
+    private var handlers: [Int: (Value) -> Void] = [:]
+    private var order: [Int] = []
+    private var nextID = 0
+
+    public init() {}
+
+    public var subscriberCount: Int {
+        handlers.count
+    }
+
+    public func subscribe(_ handler: @escaping (Value) -> Void) -> Subscription {
+        let id = nextID
+        nextID += 1
+        handlers[id] = handler
+        order.append(id)
+        return Subscription { [weak self] in
+            self?.remove(id)
+        }
+    }
+
+    public func send(_ value: Value) {
+        for id in order {
+            handlers[id]?(value)
+        }
+    }
+
+    private func remove(_ id: Int) {
+        handlers[id] = nil
+        order.removeAll { $0 == id }
+    }
+}
+
+public final class Subscription {
+    private var onCancel: (() -> Void)?
+
+    init(onCancel: @escaping () -> Void) {
+        self.onCancel = onCancel
+    }
+
+    public func cancel() {
+        let action = onCancel
+        onCancel = nil
+        action?()
+    }
+
+    deinit {
+        cancel()
+    }
+}
+```
+
+`for id in order` loops over a copy, because arrays are values: removing or appending ids during the loop changes the stored array, not the one being walked. Looking each handler up again is what skips a subscriber cancelled earlier in the same send.
+
+`cancel()` clears `onCancel` before calling it, so a second call, or `deinit` after a manual cancel, does nothing. The `[weak self]` is what lets a token outlive its channel. If the token held the channel strongly, a long-lived token would keep a whole screen's subject alive.
+
+Removing from `order` is O(n). That's fine for the handful of observers a subject usually has. A channel with thousands of subscribers would use an ordered dictionary or mark ids as dead and compact them later.
+
+</Approach>

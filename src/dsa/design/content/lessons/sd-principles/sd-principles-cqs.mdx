@@ -1,0 +1,346 @@
+## Why it matters
+
+A method that answers a question *and* changes something causes the bugs that appear only when you add a log line, read a property twice, or SwiftUI redraws a view. Command–query separation is a 1980s rule that SwiftUI and Swift concurrency have made urgent again. Its architectural sibling, CQRS, comes up in interviews whenever reads and writes look very different: feeds, chat and offline-first apps.
+
+## Command–query separation
+
+Bertrand Meyer set out the rule in *Object-Oriented Software Construction* (1988). Every method should be one of two things, never both:
+
+- A **command** performs an action. It changes state and returns nothing.
+- A **query** returns information. It has no observable side effects.
+
+His short version: **asking a question should not change the answer.**
+
+What you get is two guarantees. Queries are safe to call anywhere, any number of times: in a log line, an assertion, the debugger, a test, a SwiftUI `body`. And commands are easy to find, because every state change has a verb on it.
+
+Swift's naming conventions already lean this way: queries are properties or noun-like methods (`count`, `distance(to:)`); commands are verbs, often `mutating`, returning nothing (`append(_:)`, `removeAll()`). When you reach for `@discardableResult`, it's often a sign the method is doing both.
+
+### A paginator that skips pages
+
+Here's a CQS violation that survives code review because it reads so naturally:
+
+```swift run title="A query that changes the answer, then the fix"
+struct Page {
+    let number: Int
+    let items: [String]
+}
+
+final class FeedPaginator {
+    private let pages: [[String]]
+    private var next = 1
+
+    init(pages: [[String]]) {
+        self.pages = pages
+    }
+
+    // Reads like a question, but asking it changes the answer
+    var currentPage: Page? {
+        guard next <= pages.count else { return nil }
+        defer { next += 1 }
+        return Page(number: next, items: pages[next - 1])
+    }
+}
+
+let pages = [["a1", "a2"], ["b1", "b2"], ["c1"]]
+let paginator = FeedPaginator(pages: pages)
+print("Debug: about to show page \(paginator.currentPage?.number ?? 0)")
+if let page = paginator.currentPage {
+    print("Showing page \(page.number): \(page.items)")
+}
+
+// Separated: one command changes state, queries only report it
+final class FeedPager {
+    private let pages: [[String]]
+    private(set) var items: [String] = []
+    private(set) var loadedPages = 0
+
+    init(pages: [[String]]) {
+        self.pages = pages
+    }
+
+    var hasMore: Bool { loadedPages < pages.count }
+
+    func loadNextPage() {
+        guard hasMore else { return }
+        items += pages[loadedPages]
+        loadedPages += 1
+    }
+}
+
+let pager = FeedPager(pages: pages)
+pager.loadNextPage()
+print("Debug: \(pager.loadedPages) page loaded, more: \(pager.hasMore)")
+print("Showing \(pager.items)")
+```
+
+```output
+Debug: about to show page 1
+Showing page 2: ["b1", "b2"]
+Debug: 1 page loaded, more: true
+Showing ["a1", "a2"]
+```
+
+The debug line consumed page 1, so the user never sees it. Delete the log line and the bug vanishes, which is what makes it so hard to find. In `FeedPager`, you can read `items`, `hasMore` and `loadedPages` as often as you like; only `loadNextPage()` moves anything.
+
+### SwiftUI runs your queries more often than you think
+
+SwiftUI may evaluate a view's `body` many times, whenever anything it depends on changes, and with Observation, every property `body` reads becomes a dependency. So anything `body` calls must be a pure query. A property that fetches, advances a cursor or updates observed state from inside `body` causes repeated work, redraw loops, and the runtime warning "Modifying state during view update, this will cause undefined behavior."
+
+Commands belong in **event handlers**: button actions, `.task`, `.onAppear`, `.refreshable`, `.onChange`.
+
+```swift check ios title="Queries in body, commands in handlers"
+import SwiftUI
+
+@MainActor
+@Observable
+final class InboxModel {
+    private(set) var messages: [String] = []
+    private(set) var isLoading = false
+    private let fetch: @Sendable () async -> [String]
+
+    init(fetch: @escaping @Sendable () async -> [String]) {
+        self.fetch = fetch
+    }
+
+    var isEmpty: Bool { !isLoading && messages.isEmpty }   // query
+
+    func refresh() async {                                  // command
+        isLoading = true
+        messages = await fetch()
+        isLoading = false
+    }
+}
+
+struct InboxView: View {
+    let model: InboxModel
+
+    var body: some View {
+        List(model.messages, id: \.self) { Text($0) }
+            .overlay {
+                if model.isEmpty { ContentUnavailableView("No messages", systemImage: "tray") }
+            }
+            .task { await model.refresh() }
+            .refreshable { await model.refresh() }
+    }
+}
+```
+
+## When to combine them on purpose
+
+Meyer's rule is about *observable* side effects. A query that caches its result internally (memoisation) or writes a log line still answers the same question the same way, so it's fine.
+
+The standard library also breaks the rule deliberately, and the reason is worth knowing:
+
+- `popLast()` and `removeFirst()` remove an element and return it.
+- `Set.insert(_:)` returns `(inserted: Bool, memberAfterInsert: Element)`.
+- `Dictionary.updateValue(_:forKey:)` returns the value it replaced.
+- An iterator's `next()` is both, by nature.
+
+Each one makes **check and act a single step**. "Is it there? Then remove it" written as two calls is only correct if nothing can happen between them.
+
+### Check-then-act across an `await`
+
+With actors, something *can* happen in between. An actor runs one task at a time, but each call from outside is a separate visit, and other tasks can get in between your two visits:
+
+```visual sequence
+title: Check, then act, across two awaits
+participants:
+  - { id: a, label: Task A }
+  - { id: ledger, label: Seat ledger }
+  - { id: b, label: Task B }
+messages:
+  - [a, ledger, "isAvailable(12A)", { say: "Task A asks whether seat 12A is free." }]
+  - [ledger, a, "true", { reply: true }]
+  - [b, ledger, "isAvailable(12A)", { say: "Before A acts, Task B asks the same question. Between two separate calls, any other task can use the actor." }]
+  - [ledger, b, "true", { reply: true, say: "The seat is still free, so B gets `true` too." }]
+  - [a, ledger, "reserve(12A)", { say: "A reserves the seat it was told is free." }]
+  - [b, ledger, "reserve(12A)", { say: "B does the same: **the seat is sold twice**. Each call was correct; the pair wasn't atomic." }]
+  - { note: "The fix: one command that checks and acts inside the actor, and reports what happened.", over: [a, b] }
+```
+
+The data-race checker can't catch this: there's no data race, only a logic race. The fix is one command that checks and acts inside the actor, and returns the outcome:
+
+```swift check title="One atomic command that reports its outcome"
+actor SeatLedger {
+    enum Outcome: Equatable, Sendable {
+        case reserved
+        case alreadyTaken
+    }
+
+    private var taken: Set<String> = []
+
+    func isAvailable(_ seat: String) -> Bool {     // a query: fine for display
+        !taken.contains(seat)
+    }
+
+    func reserve(_ seat: String) -> Outcome {      // check and act, with no await in between
+        taken.insert(seat).inserted ? .reserved : .alreadyTaken
+    }
+}
+```
+
+A command that returns **a description of what it did** is the accepted exception to CQS. It still has a verb for a name, and the caller can't get the action without the answer. Keep `isAvailable` for showing seats as free or taken, and never use it to decide whether to call `reserve`.
+
+## CQRS: different models for reading and writing
+
+Around 2010 Greg Young took the idea from methods to architecture and called it **command query responsibility segregation** (CQRS). Use one model to *change* data: it validates commands and enforces the rules. Use another model, or several, to *read* data, each shaped for the screen that shows it.
+
+Why separate them? Because reads and writes usually differ in two ways:
+
+- **Shape.** A message is written once, with strict validation. A conversation list reads hundreds of messages joined with names, avatars, unread counts and the last line of each thread.
+- **Volume.** Social and content apps read far more than they write, often by a factor of a hundred or more. Separate models can be stored, indexed and scaled separately (you'll do this on the backend in D44).
+
+On the backend, the write side records each change and publishes an event; **projectors** update read models, such as a per-user conversation list, in the background. The read side is therefore **eventually consistent**: it catches up a moment later.
+
+On the device, the same split falls out of offline-first design. Commands go into a local **outbox** and sync when there's a connection; screens read only from the local database, through an observed query (`@Query` in SwiftData, `NSFetchedResultsController`, or a GRDB observation). Step through a message being sent:
+
+```visual flow
+title: CQRS in a messaging app
+layers:
+  - { label: Device, rows: [0, 1] }
+  - { label: Backend, rows: 3 }
+nodes:
+  - { id: view, label: Chat screen, kind: view, at: [0, 0] }
+  - { id: outbox, label: Outbox, kind: queue, at: [2, 0] }
+  - { id: localdb, label: Local database, kind: store, at: [0, 1] }
+  - { id: read, label: Read models, kind: db, at: [0, 3] }
+  - { id: projector, label: Projector, at: [2, 3] }
+  - { id: write, label: Write model, kind: service, at: [4, 3] }
+edges:
+  - [view, outbox, send]
+  - [outbox, localdb, pending copy, { style: data }]
+  - [localdb, view, observe, { style: data }]
+  - [outbox, write, sync, { style: async }]
+  - [write, projector, events, { style: async }]
+  - [projector, read, update]
+  - [read, localdb, sync down, { style: async }]
+steps:
+  - say: "The user taps send. The screen issues a **command** to the outbox and doesn't wait for the server."
+    send: view->outbox
+  - say: "The outbox writes a pending copy to the local database, so the sender sees their message at once."
+    send: outbox->localdb
+    label: { localdb: pending }
+  - say: "The screen only ever **reads** the local database, through an observed query."
+    send: localdb->view
+  - say: "When there's a connection, the outbox sends the command to the write side, which validates and records it."
+    send: outbox->write
+    state: { write: ok }
+  - say: "The write side publishes an event. A projector updates read models shaped for reading, such as each member's conversation list."
+    send: [write->projector, projector->read]
+  - say: "Sync brings the read model down and the pending copy is confirmed. Reads and writes never shared a model, only data."
+    send: read->localdb
+    label: { localdb: confirmed }
+```
+
+### What CQRS costs
+
+- **Two models to keep in step**, and the code that projects one into the other.
+- **Eventual consistency.** The classic symptom is a user who posts and doesn't see their own post. Fix it with an optimistic local copy, as above, or by reading the author's own items from the write side.
+- **More moving parts**: projections to rebuild, events to version, lag to monitor.
+
+Martin Fowler's warning is the right default: most systems, and most parts of any system, don't need CQRS. Settings, profile editing and other forms are simpler with one model. Use it where shapes and volumes really diverge.
+
+## Trade-offs
+
+| Approach | Complexity | Consistency | Read performance | Wins when |
+| --- | --- | --- | --- | --- |
+| One model for reads and writes | Low | Immediate | Fine for simple shapes | Forms and CRUD: settings, profiles |
+| CQS inside your types | Low | Immediate | Unchanged | Always: it's a habit, not an architecture |
+| Read models in the same store (views, denormalised tables) | Medium | Immediate | Good: shaped per screen | Lists that need joins and counts, such as an inbox with unread badges |
+| Full CQRS with asynchronous projections | High | Eventual | Excellent, scales separately | Read-heavy feeds, chat, collaboration, offline-first sync |
+
+<Callout kind="interview">
+
+**What to say:** in a feed or chat design, "the client sends commands to an outbox and renders from a local store; the server validates writes and projects them into read models per user". Mention read-your-own-writes and how you handle it.
+
+**What to ask:** "What's the read-to-write ratio?" and "Is it acceptable for others to see a new post a second or two later?" The answers decide whether separate read models pay for themselves.
+
+**Red flags interviewers listen for:** CQRS with event sourcing for a settings screen; a client that renders straight from network responses with no local read model in an offline-first app; and `if await canDoX() { await doX() }` across an actor.
+
+</Callout>
+
+<Callout kind="gotcha" title="iOS gotcha: side effects in a SwiftUI body">
+
+Calling a command from `body`, or reading a property that changes observed state, triggers "Modifying state during view update, this will cause undefined behavior" and can loop forever. If something must happen when a view appears or a value changes, use `.task`, `.task(id:)`, `.onAppear` or `.onChange(of:)`: they exist to run commands at the right moment.
+
+</Callout>
+
+## Practice
+
+The kata [An upload queue workers can share](/design/practice/sd-kata-principles-upload-queue) asks for pure queries, idempotent commands and one atomic `claimNext()`, tested by several workers claiming jobs at once. The review [The generic list screen](/design/practice/sd-review-principles-generic-list) has a property that fetches when it's read: find what that does to an empty list.
+
+```cards
+- id: cqs-rule
+  front: "What is command–query separation?"
+  back: "A method either changes state and returns nothing (a command) or returns information with no observable side effects (a query). Asking a question shouldn't change the answer."
+- id: cqs-exception
+  front: "When is it right for a command to return a value?"
+  back: "When check and act must be atomic, as in `Set.insert(_:)` or `popLast()`. The command reports what it did, so nothing can happen between the check and the act."
+- id: actor-check-act
+  front: "Why is `if await ledger.isAvailable(s) { await ledger.reserve(s) }` wrong?"
+  back: "Other tasks can use the actor between the two calls, so two callers can both see `true` and both reserve. Make one command that checks and acts inside the actor."
+- id: cqrs-cost
+  front: "What does CQRS cost?"
+  back: "Two models and the projection between them, plus eventual consistency on the read side, such as a user not seeing their own post yet."
+```
+
+```quiz
+- id: q1
+  type: sort
+  prompt: "Is each standard library member a query, a command, or deliberately both?"
+  buckets: [Query, Command, Both on purpose]
+  items:
+    - ["`sorted()`", 0]
+    - ["`append(_:)`", 1]
+    - ["`popLast()`", 2]
+    - ["`isEmpty`", 0]
+    - ["`Set.insert(_:)`, which returns whether it inserted", 2]
+    - ["`removeAll()`", 1]
+  explain: "`sorted()` and `isEmpty` only answer. `append` and `removeAll` only act. `popLast()` and `insert` combine both so the check and the act happen in one step."
+- id: q2
+  type: output
+  prompt: "What does this print?"
+  code: |
+    final class Queue {
+        private var items = ["a", "b", "c"]
+        var front: String? {
+            items.isEmpty ? nil : items.removeFirst()
+        }
+    }
+
+    let queue = Queue()
+    if queue.front != nil {
+        print(queue.front ?? "empty")
+    }
+  answer: "b"
+  explain: "Checking `front != nil` already removed `a`, so the print reads the next item. A property that changes state makes even an `if` a side effect."
+- id: q3
+  type: mcq
+  prompt: "Two tasks run `if await cart.canApply(code) { await cart.apply(code) }` for a single-use voucher on the same `actor Cart`. What's the best fix?"
+  options:
+    - "Mark the methods `nonisolated` so they run faster"
+    - "Replace both calls with one `apply(_:) -> ApplyResult` that checks and records the use inside the actor"
+    - "Add a short `Task.sleep` before `apply` so the other task finishes first"
+    - "Nothing: actors run one task at a time, so this is already safe"
+  answer: 1
+  explain: "The actor protects each call, not the pair. Between the two awaits another task can apply the voucher. One command that checks and acts with no suspension in between is atomic."
+- id: q4
+  type: truefalse
+  prompt: "A computed property that caches its result the first time it's read breaks command–query separation."
+  answer: false
+  explain: "CQS is about *observable* side effects. The cache doesn't change any answer, so callers can't tell; it's still a query."
+- id: q5
+  type: multi
+  prompt: "Which parts of an app are good candidates for separate read models? Choose all that apply."
+  options:
+    - "A chat app's conversation list with last message and unread counts"
+    - "The notification settings screen"
+    - "A social feed read far more often than posts are written"
+    - "Editing the user's display name"
+  answer: [0, 2]
+  explain: "The conversation list and the feed read data in a very different shape and volume from how it's written. Settings and profile edits read and write the same small shape; one model is simpler."
+- id: q6
+  type: recall
+  prompt: "A user posts a comment and it doesn't appear in the thread for two seconds. Explain why this happens in a CQRS design and one way to fix it."
+  model: "The thread reads from a read model that's updated asynchronously from the write side, so it's eventually consistent and lags behind the post. Insert an optimistic local copy, marked pending, as soon as the user posts, and replace it with the confirmed one when the read model catches up."
+```

@@ -1,0 +1,280 @@
+## Why it matters
+
+The bugs that only happen "sometimes" usually live where logic touches the outside world: the clock, the time zone, UserDefaults, the network. A **pure function** keeps the logic apart from all of that, so it gives the same answer every time and you can test it in microseconds. "How would you make this testable?" is one of the commonest follow-ups in an iOS interview, and the strong answer starts here: name the side effects, then move them out of the logic.
+
+## What makes a function pure
+
+A function is **pure** when two things are true:
+
+1. **Its result depends only on its arguments.** The same inputs give the same output, every time, on every device.
+2. **It has no side effects.** Calling it changes nothing anyone else can observe: no writes, no network, no logging, no haptics.
+
+A handy test is whether you could replace a call with its result without changing the program. `max(3, 9)` can always be replaced by `9`. `Date()` can't be replaced by anything, because its answer changes every moment. That property has a name, **referential transparency**, and it's what lets you reason about a pure function by reading it alone.
+
+Some everyday Swift, sorted:
+
+| Pure | Not pure |
+| --- | --- |
+| `"swift".uppercased()` | `Date()`, `UUID()`, `Int.random(in: 1...6)` |
+| `items.filter { $0.isDone }.count` | `UserDefaults.standard.bool(forKey: "onboarded")` |
+| `try JSONDecoder().decode(Order.self, from: data)` | `try await URLSession.shared.data(from: url)` |
+| `price * Decimal(quantity)` | `print(...)`, `Logger().info(...)`, an analytics call |
+| `messages.sorted { $0.sentAt < $1.sentAt }` | `UIImpactFeedbackGenerator().impactOccurred()` |
+
+Decoding counts as pure because it only reads the `Data` you hand it and either returns or throws. Throwing is part of a function's result, not a side effect.
+
+### Hidden inputs count too
+
+Side effects aren't only writes. Reading something the caller didn't pass in is a **hidden input**, and hidden inputs are the sneaky ones, because the function still *looks* pure from its signature. The usual suspects on iOS:
+
+- the clock: `Date()`, `Date.now`, `ContinuousClock.now`;
+- the device's settings: `Locale.current`, `TimeZone.current`, `Calendar.current`;
+- stored state: `UserDefaults`, the Keychain, a file, a singleton's properties;
+- the environment: `ProcessInfo.processInfo`, `UIDevice.current`, the current trait collection.
+
+### Local mutation is fine
+
+A pure function can use `var` inside, as long as nobody outside can see it. `sorted()` moves elements around in a buffer of its own before returning a new array, and it's still pure. Swift's value types make this easy to get right: an `inout` parameter or a `mutating` method changes only the caller's own copy, never something shared. You'll lean on this in [Working with immutable data in Swift](/design/learn/sd-functional-immutable-data) and when you write reducers.
+
+## An example: "Open now"
+
+A coffee chain's app shows a label under each shop: *Open until 17:30*, *Closing soon* or *Closed*. Here's how it often gets written:
+
+```swift check title="Shop.swift, the impure version"
+import Foundation
+
+enum Analytics {
+    static func track(_ event: String) { /* sends the event to the analytics SDK */ }
+}
+
+struct Shop {
+    /// Weekday (1 is Sunday) to opening time, in minutes after midnight
+    let hours: [Int: Range<Int>]
+
+    var statusLabel: String {
+        let parts = Calendar.current.dateComponents([.weekday, .hour, .minute], from: Date())
+        let minutes = (parts.hour ?? 0) * 60 + (parts.minute ?? 0)
+        guard let open = hours[parts.weekday ?? 0], open.contains(minutes) else { return "Closed" }
+        if open.upperBound - minutes <= 30 {
+            Analytics.track("closing_soon_shown")
+            return "Closing soon"
+        }
+        return "Open until \(open.upperBound / 60):\(open.upperBound % 60)"
+    }
+}
+```
+
+The call site reads `shop.statusLabel`: no arguments, a string back. Step through what it really depends on:
+
+```visual flow
+title: What the impure statusLabel really touches
+nodes:
+  - { id: view, label: ShopRow, kind: view, at: [0, 1] }
+  - { id: label, label: statusLabel, kind: service, at: [2, 1] }
+  - { id: clock, label: "Date()", kind: external, at: [4, 0] }
+  - { id: calendar, label: Calendar.current, kind: store, at: [4, 1] }
+  - { id: analytics, label: Analytics, kind: external, at: [4, 2] }
+edges:
+  - [view, label, read]
+  - [label, view, String]
+  - [clock, label, now, { style: data }]
+  - [calendar, label, time zone, { style: data }]
+  - [label, analytics, event, { style: async }]
+steps:
+  - say: "From the call site, `statusLabel` looks like a plain property: nothing in, a string out."
+    show: [view, label, "view->label", "label->view"]
+    send: view->label
+  - say: "**Hidden input:** it reads the clock, so its answer changes every minute and no test can pick the moment."
+    show: [clock]
+    send: clock->label
+  - say: "**Hidden input:** it uses the *phone's* calendar and time zone, not the shop's. A user in New York looking at a London shop gets New York hours."
+    show: [calendar]
+    send: calendar->label
+    state: { calendar: error }
+  - say: "**Hidden output:** it sends an analytics event, and SwiftUI may read this property many times per second while a list scrolls."
+    show: [analytics]
+    send: label->analytics
+    state: { analytics: error }
+  - say: "Only the string comes back. Everything else it did is invisible to the caller, and to any test."
+    send: label->view
+```
+
+Three things in there aren't in the signature, and each causes a real bug. The time-zone one ships to production all the time, because developers and their test devices share a time zone.
+
+### The pure version
+
+Make every input a parameter, and leave the analytics to whoever shows the label:
+
+```swift run title="statusLabel as a pure function"
+import Foundation
+
+struct OpeningHours {
+    /// Weekday (1 is Sunday) to opening time, in minutes after midnight
+    let byWeekday: [Int: Range<Int>]
+}
+
+func statusLabel(for hours: OpeningHours, at now: Date, in calendar: Calendar) -> String {
+    let parts = calendar.dateComponents([.weekday, .hour, .minute], from: now)
+    guard let weekday = parts.weekday, let hour = parts.hour, let minute = parts.minute else { return "Closed" }
+    let minutes = hour * 60 + minute
+    guard let open = hours.byWeekday[weekday], open.contains(minutes) else { return "Closed" }
+    if open.upperBound - minutes <= 30 { return "Closing soon" }
+    return "Open until " + String(format: "%02d:%02d", open.upperBound / 60, open.upperBound % 60)
+}
+
+var london = Calendar(identifier: .gregorian)
+london.timeZone = TimeZone(identifier: "Europe/London")!
+var newYork = london
+newYork.timeZone = TimeZone(identifier: "America/New_York")!
+
+let hours = OpeningHours(byWeekday: [2: 480..<1050, 1: 600..<960])   // Monday 08:00–17:30, Sunday 10:00–16:00
+let mondayMorning = london.date(from: DateComponents(year: 2025, month: 3, day: 3, hour: 9, minute: 15))!
+let mondayLate = mondayMorning.addingTimeInterval(8 * 3600)          // 17:15 in London
+
+print(statusLabel(for: hours, at: mondayMorning, in: london))
+print(statusLabel(for: hours, at: mondayLate, in: london))
+print(statusLabel(for: hours, at: mondayMorning, in: newYork))
+```
+
+```output
+Open until 17:30
+Closing soon
+Closed
+```
+
+What to notice:
+
+- **Any moment is one line away.** "Sunday at 15:45" or "the minute before closing" is a `Date` you construct, not a device setting you change.
+- **The bug became visible.** The last line is the same instant as the first, seen through a New York calendar: 04:15, so closed. The pure version forces the caller to choose a calendar, and the right choice is obvious once it's a parameter: the shop's, not the phone's.
+- **The old version's formatting bug shows up too.** Its interpolation, `\(open.upperBound / 60):\(open.upperBound % 60)`, gets 17:30 right by luck, but a shop closing at 18:00 would show `18:0`. Fixed inputs are where you find that kind of bug: you'd never wait for 6pm to check.
+
+### Who supplies the inputs?
+
+Something still has to read the clock. Push that job to the edge, where it's cheap to see. In SwiftUI, `TimelineView` hands the view the current date as a value and redraws on a schedule you pick:
+
+```swift
+struct ShopRow: View {
+    let hours: OpeningHours
+    let shopCalendar: Calendar   // built once from the shop's time zone
+
+    var body: some View {
+        TimelineView(.everyMinute) { context in
+            Text(statusLabel(for: hours, at: context.date, in: shopCalendar))
+        }
+    }
+}
+```
+
+The analytics event moves to a place that runs once per change rather than once per redraw, such as `.onChange(of:)` on the label. Splitting a feature this way, decisions in pure functions and the outside world at the edges, is the subject of the next lesson.
+
+## What purity buys you
+
+- **Tests without setup.** No mocks, no clean UserDefaults, no waiting. A bug report ("it said Closed at 9am in Leeds") becomes a test case with three arguments.
+- **Safe concurrency.** A pure function over `Sendable` values can run on any thread or actor with no locks, because there's nothing shared to race on.
+- **Previews that never drift.** A preview built from fixed inputs shows the same thing today and next month.
+- **Free caching.** Same input, same output, so a result can be remembered by its inputs.
+
+Swift has no `pure` keyword, so none of this is enforced. A few signals help when reading code: a non-`async` function that takes values and returns a value is *probably* pure, and `async` usually means it talks to something. Swift 6 also rejects the most dangerous hidden input outright, a mutable global:
+
+```swift
+var lastShownLabel = ""   // at file scope, in Swift 6 language mode
+```
+
+```text title="What you'll see"
+error: var 'lastShownLabel' is not concurrency-safe because it is nonisolated global shared mutable state
+note: convert 'lastShownLabel' to a 'let' constant to make 'Sendable' shared state immutable
+note: add '@MainActor' to make var 'lastShownLabel' part of global actor 'MainActor'
+```
+
+In a target whose default isolation is the main actor (new app targets since Xcode 26), the same line compiles instead, as main-actor state: still out of reach of background code, but still a hidden input for anything on the main actor.
+
+## Trade-offs
+
+| Option | Call site | Testability | Hidden dependencies | When it wins |
+| --- | --- | --- | --- | --- |
+| Impure property or method that reads the world itself | Shortest | Poor: needs the real clock, settings and SDKs | Many, invisible | Throwaway code, or a thin wrapper whose whole job is to read the world |
+| Pure function with every input as a parameter | Longer: the caller passes `now`, the calendar, the data | Excellent | None | Any rule you'd want a test for: pricing, eligibility, formatting, validation |
+| Pure function with defaults, like `at now: Date = .now` | Short | Good: tests pass explicit values | One, at the edge, visible in the signature | A widely called helper where most callers want "now" |
+
+The defaults option is a fair compromise, but notice it brings the hidden input back for every caller that forgets it exists. Use it for "now", which is usually right, and not for the calendar, which in this example was usually wrong.
+
+<Callout kind="interview">
+
+**Say** "First I'd list the side effects and hidden inputs: here it's the clock, the device's time zone and an analytics call. Then I'd pull the decision into a pure function that takes them as parameters, and test that." **Ask** whose clock and whose time zone the rule means: the user's, the shop's, or the server's. **Red flags:** reaching for a mocking framework or a `DateProvider` protocol before trying a plain `Date` parameter, and calling code testable when its tests depend on the machine they run on.
+
+</Callout>
+
+<Callout kind="gotcha" title="iOS gotcha: side effects in body run more often than you think">
+
+SwiftUI calls `body`, and every computed property it reads, whenever it decides to: on state changes, when a parent redraws, while a list scrolls. Logging, analytics or a network call in there fires an unpredictable number of times. Keep `body` and the properties it reads pure, and put effects in `.task`, `.onAppear` or `.onChange(of:)`, which run at defined moments.
+
+</Callout>
+
+<Callout kind="gotcha" title="Swift gotcha: Calendar.current is a setting, not a constant">
+
+`Calendar.current` follows the user's calendar, region and time zone, which can change while your app runs (a flight, or a change in Settings). If a rule is about a place, such as a shop, a flight departure or a delivery slot, build a `Calendar` with that place's `TimeZone` and pass it in.
+
+</Callout>
+
+## Practice
+
+The review **a promo code tangled in side effects** is a checkout view model whose pricing rules can't be tested because they're mixed with the network, UserDefaults and the clock. Start by listing every hidden input and output, as you did here for `statusLabel`.
+
+```cards
+- id: pure-definition
+  front: "What two things make a function pure?"
+  back: "Its result depends only on its arguments, and calling it has no side effects that anyone else can observe."
+- id: hidden-inputs
+  front: "What's a hidden input, and what are the common ones on iOS?"
+  back: "Something a function reads that its caller didn't pass in. The clock, `Locale.current`, `TimeZone.current`, `Calendar.current`, UserDefaults and singletons."
+- id: purity-edge
+  front: "If pure functions can't read the clock, who does?"
+  back: "The edge of the feature: the view or view model reads it (for example `TimelineView`'s `context.date`) and passes it in as a value."
+```
+
+```quiz
+- id: q1
+  type: sort
+  prompt: "Is each of these pure?"
+  buckets: [Pure, Not pure]
+  items:
+    - ["`cart.items.map(\\.price).reduce(0, +)`", 0]
+    - ["`try JSONDecoder().decode(Profile.self, from: data)`", 0]
+    - ["`TimeZone.current.identifier`", 1]
+    - ["`UUID().uuidString`", 1]
+    - ["A function that sorts a local copy of an array with `var` and returns it", 0]
+    - ["A computed property that calls `Analytics.track` before returning", 1]
+  explain: "Decoding reads only the data you pass and returns or throws, so it's pure. Locale and UUID are hidden inputs. Mutating a local copy is invisible to anyone else, so it's still pure. Sending analytics is a side effect, however small."
+- id: q2
+  type: bug
+  prompt: "This function is meant to be pure. Click the line that breaks it."
+  code: |
+    func deliveryFee(for basket: Basket, member: Bool) -> Decimal {
+        let subtotal = basket.items.reduce(Decimal(0)) { $0 + $1.price }
+        if member { return 0 }
+        if subtotal >= 40 { return 0 }
+        let isEvening = Calendar.current.component(.hour, from: .now) >= 18
+        return isEvening ? 4.99 : 2.99
+    }
+  answer: 5
+  explain: "Line 5 reads the clock and the device's calendar: two hidden inputs. Pass `at now: Date` and a calendar in, and every branch becomes testable."
+- id: q3
+  type: mcq
+  prompt: "A test of `statusLabel` passes on your Mac and fails on CI. What's the most likely cause?"
+  options:
+    - "The test runner on CI is slower"
+    - "It still reads `Calendar.current`, and CI runs in UTC"
+    - "`Range.contains` behaves differently on Linux"
+    - "Swift Testing runs tests in parallel"
+  answer: 1
+  explain: "A hidden input that differs between machines is the classic cause of 'works on my machine' tests. Passing the calendar in removes it."
+- id: q4
+  type: truefalse
+  prompt: "A function that declares a `var` and mutates it before returning can't be pure."
+  answer: false
+  explain: "Purity is about what callers can observe. Mutating local state, or your own copy of a value, is invisible from outside."
+- id: q5
+  type: recall
+  prompt: "Explain referential transparency in one or two sentences, and say why `Date()` fails it."
+  model: "An expression is referentially transparent when you can replace it with its value without changing the program. `max(3, 9)` can be replaced by `9`; `Date()` can't, because its value is different every time it runs."
+```

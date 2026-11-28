@@ -1,0 +1,128 @@
+A photo-editing app sells a Pro subscription through a purchases vendor's SDK. The first version of the paywall check called the SDK straight from the feature code:
+
+```swift
+// Before: the feature's rules depend on the vendor's SDK, its callback API and its vocabulary
+func showThemes() {
+    VendorPurchases.shared.getCustomerInfo { info, error in
+        if info?.entitlements["pro"]?.isActive == true {
+            self.openThemes()
+        } else {
+            self.showPaywall()   // offline subscribers see a paywall too
+        }
+    }
+}
+```
+
+The rule "Pro unlocks themes" is stable. The vendor isn't: it renames things between major versions, and the company is talking about switching vendor. Worse, an offline subscriber gets the paywall, because "the check failed" and "the user hasn't paid" go down the same branch.
+
+Break the dependency. The gate owns a small protocol named in its own words, **`EntitlementSource`**, and decides access using only that. An adapter, the only code that knows both sides, makes the vendor's SDK look like an `EntitlementSource`.
+
+`CouplingPremiumGate.Gate.access(to:) async -> Access` and `CouplingPremiumGate.VendorEntitlementSource.activeEntitlements() async throws -> Set<String>`
+
+**The gate** (an actor, because it remembers the last answer):
+
+- A **free** feature (its `entitlement` is `nil`) is `.granted` without asking the source at all.
+- Otherwise ask the source. If the feature's entitlement is in the answer, `.granted`; if not, `.locked`. Remember the answer.
+- If the source **throws**, decide from the last answer it gave, so a subscriber who goes offline keeps access. If it has never answered, return `.unknown`: the screen shows "can't check right now", never a paywall for someone who may have paid.
+
+**The adapter** wraps `VendorPurchases`, whose `getCustomerInfo(completion:)` calls back once, on a background queue, with the customer info or an error:
+
+- Return the identifiers of the entitlements marked `isActive`, and only those.
+- Throw the vendor's error when there is one. If the SDK ever answers with neither info nor an error, throw `VendorError.network`.
+
+Don't change the vendor's types: they stand for code you don't own.
+
+## Examples
+
+| The source answers | Feature | `access(to:)` |
+| --- | --- | --- |
+| anything, or nothing at all | Stickers (free) | `.granted`, and the source isn't asked |
+| `["pro"]` | Themes (needs `"pro"`) | `.granted` |
+| `["pro"]` | Family sharing (needs `"family"`) | `.locked` |
+| throws, never answered before | Themes | `.unknown` |
+| `["pro"]`, then throws | Themes, twice | `.granted`, then `.granted` from the remembered answer |
+| `["pro"]`, then `[]` | Themes, twice | `.granted`, then `.locked`: the subscription lapsed |
+
+| The vendor's SDK calls back with | `activeEntitlements()` |
+| --- | --- |
+| `pro` active, `family` inactive, `legacy` active | `["pro", "legacy"]` |
+| `VendorError.notConfigured` | throws `VendorError.notConfigured` |
+
+## Constraints
+
+- `Gate` uses only `EntitlementSource`. It must compile, run and pass its tests with no vendor code at all; the tests give it a scripted fake.
+- `EntitlementSource` is `Sendable`, because the gate is an actor and calls it across isolation.
+- In the adapter, resume the continuation exactly once. The simulated SDK always calls back once; a real one may not, and the D11 kata on adapters deals with that.
+- Remembering the answer is per gate, in memory. Persisting it across launches is a separate decision (and a separate trust question: a stored "is Pro" flag can be edited on a jailbroken device).
+
+<Hints>
+<Hint>
+Start with the free-feature case: `guard let required = feature.entitlement else { return .granted }`, before anything else touches the source.
+</Hint>
+<Hint>
+Keep `private var lastKnown: Set<String>?` in the actor. Set it after every successful call; in the `catch`, fall back to it, and return `.unknown` when it's `nil`.
+</Hint>
+<Hint>
+`withCheckedThrowingContinuation` turns the callback into `async`. Inside the completion, `if let info` resumes with the info; otherwise resume throwing `error ?? VendorError.network`.
+</Hint>
+<Hint>
+`Set(info.entitlements.values.filter(\.isActive).map(\.identifier))` is the whole mapping.
+</Hint>
+</Hints>
+
+## Solutions
+
+<Approach title="The gate owns a protocol; one adapter knows the vendor" time="O(e) for e entitlements" space="O(e)">
+
+```swift
+public actor Gate {
+    private let source: any EntitlementSource
+    private var lastKnown: Set<String>?
+
+    public init(source: any EntitlementSource) {
+        self.source = source
+    }
+
+    public func access(to feature: Feature) async -> Access {
+        guard let required = feature.entitlement else { return .granted }
+        let active: Set<String>
+        do {
+            active = try await source.activeEntitlements()
+            lastKnown = active
+        } catch {
+            guard let remembered = lastKnown else { return .unknown }
+            active = remembered
+        }
+        return active.contains(required) ? .granted : .locked
+    }
+}
+
+public struct VendorEntitlementSource: EntitlementSource {
+    private let purchases: VendorPurchases
+
+    public init(purchases: VendorPurchases) {
+        self.purchases = purchases
+    }
+
+    public func activeEntitlements() async throws -> Set<String> {
+        let info: VendorCustomerInfo = try await withCheckedThrowingContinuation { continuation in
+            purchases.getCustomerInfo { info, error in
+                if let info {
+                    continuation.resume(returning: info)
+                } else {
+                    continuation.resume(throwing: error ?? VendorError.network)
+                }
+            }
+        }
+        return Set(info.entitlements.values.filter(\.isActive).map(\.identifier))
+    }
+}
+```
+
+**What moved.** The gate's source now names `EntitlementSource`, which the gate owns, and nothing else. The adapter names both the protocol and the vendor, so the arrow between them points from the volatile side (the SDK) to the stable side (the rule). In a modularised app, `Gate` and `EntitlementSource` live in the feature's module, the adapter lives in a small `PurchasesVendor` module or the app target, and switching vendor means writing one new adapter.
+
+**The design decision inside.** Separating `.locked` from `.unknown` is the part that matters to users. The old code couldn't tell "hasn't paid" from "couldn't find out", because the vendor's callback mixed them; once the gate speaks its own vocabulary, it can say so. Trusting the last good answer is a deliberate trade: a lapsed subscriber who goes offline keeps Pro until the next successful check, which is almost always the right side to err on.
+
+**What a reviewer would ask next.** Should the gate cache answers for a few minutes rather than asking the vendor on every tap? Probably, with a clock injected so tests can move time. And should the answer survive a relaunch? That needs storage the gate doesn't own, so it would be another small protocol.
+
+</Approach>

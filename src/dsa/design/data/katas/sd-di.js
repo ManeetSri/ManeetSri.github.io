@@ -1,2 +1,36 @@
 // Katas for D21 · Dependency injection
-export default [];
+export default [
+    {
+        id: 'sd-kata-di-scoped-container',
+        kind: 'problem',
+        title: 'A scoped container with cycle detection',
+        difficulty: 'medium',
+        patterns: ['di', 'patterns'],
+        lessons: ['sd-di-scopes', 'sd-di-containers'],
+        swiftTest: 'DIScopedContainerTests',
+        lists: [],
+        minutes: 40,
+    },
+    {
+        id: 'sd-kata-di-task-local-values',
+        kind: 'problem',
+        title: 'Dependency values with task-local overrides',
+        difficulty: 'medium',
+        patterns: ['di', 'concurrency', 'testing'],
+        lessons: ['sd-di-dependency-values', 'sd-di-previews-tests'],
+        swiftTest: 'DITaskLocalValuesTests',
+        lists: [],
+        minutes: 35,
+    },
+    {
+        id: 'sd-kata-di-composition-root',
+        kind: 'problem',
+        title: 'A composition root for a reading app',
+        difficulty: 'easy',
+        patterns: ['di', 'architecture', 'testing'],
+        lessons: ['sd-di-composition-root', 'sd-di-why', 'sd-di-injection-forms'],
+        swiftTest: 'DIShelfCompositionRootTests',
+        lists: [],
+        minutes: 25,
+    },
+];

@@ -1,0 +1,407 @@
+## Why it matters
+
+A **proxy** stands in for another object, with the same interface, and controls access to it: when it's created, where it really lives, and who may use it. In apps that means a model or an image that loads on first use, an object whose methods are calls to a server, a paywall in front of a premium feature, a connection to another process, and the small object that stops a display link keeping its view controller alive for ever. Interviewers reach for proxies with questions like "this 150 MB model is used by one screen: how do you keep it from slowing launch?" and "why does this view controller never deinitialise?"
+
+## Proxy and decorator: the same shape, a different job
+
+In code, a proxy looks exactly like a [decorator](/design/learn/sd-structural-decorator): it conforms to its subject's protocol, holds a reference, and forwards calls. The difference is intent.
+
+- A **decorator** adds behaviour to an object someone else created and handed to it.
+- A **proxy** controls *access* to its subject, and often decides whether and when the subject exists at all.
+
+The classic catalogue names four kinds, and each controls something different:
+
+| Kind | What it controls | An iOS example |
+| --- | --- | --- |
+| Virtual | **when** the subject is created | an on-device model loaded on first use |
+| Remote | **where** the subject lives | a cart object whose methods are API calls; an XPC connection's proxy |
+| Protection | **who** may use it | a gate that requires a Pro subscription before exporting |
+| Smart reference | **how** it's referenced | a weak target that breaks a retain cycle; copy-on-write storage |
+
+## Virtual proxy: create it when it's needed
+
+Some objects are expensive to create: a spell-checking word list, a translation model, a PDF renderer, a database with a large schema. If most sessions never use them, creating them at launch wastes time and memory. [Lazy initialisation](/design/learn/sd-creational-lazy) defers the work; a virtual proxy puts that laziness **behind an interface**, so callers hold the protocol and never know whether the real object exists yet.
+
+```swift run
+protocol SpellChecking {
+    func isCorrect(_ word: String) -> Bool
+}
+
+// The real subject: expensive to create
+final class WordListChecker: SpellChecking {
+    private let words: Set<String>
+
+    init() {
+        print("Loading 300,000 words…")
+        words = ["colour", "favourite", "organise", "proxy"]
+    }
+
+    func isCorrect(_ word: String) -> Bool {
+        words.contains(word.lowercased())
+    }
+}
+
+// The virtual proxy: same interface, creates the subject on first use
+final class LazySpellChecker: SpellChecking {
+    private lazy var real = WordListChecker()
+
+    func isCorrect(_ word: String) -> Bool {
+        real.isCorrect(word)
+    }
+}
+
+let checker: any SpellChecking = LazySpellChecker()
+print("Editor opened")
+print(checker.isCorrect("Colour"))
+print(checker.isCorrect("color"))
+```
+
+```output
+Editor opened
+Loading 300,000 words…
+true
+false
+```
+
+The editor opens instantly; the word list loads at the first check. That's the whole idea, but a real app adds three problems this version ignores:
+
+1. **Loading is slow and asynchronous.** A Core ML model can take hundreds of milliseconds to compile and load, so the interface must be `async`, and the proxy is best as an actor.
+2. **Callers arrive together.** An actor runs other calls while it awaits, so two translations that start during the load would start two loads, unless the proxy remembers the one in flight.
+3. **Loading can fail, and memory runs out.** A failed load mustn't be remembered for ever, and on a memory warning the proxy should let the model go and reload it later.
+
+Those rules make the proxy a small state machine:
+
+```visual states
+title: The life of a virtual proxy
+states:
+  - { id: idle, label: Idle, at: [0, 1] }
+  - { id: loading, label: Loading, at: [2, 0] }
+  - { id: loaded, label: Loaded, at: [4, 1] }
+initial: idle
+intro: The proxy starts **idle**. Nothing is loaded and nothing is loading, so creating it costs nothing.
+transitions:
+  - [idle, loading, use]
+  - [loading, loading, use]
+  - [loading, loaded, loadFinished]
+  - [loading, idle, loadFailed]
+  - [loaded, loaded, use]
+  - [loaded, idle, memoryWarning]
+events:
+  - { event: use, say: "The first caller finds the proxy **idle**, so it starts loading the model." }
+  - { event: use, say: "A second caller arrives mid-load. It **waits for the same load** instead of starting another." }
+  - { event: loadFinished, say: "The model is in memory. Both waiting callers get their translations." }
+  - { event: use, say: "Later calls go straight to the loaded model." }
+  - { event: memoryWarning, say: "On a memory warning the proxy lets the model go. Callers don't notice; the next call just takes longer." }
+  - { event: use, say: "The next caller starts a fresh load." }
+  - { event: loadFailed, say: "This time loading fails (say, low disk space). Every waiting caller gets the error, and the proxy goes back to **idle**, not to a stuck failed state." }
+  - { event: use, say: "So the next caller tries again." }
+  - loadFinished
+```
+
+In Swift the natural shape is an actor holding an enum of those three states, where the loading state keeps the `Task` that later callers await. You'll write it in the kata.
+
+<Callout kind="gotcha" title="Swift gotcha: lazy var isn't thread-safe">
+
+The Swift book is explicit: if several threads reach a `lazy var` before it's initialised, there's no guarantee it's initialised only once. The `LazySpellChecker` above is fine on the main actor and wrong if shared across tasks. Global constants and `static let` properties *are* initialised lazily and exactly once, safely, but they can never be unloaded. For anything shared and expensive, use an actor.
+
+</Callout>
+
+## Remote proxy: the subject lives somewhere else
+
+A remote proxy gives you a local object for something that lives in another process or on a server. A shopping app can model the cart this way: guests get a cart on the device, signed-in users get a proxy whose methods are API calls, and the basket screen doesn't care which.
+
+```swift check
+import Foundation
+
+struct ProductID: Hashable, Sendable {
+    let rawValue: String
+}
+
+// The subject's interface. `async throws` admits that a cart may live on a server.
+protocol Cart: Sendable {
+    func add(_ product: ProductID, quantity: Int) async throws
+    func items() async throws -> [ProductID: Int]
+}
+
+// The real subject for a guest: kept on the device
+actor LocalCart: Cart {
+    private var contents: [ProductID: Int] = [:]
+
+    func add(_ product: ProductID, quantity: Int) {
+        contents[product, default: 0] += quantity
+    }
+
+    func items() -> [ProductID: Int] {
+        contents
+    }
+}
+
+// A remote proxy: the same interface, but the real cart is on the server
+struct RemoteCart: Cart {
+    let cartID: String
+    let session: URLSession
+
+    func add(_ product: ProductID, quantity: Int) async throws {
+        var request = URLRequest(url: URL(string: "https://api.example.com/carts/\(cartID)/items")!)
+        request.httpMethod = "POST"
+        request.httpBody = try JSONEncoder().encode(["product": product.rawValue, "quantity": String(quantity)])
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        let (_, response) = try await session.data(for: request)
+        guard (response as? HTTPURLResponse)?.statusCode == 201 else { throw URLError(.badServerResponse) }
+    }
+
+    func items() async throws -> [ProductID: Int] {
+        let url = URL(string: "https://api.example.com/carts/\(cartID)/items")!
+        let (data, _) = try await session.data(from: url)
+        let decoded = try JSONDecoder().decode([String: Int].self, from: data)
+        return Dictionary(uniqueKeysWithValues: decoded.map { (ProductID(rawValue: $0.key), $0.value) })
+    }
+}
+```
+
+The danger with remote proxies is in their selling point. Making a remote call look like a local one invites callers to treat it like one: to call it in a loop, on every keystroke, and without handling failure. Older distributed-object systems hid the network completely and paid for it. Swift's answer is in the protocol: `async throws` on every method says, at every call site, "this can be slow and this can fail". A local implementation pays nothing for it (an actor method satisfies an `async` requirement), and the remote one stays honest.
+
+You'll meet remote proxies in two more places on Apple platforms:
+
+- **XPC.** `NSXPCConnection` gives you a `remoteObjectProxy` that conforms to your protocol and sends each call to another process. On iOS you mostly see it when an app talks to its own File Provider extension.
+- **Distributed actors.** A reference to a `distributed actor` may point to an actor in another process or on another machine, and calling its `distributed func` methods from outside is always `async throws`.
+
+## Protection proxy: check before forwarding
+
+A protection proxy has the subject's interface and a rule about who may use it. Here, exporting a PDF requires a Pro subscription:
+
+```swift check
+import Foundation
+
+struct Document: Sendable {
+    let title: String
+}
+
+enum ExportError: Error {
+    case requiresPro
+}
+
+protocol PDFExporting: Sendable {
+    func export(_ document: Document) async throws -> URL
+}
+
+protocol EntitlementChecking: Sendable {
+    func hasPro() async -> Bool
+}
+
+// A protection proxy: the same interface, and a check before the real exporter runs
+struct ProExportGate: PDFExporting {
+    let exporter: any PDFExporting
+    let entitlements: any EntitlementChecking
+
+    func export(_ document: Document) async throws -> URL {
+        guard await entitlements.hasPro() else { throw ExportError.requiresPro }
+        return try await exporter.export(document)
+    }
+}
+```
+
+In production, `EntitlementChecking` would read StoreKit 2's `Transaction.currentEntitlements`; in tests, it's a stub that answers yes or no. The exporter knows nothing about subscriptions, and the rule lives in one place instead of in every screen with an export button. A consent gate in front of analytics, or a check for camera permission before a capture session starts, has the same shape.
+
+Be clear about what a client-side check protects. It keeps honest users on the right path and the UI consistent. It doesn't stop someone with a modified app or a jailbroken phone, so anything that really matters, such as downloading premium content, must also be checked by the server.
+
+## Smart references and Swift's own proxies
+
+The fourth kind controls how the subject is referenced, and Swift has several built in.
+
+**Copy-on-write.** An `Array` is a small value that refers to a shared buffer. Copying the array copies the reference; the buffer is copied only when someone writes to a shared one. The value is a proxy for storage it manages.
+
+**`@dynamicMemberLookup`** lets a type forward property access to another type generically. SwiftUI's `Binding` uses it: `$settings.volume` asks a `Binding<Settings>` for a member, and gets back a `Binding<Double>`. Here it builds a read-only protection proxy in a few lines:
+
+```swift run
+@dynamicMemberLookup
+struct ReadOnly<Wrapped> {
+    private let wrapped: Wrapped
+
+    init(_ wrapped: Wrapped) {
+        self.wrapped = wrapped
+    }
+
+    subscript<Value>(dynamicMember keyPath: KeyPath<Wrapped, Value>) -> Value {
+        wrapped[keyPath: keyPath]
+    }
+}
+
+struct Account {
+    var holder: String
+    var balancePence: Int
+}
+
+let account = ReadOnly(Account(holder: "Maneet", balancePence: 12_050))
+print(account.holder)
+print(account.balancePence)
+```
+
+```output
+Maneet
+12050
+```
+
+Every property of `Account` is readable through the proxy, and none is writable, because the subscript takes a `KeyPath`, not a `WritableKeyPath`. Try `account.balancePence = 0`, even with `var account`, and the compiler refuses:
+
+```text title="What you'll see"
+error: cannot assign to property: 'account' is immutable
+```
+
+## NSProxy, forwarding, and the weak target
+
+Objective-C has a root class built for this pattern. `NSProxy` implements almost nothing, so nearly every message sent to it falls through to `forwardInvocation:`, where the proxy can hand it to the real object: a lazily loaded one, a remote one, or a weakly held one. Swift can't use `NSInvocation`, so you can't write that kind of forwarding proxy in Swift. `NSObject` has a lighter form, `forwardingTarget(for:)`, which redirects a message to another object, but if that object has gone the message has nowhere to land and the app crashes with "unrecognized selector".
+
+The problem those proxies solved is still very much alive. **`CADisplayLink` and the target-based `Timer` APIs retain their target strongly**, and the run loop retains the link until it's invalidated. A view controller that is its own display link's target is kept alive by the run loop: popping it doesn't free it, and the animation keeps running off-screen. The Swift answer is a small proxy target that holds the view controller weakly:
+
+```swift check ios
+import UIKit
+
+/// Stands in for the view controller as the display link's target, and holds it only weakly
+@MainActor
+final class DisplayLinkProxy: NSObject {
+    private let onFrame: (CADisplayLink) -> Void
+
+    init(onFrame: @escaping (CADisplayLink) -> Void) {
+        self.onFrame = onFrame
+    }
+
+    @objc func frame(_ link: CADisplayLink) {
+        onFrame(link)
+    }
+}
+
+final class ConfettiViewController: UIViewController {
+    private var displayLink: CADisplayLink?
+
+    override func viewDidAppear(_ animated: Bool) {
+        super.viewDidAppear(animated)
+        let proxy = DisplayLinkProxy { [weak self] link in
+            guard let self else {
+                link.invalidate()
+                return
+            }
+            self.advanceConfetti(by: link.targetTimestamp - link.timestamp)
+        }
+        let link = CADisplayLink(target: proxy, selector: #selector(DisplayLinkProxy.frame(_:)))
+        link.add(to: .main, forMode: .common)
+        displayLink = link
+    }
+
+    override func viewDidDisappear(_ animated: Bool) {
+        super.viewDidDisappear(animated)
+        displayLink?.invalidate()
+        displayLink = nil
+    }
+
+    private func advanceConfetti(by interval: CFTimeInterval) {
+        // Move each particle by its velocity × interval
+    }
+}
+```
+
+The link retains the proxy, and the proxy's closure holds the view controller weakly, so nothing keeps the view controller alive. If it's freed without `viewDidDisappear` running, the next frame finds `self` gone and invalidates the link. For `Timer`, the block-based `scheduledTimer(withTimeInterval:repeats:block:)` with `[weak self]` does the same job without a proxy.
+
+## Trade-offs
+
+| | Virtual | Remote | Protection | Smart reference |
+| --- | --- | --- | --- | --- |
+| What it buys | faster launch, less memory | a local interface to something elsewhere | one place for an access rule | safe lifetimes, cheap copies |
+| What it costs | the first use is slow | latency and failure, which callers may forget | a check on every call | subtle lifetime behaviour to explain |
+| Main risk | duplicate loads; caching a failure | hiding the network | trusting the client for security | crashes when a weak target has gone |
+| Swift shape | actor with idle, loading and loaded states | protocol with `async throws` | wrapper with an injected policy | weak capture, copy-on-write, key paths |
+
+Use a virtual proxy when an object is costly and often unused, and the first use can afford a short wait (or you can warm it up before it's needed, such as when the user opens the chat). Use a remote proxy when the same interface really has local and remote implementations; otherwise a plain repository is clearer. Use a protection proxy when a rule applies to every call of an interface, not to one screen.
+
+<Callout kind="interview">
+
+**What to say:** "I'd hide the model behind a protocol and give the app a virtual proxy: it loads on first use, shares one load between concurrent callers, doesn't remember failures, and unloads on a memory warning. If the first use can't wait, I'd warm it when the user opens the feature."
+
+**What to ask:** how big the subject is and how long it takes to load, how often it's used, whether a slow first use is acceptable, and whether the check you're putting on the client is also enforced on the server.
+
+**Red flags:** a remote proxy with synchronous methods; a `lazy var` shared across threads; a client-side paywall treated as security; a view controller that's its own display link's target.
+
+</Callout>
+
+## Practice
+
+The kata is the virtual proxy from the state diagram: a `LazyTranslator` actor that loads an on-device translation model the first time it's needed, shares one load between callers that arrive together, recovers from a failed load, and unloads on request.
+
+```cards
+- id: proxy-vs-decorator
+  front: "What's the difference between a proxy and a decorator?"
+  back: "Both keep the subject's interface. A decorator adds behaviour to an object it's given; a proxy controls access to its subject, often deciding whether and when the subject exists."
+- id: proxy-kinds
+  front: "What do the four kinds of proxy control?"
+  back: "Virtual: when the subject is created. Remote: where it lives. Protection: who may use it. Smart reference: how it's referenced."
+- id: remote-proxy-async
+  front: "How does Swift keep a remote proxy honest?"
+  back: "Its protocol is `async throws`, so every call site shows the call can be slow and can fail, while local implementations satisfy it for free."
+- id: display-link-cycle
+  front: "Why can a view controller with a display link never deinitialise?"
+  back: "`CADisplayLink` retains its target strongly and the run loop retains the link, so a view controller that is its own target stays alive. A weak proxy target breaks the cycle."
+```
+
+```quiz
+- id: q1
+  type: sort
+  prompt: "Which kind of proxy is each of these?"
+  buckets: [Virtual, Remote, Protection]
+  items:
+    - ["Loads a 150 MB model the first time the user translates", 0]
+    - ["The `remoteObjectProxy` of an `NSXPCConnection`", 1]
+    - ["Throws `.requiresPro` unless the user has a subscription", 2]
+    - ["Creates the PDF renderer only when the user first exports", 0]
+    - ["A `RemoteCart` whose `add(_:quantity:)` sends a POST", 1]
+    - ["Drops analytics events until the user has consented", 2]
+  explain: "Virtual proxies control when the subject is created, remote proxies stand in for something in another process or on a server, and protection proxies check a rule before forwarding."
+- id: q2
+  type: output
+  prompt: "What does this print?"
+  code: |
+    protocol Greeter {
+        func greet() -> String
+    }
+
+    final class RealGreeter: Greeter {
+        init() { print("loading") }
+        func greet() -> String { "hi" }
+    }
+
+    final class LazyGreeter: Greeter {
+        private lazy var real = RealGreeter()
+        func greet() -> String { real.greet() }
+    }
+
+    let greeter = LazyGreeter()
+    print("created")
+    print(greeter.greet())
+    print(greeter.greet())
+  answer: "created\nloading\nhi\nhi"
+  explain: "Creating the proxy doesn't create the real greeter. The first `greet()` initialises the `lazy var`, which prints \"loading\"; the second reuses it."
+- id: q3
+  type: mcq
+  prompt: "An actor-based model proxy sets its state to loaded after `let model = try await load()`. When three translations start at once, the model loads three times. Why?"
+  options:
+    - "Actors run their methods on a background thread, so the state isn't visible"
+    - "While the first call is suspended at the `await`, the actor runs the other calls, and they still see the idle state"
+    - "`try await` runs the load once per caller by design"
+    - "The model isn't `Sendable`, so each caller gets its own copy"
+  answer: 1
+  explain: "Actors are re-entrant: suspension at an `await` lets other calls run. If the state changes only after the load finishes, every caller that arrives in between starts its own. Record the in-flight load (a stored `Task`) before awaiting it, and have later callers await that."
+- id: q4
+  type: truefalse
+  prompt: "A protection proxy in the app that checks for a Pro subscription is enough to stop people downloading premium content without paying."
+  answer: false
+  explain: "A client-side check keeps honest users on the right path, but a modified app can skip it. Anything with real value must also be checked by the server before it hands the content over."
+- id: q5
+  type: mcq
+  prompt: "A confetti screen creates `CADisplayLink(target: self, selector: #selector(step))` in `viewDidLoad` and calls `invalidate()` in `deinit`. After it's popped, Instruments shows it's still alive and animating. Why?"
+  options:
+    - "`deinit` runs on a background thread, so `invalidate()` has no effect"
+    - "The display link retains its target and the run loop retains the link, so `deinit` never runs to invalidate it"
+    - "Display links can only be invalidated from `viewWillDisappear`"
+    - "The selector keeps a strong reference to the method's class"
+  answer: 1
+  explain: "It's a cycle through the run loop: run loop → link → view controller. The invalidation that would break it is in `deinit`, which can't run while the cycle exists. Invalidate when the screen disappears, and give the link a weak proxy target."
+```

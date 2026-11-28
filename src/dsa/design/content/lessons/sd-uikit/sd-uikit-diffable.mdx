@@ -1,0 +1,334 @@
+## Why it matters
+
+Lists are most of what apps show: inboxes, feeds, orders, contacts, search results. For years, updating a `UITableView` or `UICollectionView` meant telling it precisely which index paths changed, and getting it wrong crashed the app. Diffable data sources (iOS 13) turned that around: you describe what the list should show now, and UIKit works out what changed and animates it. They're now the standard way to drive UIKit lists, and the design questions they raise (what's an identifier, where does the snapshot come from, how do content changes reach a cell) come up in every senior interview that touches a feed.
+
+## The crash diffable replaced
+
+With the classic data source, your model and the collection view each keep their own idea of how many items there are. A batch update must describe the difference exactly:
+
+```text title="What you'll see"
+*** Terminating app due to uncaught exception 'NSInternalInconsistencyException', reason: 'Invalid update: invalid number of items in section 0. The number of items contained in an existing section after the update (11) must be equal to the number of items contained in that section before the update (10), plus or minus the number of items inserted or deleted from that section (0 inserted, 0 deleted) and plus or minus the number of items moved into or out of that section (0 moved in, 0 moved out).'
+```
+
+That one comes from appending to the array and forgetting to call `insertItems(at:)`, or from a network response landing between the model change and the update call. The root problem is two sources of truth that must change in lockstep.
+
+A diffable data source removes the lockstep. You build a **snapshot**, the complete list of section and item identifiers in order, and call `apply(_:animatingDifferences:)`. The data source compares it with the previous snapshot, finds the insertions, deletions and moves, and performs them. Your model stays the only source of truth; the snapshot is a description of what to show, built from it.
+
+## Identifiers, not models
+
+A snapshot holds **identifiers**: values that are `Hashable` (and, in current SDKs, `Sendable`). The diff compares identifiers, so what you choose as an identifier decides what counts as "the same item". There are two choices, and only one scales:
+
+- **The whole model as the identifier.** `NSDiffableDataSourceSnapshot<Section, Contact>`, where `Contact` is a `Hashable` struct. It's convenient, and the cell gets the model directly. But editing a contact changes its hash, so to the diff it's a *different item*: one deletion and one insertion. The row crossfades instead of updating, loses its selection and swipe state, and the scroll position can jump.
+- **A stable ID as the identifier.** `NSDiffableDataSourceSnapshot<Section, Contact.ID>`. The diff sees identity only. The cell looks the model up by ID when it's configured, so it always shows the latest version. This is what Apple recommends, and what the rest of this lesson uses.
+
+You can see the difference with the same kind of comparison diffable makes, on plain arrays:
+
+```swift run title="What the diff sees"
+struct Todo: Hashable {
+    let id: Int
+    var title: String
+    var isDone: Bool
+}
+
+func describe<T>(_ difference: CollectionDifference<T>) -> String {
+    "deletions: \(difference.removals.count), insertions: \(difference.insertions.count)"
+}
+
+let before = [Todo(id: 1, title: "Milk", isDone: false), Todo(id: 2, title: "Eggs", isDone: false), Todo(id: 3, title: "Bread", isDone: false)]
+var after = before
+after[1].isDone = true // tick "Eggs"
+
+// Whole models as identifiers: the edited row is a different value, so it looks like a different item
+print("Models as identifiers:", describe(after.difference(from: before)))
+
+// Stable IDs as identifiers: nothing was inserted or deleted...
+print("IDs as identifiers:", describe(after.map(\.id).difference(from: before.map(\.id))))
+
+// ...and the content change is a separate question: which IDs now have different content?
+let old = Dictionary(uniqueKeysWithValues: before.map { ($0.id, $0) })
+print("Reconfigure:", after.filter { old[$0.id] != $0 }.map(\.id))
+```
+
+```output
+Models as identifiers: deletions: 1, insertions: 1
+IDs as identifiers: deletions: 0, insertions: 0
+Reconfigure: [2]
+```
+
+With IDs, *identity* (which items exist, in what order) and *content* (what each one looks like) become two separate questions. The snapshot answers the first. For the second you tell the snapshot which identifiers changed, as you'll see next.
+
+Here's how the pieces fit on a contacts screen, where a rename and a new contact arrive together:
+
+```visual flow
+title: A snapshot carries identifiers; cells look up the content
+nodes:
+  - { id: store, label: Contact store, kind: store, at: [0, 0] }
+  - { id: snapshot, label: Snapshot, kind: service, at: [2, 0] }
+  - { id: source, label: Diffable data source, kind: service, at: [4, 0], w: 1.3 }
+  - { id: list, label: Collection view, kind: view, at: [4, 2], w: 1.3 }
+  - { id: cell, label: Cell registration, kind: view, at: [2, 2] }
+edges:
+  - [store, snapshot, IDs]
+  - [snapshot, source, apply]
+  - [source, list, diff]
+  - [list, cell, dequeue]
+  - [cell, store, "contact(id)", { style: data }]
+steps:
+  - say: "The store changes: one contact is renamed, another is added. The store is the only source of truth."
+    show: [store]
+    state: { store: active }
+  - say: "The screen builds a **snapshot** from it: sections and contact IDs in order, plus `reconfigureItems` for the renamed contact. No names, no images."
+    send: store->snapshot
+    state: { store: null }
+  - say: "`apply` hands the snapshot to the data source, which diffs it against the last one **by identifier**."
+    send: snapshot->source
+  - say: "The diff is one insertion. The renamed contact kept its ID, so it isn't deleted and reinserted: it's reconfigured in place."
+    send: source->list
+  - say: "For the new cell and the reconfigured one, the registration handler runs and reads the **latest** contact from the store by ID."
+    send: [list->cell, cell->store]
+    state: { list: ok }
+```
+
+In code, the screen keeps the store, a data source keyed by identifiers, and one cell registration:
+
+```swift check ios title="ContactsViewController.swift"
+import UIKit
+
+struct Contact: Identifiable, Sendable {
+    let id: String
+    var name: String
+    var isFavourite: Bool
+}
+
+/// The source of truth. Snapshots only ever hold identifiers.
+@MainActor
+final class ContactStore {
+    private(set) var byID: [Contact.ID: Contact] = [:]
+    func contact(_ id: Contact.ID) -> Contact? { byID[id] }
+}
+
+final class ContactsViewController: UIViewController {
+    enum Section: Hashable, Sendable {
+        case favourites, everyone
+    }
+
+    /// A favourite appears twice, so each appearance needs its own identifier
+    enum Item: Hashable, Sendable {
+        case favourite(Contact.ID)
+        case contact(Contact.ID)
+
+        var contactID: Contact.ID {
+            switch self {
+            case .favourite(let id), .contact(let id): id
+            }
+        }
+    }
+
+    private let store: ContactStore
+    private var dataSource: UICollectionViewDiffableDataSource<Section, Item>!
+    private lazy var collectionView = UICollectionView(
+        frame: .zero,
+        collectionViewLayout: UICollectionViewCompositionalLayout.list(using: .init(appearance: .insetGrouped))
+    )
+
+    init(store: ContactStore) {
+        self.store = store
+        super.init(nibName: nil, bundle: nil)
+    }
+
+    required init?(coder: NSCoder) { nil }
+
+    override func viewDidLoad() {
+        super.viewDidLoad()
+        collectionView.frame = view.bounds
+        collectionView.autoresizingMask = [.flexibleWidth, .flexibleHeight]
+        view.addSubview(collectionView)
+
+        // Looks the contact up by ID, so a reconfigure always shows the latest version
+        let registration = UICollectionView.CellRegistration<UICollectionViewListCell, Item> { [store] cell, _, item in
+            guard let contact = store.contact(item.contactID) else { return }
+            var content = cell.defaultContentConfiguration()
+            content.text = contact.name
+            content.image = UIImage(systemName: contact.isFavourite ? "star.fill" : "person")
+            cell.contentConfiguration = content
+        }
+        dataSource = UICollectionViewDiffableDataSource(collectionView: collectionView) { collectionView, indexPath, item in
+            collectionView.dequeueConfiguredReusableCell(using: registration, for: indexPath, item: item)
+        }
+    }
+
+    /// Shows what the store holds now. `edited` are contacts whose content changed since the last render.
+    func render(favourites: [Contact.ID], everyone: [Contact.ID], edited: Set<Contact.ID>, animated: Bool) {
+        var snapshot = NSDiffableDataSourceSnapshot<Section, Item>()
+        if !favourites.isEmpty {
+            snapshot.appendSections([.favourites])
+            snapshot.appendItems(favourites.map(Item.favourite), toSection: .favourites)
+        }
+        snapshot.appendSections([.everyone])
+        snapshot.appendItems(everyone.map(Item.contact), toSection: .everyone)
+        // Only identifiers that are in this snapshot: reconfiguring an unknown one raises an exception
+        snapshot.reconfigureItems(snapshot.itemIdentifiers.filter { edited.contains($0.contactID) })
+        dataSource.apply(snapshot, animatingDifferences: animated)
+    }
+}
+```
+
+`render` builds the whole snapshot from scratch every time rather than editing the last one. That's deliberate: a snapshot computed from the current state can't drift from it, and building one is cheap compared with the diff.
+
+## Telling UIKit what changed
+
+Because the diff only sees identifiers, a content change needs a separate instruction. Snapshots have two (both iOS 15 and later for reconfigure):
+
+- **`reconfigureItems(_:)`** reruns the cell registration's handler on the cell that's already showing the item. No new cell is dequeued and `prepareForReuse()` isn't called, so it's cheap, it keeps state that lives in the cell (an in-progress swipe, a focused text field), and it's what you want for nearly every content change.
+- **`reloadItems(_:)`** throws the cell away and dequeues a fresh one. Use it only when the item needs a *different cell type* than before, for example a row that changes from a plain message to an expanded one with an attached photo.
+
+Items that are off screen don't need either: their cells will be configured, with the latest content, when they scroll in.
+
+## Applying snapshots
+
+`apply(_:animatingDifferences:completion:)` diffs and updates on the main actor. Current SDKs mark `UICollectionViewDiffableDataSource` as `@MainActor`, and the snapshot type as `Sendable`, which suggests the right split for big lists:
+
+- **Build** the snapshot wherever is convenient, including off the main actor for tens of thousands of items or expensive grouping.
+- **Apply** it on the main actor. There's also an `async` version, `await dataSource.apply(snapshot)`, that resumes when the update has finished.
+
+Animating is a choice per update:
+
+- **Animate** changes the user caused or should notice: a new message arriving, an item deleted, a filter toggled.
+- **Don't animate** the first load or a full refresh. Since iOS 15, `animatingDifferences: false` still diffs (it no longer falls back to `reloadData`), so it's cheap and keeps cell state.
+- **`applySnapshotUsingReloadData(_:)`** (iOS 15) skips the diff and resets the list. Use it when the new contents have nothing to do with the old, such as switching accounts.
+
+Never mix in the collection view's own update methods (`reloadData()`, `insertItems(at:)`, `performBatchUpdates`) on a view driven by a diffable data source. The data source's record of what's shown and the view's would disagree, which is the original crash again.
+
+### Sections and section snapshots
+
+Section identifiers work like item identifiers: an enum for fixed sections, or server IDs for sections that come from data (a home feed's rails). For hierarchical content such as an outline with expandable folders, or for updating one section independently, use **`NSDiffableDataSourceSectionSnapshot`** (iOS 14): a snapshot of one section's items with parent–child relationships, applied with `apply(_:to:animatingDifferences:)`. Expanding and collapsing are then just changes to that section's snapshot.
+
+## Rules that crash
+
+The data source is strict about identifiers, and its exceptions terminate the app:
+
+- **Every item identifier must be unique across the whole snapshot.** Appending identifiers that aren't unique raises an `NSInternalInconsistencyException`. So does putting the same identifier in two sections, which is why the contacts screen wraps IDs in `Item.favourite` and `Item.contact`.
+- **Section identifiers must be unique too.**
+- **Reconfiguring or reloading an identifier that isn't in the snapshot** raises an exception, so filter the changed IDs by what you're showing.
+- **`hash(into:)` must agree with `==`**, and an identifier's hash must never change while it's in a snapshot. A mutable class used as an identifier, hashed by its contents, breaks both.
+
+The most common way to break the first rule isn't a bug in the screen at all. A paginated API returns page 2 after a new item was inserted at the top, so the last item of page 1 appears again at the start of page 2. Appending pages naively puts the same ID in the snapshot twice. Whatever builds the snapshot must drop repeats, and it should log them, because they're a server or paging bug worth knowing about.
+
+## Where the snapshot comes from
+
+Put those rules together and a clear division appears:
+
+1. The **model layer** (a store, a repository) owns the data.
+2. A **pure function** turns the current state into a snapshot plan: which sections, which identifiers in which order, which ones changed content, which duplicates were dropped. It's Foundation-only, so it's tested in milliseconds without UIKit.
+3. The **view controller** turns the plan into an `NSDiffableDataSourceSnapshot` and applies it. That's the only part that touches UIKit, and it has no decisions left to get wrong.
+
+That's exactly the kata for this lesson.
+
+## Trade-offs
+
+| Approach | Animations | Crash risk | Cell state on content change | Effort |
+| --- | --- | --- | --- | --- |
+| `reloadData()` | None | Low | Lost: every cell reconfigured | Lowest |
+| `performBatchUpdates` with index paths | Yes | High: counts must match exactly | Kept, if you get the index paths right | High |
+| Diffable, whole models as identifiers | Yes | Low | Lost: edits look like delete and insert | Low |
+| Diffable, stable IDs with reconfigure | Yes | Low, if identifiers are unique | Kept | Medium |
+| SwiftUI `List` or `LazyVStack` | Yes, from identity | Low | Kept, by `id` | Low, in SwiftUI screens |
+
+`reloadData()` is still fine for a short list that changes rarely and doesn't need animation. Diffable with stable IDs is the default for anything users scroll, edit or watch update. Hand-written batch updates have almost no remaining use in new code.
+
+<Callout kind="interview">
+
+**What to say:** "Snapshots hold stable identifiers, not models. The cell registration looks the model up by ID. Content changes go through `reconfigureItems`, identity changes through the diff. A pure function builds the snapshot from state, deduplicates identifiers and is unit-tested; the view controller only applies it."
+
+**What to ask:** can the same item appear in two sections? Does the API page with offsets (duplicates likely) or cursors? How big can the list get?
+
+**Red flags:** whole mutable models as identifiers; editing `dataSource.snapshot()` piecemeal from several places; calling `reloadData()` on a diffable-driven view; no plan for duplicate IDs from paging.
+
+</Callout>
+
+<Callout kind="gotcha" title="iOS gotcha: selection belongs to identifiers">
+
+`collectionView.indexPathsForSelectedItems` gives index paths, which change meaning after every apply. Map them to identifiers straight away with `dataSource.itemIdentifier(for:)`, and keep selection in your state as identifiers, so a refresh that inserts rows above doesn't silently move the selection to a different item.
+
+</Callout>
+
+## Practice
+
+The [snapshot planner kata](/design/practice/sd-kata-uikit-snapshot-planner) is the pure function from the last section: group rows into sections, drop repeated identifiers, and work out which items to reconfigure. The [reusable list screen design](/design/practice/sd-design-uikit-list-screen) puts it inside a component that eight teams would build on.
+
+```cards
+- id: ids-not-models
+  front: "Why should a snapshot hold stable IDs rather than whole models?"
+  back: "The diff compares identifiers. With whole models, any edit changes the identifier, so the row is deleted and reinserted: it crossfades, loses selection and can jump. With IDs, identity and content are separate, and content changes go through `reconfigureItems`."
+- id: reconfigure-vs-reload
+  front: "`reconfigureItems` vs `reloadItems`?"
+  back: "Reconfigure reruns the registration handler on the existing cell: cheap, keeps cell state. Reload dequeues a fresh cell: only needed when the item needs a different cell type."
+- id: diffable-crash-rules
+  front: "Which identifier mistakes crash a diffable data source?"
+  back: "Repeated item identifiers (including one in two sections), repeated section identifiers, and reconfiguring or reloading an identifier that isn't in the snapshot."
+- id: apply-main-actor
+  front: "Where do you build and apply a snapshot under Swift 6?"
+  back: "Build it anywhere, since the snapshot type is `Sendable`. Apply it on the main actor: the data source is `@MainActor`."
+```
+
+```quiz
+- id: q1
+  type: mcq
+  prompt: "In a to-do list, ticking an item makes its row fade out and back in, and the item loses its selection. What's the most likely cause?"
+  options:
+    - "The list is animating with `animatingDifferences: true`"
+    - "The snapshot uses whole `Todo` values as identifiers, so the edited item looks like a new one"
+    - "The cell doesn't call `prepareForReuse()`"
+    - "`reconfigureItems` was used instead of `reloadItems`"
+  answer: 1
+  explain: "Changing `isDone` changes the value's hash, so the diff sees a deletion and an insertion. Use the to-do's ID as the identifier and reconfigure it instead."
+- id: q2
+  type: multi
+  prompt: "Which of these make a diffable data source raise an exception?"
+  options:
+    - "Appending `[a, b, a]` to a section"
+    - "Putting item `a` in both the Favourites and Everyone sections"
+    - "Reconfiguring an identifier that isn't in the snapshot"
+    - "Applying a snapshot with no sections"
+    - "Applying the same snapshot twice in a row"
+  answer: [0, 1, 2]
+  explain: "Identifiers must be unique across the whole snapshot, and reconfigure or reload can only name identifiers it contains. An empty snapshot is a valid, empty list, and reapplying an identical snapshot is a no-op diff."
+- id: q3
+  type: match
+  prompt: "Match each call to what it does."
+  pairs:
+    - ["`reconfigureItems(_:)`", "Reruns the registration handler on the existing cell"]
+    - ["`reloadItems(_:)`", "Dequeues a fresh cell for the item"]
+    - ["`apply(_:animatingDifferences: false)`", "Diffs and updates without animation"]
+    - ["`applySnapshotUsingReloadData(_:)`", "Resets the list without diffing"]
+  explain: "Since iOS 15, not animating still diffs, which keeps cell state; only `applySnapshotUsingReloadData` throws everything away, for contents unrelated to the old ones."
+- id: q4
+  type: sort
+  prompt: "For each list, is a stable ID or the value itself a good item identifier?"
+  buckets: ["A stable ID", "The value itself"]
+  items:
+    - ["Contacts that can be renamed", 0]
+    - ["Chat messages that can be edited", 0]
+    - ["Products whose price updates", 0]
+    - ["Recent search terms, which never change once stored", 1]
+    - ["The fixed rows of a settings screen, as an enum", 1]
+  explain: "If an item's content can change while it's on screen, its identity must not depend on that content. Immutable values, like a stored search string or an enum case, can safely be their own identifier."
+- id: q5
+  type: bug
+  prompt: "This crashes the first time a contact is deleted while another is being renamed. Click the faulty line."
+  code: |
+    func render(_ ids: [Contact.ID], changed: [Contact.ID]) {
+        var snapshot = NSDiffableDataSourceSnapshot<Section, Contact.ID>()
+        snapshot.appendSections([.main])
+        snapshot.appendItems(ids, toSection: .main)
+        snapshot.reconfigureItems(changed)
+        dataSource.apply(snapshot, animatingDifferences: true)
+    }
+  answer: 5
+  explain: "`changed` can include a contact that was deleted, which isn't in the new snapshot, and reconfiguring an unknown identifier raises an exception. Filter it first: `changed.filter { snapshot.indexOfItem($0) != nil }`."
+- id: q6
+  type: truefalse
+  prompt: "Under Swift 6 you may call `dataSource.apply(_:)` from a background task, as long as every call comes from the same queue."
+  answer: false
+  explain: "That was the old rule for Objective-C and Swift 5 code. In current SDKs the data source is `@MainActor`, so `apply` runs on the main actor. Building the snapshot can still happen anywhere, since the snapshot is `Sendable`."
+```

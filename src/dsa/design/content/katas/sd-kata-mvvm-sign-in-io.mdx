@@ -1,0 +1,161 @@
+A sign-in screen has two fields and a button, and still manages to hide half a dozen rules: when to complain about the email, when the button is enabled, what each failure should say, and how to stop a double tap signing in twice. Write its view model in the **input/output** shape: everything the view can say is one `Input` enum, everything it shows is one `Output` value, and the one-off "signed in" goes to the coordinator through a closure.
+
+`InputOutputSignIn.ViewModel`: `send(_ input: Input) async` and `output: Output`
+
+The view model is `@MainActor @Observable`. It's created with an `Authenticating` service and an `onRoute` closure, and starts with an empty email and password.
+
+- **Email rule.** After trimming spaces and newlines, a valid email has no spaces, exactly one `@`, at least one character before it, and after it a `.` with at least one character on each side.
+- **When the email error shows.** `emailError` is `invalidEmailMessage` when the email is invalid **and** the field has been touched: it lost focus once (`.emailEditingEnded`), or the user tried to submit. Before that, typing never shows an error. After it, the error follows the text as it changes.
+- **The button.** `isSubmitEnabled` when the email is valid, the password isn't empty (any characters count, spaces included), no attempt is running and the user hasn't already signed in.
+- **Submitting.** `.submitTapped` marks the email as touched. If the button isn't enabled, nothing is sent. Otherwise it sets `isSubmitting`, clears `failureMessage`, and sends the email **trimmed** and the password **exactly as typed**. It returns when the attempt finishes. A tap while an attempt is running, or after signing in, is ignored.
+- **Success.** `isSubmitting` goes back to false, the button stays disabled, and `onRoute(.signedIn(account))` is called **once**.
+- **Failure.** `isSubmitting` goes back to false, the button is enabled again for a retry, and `failureMessage` says what happened:
+
+| The service throws | `failureMessage` |
+| --- | --- |
+| `SignInError.wrongCredentials` | `wrongCredentialsMessage` |
+| `SignInError.locked(minutes: 1)` | `"Too many attempts. Try again in 1 minute."` |
+| `SignInError.locked(minutes: 15)` | `"Too many attempts. Try again in 15 minutes."` |
+| `SignInError.offline`, or `URLError(.notConnectedToInternet)` | `offlineMessage` |
+| `CancellationError`, or `URLError(.cancelled)` | none: cancelling isn't failing |
+| anything else | `genericFailureMessage` |
+
+- **Editing** either field clears `failureMessage`.
+
+## Examples
+
+| Inputs, in order | `output` afterwards |
+| --- | --- |
+| `emailChanged("ada@")` | no error, button disabled |
+| … `emailEditingEnded` | `emailError` is `invalidEmailMessage` |
+| … `emailChanged("ada@example.com")`, `passwordChanged("hunter2")` | no error, button enabled |
+| `emailChanged(" ada@example.com ")`, `passwordChanged(" secret ")`, `submitTapped` (in flight) | submitting, button disabled; the service received `"ada@example.com"` and `" secret "` |
+| … the service returns Ada | not submitting, button disabled, one route: `.signedIn(Ada)` |
+| `emailChanged("ada")`, `passwordChanged("pw")`, `submitTapped` | `emailError` shown at once, nothing sent |
+| a valid submit, then the service throws `.wrongCredentials` | button enabled, `failureMessage` is `wrongCredentialsMessage` |
+| … `passwordChanged("new")` | `failureMessage` is nil |
+
+## Constraints
+
+- No SwiftUI or UIKit: the view model is tested on a Mac with Foundation and Observation only.
+- Tests hold each sign-in open until they answer it, so they can look at `output` mid-flight, and they compare whole `Output` values.
+- `output` must always be consistent: there's no moment where the button is enabled while submitting.
+
+<Hints>
+<Hint>
+Store the facts, not the output: the email, the password, whether the email was touched, whether an attempt is running, whether the user signed in, and the last failure message. Then make `output` a computed property that builds the whole `Output` from them.
+</Hint>
+<Hint>
+`send` is a `switch` over the input. Only `.submitTapped` needs to `await`; the other cases change one stored property and return.
+</Hint>
+<Hint>
+Check "already running" before anything else in the submit path, then mark the email as touched, then check whether the button is enabled.
+</Hint>
+<Hint>
+Map errors in one function that returns `String?`: nil for the two kinds of cancellation, a message for everything else. Check `CancellationError` and `URLError` before casting to `SignInError`.
+</Hint>
+</Hints>
+
+## Solutions
+
+<Approach title="Inputs change stored facts; the output is computed from them" time="O(length of the email) per input" space="O(1)">
+
+```swift
+@MainActor
+@Observable
+public final class ViewModel {
+    public var output: Output {
+        Output(
+            emailError: emailTouched && !emailIsValid ? invalidEmailMessage : nil,
+            isSubmitEnabled: canSubmit,
+            isSubmitting: isSubmitting,
+            failureMessage: failureMessage
+        )
+    }
+
+    private var email = ""
+    private var password = ""
+    private var emailTouched = false
+    private var isSubmitting = false
+    private var hasSignedIn = false
+    private var failureMessage: String?
+
+    private let authenticator: any Authenticating
+    private let onRoute: @MainActor (Route) -> Void
+
+    public init(authenticator: any Authenticating, onRoute: @escaping @MainActor (Route) -> Void) {
+        self.authenticator = authenticator
+        self.onRoute = onRoute
+    }
+
+    public func send(_ input: Input) async {
+        switch input {
+        case .emailChanged(let text):
+            email = text
+            failureMessage = nil
+        case .passwordChanged(let text):
+            password = text
+            failureMessage = nil
+        case .emailEditingEnded:
+            emailTouched = true
+        case .submitTapped:
+            await submit()
+        }
+    }
+
+    private var emailIsValid: Bool { InputOutputSignIn.isValidEmail(email) }
+    private var canSubmit: Bool { emailIsValid && !password.isEmpty && !isSubmitting && !hasSignedIn }
+
+    private func submit() async {
+        guard !isSubmitting, !hasSignedIn else { return }
+        emailTouched = true
+        guard canSubmit else { return }
+
+        let credentials = Credentials(email: email.trimmingCharacters(in: .whitespacesAndNewlines), password: password)
+        isSubmitting = true
+        failureMessage = nil
+        do {
+            let account = try await authenticator.signIn(credentials)
+            isSubmitting = false
+            hasSignedIn = true
+            onRoute(.signedIn(account))
+        } catch {
+            isSubmitting = false
+            failureMessage = InputOutputSignIn.message(for: error)
+        }
+    }
+}
+
+static func isValidEmail(_ raw: String) -> Bool {
+    let email = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+    guard !email.contains(where: \.isWhitespace) else { return false }
+    let parts = email.split(separator: "@", omittingEmptySubsequences: false)
+    guard parts.count == 2, !parts[0].isEmpty else { return false }
+    return parts[1].dropFirst().dropLast().contains(".")
+}
+
+static func message(for error: any Error) -> String? {
+    if error is CancellationError { return nil }
+    if let error = error as? URLError {
+        switch error.code {
+        case .cancelled: return nil
+        case .notConnectedToInternet, .networkConnectionLost: return offlineMessage
+        default: return genericFailureMessage
+        }
+    }
+    guard let error = error as? SignInError else { return genericFailureMessage }
+    switch error {
+    case .wrongCredentials: return wrongCredentialsMessage
+    case .locked(let minutes): return "Too many attempts. Try again in \(minutes) \(minutes == 1 ? "minute" : "minutes")."
+    case .offline: return offlineMessage
+    }
+}
+```
+
+The view's whole contract is two types. A SwiftUI view sends `.emailChanged` from an `onChange` (or a custom binding) and `.submitTapped` from the button, inside a `Task`; a UIKit view controller does the same from `UIAction`s. Both render `output` and nothing else, so the same view model serves either.
+
+Computing `output` instead of storing it is what makes the "always consistent" rule free. A stored `Output` would need every input to remember to update every field it affects; one forgotten line and the button is enabled while submitting. With Observation, a computed property is tracked through what it reads, so a view that reads `output` updates whenever any of the facts change.
+
+The route is a closure rather than part of `Output` because it happens **once**. If "signed in" were state, every re-render would see it again and the coordinator would have to remember whether it had already acted on it. The `hasSignedIn` flag closes the last gap: without it, a tap that lands while the coordinator is animating to the next screen would sign in a second time.
+
+</Approach>

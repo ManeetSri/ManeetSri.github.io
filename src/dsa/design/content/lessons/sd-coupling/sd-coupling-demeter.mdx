@@ -1,0 +1,325 @@
+## Why it matters
+
+`order.courier.vehicle.location.coordinate` looks harmless. It's one line, and it compiles. But that line knows the structure of four types it doesn't own, and it breaks when any of them changes shape. The Law of Demeter names this, and "tell, don't ask" fixes most of it by moving decisions to the object that owns the data. In Swift there's a bonus: with actors, *asking then acting* is a race, and *telling* isn't. Interviewers notice whether your models have behaviour or are bags of properties that every view model pokes at.
+
+## The Law of Demeter
+
+The rule comes from the Demeter project at Northeastern University in 1987, and its summary is "only talk to your immediate friends". Precisely: a method `m` on an object `o` should only call methods on:
+
+1. `o` itself;
+2. `m`'s parameters;
+3. objects that `m` creates;
+4. `o`'s own stored properties.
+
+What it rules out is calling methods on objects you got *back* from one of those calls: friends of friends. Every extra hop means your code knows one more piece of someone else's structure.
+
+Here's a delivery-tracking view model that breaks it:
+
+```swift check title="Talking to strangers"
+struct Point {
+    var x: Double
+    var y: Double
+
+    func distance(to other: Point) -> Double {
+        ((x - other.x) * (x - other.x) + (y - other.y) * (y - other.y)).squareRoot()
+    }
+}
+
+final class Vehicle {
+    var metresPerMinute: Double = 250
+    var location = Point(x: 0, y: 0)
+}
+
+final class Courier {
+    var name = "Sam"
+    var vehicle = Vehicle()
+}
+
+final class Order {
+    var courier: Courier? = Courier()
+    var destination = Point(x: 3000, y: 0)
+}
+
+final class TrackingViewModel {
+    func etaText(for order: Order) -> String {
+        guard let courier = order.courier else { return "Finding a courier" }
+        let metres = courier.vehicle.location.distance(to: order.destination)
+        let minutes = Int((metres / courier.vehicle.metresPerMinute).rounded(.up))
+        return "\(courier.name) is \(minutes) min away"
+    }
+}
+```
+
+`TrackingViewModel` knows that orders have couriers, couriers have vehicles, vehicles have a location and a speed, and how to turn those into minutes. If couriers start sharing vehicles, if location moves to the courier's phone, or if ETAs start coming from the server with traffic included, this view model changes, and so does every other screen that copied the calculation. In connascence terms, the chain is connascence of name along a whole path, across four types.
+
+The fix is to ask each object only about what it owns, and to let it answer from its own data:
+
+```swift check title="Talking to friends"
+struct Point {
+    var x: Double
+    var y: Double
+
+    func distance(to other: Point) -> Double {
+        ((x - other.x) * (x - other.x) + (y - other.y) * (y - other.y)).squareRoot()
+    }
+}
+
+final class Vehicle {
+    private let metresPerMinute: Double = 250
+    private(set) var location = Point(x: 0, y: 0)
+
+    func minutes(to destination: Point) -> Int {
+        Int((location.distance(to: destination) / metresPerMinute).rounded(.up))
+    }
+}
+
+final class Courier {
+    let name = "Sam"
+    private let vehicle = Vehicle()
+
+    func minutes(to destination: Point) -> Int {
+        vehicle.minutes(to: destination)
+    }
+}
+
+enum ETA: Equatable {
+    case findingCourier
+    case arriving(courierName: String, minutes: Int)
+}
+
+final class Order {
+    private let courier: Courier? = Courier()
+    private let destination = Point(x: 3000, y: 0)
+
+    func eta() -> ETA {
+        guard let courier else { return .findingCourier }
+        return .arriving(courierName: courier.name, minutes: courier.minutes(to: destination))
+    }
+}
+
+final class TrackingViewModel {
+    func etaText(for order: Order) -> String {
+        switch order.eta() {
+        case .findingCourier: "Finding a courier"
+        case .arriving(let name, let minutes): "\(name) is \(minutes) min away"
+        }
+    }
+}
+```
+
+Each type now talks only to its own stored properties and parameters, and `private` makes the law enforceable: the view model *can't* reach `order.courier` any more. When ETAs move to the server, only `Order.eta()` changes.
+
+## What the law isn't: counting dots
+
+"Use only one dot" is a popular summary, and it's wrong. These are all fine:
+
+- `posts.filter(\.isPublished).map(\.title).prefix(3)`: each call returns a new value that *you* own. You're not reaching into anyone's internals.
+- `Text(title).font(.headline).padding()`: SwiftUI modifiers return new views. A fluent API is designed to be chained.
+- `response.data.items.first?.id` on a decoded, immutable struct: navigating plain data is reading a document, not commanding objects.
+
+The law is about **objects with behaviour and hidden state**, where reaching through means depending on how someone else has arranged their internals. The question to ask isn't "how many dots?" but "**does this code know the structure of something it doesn't own?**" Even with plain data, when many places walk the same long path, give the path a name, so the knowledge lives in one place.
+
+## Tell, don't ask
+
+Most Demeter violations come from code that **asks** objects for their data, makes a decision, and then changes them. The alternative is to **tell** the object what you want, and let it decide. Alec Sharp drew the line in 1997: procedural code fetches data and then decides, while object-oriented code hands the decision to the object that has the data. Andy Hunt and Dave Thomas later gave the idea its catchy name.
+
+Compare two checkout view models paying with a gift card:
+
+```swift title="Ask, decide, change"
+if card.balancePence >= price && !card.isFrozen {
+    card.balancePence -= price
+    card.history.append(.payment(price))
+}
+```
+
+```swift title="Tell"
+try card.pay(price)
+```
+
+The ask version spreads the card's rules (sufficient funds, not frozen, record history) into every caller. A top-up screen, an Apple Watch app and a refund flow each re-implement part of it, and one of them forgets the history line. The tell version keeps the rules and the data in one type, which can make its properties `private(set)` and guarantee its invariants, as you saw with contracts in D02.
+
+### With actors, asking is a race
+
+Make the gift card an actor and the difference stops being style. Every `await` is a point where other work can run on the actor. If a caller asks for the balance in one `await` and sets it in another, a second caller can slip in between:
+
+```visual sequence
+title: Ask then act, or tell
+participants:
+  - { id: first, label: Tap 1 }
+  - { id: card, label: GiftCard actor }
+  - { id: second, label: Tap 2 }
+messages:
+  - [first, card, await balance]
+  - [card, first, 500p, { reply: true }]
+  - [second, card, await balance]
+  - [card, second, 500p, { reply: true }]
+  - [first, card, "await setBalance(0)"]
+  - [second, card, "await setBalance(0)"]
+  - { note: Two £5 payments from one £5 card, over: [first, second] }
+  - [first, card, "pay(500)"]
+  - [card, first, paid, { reply: true }]
+  - [second, card, "pay(500)"]
+  - [card, second, insufficientFunds, { reply: true }]
+fragments:
+  - { kind: alt, label: ask then act, from: 0, to: 10, else: 7, elseLabel: tell }
+steps:
+  - { upTo: -1, say: "Two taps on **Pay** arrive together, for £5 each, on a card holding £5." }
+  - { upTo: 1, say: "Tap 1 asks for the balance: 500p, enough." }
+  - { upTo: 3, say: "Before tap 1 acts, the actor is free, because tap 1 is between two `await`s. Tap 2 asks and also sees 500p." }
+  - { upTo: 6, say: "Both decide yes, and both write 0. The actor prevented a **data race**, but not this **logic race**: the check and the change were separate calls." }
+  - { upTo: 8, say: "Tell instead. `pay(500)` checks and subtracts inside one actor method with no `await` in it, so nothing can run in between." }
+  - { upTo: 10, say: "Tap 2's payment runs after tap 1's and is declined. Because the rule lives with the data, it holds under concurrency too." }
+```
+
+The tell version, run with two simultaneous taps, always pays exactly once:
+
+```swift run title="GiftCard.swift"
+enum PaymentError: Error {
+    case insufficientFunds
+    case frozen
+}
+
+actor GiftCard {
+    private var balancePence: Int
+    private var isFrozen = false
+
+    init(balancePence: Int) {
+        self.balancePence = balancePence
+    }
+
+    var balance: Int { balancePence }
+
+    // Tell: the check and the change run together, with no await between them
+    func pay(_ pence: Int) throws(PaymentError) {
+        guard !isFrozen else { throw .frozen }
+        guard pence <= balancePence else { throw .insufficientFunds }
+        balancePence -= pence
+    }
+}
+
+func tapPay(_ pence: Int, on card: GiftCard) async -> Bool {
+    do {
+        try await card.pay(pence)
+        return true
+    } catch {
+        return false
+    }
+}
+
+let card = GiftCard(balancePence: 500)
+
+// Two taps on "Pay" arrive at the same moment
+async let first = tapPay(500, on: card)
+async let second = tapPay(500, on: card)
+let results = await [first, second]
+
+print("Paid: \(results.filter { $0 }.count), declined: \(results.filter { !$0 }.count)")
+print("Balance: \(await card.balance)p")
+```
+
+```output
+Paid: 1, declined: 1
+Balance: 0p
+```
+
+Which tap wins varies from run to run; that exactly one does never varies. The ask-then-act version can't promise that, however carefully its callers are written. That's why actor methods should usually be whole operations ("pay", "reserve", "enqueue"), not getters and setters.
+
+## Where tell, don't ask stops
+
+Taken to the extreme, both rules make code worse.
+
+- **Views need data.** A view model reading `order.total` to show it isn't a violation. Queries are fine; the smell is asking *in order to decide and change* someone else's state. You'll meet the formal split between queries and commands in D05.
+- **Forwarding methods pile up.** Obeying Demeter mechanically gives `order.courierName()`, `order.courierPhone()`, `order.courierVehicleColour()`: `Order` turns into a **middle man** that only forwards calls. When that happens, ask what the caller really needs. Often it's one value made for it, like the `ETA` enum above, or a plain struct the view can read freely.
+- **Value types are data.** Reading `address.city` from an immutable `Address` struct is reading data. Demeter matters most for reference types with invariants and for actors.
+
+## Trade-offs
+
+| Style | Who holds the rule | Safe under concurrency | Cost | Wins when |
+| --- | --- | --- | --- | --- |
+| Ask, decide, change | Every caller | No: check and change are separate | Duplicated rules drift | Never for state with invariants |
+| Reach through a chain | The caller, with knowledge of every link | Depends on the links | Breaks when any link changes shape | Navigating immutable data you own |
+| Tell (a command method) | The owner of the data | Yes, inside one actor method | A method per operation | Anything with invariants: money, quantities, state machines |
+| Forwarding methods for Demeter | The owner, via a chain of forwards | Same as tell | A middle man with dozens of one-liners | Rarely; return a value made for the caller instead |
+| Return a value made for the caller | The owner computes, the caller displays | Yes | One small type | Presentation: ETAs, badges, summaries |
+
+<Callout kind="interview">
+
+**Say** where each rule lives: "Adding to the cart goes through `cart.add(product)`, which enforces the per-item limit, so the product screen, the widget and the Watch app can't disagree." **Ask** whether the data is shared across tasks or devices, since that turns ask-then-act into a race. **Red flags:** view models that read three levels into a model and write back to it, actor APIs made of getters and setters, and "helper" methods that walk the app's window or view-controller hierarchy.
+
+</Callout>
+
+<Callout kind="gotcha" title="iOS gotcha: the top-view-controller helper">
+
+Many apps have a helper that reaches through `UIApplication.shared.connectedScenes`, takes the first window scene, its key window, its root view controller, and follows `presentedViewController` to the top, so it can present an alert from anywhere. It's a Demeter violation against UIKit's structure, and it breaks on iPad with several windows, on an external display, or when the first scene isn't the one the user is looking at. Present from the context you already have: the view controller that's asking, `view.window?.windowScene`, or in SwiftUI, state that the view itself turns into an alert.
+
+</Callout>
+
+## Practice
+
+Two katas. **Delivery tracker** asks you to compute an ETA where each type answers only from its own data, with `private` stored properties keeping you honest. **Gift card wallet** turns an ask-then-act balance into commands on an actor, and a test fires a hundred payments at once to prove the rule holds.
+
+```cards
+- id: demeter-rule
+  front: "What may a method call, under the Law of Demeter?"
+  back: "Methods on its own object, its parameters, objects it creates and its object's stored properties. Not methods on objects returned from those: friends of friends."
+- id: not-dots
+  front: "Is `posts.filter(\\.isPublished).map(\\.title)` a Demeter violation?"
+  back: "No. Each call returns a new value you own. The law is about knowing the internal structure of objects you don't own, not about counting dots."
+- id: tell-dont-ask
+  front: "What does tell, don't ask mean?"
+  back: "Instead of asking an object for its data, deciding, and changing it, tell it what you want and let it decide. The rule and the data stay together."
+- id: actor-ask-race
+  front: "Why is ask-then-act unsafe on an actor?"
+  back: "Each `await` is a suspension point. Between `await balance` and `await setBalance`, another task can run on the actor, so the check is stale. A single actor method that checks and changes with no `await` inside is atomic."
+```
+
+```quiz
+- id: q1
+  type: bug
+  prompt: "Which line breaks the Law of Demeter?"
+  code: |
+    final class ReceiptPresenter {
+        private let formatter: PriceFormatter
+
+        init(formatter: PriceFormatter) {
+            self.formatter = formatter
+        }
+
+        func lines(for order: Order) -> [String] {
+            let total = formatter.string(fromPence: order.totalPence)
+            let city = order.customer.defaultAddress.city
+            return ["Total \(total)", "Delivering to \(city)"]
+        }
+    }
+  answer: 10
+  explain: "Line 9 calls a stored property's method and reads the order it was given. Line 10 walks from the order to its customer to their address: two hops into structure the presenter doesn't own. `order.deliveryCity`, or passing the address in, keeps the knowledge with the order."
+- id: q2
+  type: truefalse
+  prompt: "`Text(name).font(.title).foregroundStyle(.secondary).padding()` violates the Law of Demeter because it chains four calls."
+  answer: false
+  explain: "SwiftUI modifiers each return a new view, and they're designed to be chained. No code here depends on anyone's internal structure, which is what the law is about."
+- id: q3
+  type: mcq
+  prompt: "An `actor Inventory` exposes `func stock(of id: String) -> Int` and `func setStock(_ count: Int, of id: String)`. Two buyers check out the last item at the same moment. What happens, and what's the fix?"
+  options:
+    - "Nothing goes wrong: actors serialise access, so this is safe"
+    - "Both can read 1 and both set 0, selling the item twice; add `func reserve(_ id: String) throws` that checks and decrements in one method"
+    - "The app crashes with a data race"
+    - "The second buyer's `setStock` call is rejected by the actor"
+  answer: 1
+  explain: "The actor prevents simultaneous access to its state, but each `await` lets other calls in. Checking in one call and changing in another is a logic race. A command that checks and changes in one actor method, with no `await` inside, is atomic."
+- id: q4
+  type: mcq
+  prompt: "To follow Demeter, a teammate adds `order.courierName()`, `order.courierPhone()`, `order.courierRating()` and `order.courierVehiclePlate()`. What's the better design?"
+  options:
+    - "Keep going: every courier property should get a forwarding method on `Order`"
+    - "Revert to `order.courier.vehicle.plate` everywhere"
+    - "Ask what the tracking screen needs and have `Order` return one value made for it, such as a `CourierSummary` struct"
+    - "Make `Order` subclass `Courier`"
+  answer: 2
+  explain: "A pile of forwards turns `Order` into a middle man. The caller needs a summary to display, so return one plain value with exactly that. The screen reads data from it freely, and the order still decides how it's built."
+- id: q5
+  type: recall
+  prompt: "Rewrite this ask-then-act code so the cart owns its rule: `if cart.items.count < 20 { cart.items.append(item) } else { showLimitAlert() }`."
+  model: "Give the cart a command that enforces the limit, and make `items` `private(set)`: `func add(_ item: Item) throws(CartError)`, which throws `.limitReached` when the cart already holds 20 items. The caller becomes `do { try cart.add(item) } catch { showLimitAlert() }`. The limit now lives in one place, every screen gets the same behaviour, and if the cart is an actor the check and the append can't be interleaved."
+```

@@ -1,0 +1,265 @@
+## Why it matters
+
+A SwiftUI app replaces the app delegate and scene delegates with a few declarations: an `App`, its `Scene`s, and an environment value called `scenePhase`. The lifecycle underneath is exactly the one from [the previous lesson](/design/learn/sd-runtime-app-states); SwiftUI only changes how you hear about it. The architectural questions are the same as ever: where app-wide state lives, which code hears which window's transitions, and how to reach the UIKit callbacks SwiftUI doesn't expose. Getting the aggregate `scenePhase` wrong is one of the most common SwiftUI lifecycle bugs, and interviewers who know SwiftUI ask about it.
+
+## The App: your app as a value
+
+```swift
+@main
+struct ShelfApp: App {
+    var body: some Scene {
+        WindowGroup {
+            LibraryView()
+        }
+    }
+}
+```
+
+`@main` on a type conforming to `App` makes SwiftUI generate the program's entry point. It starts UIKit for you, creates its own app delegate and scene delegates, and asks your `body` which scenes the app has.
+
+Two facts about the `App` value shape your design:
+
+- **Its `init` runs once per process, during launch**, before the first frame. Whatever you do there delays the first frame, so keep it to building cheap objects.
+- **Its `body` can be evaluated more than once**, like a view's: whenever state it reads changes. Don't start work from `body`.
+
+State declared in the `App` with `@State` lives as long as the process. That makes it the natural owner of app-wide models: the library store, the session, the API client. Every window then gets them through the environment.
+
+## Scenes: templates for windows
+
+A `Scene` describes a kind of window, not a window. SwiftUI creates actual windows from it as the system and the user ask.
+
+| Scene | On iOS and iPadOS | What it creates |
+| --- | --- | --- |
+| `WindowGroup { … }` | Yes | One window on iPhone; on iPad, as many as the user opens, each with its own view state |
+| `WindowGroup(for: Note.ID.self) { $id in … }` (iOS 16+) | Yes | A window per value: `openWindow(value: note.id)` opens one for that note, or brings it forward |
+| `DocumentGroup` | Yes | Document-based apps: the system browser, then one window per open document |
+| `Window`, `Settings`, `MenuBarExtra` | No | macOS (and `Window` on visionOS) |
+
+Scene-level modifiers attach behaviour to every window a scene creates: `.backgroundTask(.appRefresh("id"))` runs a BGTask (iOS 16+), `.commands` adds keyboard menu commands on iPad, and `.handlesExternalEvents(matching:)` chooses which window a URL or activity opens in.
+
+## scenePhase: three values, and where you read them
+
+`@Environment(\.scenePhase)` reports one of three values:
+
+| `ScenePhase` | UIKit state | Meaning |
+| --- | --- | --- |
+| `.active` | foreground active | On screen and interactive |
+| `.inactive` | foreground inactive | On screen, not interactive: launching, interrupted, in the app switcher |
+| `.background` | background | Not visible. Expect suspension, and possibly termination, soon after |
+
+There's no `.suspended` and no "not running": your code isn't running then, so there'd be nobody to tell. There's also no separate "will enter foreground"; it shows up as a change from `.background` to `.inactive`.
+
+**Where you read `scenePhase` decides what it means:**
+
+- **In a view**, it's the phase of the window that view is in.
+- **In the `App`**, it's an **aggregate** over every window: `.active` if any window is active, `.inactive` if none is active but not all have left, and `.background` only when every window is in the background.
+- **In a custom `Scene`**, it's the aggregate over that scene's windows.
+
+On an iPhone with one window, the three agree, which is why the difference catches people out the first time their app runs on an iPad. Step through two windows side by side:
+
+```visual timeline
+title: Two windows on an iPad, and the phase the App sees
+unit: s
+lanes:
+  - { id: a, label: Window A }
+  - { id: b, label: Window B }
+  - { id: app, label: App (aggregate) }
+spans:
+  - { lane: a, from: 0, to: 3, label: active, tone: ok }
+  - { lane: a, from: 3, to: 4, label: inactive, tone: wait }
+  - { lane: a, from: 4, to: 10, label: active, tone: ok }
+  - { lane: a, from: 10, to: 11, label: inactive, tone: wait }
+  - { lane: a, from: 11, to: 14, label: background }
+  - { lane: b, from: 0, to: 3, label: active, tone: ok }
+  - { lane: b, from: 3, to: 4, label: inactive, tone: wait }
+  - { lane: b, from: 4, to: 7, label: active, tone: ok }
+  - { lane: b, from: 7, to: 14, label: background }
+  - { lane: app, from: 0, to: 3, label: active, tone: ok }
+  - { lane: app, from: 3, to: 4, label: inactive, tone: wait }
+  - { lane: app, from: 4, to: 10, label: active, tone: ok }
+  - { lane: app, from: 10, to: 11, label: inactive, tone: wait }
+  - { lane: app, from: 11, to: 14, label: background }
+markers:
+  - { at: 3, label: Control Center }
+  - { at: 7, label: B replaced }
+  - { at: 10, label: home }
+steps:
+  - { at: 1, say: "Two windows of the app share the screen. Both are **active**, so the App's aggregate is active too." }
+  - { at: 3.5, say: "The user pulls down Control Center: both windows go **inactive**, and so does the aggregate." }
+  - { at: 8, say: "The user swaps window B for another app. B goes to the **background**, but A is still active, so the App's phase **doesn't change**. Code watching `scenePhase` in the App never hears that B left." }
+  - { at: 10.5, say: "Home: A goes inactive, and now the aggregate follows." }
+  - { at: 12, say: "Only when **every** window is in the background does the App's phase become `.background`." }
+```
+
+So the rule is: **per-window work reads `scenePhase` in that window's views; app-wide work reads it in the `App`.** Saving window B's half-written note belongs in B's view, because the App-level phase stayed `.active` when B left. Flushing the app-wide store belongs in the `App`, at the moment no window is left.
+
+## Putting it together
+
+Here's an app with an app-wide model owned by the `App`, a save when the whole app leaves, a per-window refresh, and a BGTask:
+
+```swift check ios title="ShelfApp.swift"
+import SwiftUI
+import UIKit
+
+@MainActor @Observable
+final class Library {
+    private(set) var titles: [String] = []
+    private var lastRefresh: Date?
+
+    func refreshIfStale() async {
+        if let lastRefresh, Date.now.timeIntervalSince(lastRefresh) < 15 * 60 { return }
+        lastRefresh = .now
+        // fetch, then update titles
+    }
+
+    func save() { /* write the store to disk */ }
+    func syncInBackground() async { /* the BGTask's work */ }
+}
+
+final class AppDelegate: NSObject, UIApplicationDelegate {
+    func application(_ application: UIApplication, didRegisterForRemoteNotificationsWithDeviceToken deviceToken: Data) {
+        // SwiftUI has no equivalent: hand the token to the push service here
+    }
+}
+
+// Marked @main in the app target
+struct ShelfApp: App {
+    @UIApplicationDelegateAdaptor(AppDelegate.self) private var appDelegate
+    // One per process, shared by every window
+    @State private var library = Library()
+    // Read here, this is the aggregate over all windows
+    @Environment(\.scenePhase) private var phase
+
+    var body: some Scene {
+        WindowGroup {
+            LibraryView()
+                .environment(library)
+        }
+        .onChange(of: phase) { _, newPhase in
+            if newPhase == .background { library.save() } // no window is left
+        }
+        .backgroundTask(.appRefresh("library-sync")) {
+            await library.syncInBackground()
+        }
+    }
+}
+
+struct LibraryView: View {
+    @Environment(Library.self) private var library
+    // Read here, this is this window's phase
+    @Environment(\.scenePhase) private var phase
+
+    var body: some View {
+        List(library.titles, id: \.self) { Text($0) }
+            .onChange(of: phase) { _, newPhase in
+                if newPhase == .active {
+                    Task { await library.refreshIfStale() }
+                }
+            }
+    }
+}
+```
+
+A few details worth noticing:
+
+- `refreshIfStale()` checks the data's age, so a burst of `.inactive`/`.active` flips (Control Center, a Face ID prompt) costs nothing.
+- `.backgroundTask(.appRefresh(...))` only *handles* the task. You still list the identifier under `BGTaskSchedulerPermittedIdentifiers` in Info.plist and submit a `BGAppRefreshTaskRequest`, and iOS still decides when, or whether, it runs. You'll design with it in D52.
+- `@UIApplicationDelegateAdaptor` is the escape hatch for what SwiftUI doesn't cover: the push token, SDKs that want `launchOptions`, and handlers that must be registered before launch finishes. SwiftUI creates the delegate itself; never instantiate it yourself.
+
+### App-wide or per window?
+
+| Kind of state | Where it lives in SwiftUI | Lifetime |
+| --- | --- | --- |
+| Stores, session, API client, caches | `@State` in the `App`, passed down with `.environment` | The process |
+| Navigation path, selection, a draft in progress | `@State` in the window's root view | That window |
+| What to restore if the window is recreated | `@SceneStorage` (more on it later in this module) | That window, across launches |
+| Small preferences | `@AppStorage` (backed by `UserDefaults`) | Across launches, all windows |
+
+The classic mistake is putting per-window state, such as the navigation path, in an app-wide model. On an iPhone it works. On an iPad, opening a second window makes both windows navigate together.
+
+## Trade-offs
+
+| Lifecycle | Effort | Access to UIKit callbacks | Testability | When it wins |
+| --- | --- | --- | --- | --- |
+| Pure SwiftUI `App` | Lowest | None beyond what SwiftUI exposes | Good if logic lives in models | New apps whose needs SwiftUI covers |
+| SwiftUI `App` plus `@UIApplicationDelegateAdaptor` | Low | App delegate events; scene delegate via a returned configuration | Good | Most real SwiftUI apps: push, SDKs, BGTask registration |
+| UIKit delegates hosting SwiftUI in `UIHostingController` | Higher | Everything | Good | Existing UIKit apps adopting SwiftUI screen by screen, or apps with heavy scene-level needs |
+
+None of these is a one-way door: a UIKit app can host SwiftUI screens today and move to a SwiftUI `App` later, once nothing depends on the delegates directly.
+
+<Callout kind="interview">
+
+**Say** where each piece of state lives and which phase you watch: "The store is `@State` in the App and goes down through the environment; each window owns its navigation; the App saves when the aggregate phase reaches background; each window refreshes stale data when its own phase becomes active." **Ask** whether the app supports multiple windows on iPad, because it changes where state goes. **Red flags:** treating `onAppear` of the root view as "app launched", heavy work in `App.init`, and per-window state in a global model.
+
+</Callout>
+
+<Callout kind="gotcha" title="iOS gotcha: onAppear isn't launch">
+
+`.onAppear` and `.task` on the root view run once **per window**, and again whenever that view is recreated. Analytics that log "app opened" there double-count on iPad, and setup done there runs twice. One-time process setup belongs in the `App`'s `init` (if cheap) or in a model that remembers it has started.
+
+</Callout>
+
+## Practice
+
+[The lifecycle kata](/design/practice/sd-kata-app-runtime-lifecycle-machine) is framework-neutral on purpose: the same machine sits behind a scene delegate or behind `onChange(of: scenePhase)`. Notice that `scenePhase` has no separate "will enter foreground", so mapping `.background` to `.inactive` onto the machine's events is the adapter's job.
+
+```cards
+- id: scenephase-values
+  front: "What values can scenePhase have, and which UIKit states are missing?"
+  back: "`.active`, `.inactive` and `.background`. Suspended and not running are missing, because no code runs then."
+- id: aggregate-phase
+  front: "What does scenePhase mean when read in the App rather than in a view?"
+  back: "An aggregate over all windows: active if any window is active, background only once every window is. A single window leaving doesn't change it."
+- id: app-init
+  front: "When does an App's init run, and what does that imply?"
+  back: "Once per process, during launch and before the first frame. Keep it cheap: anything slow there delays the first frame."
+```
+
+```quiz
+- id: q1
+  type: mcq
+  prompt: "An iPad note app saves the open draft in `.onChange(of: scenePhase)` inside the `App`. A user drags a second app over one of two note windows, then the app is terminated, and that window's draft is lost. Why?"
+  options:
+    - "`onChange(of:)` doesn't work on scenes"
+    - "The other window stayed active, so the App's aggregate phase never left `.active` and the save never ran"
+    - "SwiftUI saves drafts itself, but only for `DocumentGroup`"
+    - "The draft was too large to save in the background"
+  answer: 1
+  explain: "In the App, `scenePhase` is an aggregate: it stays `.active` while any window is. Per-window work like saving that window's draft must watch the phase in the window's own view."
+- id: q2
+  type: sort
+  prompt: "Where should each piece of state live in a SwiftUI app that supports multiple windows?"
+  buckets: [App-level @State, Window's root view @State, "@SceneStorage", "@AppStorage"]
+  items:
+    - [The repository of the user's notes, 0]
+    - [The navigation path in this window, 1]
+    - ["The id of the note open in this window, so it reopens after relaunch", 2]
+    - [Whether the user prefers a compact list, 3]
+    - [The signed-in session, 0]
+  explain: "Shared models live once per process in the App. Navigation is per window. SceneStorage restores small per-window values after the window is recreated. AppStorage is for small preferences shared by all windows."
+- id: q3
+  type: truefalse
+  prompt: "SwiftUI's `scenePhase` reports `.suspended` right before iOS suspends the app, so you can save there."
+  answer: false
+  explain: "There's no suspended phase. The last thing you hear is `.background`; save then."
+- id: q4
+  type: mcq
+  prompt: "Which job needs `@UIApplicationDelegateAdaptor` in a SwiftUI app?"
+  options:
+    - "Refreshing data when a window becomes active"
+    - "Receiving the APNs device token after registering for remote notifications"
+    - "Sharing a model between windows"
+    - "Handling a BGAppRefreshTask"
+  answer: 1
+  explain: "SwiftUI has no API for the device token callback, so it goes through the adapted app delegate. The others are covered by `scenePhase`, App-level `@State` and the `.backgroundTask` scene modifier."
+- id: q5
+  type: multi
+  prompt: "Which of these run once per window rather than once per process? Choose all that apply."
+  options:
+    - "`.task` on the `WindowGroup`'s root view"
+    - "The `App`'s `init`"
+    - "`.onAppear` on the root view"
+    - "The initial value of `@State` in the `App`"
+  answer: [0, 2]
+  explain: "The root view exists once per window, so its `.task` and `.onAppear` run for each, and again if it's recreated. The App and its state are created once for the process."
+```

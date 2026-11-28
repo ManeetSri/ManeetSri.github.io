@@ -1,0 +1,164 @@
+A ride-hailing app shows the current ride on its main screen and in a Live Activity. The server sends the ride's status as one flat JSON object: a `status` string plus whichever fields that status needs. Today the app decodes it into a struct of optionals (`status: String`, `driverName: String?`, `etaMinutes: Int?`, `startedAt: Date?`…) and every screen re-checks which combinations make sense. Replace it with an enum whose cases carry exactly their own data, and parse the JSON into it once, at the boundary.
+
+`ModellingRideTracking.RideStatus: Codable`, with `init(from:)`, `encode(to:)`, `isLive`, `canCancel` and `driver`
+
+The enum's cases are given:
+
+```swift
+public enum RideStatus: Equatable, Sendable, Codable {
+    case searching
+    case driverAssigned(Driver, etaMinutes: Int)
+    case onTrip(Driver, startedAt: Date)
+    case completed(farePence: Int)
+    case cancelled(by: CancelledBy)
+}
+```
+
+- **Decode** the flat JSON below into the matching case. Read only the fields that status needs, and ignore any others, even when they're present or `null`.
+- **Reject** anything the enum can't honestly hold by throwing a `DecodingError`: a missing or `null` field the status needs, a field of the wrong type, a blank driver name or plate, a negative ETA or fare, an unknown `cancelled_by`, and an unknown `status`.
+- **Encode** the same flat shape, with only that status's fields, so decoding what you encoded gives back the same value.
+- **Answer questions with exhaustive switches:** `isLive` (searching, a driver assigned, or on the trip), `canCancel` (until the trip starts) and `driver` (in the two statuses that have one).
+
+## Examples
+
+| JSON | Decodes to |
+| --- | --- |
+| `{"status": "searching"}` | `.searching` |
+| `{"status": "driver_assigned", "driver_name": "Sam", "plate": "AB12 CDE", "eta_minutes": 4}` | `.driverAssigned(Driver(name: "Sam", plate: "AB12 CDE"), etaMinutes: 4)` |
+| `{"status": "on_trip", "driver_name": "Sam", "plate": "AB12 CDE", "started_at": "2026-03-01T08:15:00Z"}` | `.onTrip(sam, startedAt: 08:15 UTC on 1 March 2026)` |
+| `{"status": "completed", "fare_pence": 1450}` | `.completed(farePence: 1450)` |
+| `{"status": "cancelled", "cancelled_by": "driver"}` | `.cancelled(by: .driver)` |
+| `{"status": "searching", "driver_name": null, "eta_minutes": null}` | `.searching` (other fields are ignored) |
+| `{"status": "driver_assigned", "driver_name": "Sam", "plate": "AB12 CDE"}` | throws: no `eta_minutes` |
+| `{"status": "completed", "fare_pence": -50}` | throws: a negative fare |
+| `{"status": "teleporting"}` | throws: an unknown status |
+
+## Constraints
+
+- The keys are snake_case, as shown. Write them in your own `CodingKeys` rather than relying on the decoder's `keyDecodingStrategy`, because callers may not set one.
+- Dates are ISO 8601. The tests configure `dateDecodingStrategy` and `dateEncodingStrategy` as `.iso8601`, so decode and encode `Date` through the container as usual.
+- A name or plate is blank if it's empty or only whitespace. Keep valid values exactly as sent.
+- No `default:` in your switches over `RideStatus`: when the next status arrives, the compiler should point at every place that needs a decision.
+
+<Hints>
+<Hint>
+Declare `private enum CodingKeys: String, CodingKey` with a case for every field (`case driverName = "driver_name"`, and so on). Decode `status` as a `String` first, then `switch` on it and decode only that case's fields.
+</Hint>
+<Hint>
+`DecodingError.dataCorruptedError(forKey:in:debugDescription:)` builds the error for a value that's present but impossible, such as a negative ETA. Missing fields and wrong types already throw the right `DecodingError` from `container.decode(_:forKey:)`.
+</Hint>
+<Hint>
+Two small helpers keep `init(from:)` short: one that decodes a non-blank `String` for a key, and one that decodes a non-negative `Int`. `encode(to:)` is a `switch self` that writes the status string and then that case's fields.
+</Hint>
+</Hints>
+
+## Solutions
+
+<Approach title="Parse at the boundary, then switch exhaustively" time="O(1)" space="O(1)">
+
+```swift
+private enum CodingKeys: String, CodingKey {
+    case status, plate
+    case driverName = "driver_name"
+    case etaMinutes = "eta_minutes"
+    case startedAt = "started_at"
+    case farePence = "fare_pence"
+    case cancelledBy = "cancelled_by"
+}
+
+public init(from decoder: any Decoder) throws {
+    let container = try decoder.container(keyedBy: CodingKeys.self)
+    let status = try container.decode(String.self, forKey: .status)
+    switch status {
+    case "searching":
+        self = .searching
+    case "driver_assigned":
+        self = .driverAssigned(try Self.driver(in: container), etaMinutes: try Self.nonNegative(.etaMinutes, in: container))
+    case "on_trip":
+        self = .onTrip(try Self.driver(in: container), startedAt: try container.decode(Date.self, forKey: .startedAt))
+    case "completed":
+        self = .completed(farePence: try Self.nonNegative(.farePence, in: container))
+    case "cancelled":
+        let raw = try container.decode(String.self, forKey: .cancelledBy)
+        guard let cancelledBy = CancelledBy(rawValue: raw) else {
+            throw DecodingError.dataCorruptedError(forKey: .cancelledBy, in: container, debugDescription: "Unknown cancelled_by \"\(raw)\"")
+        }
+        self = .cancelled(by: cancelledBy)
+    default:
+        throw DecodingError.dataCorruptedError(forKey: .status, in: container, debugDescription: "Unknown status \"\(status)\"")
+    }
+}
+
+private static func driver(in container: KeyedDecodingContainer<CodingKeys>) throws -> Driver {
+    Driver(name: try nonBlank(.driverName, in: container), plate: try nonBlank(.plate, in: container))
+}
+
+private static func nonBlank(_ key: CodingKeys, in container: KeyedDecodingContainer<CodingKeys>) throws -> String {
+    let value = try container.decode(String.self, forKey: key)
+    guard !value.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+        throw DecodingError.dataCorruptedError(forKey: key, in: container, debugDescription: "\(key.stringValue) is blank")
+    }
+    return value
+}
+
+private static func nonNegative(_ key: CodingKeys, in container: KeyedDecodingContainer<CodingKeys>) throws -> Int {
+    let value = try container.decode(Int.self, forKey: key)
+    guard value >= 0 else {
+        throw DecodingError.dataCorruptedError(forKey: key, in: container, debugDescription: "\(key.stringValue) is negative")
+    }
+    return value
+}
+
+public func encode(to encoder: any Encoder) throws {
+    var container = encoder.container(keyedBy: CodingKeys.self)
+    switch self {
+    case .searching:
+        try container.encode("searching", forKey: .status)
+    case let .driverAssigned(driver, etaMinutes):
+        try container.encode("driver_assigned", forKey: .status)
+        try container.encode(driver.name, forKey: .driverName)
+        try container.encode(driver.plate, forKey: .plate)
+        try container.encode(etaMinutes, forKey: .etaMinutes)
+    case let .onTrip(driver, startedAt):
+        try container.encode("on_trip", forKey: .status)
+        try container.encode(driver.name, forKey: .driverName)
+        try container.encode(driver.plate, forKey: .plate)
+        try container.encode(startedAt, forKey: .startedAt)
+    case let .completed(farePence):
+        try container.encode("completed", forKey: .status)
+        try container.encode(farePence, forKey: .farePence)
+    case let .cancelled(cancelledBy):
+        try container.encode("cancelled", forKey: .status)
+        try container.encode(cancelledBy.rawValue, forKey: .cancelledBy)
+    }
+}
+
+public var isLive: Bool {
+    switch self {
+    case .searching, .driverAssigned, .onTrip: true
+    case .completed, .cancelled: false
+    }
+}
+
+public var canCancel: Bool {
+    switch self {
+    case .searching, .driverAssigned: true
+    case .onTrip, .completed, .cancelled: false
+    }
+}
+
+public var driver: Driver? {
+    switch self {
+    case let .driverAssigned(driver, _), let .onTrip(driver, _): driver
+    case .searching, .completed, .cancelled: nil
+    }
+}
+```
+
+The `default:` in `init(from:)` is over a `String`, not over the enum, so it's the right place for one: it's where an unknown status from a newer server lands. The switches over `RideStatus` have none, so adding a case later makes the compiler list each one.
+
+Once decoding succeeds, no screen can see a trip with no driver, an ETA after pick-up, or a fare before the ride ends. Those checks happened once, here, instead of in every view.
+
+Throwing on an unknown status is a choice. It keeps the enum honest, and the caller keeps showing the last status it understood (and logs the new one). The alternative is a `case unknown(String)`, which keeps decoding working on an old app but forces every switch to handle a state it can't describe. For a ride, where showing a wrong state could send a rider to the kerb too early, failing loudly and refreshing is the safer default. A real app would also hold the fare as a `Money` value rather than `Int` pence, which is the next kata.
+
+</Approach>

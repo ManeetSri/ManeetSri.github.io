@@ -1,0 +1,322 @@
+## Why it matters
+
+"These two are coupled" isn't enough to act on. Some coupling is harmless and some is a time bomb, and the difference is *how* one part depends on the other. The classic scale of coupling kinds gives you names for that difference, so a code review comment can say "this is control coupling: split the function" instead of "this feels messy". Interviewers rarely ask for the names, but they listen for the judgement behind them: what you pass between screens, where shared state lives, and how much each part knows about the others.
+
+## A ladder from worst to best
+
+Glenford Myers and Larry Constantine ranked the ways one module can depend on another in the 1970s. The ranking still holds, because it measures one thing: **how much one part has to know about another** to work.
+
+| Kind | What one part knows about the other | iOS example |
+| --- | --- | --- |
+| **Content** | Its internals | One view controller editing another's labels |
+| **Common** | Shared global state they both read and write | `Session.currentUser` set by one screen, read by ten |
+| **External** | A format or protocol imposed from outside | The app and its widget reading the same App Group key |
+| **Control** | How it does its job, through a flag | `load(fromCache: true, showSpinner: false)` |
+| **Stamp** | The shape of a whole structure, when it needs part | `avatarURL(for: user)` that only reads `user.id` |
+| **Data** | Only the values it needs | `avatarURL(userID:pointSize:)` |
+
+Below data coupling, some authors add **message coupling**: parts that share nothing but a message, such as a notification. You'll see why it isn't automatically the best at the end.
+
+Read the table as a direction of travel, not a rule that everything must be data coupling. Each kind has places where it's the right choice, and the sections below say where.
+
+## Content coupling: reaching inside
+
+**Content coupling** is one part using another's internals: its stored properties, its subviews, its private state. It's the worst kind because the target can't change anything about itself without breaking the part that reaches in.
+
+```swift check ios title="ProductViewController.swift"
+import UIKit
+
+final class CartViewController: UIViewController {
+    let badgeLabel = UILabel()
+    var items: [String] = []
+}
+
+final class ProductViewController: UIViewController {
+    func addToCart(_ item: String) {
+        guard let cart = tabBarController?.viewControllers?[2] as? CartViewController else { return }
+        cart.items.append(item)
+        cart.badgeLabel.text = "\(cart.items.count)"
+    }
+}
+```
+
+The product screen knows the cart's tab index, its class, its storage and its label. Reorder the tabs, wrap the cart in a navigation controller, or move the badge into the tab bar item, and adding to the cart silently does nothing. Worse, it bypasses any rule the cart has, such as a maximum quantity, because it writes the array directly.
+
+The fix is to give the cart a front door: a `Cart` model that both screens share, with an `add(_:)` method that keeps its own rules. The product screen tells the model; the cart screen observes it.
+
+Content coupling to Apple's frameworks is the same mistake with a harsher landlord. Apps that read `UITextField`'s private `_placeholderLabel` through key-value coding started crashing on iOS 13, when UIKit began throwing an exception for that access. Code that walked `UISearchBar`'s subviews to find its text field broke when the hierarchy changed; iOS 13 added the public `searchTextField` instead. If it isn't public API, it isn't yours to depend on.
+
+## Common coupling: shared global state
+
+**Common coupling** is several parts reading and writing the same global state. The textbook iOS version is a session singleton:
+
+```swift
+enum Session {
+    static var currentUser: User?
+}
+```
+
+In Swift 6 that doesn't even compile:
+
+```text title="What you'll see"
+error: static property 'currentUser' is not concurrency-safe because it is nonisolated global shared mutable state
+note: add '@MainActor' to make static property 'currentUser' part of global actor 'MainActor'
+```
+
+The compiler is objecting to the data race. Adding `@MainActor` fixes the race, but not the design problem underneath. Step through what happens when three screens share one variable:
+
+```visual flow
+title: Three screens and one global
+nodes:
+  - { id: login, label: Sign-in screen, kind: view, at: [0, 0] }
+  - { id: settings, label: Settings, kind: view, at: [0, 2] }
+  - { id: session, label: Session.currentUser, kind: store, at: [2, 1], w: 1.5 }
+  - { id: profile, label: Profile, kind: view, at: [4, 0] }
+  - { id: checkout, label: Checkout, kind: view, at: [4, 2] }
+edges:
+  - [login, session, write]
+  - [settings, session, write nil]
+  - [session, profile, read, { style: data }]
+  - [session, checkout, read, { style: data }]
+steps:
+  - say: Signing in writes the user into the global.
+    send: login->session
+    label: { session: Ada }
+  - say: Profile and checkout read it. Nothing passed it to them, and nothing in their initialisers says they need it.
+    send: [session->profile, session->checkout]
+  - say: On another tab, the user signs out. Settings writes `nil`.
+    send: settings->session
+    label: { session: "nil" }
+  - say: Checkout, still on the navigation stack, places the order and reads `nil`. It fails, or worse, places the order as a guest.
+    send: session->checkout
+    state: { checkout: error }
+  - say: The bug spans three files that never mention each other. Each one is correct on its own; the coupling is in the **shared variable**, so no single file shows it.
+    active: [session]
+```
+
+Common coupling has three costs. **Anyone can write**, so when the value is wrong you can't tell who set it. **Order matters**, so a screen that reads too early or too late breaks (the next lesson is about exactly this). And **tests leak into each other**: Swift Testing runs tests in parallel by default, so two tests that set `Session.currentUser` interfere at random.
+
+`UserDefaults` keys are common coupling too. When six files read and write `"selectedStoreID"`, the key is a global variable with extra steps.
+
+The fixes, from lightest to heaviest:
+
+- **Pass the value in.** Checkout needs a user, so its initialiser takes one. Signing out then dismisses the flow rather than pulling the user from under it.
+- **Share a model, not a variable.** One `SessionStore` object, created at launch and handed to the screens that need it, with methods for the changes it allows and an observable `state`. It's still shared, but every reader is visible in an initialiser, and every write goes through code you can search for.
+- **Wrap the key.** If a `UserDefaults` key really is shared, give it one owner type, so the string appears once.
+
+## External coupling: a format someone else owns
+
+**External coupling** is two parts depending on the same externally imposed format, protocol or device. The app and its widget extension both read a snapshot from an App Group. Every screen decodes the server's date format. Twenty files use a payment SDK's types.
+
+You can't remove external coupling, because the format isn't yours. You can **contain** it: one type owns the format, and both sides go through it.
+
+```swift check title="WidgetSnapshot.swift (compiled into the app and the widget)"
+import Foundation
+
+// The only code that knows the App Group's name, the key or the layout of the data
+struct WidgetSnapshot: Codable, Equatable {
+    var cartCount: Int
+    var updatedAt: Date
+
+    private static let suiteName = "group.com.example.shop"
+    private static let key = "widgetSnapshot.v1"
+
+    static func load() -> WidgetSnapshot? {
+        guard let data = UserDefaults(suiteName: suiteName)?.data(forKey: key) else { return nil }
+        return try? JSONDecoder().decode(WidgetSnapshot.self, from: data)
+    }
+
+    func save() throws {
+        let data = try JSONEncoder().encode(self)
+        UserDefaults(suiteName: Self.suiteName)?.set(data, forKey: Self.key)
+    }
+}
+```
+
+The version in the key matters. A user can update the app while the widget is mid-render, and an old widget process may read a new layout. Changing the layout means a new key (or a version field) and a reader that tolerates the old one. The same thinking applies to an SDK: wrap it in one adapter that speaks your app's types, and the other nineteen files never import it. You'll build exactly that adapter in a kata later in this module.
+
+## Control coupling: telling a part how to do its job
+
+**Control coupling** is passing a flag that selects what the other part does. The caller has to know the callee's internal branches, and the callee grows a branch for every caller.
+
+```swift check title="Control coupling"
+struct Order {
+    let id: String
+}
+
+protocol OrdersLoading {
+    func loadOrders(fromCache: Bool, showSpinner: Bool, isRetry: Bool) async throws -> [Order]
+}
+```
+
+Three booleans make eight combinations, and nobody has tested what `fromCache: true, isRetry: true` means. Worse, `showSpinner` is a decision about the *screen*, and it has leaked into the data layer. Split the jobs so each operation says what it is:
+
+```swift check title="One operation per job"
+struct Order {
+    let id: String
+}
+
+protocol OrdersRepository {
+    /// What's on disk, instantly; empty on first launch
+    func cachedOrders() async -> [Order]
+    /// Asks the server, updates the cache, and returns the fresh list
+    func refreshOrders() async throws -> [Order]
+}
+```
+
+The spinner moves back to the view model, which knows whether it's waiting. Retry policy moves to whoever owns retries.
+
+Not every boolean is control coupling worth fixing. UIKit's `setEditing(_:animated:)` takes a flag, but it describes the caller's intent, it's narrow, and it has been stable since the first iPhone SDK. The flags to worry about are the ones that make a function do **different jobs**, and the worst of all are flags that tell the callee **who is calling**: `isFromSearchScreen: Bool` means the function now depends on the search screen's existence.
+
+## Stamp coupling: passing more than is needed
+
+**Stamp coupling** is passing a whole structure when the callee uses part of it. The callee now depends on the structure's shape, and so do its tests.
+
+```swift check title="Stamp coupling and data coupling"
+import Foundation
+
+struct User {
+    let id: String
+    let name: String
+    let email: String
+    let joinedAt: Date
+}
+
+enum Avatars {
+    // Stamp: depends on all of User, and a test must build one
+    static func url(for user: User) -> URL {
+        URL(string: "https://cdn.example.com/avatars/\(user.id)")!
+    }
+
+    // Data: depends on exactly what it uses, and works for a contact or a team as well
+    static func url(id: String, pointSize: Int, scale: Int) -> URL {
+        URL(string: "https://cdn.example.com/avatars/\(id)?px=\(pointSize * scale)")!
+    }
+}
+```
+
+How much stamp coupling costs depends on what you pass. A small immutable struct is cheap in Swift: it's copied, so the callee can't change it behind your back. A large reference type is expensive. Passing an `NSManagedObject` to a table cell ties the cell to Core Data: it can fault data in while scrolling, it's bound to its context's queue, and it can crash if the object is deleted while the cell still shows it. Pass the cell a small value made for it instead.
+
+Sometimes stamp coupling is the better design. Prices and currencies travel together, and so do a street, a city and a postcode. Passing a `Money` or an `Address` is clearer than four loose parameters.
+
+## Data coupling: only what's needed
+
+**Data coupling** passes only the values the callee needs, as plain parameters or small values. It's the best rung on the ladder: the callee knows nothing about where the values came from, and a test passes literals.
+
+It has one failure mode. Push it too far and you get long parameter lists, where the same five values travel together everywhere. That's a **data clump**, and the fix is a small value type made for the purpose. Formally that's stamp coupling again, but to a type that exists for this call, so it carries only what the call needs.
+
+## Message coupling, and why lowest isn't best
+
+**Message coupling** shares nothing but a message: a `NotificationCenter` post, an `AsyncStream`, a Combine publisher. The sender doesn't even know who's listening. On the ladder it's the loosest of all.
+
+It has its own costs. The flow is invisible: "jump to definition" can't take you from a post to its observers. A string-named notification or a renamed `userInfo` key fails silently, at run time, with no compiler help. Use it for genuine broadcasts that many unrelated parts care about, such as "the user signed out" or "the app moved to the background". For one screen talking to one model, a direct call is easier to follow and the compiler checks it. iOS 26 adds typed notification messages to `NotificationCenter`, which removes the string keys but not the invisibility.
+
+## Spotting the kind in a review
+
+| You see | Kind | Usual fix |
+| --- | --- | --- |
+| A cast to another screen's class, then a property write | Content | A shared model with methods |
+| `static var`, `shared` with mutable state, a `UserDefaults` key in many files | Common | Pass the value in, or one owner type |
+| An SDK's or server's types in many files | External | One adapter or mapping that speaks app types |
+| Boolean or mode parameters that select behaviour | Control | One function per job; move UI decisions up |
+| A large type passed where one or two fields are used | Stamp | Pass the fields, or a small value made for the call |
+
+## Trade-offs
+
+| Kind | Cost when the other side changes | Testability | Where it's acceptable |
+| --- | --- | --- | --- |
+| Content | Breaks silently | Very poor | Inside one type, or a tightly scoped extension in the same file |
+| Common | Hard to trace, order-dependent | Poor: tests interfere | Truly app-wide, read-mostly values set once at launch, such as build configuration |
+| External | Every user of the format changes | Fair, once contained | Always present at the edges; contain it in one place |
+| Control | Callee and every caller change | Poor: combinations multiply | Narrow, stable intent flags like `animated:` |
+| Stamp | Changes to the structure ripple | Good with small values | Cohesive values like `Money` or `Address` |
+| Data | Only when the needed values change | Very good | The default between parts |
+| Message | Silent failures | Good for each side alone | Broadcasts with many independent listeners |
+
+<Callout kind="interview">
+
+**Say** how data moves between screens and why: "The detail screen takes the order ID and asks the repository, so it doesn't depend on the list's model or on global state." **Ask** which parts are owned by other teams or vendors, since that's where external coupling needs containing. **Red flags:** a singleton holding the current user that any screen can write, view controllers reaching into each other, and an SDK's types threaded through the whole app.
+
+</Callout>
+
+<Callout kind="gotcha" title="Swift gotcha: internal is the default">
+
+Every declaration without an access modifier is `internal`, visible to the whole module, and an app target is one module. So in an app, content coupling is one dot away from any type. Mark stored state `private` or `private(set)` by default, and expose methods for the changes you allow. The compiler then turns content coupling into a build error.
+
+</Callout>
+
+## Practice
+
+The review **the checkout screen** has a global session, a reach into another screen, a flag that chooses behaviour and an SDK used directly. Name the kind of each, and say what you'd do first.
+
+```cards
+- id: coupling-ladder
+  front: "Rank these kinds of coupling from worst to best: stamp, content, data, control, common."
+  back: "Content, common, control, stamp, data. The ranking measures how much one part must know about another."
+- id: common-coupling-cost
+  front: "Why does `@MainActor static var currentUser` still cause bugs?"
+  back: "Isolation removes the data race, not the design problem: anyone can write it, readers depend on the order of writes, and tests that touch it interfere."
+- id: control-coupling-smell
+  front: "Which boolean parameters are control coupling worth fixing?"
+  back: "Flags that make a function do different jobs, and above all flags that say who's calling. Narrow intent flags like `animated:` are fine."
+- id: contain-external
+  front: "How do you handle external coupling to a format or SDK you don't own?"
+  back: "Contain it: one type owns the format or wraps the SDK, and the rest of the app uses that type's own vocabulary."
+```
+
+```quiz
+- id: q1
+  type: sort
+  prompt: "Which kind of coupling is each of these?"
+  buckets: [Content, Common, Control, Stamp, Data]
+  items:
+    - ["`(presentingViewController as? FeedViewController)?.tableView.reloadData()`", 0]
+    - ["Five screens read and write `UserDefaults.standard` key `\"selectedStoreID\"`", 1]
+    - ["`func share(post: Post, asStory: Bool, fromWidget: Bool)`", 2]
+    - ["`func priceLabel(for product: Product) -> String` that reads only `product.pricePence`", 3]
+    - ["`func priceLabel(pence: Int, currencyCode: String) -> String`", 4]
+    - ["Writing `_placeholderLabel` on a `UITextField` with `setValue(_:forKey:)`", 0]
+  explain: "Reaching into another object's internals (its table view, or a private ivar) is content coupling. A key many files share is a global. Flags select behaviour, and `fromWidget` even says who's calling. Passing a whole product for one field is stamp coupling; passing the values is data coupling."
+- id: q2
+  type: bug
+  prompt: "Which line couples this screen to another screen's internals?"
+  code: |
+    final class EditProfileViewController: UIViewController {
+        var onSave: ((Profile) -> Void)?
+        let store: ProfileStore
+
+        func save(_ profile: Profile) async throws {
+            try await store.save(profile)
+            onSave?(profile)
+            (navigationController?.viewControllers.first as? ProfileViewController)?.nameLabel.text = profile.name
+            navigationController?.popViewController(animated: true)
+        }
+    }
+  answer: 8
+  explain: "Line 8 knows the stack's order, the previous screen's class and its label. The `onSave` callback on line 7 already tells whoever presented this screen; the profile screen should update its own label from that, or by observing the store."
+- id: q3
+  type: mcq
+  prompt: "`func configure(cell: OrderCell, isFromSearch: Bool)` shows the search term highlighted when called from search. What's the best change?"
+  options:
+    - "Rename the flag to `highlightSearchTerm`"
+    - "Pass the text to highlight, `highlight: String?`, so the cell shows data instead of knowing its caller"
+    - "Make two cell classes, one for search"
+    - "Read the current search term from a shared `SearchState.shared`"
+  answer: 1
+  explain: "The flag tells the cell who's calling, so the cell depends on the search screen existing. Passing the data (what to highlight, or nil) turns control coupling into data coupling, and any future screen can use it. A shared global would be common coupling."
+- id: q4
+  type: truefalse
+  prompt: "Message coupling through `NotificationCenter` is always better than calling a method directly, because it's lower on the coupling ladder."
+  answer: false
+  explain: "It's looser, but the flow becomes invisible and a mistyped name fails silently at run time. Use it for genuine broadcasts with many independent listeners; for one screen talking to one model, a direct call is clearer and checked by the compiler."
+- id: q5
+  type: mcq
+  prompt: "A table cell is configured with an `NSManagedObject`. What's the strongest reason to pass it a small struct instead?"
+  options:
+    - "Structs render faster in table views"
+    - "The cell becomes tied to Core Data: it can fault data while scrolling, is bound to the object's context queue, and breaks if the object is deleted while it's on screen"
+    - "Swift forbids passing classes to cells"
+    - "Managed objects can't be displayed in UIKit"
+  answer: 1
+  explain: "That's expensive stamp coupling: the cell depends on a live, mutable object with threading rules of its own. A small value made for the cell carries just what it shows and can't change underneath it."
+```

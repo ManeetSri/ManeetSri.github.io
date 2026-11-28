@@ -6,7 +6,7 @@ import { TONE_NAMES } from '../tones.js';
 import { asList, buildFrames, edgeKey, splitEdgeKey } from './frames.js';
 import { checkAt, checkEntries, checkLine, fail, isNumber, isObject, isText, listOf, need, optionalText, overlaps, quote, schema } from './check.js';
 
-export const FLOW_KINDS = ['client', 'view', 'service', 'store', 'db', 'cache', 'queue', 'cdn', 'external', 'actor'];
+export const FLOW_KINDS = ['client', 'view', 'service', 'store', 'db', 'cache', 'queue', 'cdn', 'external', 'actor', 'plain'];
 export const EDGE_STYLES = ['sync', 'async', 'data'];
 
 // Grid geometry: a node fills most of its cell, leaving room between cells for edges and their labels
@@ -140,7 +140,7 @@ export const flowFrames = (props = {}) => {
 // What a screen reader hears for the whole diagram
 export const flowSummary = (model) => {
     const name = Object.fromEntries(model.nodes.map((node) => [node.id, node.label]));
-    const parts = model.nodes.map((node) => `${node.label} (${node.kind})`).join(', ');
+    const parts = model.nodes.map((node) => (node.kind === 'plain' ? node.label : `${node.label} (${node.kind})`)).join(', ');
     const links = model.edges.map((edge) => `${name[edge.from]} to ${name[edge.to]}${edge.label ? `: ${edge.label}` : ''}${edge.style === 'sync' ? '' : ` (${edge.style})`}`);
     const grouped = model.groups.map((group) => `${group.label || group.id} contains ${group.nodes.map((id) => name[id]).join(', ')}`);
     return [`Flow diagram of ${model.nodes.length} parts: ${parts}.`, links.length ? `Connections: ${links.join('; ')}.` : '', grouped.length ? `${grouped.join('. ')}.` : '']

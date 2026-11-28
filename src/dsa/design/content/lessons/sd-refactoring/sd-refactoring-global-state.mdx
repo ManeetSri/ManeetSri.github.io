@@ -1,0 +1,303 @@
+## Why it matters
+
+Shared mutable state is behind some of the hardest bugs an app has: tests that pass alone and fail together, a screen showing the previous user's data, crashes that never reproduce. Singletons are the usual way it gets in. Swift 6 now rejects most of it at compile time, so every team migrating has to decide what to do with its `.shared` objects. Interviewers probe this because the answer shows whether you can make legacy code testable without stopping the world.
+
+## One instance is fine; global access is the problem
+
+You met the singleton pattern and its testable alternatives in [Why to avoid singletons, and testable alternatives](/design/learn/sd-creational-singleton-alternatives). This lesson is about the anti-pattern as you'll find it in a real codebase, and how to get out of it one step at a time.
+
+A singleton gives you two things, and they deserve different verdicts:
+
+- **One instance** for the app's lifetime: one image cache, one database connection, one signed-in session. That's a decision about lifetime, and it's often right.
+- **Global access**: any code anywhere can reach it with `.shared`. That's the part that hurts.
+
+Apple's shared instances (`URLSession.shared`, `UserDefaults.standard`, `NotificationCenter.default`, `FileManager.default`) are fine to use at the edges of your app, where you assemble its parts. They cause trouble when they're reached from deep inside logic. Global access costs you in four ways:
+
+1. **Hidden inputs.** A function that reads `Session.shared.user` has an input that isn't in its signature, so its callers and tests can't see it.
+2. **Test pollution.** State one test sets leaks into the next, so results depend on the order tests run in. Swift Testing runs tests in parallel by default, which turns that into flakiness.
+3. **Lifecycle bugs.** Global state lives as long as the process. Logging out has to remember to reset every field, and the one it forgets shows the next user someone else's data.
+4. **Races.** State reachable from everywhere is reachable from every thread.
+
+Here are the first two in eight lines of logic. The price label depends on a setting it never mentions, and one "test" changes that setting for every test after it:
+
+```swift run
+import Foundation
+
+@MainActor final class Settings {
+    static let shared = Settings()
+    var currencyCode = "GBP"
+}
+
+// A hidden input: nothing in the signature says the result depends on Settings
+@MainActor func priceLabel(pence: Int) -> String {
+    let amount = Decimal(pence) / 100
+    let style = Decimal.FormatStyle.Currency(code: Settings.shared.currencyCode, locale: Locale(identifier: "en_GB"))
+    return amount.formatted(style)
+}
+
+// Two tests, run one after the other, as a test runner might
+@MainActor func irishPricesUseEuros() -> Bool {
+    Settings.shared.currencyCode = "EUR"
+    return priceLabel(pence: 1250) == "€12.50"
+}
+
+@MainActor func britishPricesUsePounds() -> Bool {
+    priceLabel(pence: 1250) == "£12.50"
+}
+
+print("British prices:", britishPricesUsePounds() ? "pass" : "fail")
+print("Irish prices:", irishPricesUseEuros() ? "pass" : "fail")
+print("British prices again:", britishPricesUsePounds() ? "pass" : "fail")
+```
+
+```output
+British prices: pass
+Irish prices: pass
+British prices again: fail
+```
+
+Nothing is wrong with `britishPricesUsePounds` itself. It fails because of what ran before it, which is exactly what makes these failures so expensive to track down.
+
+## Swift 6 turns global state into compile errors
+
+In the Swift 6 language mode, a mutable global or static variable is a data race waiting to happen, and the compiler says so:
+
+```text title="What you'll see"
+error: static property 'shared' is not concurrency-safe because it is nonisolated global shared mutable state
+error: static property 'shared' is not concurrency-safe because non-'Sendable' type 'Session' may have shared mutable state
+```
+
+The first is for `static var shared = Settings()`; the second for `static let shared = Session()` when `Session` is a class with mutable properties. The fixes the compiler suggests mean very different things:
+
+- **Make it a `let` of a `Sendable` type.** Immutable shared state is safe. This is right for constants and configuration.
+- **Isolate it with `@MainActor`**, or make it an actor. Every access now goes through that isolation, so code elsewhere has to `await` it. Right for UI state; for anything used by background work, an actor fits better.
+- **`nonisolated(unsafe)` or `@unchecked Sendable`.** These tell the compiler to stop checking. The race is still there. They're only honest when the state really is protected, for example by a `Mutex` from the Synchronization framework (iOS 18) or an `OSAllocatedUnfairLock`.
+
+The migration is a good moment to ask the bigger question: does this need to be global at all? If your app target uses the `MainActor` default actor isolation that Swift 6.2 introduced (new Xcode 26 app projects turn it on), a `static var` compiles because it's implicitly main-actor isolated. That fixes the race, not the hidden inputs.
+
+## Service locators: global state with a registry
+
+A **service locator** looks like a cure. Instead of reaching for `PaymentProcessor.shared`, code asks a registry for whatever is registered for a type, and tests can register a fake:
+
+```swift check title="A service locator"
+protocol PaymentProcessing {
+    func charge(pence: Int) async throws
+}
+
+@MainActor final class ServiceLocator {
+    static let shared = ServiceLocator()
+    private var services: [ObjectIdentifier: Any] = [:]
+
+    func register<Service>(_ service: Service, as type: Service.Type) {
+        services[ObjectIdentifier(type)] = service
+    }
+
+    func resolve<Service>(_ type: Service.Type) -> Service {
+        services[ObjectIdentifier(type)] as! Service
+    }
+}
+
+@MainActor final class CheckoutModel {
+    // Nothing in the initialiser says this type needs a payment processor
+    private let payments = ServiceLocator.shared.resolve((any PaymentProcessing).self)
+}
+```
+
+It swaps one global for another and keeps most of the costs:
+
+- **Dependencies stay hidden.** To learn what `CheckoutModel` needs, you read its body.
+- **Mistakes surface at run time.** Forget a registration and the `as!` crashes when the screen opens, not when you build.
+- **Tests still share state.** The registry is global, so a fake registered by one test is there for the next.
+- **Order matters.** Everything must be registered before anything resolves, a hidden ordering rule of the kind you met in [temporal coupling](/design/learn/sd-coupling-temporal).
+
+Passing dependencies through initialisers fixes all four, because the compiler checks them. You'll compare service locators with dependency injection and containers properly in D21.
+
+## Getting out, one step at a time
+
+You can't replace 300 uses of `.shared` in one pull request, and you don't need to. This sequence keeps the app working after every step:
+
+1. **Find the uses.** `git grep -n "Session.shared"` tells you how many there are and which types have them.
+2. **Extract a role protocol** with only what callers use. Most need one or two members, not the whole singleton.
+3. **Parameterise the initialiser, defaulting to the singleton.** Every existing call site still compiles and behaves the same; tests pass a fake. Michael Feathers calls this *parameterise constructor*.
+4. **Push creation up.** Build the object once in the **composition root** (the scene delegate, or your SwiftUI `App`) and pass it down. Then delete the default argument: the compiler lists every caller still relying on it.
+5. **Give the state a real lifetime and isolation.** A `UserSession` created at login and dropped at logout can't leak into the next user. Isolate it with `@MainActor` or make it an actor.
+6. **Lock the door.** Add a lint rule that fails the build on new `.shared` uses outside the composition root.
+
+Steps 2 and 3 look like this:
+
+```swift check title="A seam with a default"
+struct User: Sendable {
+    let id: String
+    let isPremium: Bool
+}
+
+@MainActor final class Session {
+    static let shared = Session()
+    var currentUser: User?
+}
+
+// Step 2: a role protocol with only what this caller uses
+@MainActor protocol CurrentUserProviding {
+    var currentUser: User? { get }
+}
+
+extension Session: CurrentUserProviding {}
+
+// Step 3: parameterise the initialiser, defaulting to the singleton, so every call site still compiles
+@MainActor final class DownloadsModel {
+    private let users: any CurrentUserProviding
+
+    init(users: any CurrentUserProviding = Session.shared) {
+        self.users = users
+    }
+
+    var canDownload: Bool { users.currentUser?.isPremium == true }
+}
+
+// In tests: a value of their own, with nothing global to set or reset
+struct StubUsers: CurrentUserProviding {
+    var currentUser: User?
+}
+```
+
+Step through the whole move, from a star of hidden dependencies to a composition root:
+
+```visual flow
+title: From global access to injection
+nodes:
+  - { id: root, label: Composition root, kind: client, at: [2, 0] }
+  - { id: downloads, label: DownloadsModel, at: [0, 2] }
+  - { id: checkout, label: CheckoutModel, at: [2, 2] }
+  - { id: profile, label: ProfileModel, at: [4, 2] }
+  - { id: role, label: CurrentUserProviding, kind: service, at: [0, 4], w: 2 }
+  - { id: session, label: Session, kind: store, at: [4, 4] }
+edges:
+  - [downloads, session]
+  - [checkout, session]
+  - [profile, session]
+  - [session, role, conforms, { style: data }]
+  - [downloads, role, { style: data }]
+  - [checkout, role, { style: data }]
+  - [profile, role, { style: data }]
+  - [root, downloads]
+  - [root, checkout]
+  - [root, profile]
+  - [root, session, creates]
+steps:
+  - say: "Before: each model reaches for `Session.shared` itself. Nothing in their initialisers says they depend on it, and every test shares the one instance."
+    show: [downloads, checkout, profile, session, downloads->session, checkout->session, profile->session]
+    state: { session: error }
+    label: { session: global }
+  - say: "Extract a **role protocol** with only what the models use, and make `Session` conform. Nothing else changes yet."
+    show: [role, session->role]
+    state: { session: null }
+    label: { session: null }
+  - say: "Each model takes the protocol in its initialiser, with `Session.shared` as the default for now. Tests pass a stub."
+    hide: [downloads->session, checkout->session, profile->session]
+    show: [downloads->role, checkout->role, profile->role]
+  - say: "Finally the **composition root** creates the one `Session` and passes it in. The defaults are deleted, and `.shared` can go."
+    show: [root, root->downloads, root->checkout, root->profile, root->session]
+    state: { session: ok }
+```
+
+## Trade-offs
+
+| Approach | Dependencies visible? | Test isolation | Cost to adopt | How it fails |
+| --- | --- | --- | --- | --- |
+| Global `.shared` access | no | poor: shared state | none | flaky tests, leaks between users |
+| Default-argument seam | in the initialiser | good, where tests pass fakes | small, per type | the default keeps the global alive |
+| Injection from a composition root | yes, checked by the compiler | full | moderate: threading values through | long initialisers (a sign to split) |
+| Service locator | no | poor: a global registry | moderate | crashes on a missing registration |
+| SwiftUI `@Environment` | partly (in the view) | good: per view tree | small, in SwiftUI | a missing key silently uses its default; a missing `@Observable` object crashes |
+
+The default-argument seam is the workhorse of a migration: cheap, safe and incremental. Treat it as a stage, not a destination; it's done when the defaults are gone.
+
+<Callout kind="interview">
+
+**What to say:** "One instance is often right; global access is the problem." Then name the costs (hidden inputs, test pollution, lifecycle leaks, races), and the incremental way out: a role protocol, an initialiser parameter that defaults to the singleton, then creation moved to the composition root.
+
+**What to ask:** How do tests isolate state today? Who resets the singleton on logout? Is the codebase on Swift 6 yet, and how were the concurrency errors resolved?
+
+**Red flags:** "Singletons are always bad" (Apple's frameworks are full of sensible ones); using `nonisolated(unsafe)` or `@unchecked Sendable` to make the Swift 6 errors go away; replacing `.shared` with a service locator and calling it dependency injection.
+
+</Callout>
+
+<Callout kind="gotcha" title="iOS gotcha: UserDefaults.standard in tests is real and persistent">
+
+Unit tests usually run inside your app's process, so `UserDefaults.standard` is the app's real defaults: values one test writes survive into the next test, and into the next run. Give each test its own store with `UserDefaults(suiteName:)` and a unique name, and clean up with `removePersistentDomain(forName:)`. Better still, inject a small key–value protocol so tests use an in-memory one.
+
+</Callout>
+
+<Callout kind="gotcha" title="Swift gotcha: nonisolated(unsafe) is a promise, not a fix">
+
+`nonisolated(unsafe) static var shared` compiles in Swift 6, and Xcode even suggests it. It means "I've synchronised this myself". If you haven't, the data race is exactly where it was, and now the compiler won't mention it again. Search the codebase for it during reviews.
+
+</Callout>
+
+## Practice
+
+**The AppManager singleton** review is this lesson in one file: a god object reached from every screen, a data race hidden by `@unchecked Sendable`, and a logout that leaks one customer's basket to the next. Find the problems, then plan the way out in small steps.
+
+```cards
+- id: lifetime-vs-access
+  front: "What's the difference between a single instance and a singleton's global access?"
+  back: "One instance is a lifetime decision and is often right. Global access lets any code reach it, which hides dependencies, leaks state between tests and users, and invites races."
+- id: default-seam
+  front: "How do you make a class that uses `Session.shared` testable without changing its callers?"
+  back: "Extract a role protocol, then add an initialiser parameter of that type with `Session.shared` as the default. Callers still compile; tests pass a fake."
+- id: service-locator-cost
+  front: "Why isn't a service locator dependency injection?"
+  back: "Dependencies stay hidden in the body, a missing registration crashes at run time, and the registry is global state that tests share."
+```
+
+```quiz
+- id: q1
+  type: mcq
+  prompt: "In Swift 6, `static var shared = ImageCache()` fails to compile. Background tasks decode images and store them in the cache. Which fix is best?"
+  options:
+    - "Mark it `nonisolated(unsafe)`"
+    - "Make `ImageCache` an actor and declare `static let shared`"
+    - "Mark `ImageCache` `@MainActor`"
+    - "Conform `ImageCache` to `@unchecked Sendable`"
+  answer: 1
+  explain: "An actor protects the cache's state from any thread, and a `let` of an actor is `Sendable`. `@MainActor` would also be safe, but would drag background decoding work onto the main thread to store results. The other two silence the compiler and keep the race."
+- id: q2
+  type: bug
+  prompt: "These two tests pass when run on their own, but the second fails whenever the first runs before it. Click the line responsible."
+  code: |
+    @Test func irishPricesUseEuros() {
+        Settings.shared.currencyCode = "EUR"
+        #expect(priceLabel(pence: 1250) == "€12.50")
+    }
+
+    @Test func britishPricesUsePounds() {
+        #expect(priceLabel(pence: 1250) == "£12.50")
+    }
+  answer: 2
+  explain: "The first test changes global state and never restores it, so every later test sees euros. The real fix isn't a reset at the end of the test: it's making the currency an explicit input of `priceLabel`, or of a formatter the test creates."
+- id: q3
+  type: order
+  prompt: "Put the steps for retiring `Session.shared` in order."
+  lines:
+    - "Find every use of `Session.shared`"
+    - "Extract a role protocol with only what callers use"
+    - "Add an initialiser parameter that defaults to `Session.shared`"
+    - "Create the session in the composition root and pass it down"
+    - "Delete the default arguments, then `.shared` itself"
+  explain: "Each step leaves the app working. The default argument is what lets you change one type at a time; deleting it at the end makes the compiler find any caller you missed."
+- id: q4
+  type: truefalse
+  prompt: "Replacing `Analytics.shared` with `ServiceLocator.shared.resolve(Analytics.self)` removes the hidden dependency, because tests can register a fake."
+  answer: false
+  explain: "The dependency is still found inside the body, not declared in the initialiser; the registry is still global state shared by tests; and a missing registration now crashes at run time instead of failing to compile."
+- id: q5
+  type: multi
+  prompt: "Which of these uses of shared instances are reasonable?"
+  options:
+    - "Passing `URLSession.shared` into the API client from the app's composition root"
+    - "Reading `Session.shared.user` inside a price calculation"
+    - "A `static let` holding an immutable, `Sendable` configuration struct"
+    - "Calling `Analytics.shared.track` from inside a model property's `didSet`"
+  answer: [0, 2]
+  explain: "Using a shared instance at the edge, where the app is assembled, keeps it visible and replaceable. Immutable `Sendable` constants are safe to share. The other two hide an input or a side effect deep inside logic, which is where global access hurts."
+```

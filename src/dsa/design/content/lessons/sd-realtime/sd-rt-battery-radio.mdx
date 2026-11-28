@@ -1,0 +1,208 @@
+## Why it matters
+
+A live connection that costs nothing on a server can cost a phone a noticeable slice of its battery, and users find out from the Battery screen in Settings, which names your app. The cost isn't the bytes; it's how often you wake the cellular radio and how long it stays awake afterwards. Every choice in this module (polling interval, heartbeat interval, coalescing, when to close) is also a battery choice, and interviewers for senior roles expect you to make it out loud.
+
+## The radio's tail
+
+You met the cellular radio's power states in [radio states and cellular links](/design/learn/sd-net-radio-cellular). The short version that matters here:
+
+- An idle radio uses very little power, but sending anything first needs a **promotion** to the connected state, which takes from tens to hundreds of milliseconds and some signalling with the network.
+- After the last packet, the radio doesn't drop back at once. It stays in a high-power state for a **tail** of several seconds, set by the carrier's network, in case more data follows. Measurements of LTE networks have found tails of around ten seconds.
+- 5G adds an inactive state that resumes faster, and Wi-Fi sleeps between packets far more cheaply, but the principle holds everywhere: **each wake-up costs a fixed chunk of energy, almost regardless of how much you send.**
+
+So a 60-byte heartbeat costs about the same radio time as a 60 KB message: the promotion plus the tail. Ten small transmissions spread over a minute keep the radio awake for most of that minute; the same ten bundled into one burst keep it awake for one tail.
+
+## What a heartbeat costs
+
+Move the sliders. The model is deliberately simple (each heartbeat keeps the radio awake for one tail, and nothing else is sent), but it shows the shape of the problem: when the interval approaches the tail, the radio never rests.
+
+```visual estimator
+title: The battery cost of heartbeats on cellular
+inputs:
+  - { id: interval, label: Heartbeat interval, min: 5, max: 600, value: 30, scale: log, unit: s }
+  - { id: tail, label: Radio tail after each wake-up, min: 1, max: 20, step: 0.5, value: 10, unit: s }
+  - { id: power, label: Radio power while awake, min: 100, max: 2000, step: 50, value: 800, unit: mW }
+  - { id: battery, label: Battery capacity, min: 5, max: 25, step: 0.5, value: 13, unit: Wh }
+  - { id: hours, label: Hours a day the connection is open, min: 0.5, max: 24, step: 0.5, value: 2, unit: h }
+outputs:
+  - { id: wakes, label: Radio wake-ups per hour, formula: 3600 / interval, unit: /h }
+  - { id: awake, label: Share of the time the radio is awake, formula: "min(100, tail / interval * 100)", unit: "%" }
+  - { id: energy, label: Radio energy per hour connected, formula: awake / 100 * power / 1000, unit: Wh }
+  - { id: perHour, label: Battery used per hour connected, formula: energy / battery * 100, unit: "%" }
+  - { id: perDay, label: Battery used per day by heartbeats alone, formula: perHour * hours, unit: "%" }
+```
+
+With a 30-second heartbeat and a 10-second tail, the radio is awake a third of the time the connection is open: about 2% of a typical battery per hour, from traffic that carries no information. Drop the interval to 10 seconds and it never sleeps. Stretch it to 2 minutes and the cost falls by three quarters, but now the 60-second idle timeouts on the path close the connection for you. The real numbers vary with the network, the signal and the device (a weak signal costs much more), so treat the outputs as orders of magnitude, not a forecast.
+
+## What iOS does for you
+
+The platform already protects the battery in ways that shape every real-time design:
+
+- **Suspension.** A few seconds after the user leaves, your app stops running, and its connections stop with it. That's the single biggest reason real-time apps don't drain phones overnight, and why the background mode belongs to push.
+- **One push connection for every app.** The system keeps a single long-lived connection to APNs, with its keep-alive tuned by Apple for each network, shared by every app on the device. A push costs your app no idle connection at all. A dozen apps each holding their own socket in the background would cost a dozen sets of heartbeats.
+- **Low Power Mode.** When the user turns it on (or iOS suggests it at 20%), the system cuts back background activity such as background app refresh. `ProcessInfo.processInfo.isLowPowerModeEnabled` tells you, and the `NSProcessInfoPowerStateDidChange` notification says when it changes. Your app should cut back too.
+- **Low Data Mode and expensive networks.** `NWPath.isConstrained` is true in Low Data Mode, and `isExpensive` on cellular and personal hotspots. Setting `allowsConstrainedNetworkAccess = false` on a `URLSessionConfiguration` for non-essential traffic (prefetching, analytics) makes those requests fail fast in Low Data Mode instead of using the user's data.
+- **Discretionary transfers.** A background `URLSession` with `isDiscretionary = true` lets the system schedule big transfers for when the device is on Wi-Fi and charging.
+
+## Designing for the radio
+
+Most of the savings come from a handful of habits:
+
+- **One connection per app**, shared by every screen. Two sockets mean two sets of heartbeats that rarely line up.
+- **Heartbeat only when quiet.** Any frame received proves the connection is alive; reset the ping timer on traffic so a busy connection never sends a heartbeat at all.
+- **Batch what you send.** Read receipts, typing stops, analytics and "message delivered" acks can wait a second or two and go together, in one wake-up instead of five. Piggyback on wake-ups you're making anyway: if you're about to send a message, flush the pending receipts with it.
+- **Coalesce what the server sends.** For data that changes many times a second (match statistics, prices, a moving map), the server can send the latest state once a second instead of every change. The user sees the same screen; the radio sees a fraction of the wake-ups.
+- **Close when nothing live is on screen.** Unsubscribe when a live screen disappears, and close the socket altogether once nothing has needed it for a while (say a minute), rather than keeping it open "in case".
+- **Adapt to the user's settings.** In Low Power Mode or Low Data Mode, stretch the heartbeat (staying under the path's idle timeouts), coalesce more, and stop prefetching.
+- **Let push do the background.** Never poll or keep sockets alive in the background to save a few seconds of latency; send a push and sync on open.
+
+The adaptation is a few lines. Pick a policy from the two system signals, and hand it to the connection:
+
+```swift check ios title="LivenessMonitor.swift"
+import Foundation
+import Network
+
+/// How lively the connection should be: frequent heartbeats and every update only when the user can afford them
+struct LivenessPolicy: Equatable, Sendable {
+    var heartbeat: Duration
+    var coalesceUpdates: Duration
+
+    static let normal = LivenessPolicy(heartbeat: .seconds(25), coalesceUpdates: .zero)
+    // Still under the 60-second idle timeouts common on proxies and load balancers
+    static let frugal = LivenessPolicy(heartbeat: .seconds(45), coalesceUpdates: .seconds(2))
+}
+
+/// Picks the policy from Low Power Mode and Low Data Mode, and updates it when either changes
+@MainActor @Observable
+final class LivenessMonitor {
+    private(set) var policy = LivenessPolicy.normal
+    private var lowPower = ProcessInfo.processInfo.isLowPowerModeEnabled
+    private var lowData = false
+
+    /// Runs for as long as the calling task does
+    func run() async {
+        // A path monitor can't be restarted once cancelled, so each run gets its own
+        let monitor = NWPathMonitor()
+        monitor.pathUpdateHandler = { [weak self] path in
+            let constrained = path.isConstrained
+            Task { @MainActor in self?.lowDataChanged(constrained) }
+        }
+        monitor.start(queue: DispatchQueue(label: "liveness.path"))
+        defer { monitor.cancel() }
+        choose()
+        for await _ in NotificationCenter.default.notifications(named: .NSProcessInfoPowerStateDidChange) {
+            lowPower = ProcessInfo.processInfo.isLowPowerModeEnabled
+            choose()
+        }
+    }
+
+    private func lowDataChanged(_ constrained: Bool) {
+        lowData = constrained
+        choose()
+    }
+
+    private func choose() {
+        policy = lowPower || lowData ? .frugal : .normal
+    }
+}
+```
+
+The `coalesceUpdates` value isn't only a client setting: send it to the server when subscribing ("at most one update every 2 seconds"), so the saving happens before the bytes reach the radio.
+
+## Measuring it
+
+You can't see radio cost on a Mac or in the Simulator, which uses your Mac's network. Measure on a device, on cellular:
+
+- **Xcode's energy impact gauge** (in the debug navigator while the app runs) shows network and CPU overhead live; watch it with a socket idle for a few minutes.
+- **MetricKit** reports what happened on real users' devices, in daily payloads: `MXNetworkTransferMetric` for bytes over Wi-Fi and cellular, and `MXCellularConditionMetric` for the signal strength they were on. A jump in cellular transfer after a release is a heartbeat or polling regression.
+- **Xcode Organizer** shows battery usage metrics aggregated from users who share diagnostics, by app version.
+
+You'll go deeper into energy, including CPU, location and thermal state, in D51.
+
+## Trade-offs
+
+| Approach | Freshness | Radio wake-ups | Wins when |
+| --- | --- | --- | --- |
+| Socket with a 10 s heartbeat | Dead connections found in seconds | Constant: the radio never sleeps | Almost never on cellular |
+| Socket with a 25–30 s heartbeat, ping only when quiet | Live, failures found within ~40 s | A few per minute when idle | The foreground default |
+| Socket with a 45 s heartbeat and coalesced updates | Live, a little slower to notice failure | About half as many | Low Power Mode, Low Data Mode |
+| Polling every 30–60 s | Interval-bound | One per poll, plus the tail | Low-rate data, and when no socket is open anyway |
+| Push, then fetch on open | Seconds, best-effort | Shared system connection | Everything in the background |
+
+<Callout kind="interview">
+
+**Say** the cost and the mitigation together: "Each heartbeat wakes the cellular radio for a tail of several seconds, so a 30-second heartbeat keeps it awake about a third of the time the socket is open. We only ping when the connection is quiet, share one socket across screens, batch receipts and analytics into existing wake-ups, coalesce high-frequency updates on the server, close the socket when nothing live is on screen, and stretch the heartbeat in Low Power Mode. Nothing stays connected in the background; that's what push is for." **Ask** how long users keep the live screen open; that's the number that turns the per-hour cost into a daily one. **Red flags:** counting bytes instead of wake-ups, sub-15-second heartbeats on cellular, and background sockets "for freshness".
+
+</Callout>
+
+<Callout kind="gotcha" title="iOS gotcha: the office Wi-Fi hides the cost">
+
+Developers test on fast Wi-Fi, where wake-ups are cheap and the energy gauge stays low. The same app on cellular with one bar of signal can cost several times as much per hour, because a weak signal needs more transmit power and retransmissions. Before shipping a heartbeat or polling change, leave the app connected on cellular for twenty minutes and look at the gauge and at Settings → Battery.
+
+</Callout>
+
+## Practice
+
+The review **"a live-scores socket client"** includes the hot-phone report: find the loop that keeps the radio and CPU busy in Airplane Mode, and what the client should do instead while there's no network or the app is in the background.
+
+```cards
+- id: radio-tail
+  front: "Why does a tiny heartbeat cost nearly as much battery as a large message?"
+  back: "The cellular radio stays in a high-power state for a tail of several seconds after any transmission, so each wake-up costs about the same whatever its size."
+- id: heartbeat-cost
+  front: "Roughly what share of the time is the radio awake with a 30 s heartbeat and a 10 s tail?"
+  back: "About a third: each heartbeat buys one tail. At a 10 s interval it never sleeps."
+- id: shared-push
+  front: "Why is APNs cheaper for the battery than an app's own background socket?"
+  back: "The system keeps one tuned connection to APNs shared by every app, so a push needs no extra connection or heartbeats for your app."
+- id: radio-habits
+  front: "Name four habits that cut radio wake-ups in a real-time app."
+  back: "One socket per app, ping only when quiet, batch outgoing receipts and analytics, coalesce high-frequency updates on the server, and close the socket when nothing live is on screen."
+```
+
+```quiz
+- id: q1
+  type: estimate
+  prompt: "An app sends a heartbeat every 20 seconds while its live screen is open. How many radio wake-ups is that per hour, if nothing else is sent?"
+  answer: 180
+  unit: wake-ups an hour
+  within: { percent: 10 }
+  explain: "3,600 s ÷ 20 s = 180. With a 10-second tail, that keeps the radio awake half the time the screen is open."
+- id: q2
+  type: mcq
+  prompt: "Your app sends a read receipt the moment each message is displayed. A user scrolls through 30 unread messages in 20 seconds. What's the most battery-friendly change?"
+  options:
+    - "Send receipts over HTTP instead of the socket"
+    - "Collect receipts and send one 'read up to sequence number N' a second or two after scrolling stops"
+    - "Skip read receipts on cellular"
+    - "Compress each receipt"
+  answer: 1
+  explain: "Thirty separate sends keep the radio awake throughout; one batched 'read up to N' costs one wake-up. Sequence numbers make the batched form natural, and it's idempotent too."
+- id: q3
+  type: multi
+  prompt: "Which changes reduce the radio cost of a live-scores screen? Choose all that apply."
+  options:
+    - "The server sends at most one statistics update a second per match"
+    - "Pinging only when no frame has arrived for 25 seconds"
+    - "A separate socket for scores and another for commentary"
+    - "Stretching the heartbeat in Low Power Mode"
+    - "Keeping the socket open in the background so it's ready when the user returns"
+  answer: [0, 1, 3]
+  explain: "Coalescing, quiet-only pings and Low Power Mode adaptation all cut wake-ups. Two sockets double the heartbeats, and a background socket can't run while suspended anyway; it just fails."
+- id: q4
+  type: truefalse
+  prompt: "Halving the size of each heartbeat message roughly halves its battery cost."
+  answer: false
+  explain: "The cost is dominated by the radio's promotion and tail, not the bytes. Fewer wake-ups help; smaller heartbeats barely do."
+- id: q5
+  type: sort
+  prompt: "Foreground connection, or push and fetch on open?"
+  buckets: [Foreground connection, Push and fetch on open]
+  items:
+    - [New messages while the chat is open, 0]
+    - [New messages while the app is in the background, 1]
+    - ["A goal in a match the user follows, while their phone is locked", 1]
+    - [Typing indicators in the open conversation, 0]
+    - [An order that's out for delivery while the user is in another app, 1]
+  explain: "While the app is on screen, its own connection gives live updates. Once it's backgrounded or the phone is locked, the app isn't running: push (or a Live Activity update) reaches the user, and the app syncs when it opens."
+```

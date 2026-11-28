@@ -1,0 +1,334 @@
+## Why it matters
+
+`String`, `Int` and `Double` are the most common types in an app and the least informative. An email address, a user id and a promo code are all `String`, so the compiler can't stop you passing one where another belongs, and the rules about each (trimmed? upper case? valid?) are checked everywhere or nowhere. Money held in a `Double` is wrong in the third decimal place before anyone notices. Domain types move each rule into a type, once. In interviews, "ids are typed and money is integer minor units plus a currency" is a detail that marks out a careful data model.
+
+## Primitive obsession
+
+Martin Fowler's *Refactoring* lists **primitive obsession** among its code smells: using built-in types for domain ideas that deserve their own. You can spot it by its symptoms.
+
+- **The same check in many places.** `email.contains("@")` in the sign-up screen, a slightly different regular expression in the profile screen, nothing at all in the share extension.
+- **Arguments that can be swapped.** `func assign(courier: String, to order: String)` compiles just as happily with the two ids reversed.
+- **Values with an unwritten unit.** `timeout: Double` (seconds? milliseconds?), `distance: Double` (miles? metres?), `price: Double` (pounds? pence? which currency?).
+- **Magic strings.** `if status == "payed"` compiles, and is always false.
+- **Normalisation repeated, or forgotten.** One screen upper-cases promo codes; another doesn't, so "summer25" works in one place and fails in the other.
+
+Each symptom has the same cure: give the idea a type, and give the type the rule.
+
+## The smallest domain type: a typed id
+
+Start with the cheapest win. Ids are opaque, never validated, and constantly passed around, so mixing them up is easy. A wrapper costs a few lines:
+
+```swift check title="ID.swift"
+import Foundation
+
+/// An entity's identity. `Entity` is never stored: it's a "phantom" type parameter that only
+/// exists to make `ID<User>` and `ID<Order>` different types.
+struct ID<Entity>: Hashable, Sendable {
+    let rawValue: UUID
+
+    init(_ rawValue: UUID = UUID()) {
+        self.rawValue = rawValue
+    }
+}
+
+// Encode as the bare UUID string, so the JSON and the database don't change
+extension ID: Codable {
+    init(from decoder: any Decoder) throws {
+        rawValue = try decoder.singleValueContainer().decode(UUID.self)
+    }
+
+    func encode(to encoder: any Encoder) throws {
+        var container = encoder.singleValueContainer()
+        try container.encode(rawValue)
+    }
+}
+
+struct Courier: Identifiable {
+    let id: ID<Courier>
+    var name: String
+}
+
+struct Order: Identifiable {
+    let id: ID<Order>
+    var courier: ID<Courier>?
+}
+
+func assign(_ courier: ID<Courier>, to order: ID<Order>) {
+    // …
+}
+```
+
+Now the mix-up is a compile error instead of a bug report:
+
+```text title="What you'll see"
+assign(order.id, to: courier.id)
+error: cannot convert value of type 'ID<Order>' to expected argument type 'ID<Courier>'
+```
+
+A `typealias UserID = String` doesn't give you this: an alias is just another spelling of `String`, and the compiler treats them as the same type. Point-Free's `swift-tagged` package offers the same idea ready-made, as `Tagged<User, UUID>`, with `Codable`, literals and comparisons already written.
+
+At runtime the wrapper is free. A struct with one stored `UUID` is the same size as a `UUID` (16 bytes), and the compiler passes it the same way.
+
+## Parse, don't validate
+
+The bigger win is for values with **rules**. The usual approach is to validate: check the string, then pass the same `String` along and hope everyone downstream remembers it was checked. The alternative is to **parse**: check once, at the boundary, and return a new type that can only hold checked values. Holding an `EmailAddress` is then proof the check happened.
+
+```visual flow
+title: Parse at the boundary, trust inside
+nodes:
+  - { id: field, label: Text field, kind: view, at: [0, 0] }
+  - { id: json, label: Server JSON, kind: external, at: [0, 1.5] }
+  - { id: link, label: Deep link, kind: external, at: [0, 3] }
+  - { id: parse, label: "init(_:) throws", at: [2, 1.5] }
+  - { id: core, label: Domain code, at: [4, 1.5] }
+groups:
+  - { id: outside, label: Untrusted, nodes: [field, json, link] }
+  - { id: inside, label: Trusted types only, nodes: [core] }
+edges:
+  - [field, parse, typed text]
+  - [json, parse, strings]
+  - [link, parse, query]
+  - [parse, core, domain types]
+steps:
+  - say: "Everything from outside arrives as `String`s and numbers: what the user typed, the server's JSON, a deep link's query items. Any of it can be wrong."
+    show: [outside]
+  - say: "At the boundary, each value goes through its type's initialiser once. `try EmailAddress(\" Sam@Example.COM \")` trims it, lower-cases the domain, and checks its shape."
+    show: [parse]
+    send: field->parse
+    label: { parse: "trim · normalise · check" }
+  - say: "Bad input stops here. A deep link whose order id isn't an id becomes an error the link handler can report, not a crash three screens later."
+    send: link->parse
+    state: { parse: error }
+    label: { parse: rejected }
+  - say: "Past the boundary, code takes `EmailAddress`, `Money` and `ID<Order>`, never raw strings. It can't be handed an unchecked value, so it never checks again."
+    show: [inside]
+    send: [json->parse, parse->core]
+    state: { parse: ok }
+    label: { parse: null }
+```
+
+Here's what those initialisers look like:
+
+```swift run title="Types that refuse bad input"
+import Foundation
+
+struct EmailAddress: Hashable, Sendable, CustomStringConvertible {
+    enum Problem: Error {
+        case empty
+        case missingAt
+        case badDomain
+    }
+
+    let rawValue: String
+
+    init(_ text: String) throws {
+        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { throw Problem.empty }
+        let parts = trimmed.split(separator: "@", omittingEmptySubsequences: false)
+        guard parts.count == 2, !parts[0].isEmpty else { throw Problem.missingAt }
+        // Domains are case-insensitive, so normalise them; leave the part before the @ alone
+        let domain = parts[1].lowercased()
+        guard domain.contains("."), !domain.hasPrefix("."), !domain.hasSuffix("."), !domain.contains(" ") else {
+            throw Problem.badDomain
+        }
+        rawValue = "\(parts[0])@\(domain)"
+    }
+
+    var description: String { rawValue }
+}
+
+struct PromoCode: Hashable, Sendable {
+    let rawValue: String
+
+    /// Codes are 4 to 12 letters or digits; whatever case and spacing people type, they're stored upper case.
+    init?(_ text: String) {
+        let code = text.trimmingCharacters(in: .whitespacesAndNewlines).uppercased()
+        guard (4...12).contains(code.count),
+              code.allSatisfy({ $0.isASCII && ($0.isLetter || $0.isNumber) }) else { return nil }
+        rawValue = code
+    }
+}
+
+for text in [" Sam@Example.COM ", "sam.example.com", "sam@localhost", ""] {
+    do {
+        print("Email \"\(text)\": \(try EmailAddress(text))")
+    } catch {
+        print("Email \"\(text)\": rejected, \(error)")
+    }
+}
+for text in [" summer25 ", "50%OFF", "ab"] {
+    print("Promo \"\(text)\": \(PromoCode(text)?.rawValue ?? "rejected")")
+}
+```
+
+```output
+Email " Sam@Example.COM ": Sam@example.com
+Email "sam.example.com": rejected, missingAt
+Email "sam@localhost": rejected, badDomain
+Email "": rejected, empty
+Promo " summer25 ": SUMMER25
+Promo "50%OFF": rejected
+Promo "ab": rejected
+```
+
+A few design decisions are hiding in there.
+
+- **The stored properties are `let`, and the only way in is the initialiser.** There's no way to make an `EmailAddress` that skipped the check, so no code that receives one needs to check it again.
+- **Normalisation happens once.** `PromoCode(" summer25 ")` and `PromoCode("SUMMER25")` are equal, so a `Set<PromoCode>` or a dictionary lookup does the right thing everywhere.
+- **The email check is deliberately light.** The full grammar for addresses (RFC 5322) allows things no real person types, and many "strict" patterns reject real addresses with a `+` or a new top-level domain. Check the shape, then prove the address works the only reliable way: send a confirmation link.
+- **One throws, one returns `nil`.** The email's caller shows *why* it failed ("there's no @"); the promo field just shows "That code isn't valid", so an optional is enough.
+
+## Money: the type everyone gets wrong
+
+`Double` is binary floating point. It can't represent 0.1 exactly, any more than a decimal can represent ⅓ exactly, and the errors surface in exactly the places money goes: sums, comparisons and conversion to pennies.
+
+```swift run title="Why money isn't a Double"
+import Foundation
+
+let prices = [0.10, 0.20, 0.30]
+let total = prices.reduce(0, +)
+print("Double total: \(total), equals 0.6? \(total == 0.6)")
+print("£19.99 in pence, via Double: \(Int(19.99 * 100))")
+print("Decimal made from a Double: \(Decimal(19.99) * 100)")
+
+let pence = [10, 20, 30].reduce(0, +)
+print("Integer pence: \(pence), equals 60? \(pence == 60)")
+let price = Decimal(string: "19.99")!
+print("Decimal from a string: \(price * 100)")
+print("Shown to the user: \(price.formatted(.currency(code: "GBP").locale(Locale(identifier: "en_GB"))))")
+```
+
+```output
+Double total: 0.6000000000000001, equals 0.6? false
+£19.99 in pence, via Double: 1998
+Decimal made from a Double: 1998.999999999999488
+Integer pence: 60, equals 60? true
+Decimal from a string: 1999
+Shown to the user: £19.99
+```
+
+`Int(19.99 * 100)` is 1998: the customer is undercharged a penny, every time, on every price whose binary approximation falls just short. The rules for a Money type follow:
+
+1. **Store an exact amount**: an `Int` count of the currency's minor units (pence, cents), or a `Decimal` built from a string or an integer, never from a `Double`. StoreKit 2 does the same: `Product.price` is a `Decimal`.
+2. **Carry the currency with the amount**, and refuse arithmetic across currencies. £5 + $5 isn't £10.
+3. **Respect each currency's minor units.** ISO 4217 says pounds and dollars have 2 decimal places, yen have 0, and Kuwaiti dinars have 3. A type that assumes 2 shows ¥1,200 as "¥12.00".
+4. **Decide rounding explicitly**, once, in the type: when a 15% discount on £3.33 gives 49.95p, the rule for that half penny belongs in one place, ideally the same rule the server uses.
+5. **Format at the edge.** `price.formatted(.currency(code:))` uses the user's locale for the symbol, separators and position. `String(format: "£%.2f")` gets all three wrong for most of the world.
+
+## Use Apple's domain types first
+
+Foundation already has types for many everyday ideas. Reach for them before writing your own.
+
+| Instead of | Use | Because |
+| --- | --- | --- |
+| `String` for links | `URL` | Parsed once; `appending(path:)` and `URLComponents` build them safely |
+| `Double` seconds | `Duration` (Swift 5.7) | Carries its unit; `Task.sleep(for:)` and `Clock` take it |
+| `TimeInterval` since 1970 | `Date` | One instant, whatever the time zone; format with `formatted()` |
+| `Double` kilometres | `Measurement<UnitLength>` | Converts (`.converted(to: .miles)`) and formats for the locale |
+| `String` currency codes | `Locale.Currency` (iOS 16) | Knows the ISO codes the system knows |
+| `String` ids | `UUID` | 128 bits of uniqueness, `Codable` as a string |
+| first and last name strings | `PersonNameComponents` | Formats names in the user's locale order |
+
+## What it costs, and where to stop
+
+Domain types aren't free.
+
+- **Boilerplate.** Each needs an initialiser, conformances (`Hashable`, `Codable`, `Sendable`, `CustomStringConvertible`) and sometimes custom coding so the JSON stays a plain string.
+- **Conversions at the edges.** SwiftUI's `TextField` binds to a `String`, so the screen keeps raw text in its state and parses it when the user submits. Persistence frameworks store primitives, so repositories convert on the way in and out.
+- **Shortcuts that undo the point.** `ExpressibleByStringLiteral` lets you write `let email: EmailAddress = "sam@example.com"`, which is lovely in tests and previews, and also lets `"not an email"` compile, skipping validation. Add that conformance only to types with no rules (plain ids), or only inside your test target.
+
+Wrap a primitive when at least one of these is true:
+
+- **mixing it up would be a bug** (ids, account numbers);
+- **it has rules or normalisation** (emails, promo codes, quantities from 1 to 10);
+- **it has behaviour** (money arithmetic, date ranges that can overlap);
+- **it has a unit** (durations, distances, currencies).
+
+Leave it alone when it's just data: the text of a comment, a title shown as-is, a loop counter.
+
+## Trade-offs
+
+| Option | Catches mix-ups | Rules in one place | Boilerplate | `Codable` and storage | Good for |
+| --- | --- | --- | --- | --- | --- |
+| Raw primitive | No | No | None | Free | Display text, local counters |
+| `typealias` | No: same type | No | None | Free | Readability only |
+| Wrapper struct | Yes | If its init checks | A little | A single-value container | Ids, codes, simple values |
+| Generic `ID<Entity>` or `Tagged` | Yes | No rules to hold | Written once | Written once | Every entity's id |
+| Full value object (`Money`) | Yes | Yes, with behaviour | Most | Hand-written, deliberately | Money, quantities, ranges, anything with rules |
+
+<Callout kind="interview">
+
+**Say** the types in your data model, not just the fields: "Ids are typed, so an `ID<User>` can't be passed as an `ID<Conversation>`. Money is integer minor units plus a currency, formatted with the user's locale at the edge." **Ask** which values have rules (limits, formats, normalisation) and which currencies or units are in play. **Red flags:** prices in `Double`, statuses as strings, the same validation in several screens, and `typealias` presented as type safety.
+
+</Callout>
+
+<Callout kind="gotcha" title="Swift gotcha: a Decimal made from a Double inherits the Double's error">
+
+`Decimal(19.99)` and even `let price: Decimal = 19.99` start from a `Double` literal, so the binary rounding error comes along: multiplied by 100 it prints `1998.999999999999488`. How Foundation rounds that conversion has varied between versions, so don't rely on it ever looking right. Build `Decimal`s from strings (`Decimal(string: "19.99")`), from integers (`Decimal(1999) / 100`), or decode them from JSON with `JSONDecoder`, and keep `Double` out of the money path entirely.
+
+</Callout>
+
+## Practice
+
+Two items practise this lesson. The kata **A Money value object** has you build the type described above, with parsing, currency rules, arithmetic and allocation. The review **An anaemic ticket order** shows what an app looks like without domain types: statuses as strings, money as `Double`, ids that can be swapped and an email check that's one `contains("@")`.
+
+```cards
+- id: primitive-obsession
+  front: "What is primitive obsession, and what are its symptoms?"
+  back: "Using `String`, `Int` or `Double` for domain ideas that deserve their own types. Symptoms: the same check in many places, swappable arguments, values with an unwritten unit, magic strings, and normalisation done in some places and not others."
+- id: parse-dont-validate
+  front: "What does \"parse, don't validate\" mean in Swift?"
+  back: "Check raw input once, at the boundary, in an initialiser that returns a new type (`EmailAddress`, `Money`). Code that receives the type knows the check happened and never repeats it."
+- id: money-rules
+  front: "How should an app represent money?"
+  back: "An exact amount (integer minor units, or a `Decimal` never built from a `Double`) together with its currency, with each currency's decimal places, rounding decided once, and locale-aware formatting only at the edge."
+```
+
+```quiz
+- id: q1
+  type: output
+  prompt: "What does this print?"
+  code: |
+    let price = 0.29
+    print(Int(price * 100))
+  answer: "28"
+  explain: "0.29 can't be stored exactly in binary, and 0.29 × 100 comes out as 28.999999999999996. Converting to `Int` truncates, so a 29p item becomes 28p."
+- id: q2
+  type: sort
+  prompt: "Would you give each of these its own type, or leave it as a primitive?"
+  buckets: [Its own type, Leave it a primitive]
+  items:
+    - [A user's id, 0]
+    - [An email address entered at sign-up, 0]
+    - [A product's price, 0]
+    - [The body text of a comment, 1]
+    - [A promo code, 0]
+    - [The index in a `for` loop, 1]
+    - [A video's length, 0]
+  explain: "Ids get mixed up, emails and promo codes have rules and normalisation, prices need exact arithmetic and a currency, and a video's length has a unit (`Duration`). Comment text and a loop index are just data."
+- id: q3
+  type: mcq
+  prompt: "`func assign(courier: String, to order: String)` was called with the arguments swapped, and the courier app showed the wrong job. Which change makes that mistake impossible to compile?"
+  options:
+    - "`typealias CourierID = String` and `typealias OrderID = String`"
+    - "Typed ids: `func assign(_ courier: ID<Courier>, to order: ID<Order>)`"
+    - "A `precondition` that checks the courier id starts with \"c_\""
+    - "Better argument labels"
+  answer: 1
+  explain: "Distinct types make the swap a compile error. A `typealias` is the same type under another name, a precondition only catches it at runtime, and labels already existed."
+- id: q4
+  type: mcq
+  prompt: "A teammate adds `extension EmailAddress: ExpressibleByStringLiteral` so tests can write `let email: EmailAddress = \"sam@example.com\"`. What's the risk?"
+  options:
+    - "None: literals are checked at compile time"
+    - "Any string literal now becomes an `EmailAddress` without going through the validating initialiser, so `\"not an email\"` compiles in app code too"
+    - "It makes `EmailAddress` slower"
+    - "It stops `EmailAddress` being `Codable`"
+  answer: 1
+  explain: "The literal initialiser can't throw, so it either skips the check or crashes on a bad literal. Keep the conformance out of the app target: put it in a test-only extension, or write `try EmailAddress(\"…\")` in tests."
+- id: q5
+  type: truefalse
+  prompt: "Wrapping an `Int` in a single-property struct makes it bigger in memory and slower to pass around."
+  answer: false
+  explain: "A struct with one stored `Int` has the same size and layout as the `Int` itself, and the optimiser passes it the same way. The cost of domain types is code to write, not performance."
+```

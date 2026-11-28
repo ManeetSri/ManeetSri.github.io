@@ -1,0 +1,287 @@
+## Why it matters
+
+Swift 6 turns data races into compile errors. That changes when you think about threads: isolation is no longer something you check in code review, it's an architecture decision the compiler holds you to. Which code runs on the main actor? Which state lives in which actor? What crosses between them, and in what shape? Teams that design for it get thread safety proven for free. Teams that bolt it on end up with `@unchecked Sendable` and `@MainActor` sprinkled around to silence errors. "How would you structure concurrency in this feature?" is now a routine interview question.
+
+## Isolation domains are boundaries for state
+
+Every piece of mutable state in a Swift 6 program belongs to exactly one **isolation domain**:
+
+- **the main actor,** for UI and the state it displays;
+- **an actor instance,** for state it protects;
+- **a task's own local variables,** which nothing else can see.
+
+Code inside a domain touches its state directly and synchronously. Anything that **crosses** from one domain to another must be safe to share, which is what `Sendable` means: a value type of `Sendable` parts, an immutable class, an actor, or a type that synchronises itself.
+
+That makes isolation domains a lot like the modules of the previous lessons. You choose the boundaries; crossing one has a cost (an `await`, a `Sendable` requirement); and a good design keeps crossings few and their payloads simple. You'll learn the mechanics of actors, tasks and `@MainActor` in D22. This lesson is about where to draw the lines. Step through a feed screen:
+
+```visual flow
+title: A feed, drawn as isolation domains
+nodes:
+  - { id: view, label: FeedView, kind: view, at: [0, 0] }
+  - { id: model, label: FeedModel, kind: service, at: [0, 2] }
+  - { id: repo, label: FeedRepository, kind: service, at: [2, 2] }
+  - { id: api, label: Feed API, kind: external, at: [4, 2] }
+  - { id: cache, label: ThumbnailCache, kind: cache, at: [2, 0] }
+groups:
+  - { id: main, label: Main actor, nodes: [view, model] }
+  - { id: actor, label: Actor, nodes: [cache] }
+edges:
+  - [model, repo, await feed()]
+  - [repo, api, GET /feed, { style: async }]
+  - [repo, model, "[Post]", { style: data }]
+  - [view, cache, await thumbnail(), { style: async }]
+steps:
+  - say: "The view and its model live on the **main actor**. They own what's on screen and change it synchronously, with no locks."
+    show: [main]
+    state: { model: active }
+  - say: "The model calls the repository. `FeedRepository` is a `Sendable` struct with no mutable state, so it can run anywhere: nothing about it needs protecting."
+    send: model->repo
+  - say: "The repository fetches and decodes off the main actor, so a large payload doesn't stall scrolling."
+    send: repo->api
+  - say: "What comes back is `[Post]`, an array of `Sendable` structs. Values cross the boundary freely: no copy to make, no lock to take."
+    send: repo->model
+    state: { model: ok }
+  - say: "Thumbnails are **shared mutable state**: every cell, plus a background prefetcher, reads and writes one cache. That's what an actor is for: one owner, and every access an `await`."
+    show: [actor]
+    send: view->cache
+    state: { cache: ok }
+```
+
+## Design the payloads: what crosses must be Sendable
+
+The cheapest crossing is a value. The previous lessons' advice, value types for data, pays off here: a struct or enum whose stored properties are all `Sendable` is `Sendable` itself, inferred automatically for non-public types (public ones declare it). When a crossing needs more than a value, there's a short list of shapes, in roughly the order to reach for them:
+
+```swift check
+import Foundation
+import Observation
+import Synchronization
+
+// 1. Values: the default for anything that crosses
+struct Post: Identifiable, Sendable, Decodable {
+    let id: Int
+    let title: String
+}
+
+// 2. A Sendable service: no mutable state, so it can run anywhere
+protocol FeedLoading: Sendable {
+    func feed() async throws -> [Post]
+}
+
+struct RemoteFeed: FeedLoading {
+    let session: URLSession
+    let url: URL
+
+    func feed() async throws -> [Post] {
+        let (data, _) = try await session.data(from: url)
+        return try JSONDecoder().decode([Post].self, from: data)
+    }
+}
+
+// 3. An actor: shared mutable state, reached with await
+actor ThumbnailCache {
+    private var images: [Int: Data] = [:]
+    private var inFlight: [Int: Task<Data, any Error>] = [:]
+
+    func thumbnail(for id: Int, load: @escaping @Sendable () async throws -> Data) async throws -> Data {
+        if let cached = images[id] { return cached }
+        // Another caller may already be loading it: wait for that instead of loading twice
+        if let running = inFlight[id] { return try await running.value }
+        let task = Task { try await load() }
+        inFlight[id] = task
+        defer { inFlight[id] = nil }
+        let data = try await task.value
+        images[id] = data
+        return data
+    }
+}
+
+// 4. A lock: shared state that must be reachable synchronously
+final class RequestCounter: Sendable {
+    private let count = Mutex(0)
+
+    func next() -> Int {
+        count.withLock { value in
+            value += 1
+            return value
+        }
+    }
+}
+
+// The UI side: main actor, holding a Sendable dependency
+@MainActor @Observable
+final class FeedModel {
+    private(set) var posts: [Post] = []
+    private(set) var failed = false
+    private let loader: any FeedLoading
+
+    init(loader: any FeedLoading) {
+        self.loader = loader
+    }
+
+    func refresh() async {
+        do {
+            posts = try await loader.feed()
+            failed = false
+        } catch {
+            failed = true
+        }
+    }
+}
+```
+
+Each shape has a reason:
+
+1. **Values** cross for free, and they're the right answer for almost everything passed between layers: models, view state, requests, results, errors.
+2. **A `Sendable` service** holds only immutable, `Sendable` things (a session, a URL, a decoder configuration), so there's nothing to protect.
+3. **An actor** owns state many callers share. Note the `inFlight` dictionary: an actor runs one piece of its code at a time, but at every `await` another caller can get in. Two cells asking for the same thumbnail would both load it without that check. You'll study this *reentrancy* properly in D22.
+4. **A `Mutex`** (Synchronization, iOS 18) protects state that must be reached synchronously: from a `deinit`, a synchronous API, or very hot code where an `await` would cost too much. It makes the class `Sendable` with the compiler's agreement.
+
+Two more exist, for the edges: `@unchecked Sendable` is *your* promise that a type synchronises itself, for example a legacy class guarded by a lock the compiler can't see; and `nonisolated(unsafe)` opts one variable out of checking. Both turn a compile-time proof back into a code-review hope, so keep them rare and write down why each is safe.
+
+## Handing over non-Sendable values
+
+Not everything has to be `Sendable`. Since Swift 6.0, **region-based isolation** lets a non-`Sendable` value cross a boundary when the compiler can prove the sender won't touch it again. A freshly built object can be handed to an actor; one that's still stored where the main actor can reach it can't:
+
+```swift
+@MainActor final class SettingsScreen {
+    let settings = Settings()            // a plain, non-Sendable class
+    let exporter = Exporter()            // an actor
+
+    func shareCurrent() async {
+        await exporter.export(settings)  // the main actor keeps using `settings`
+    }
+
+    func shareCopy() async {
+        let copy = Settings()
+        copy.theme = settings.theme
+        await exporter.export(copy)      // fine: nothing else can reach `copy`
+    }
+}
+```
+
+```text title="What you'll see"
+error: sending 'self.settings' risks causing data races
+```
+
+The `sending` keyword (SE-0430) puts the same idea in a signature: a parameter or result marked `sending` must be a value the caller is giving away. For design this means you don't need to make every type `Sendable`. Make the types that are *shared* `Sendable`, and let the ones that are *handed over* stay ordinary.
+
+## Where the main actor goes
+
+Most of an app is UI glue: views, view models, coordinators, navigation. That code belongs on the main actor, and fighting that only adds `await`s. A few components do heavy or blocking work: decoding big payloads, image processing, database work, cryptography. Those should leave the main actor, explicitly.
+
+Swift 6.2 (Xcode 26) makes this the default shape. An app target can set its **default isolation to the main actor** (SE-0466), so unannotated code is `@MainActor`, and new Xcode 26 app projects do. With **approachable concurrency** (SE-0461), a `nonisolated async` function runs on its caller's actor instead of hopping to a background thread, and you mark work that should run in the background with `@concurrent`. The design consequence is the same either way: **main actor by default, background by decision**, with each background component named and justified. Packages and frameworks keep the old default, nonisolated, because a library shouldn't assume it's used from the UI.
+
+## Protocols carry isolation
+
+Isolation is part of a protocol's contract, so decide it when you design the protocol:
+
+- **A `@MainActor` protocol** for UI-facing roles, such as a delegate a view controller implements: every conformer's requirements run on the main actor.
+- **A `Sendable` protocol** for services passed between domains, like `FeedLoading` above.
+- **An isolated conformance** (SE-0470, Swift 6.2) when a main-actor type must satisfy a nonisolated protocol such as `Equatable`: `extension Badge: @MainActor Equatable` is allowed, and the compiler stops that conformance being used off the main actor. Before 6.2, the only options were `nonisolated` requirements or `@preconcurrency`.
+
+<Callout kind="gotcha" title="Swift gotcha: an actor doesn't keep invariants across await">
+
+An actor serialises its code, but each `await` inside an actor method is a point where another call can run. `if token.isExpired { token = try await refresh() }` lets two callers both see an expired token and both refresh. Keep invariants true at every `await`, re-check state after one, and share in-flight work through a stored `Task`, as `ThumbnailCache` does.
+
+</Callout>
+
+## Trade-offs
+
+| | Sendable value | Sendable service (immutable) | Actor | Mutex-protected class | `@MainActor` class | `@unchecked Sendable` |
+| --- | --- | --- | --- | --- | --- | --- |
+| **Access** | copy anywhere | call anywhere | `async` from outside | synchronous | synchronous on main; `await` elsewhere | whatever you built |
+| **Safety proven by** | the compiler | the compiler | the compiler | the compiler | the compiler | you |
+| **Reentrancy to think about** | none | none | at every `await` | none (keep locks short) | at every `await` | depends |
+| **Best for** | data between layers | stateless services | shared mutable state, async callers | tiny shared state, sync or `deinit` access | UI and its state | wrapping legacy code |
+
+Values and stateless services should make up most crossings. Use one actor per shared *resource* (a cache, a token store, a database connection), not one per model object. Use a `Mutex` for small, hot or synchronous state. Keep `@unchecked Sendable` for legacy types, each with a comment saying what makes it safe.
+
+<Callout kind="interview">
+
+**Say:** "UI and its state on the main actor. Data between layers as `Sendable` values. One actor per shared resource, like the image cache or the token store, with in-flight work deduplicated. A `Mutex` where access must be synchronous. Heavy work leaves the main actor explicitly." Then point at the boundaries on your diagram.
+
+**Ask:** which state is shared, and by whom? What must be reachable synchronously? What's heavy enough to leave the main thread?
+
+**Red flags:** `@unchecked Sendable` or `nonisolated(unsafe)` to make errors go away; an actor for every class; "actors make it thread-safe" with no mention of reentrancy; `Task.detached` as the default way to get off the main actor.
+
+</Callout>
+
+## Practice
+
+The **seat hold** kata makes you choose between an actor and a lock for real: the box office's books must be updated from a `deinit`, which can't `await`.
+
+```cards
+- id: isolation-domain
+  front: "What is an isolation domain, as a design idea?"
+  back: "A boundary around mutable state: the main actor, an actor instance, or a task's locals. Inside, access is direct; anything crossing must be Sendable or handed over."
+- id: sendable-shapes
+  front: "What are the main ways to make something safe to cross domains?"
+  back: "A value of Sendable parts; an immutable final class or stateless service; an actor; a Mutex-protected class. `@unchecked Sendable` only when you can say why it's safe."
+- id: region-isolation
+  front: "When can a non-Sendable value cross into an actor?"
+  back: "When the compiler can prove the sender won't use it again (region-based isolation, Swift 6.0), such as a freshly created object. `sending` states it in a signature."
+- id: main-by-default
+  front: "Where should the main actor go in an app's design?"
+  back: "Main actor by default for UI glue (views, view models, coordinators); background only for named, heavy components. Swift 6.2 can make main-actor isolation the target default."
+```
+
+```quiz
+- id: q1
+  type: sort
+  prompt: "Which shape fits each piece of a feature?"
+  buckets: [Main actor, Actor, Sendable value, Mutex-protected class]
+  items:
+    - [A feed screen's view model, 0]
+    - [An image cache shared by every cell and a prefetcher, 1]
+    - [The posts passed from the repository to the view model, 2]
+    - [A request counter a synchronous logger reads, 3]
+    - [A token store that must refresh once for many callers, 1]
+    - [A decoded user profile, 2]
+  explain: "UI state lives on the main actor; shared mutable resources with async callers are actors; data crossing layers is values; small state needed synchronously goes behind a lock."
+- id: q2
+  type: mcq
+  prompt: "A `@MainActor` view model passes its stored property `settings`, a plain mutable class, to an actor's method. What happens in Swift 6?"
+  options:
+    - "It compiles, and the actor gets a copy"
+    - "A compile error: sending it risks a data race, because the main actor can still reach it"
+    - "It compiles, but crashes at run time"
+    - "It compiles, because actors make everything thread-safe"
+  answer: 1
+  explain: "The value is still reachable from the main actor, so both domains could touch it at once. A freshly created object, never used again by the sender, could be handed over; a stored one can't."
+- id: q3
+  type: truefalse
+  prompt: "Marking a class `@unchecked Sendable` makes it thread-safe."
+  answer: false
+  explain: "It only tells the compiler to stop checking. The class is safe only if you made it so, for example with a lock around every access. Otherwise you've hidden a data race."
+- id: q4
+  type: mcq
+  prompt: "An actor's `validToken()` checks `if token.isExpired { token = try await refresh() }`. Two callers arrive at once with an expired token. What happens?"
+  options:
+    - "One refresh: the actor runs one call at a time"
+    - "Two refreshes: the first call suspends at `await`, and the second runs and sees the token still expired"
+    - "A deadlock"
+    - "A compile error"
+  answer: 1
+  explain: "Actors are reentrant: while one call is suspended, another may run. Store the refresh as a `Task` and have later callers await that task, so only one refresh happens."
+- id: q5
+  type: mcq
+  prompt: "In an app target built with Swift 6.2's default main-actor isolation, what is a new `final class ReportFormatter` with no annotations?"
+  options:
+    - "Nonisolated, as before"
+    - "Isolated to the main actor"
+    - "An actor"
+    - "Automatically `Sendable` and nonisolated"
+  answer: 1
+  explain: "With default isolation set to `MainActor`, unannotated declarations in that module are main-actor isolated. Code that should run elsewhere says so with `nonisolated`, `@concurrent` or an actor."
+- id: q6
+  type: multi
+  prompt: "Which of these are safe to share across isolation domains?"
+  options:
+    - "A struct whose stored properties are all `Sendable`"
+    - "A final class with only `let` properties of `Sendable` types"
+    - "An actor"
+    - "A final class whose mutable state is behind a `Mutex`"
+    - "A class with `var` properties and no synchronisation, marked `@unchecked Sendable`"
+  answer: [0, 1, 2, 3]
+  explain: "Values, immutable classes, actors and properly locked classes are all genuinely safe. The last one compiles, but `@unchecked` only silences the check: it still races."
+```

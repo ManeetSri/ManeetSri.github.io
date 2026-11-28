@@ -1,0 +1,222 @@
+## Why it matters
+
+Hexagonal, onion and clean architecture come up in almost every architecture discussion, often as if they were three rival schools. They're one idea with three sets of names: put the business rules at the centre, make every dependency point towards them, and keep frameworks at the edges. You'll study them properly in D30; this lesson gives you the core idea, how it differs from the layered style you met earlier in this module, and enough to recognise it and argue about it.
+
+## The one arrow that changes
+
+In the [layered style](/design/learn/sd-styles-layered), dependencies run top to bottom: presentation → domain → data. That means the domain, your most important code, depends on the data layer's types. Change the persistence layer's interface and the business rules change with it.
+
+These styles turn that one arrow round. **The domain defines the interfaces it needs; the data layer implements them.** Now everything points inwards:
+
+- The **core** (domain and use cases) depends on nothing outside itself: no UIKit, no SwiftUI, no SwiftData, no `URLSession`.
+- The **outer parts** (UI, persistence, networking, the OS) depend on the core.
+
+That's the dependency inversion principle from D04 ([the policy owns the abstraction](/design/learn/sd-solid-dip)) applied to the whole architecture.
+
+## Three names for one shape
+
+- **Hexagonal, or ports and adapters** (Alistair Cockburn, 2005). The application sits inside a boundary. It talks to the outside world only through **ports**, interfaces it defines, and **adapters** plug real technology into those ports. The hexagon is only a drawing with room for many ports; six sides have no meaning.
+- **Onion** (Jeffrey Palermo, 2008). The same idea drawn as rings: the domain model at the centre, domain services around it, application services next, and infrastructure and UI on the outside. Dependencies point inwards across the rings.
+- **Clean** (Robert C. Martin, 2012). Rings again: **entities** (enterprise rules), **use cases** (application rules), **interface adapters** (presenters, controllers, gateways) and **frameworks and drivers** (UI, database, web). Its one rule, the **dependency rule**: source code dependencies point only inwards.
+
+### Driving and driven adapters
+
+Hexagonal adds a useful distinction. **Driving** (primary) adapters call *into* the core: a SwiftUI view, an App Intent, a push handler, a test. **Driven** (secondary) adapters are called *by* the core through its ports: the payment SDK, the SwiftData store, the Keychain. Tests are the telling case: to the core, a unit test is another driving adapter, and a fake is another driven one.
+
+## Ports and adapters in Swift
+
+```swift run title="A use case with two ports, and adapters plugged in"
+// MARK: The core. No UIKit, SwiftData or URLSession: only the rules, and the ports they need.
+struct Order: Sendable {
+    let id: String
+    let totalPence: Int
+    let receipt: String
+}
+
+enum CheckoutError: Error {
+    case emptyBasket
+    case declined
+}
+
+/// A port: what the core needs from a payment provider, in the core's own words
+protocol PaymentPort: Sendable {
+    func charge(pence: Int, reference: String) async throws -> String
+}
+
+/// A port for keeping orders, whatever the storage turns out to be
+protocol OrderStorePort: Sendable {
+    func save(_ order: Order) async throws
+}
+
+/// The use case. It depends on the ports above, never on an adapter.
+struct PlaceOrder: Sendable {
+    let payments: any PaymentPort
+    let store: any OrderStorePort
+
+    func callAsFunction(id: String, itemPence: [Int]) async throws -> Order {
+        guard !itemPence.isEmpty else { throw CheckoutError.emptyBasket }
+        let total = itemPence.reduce(0, +)
+        let receipt = try await payments.charge(pence: total, reference: id)
+        let order = Order(id: id, totalPence: total, receipt: receipt)
+        try await store.save(order)
+        return order
+    }
+}
+
+// MARK: Driven adapters: they import the core and implement its ports
+struct FakeCardGateway: PaymentPort {
+    let declinesOver: Int
+    func charge(pence: Int, reference: String) async throws -> String {
+        guard pence <= declinesOver else { throw CheckoutError.declined }
+        return "rcpt-\(reference)"
+    }
+}
+
+actor InMemoryOrderStore: OrderStorePort {
+    private(set) var saved: [String] = []
+    func save(_ order: Order) async throws { saved.append(order.id) }
+}
+
+// MARK: A driving adapter: here a script; in the app, a SwiftUI button or an App Intent
+let store = InMemoryOrderStore()
+let placeOrder = PlaceOrder(payments: FakeCardGateway(declinesOver: 5000), store: store)
+
+for (id, items) in [("A12", [1200, 650]), ("A13", [4000, 3000]), ("A14", [])] {
+    do {
+        let order = try await placeOrder(id: id, itemPence: items)
+        print("\(id): placed, \(order.totalPence)p, receipt \(order.receipt)")
+    } catch {
+        print("\(id): failed, \(error)")
+    }
+}
+print("Saved:", await store.saved)
+```
+
+```output
+A12: placed, 1850p, receipt rcpt-A12
+A13: failed, declined
+A14: failed, emptyBasket
+Saved: ["A12"]
+```
+
+The port is named after what the core *needs*, `charge(pence:reference:)`, not after a vendor's API. That's deliberate: when you replace one payment provider with another, only an adapter changes. In the real app, a `StripePaymentAdapter` in its own module would import both the core and the vendor's SDK, and translate between them.
+
+## Seeing the arrows point in
+
+```visual flow
+title: Ports at the edge of the core, adapters outside
+nodes:
+  - { id: ui, label: SwiftUI view, kind: view, at: [0, 0] }
+  - { id: intent, label: App Intent, kind: client, at: [0, 1] }
+  - { id: test, label: Unit test, kind: client, at: [0, 2] }
+  - { id: payport, label: PaymentPort, kind: service, at: [2, 0] }
+  - { id: usecase, label: PlaceOrder, kind: service, at: [2, 1] }
+  - { id: storeport, label: OrderStorePort, kind: service, at: [2, 2] }
+  - { id: stripe, label: Payment SDK adapter, kind: external, at: [4, 0] }
+  - { id: swiftdata, label: SwiftData adapter, kind: db, at: [4, 2] }
+groups:
+  - { id: core, label: Core (no frameworks), nodes: [payport, usecase, storeport] }
+edges:
+  - [ui, usecase, place]
+  - [intent, usecase, place]
+  - [test, usecase, place]
+  - [usecase, payport]
+  - [usecase, storeport]
+  - [stripe, payport, implements, { style: data }]
+  - [swiftdata, storeport, implements, { style: data }]
+steps:
+  - say: The **core** holds the use case and the **ports** it needs, written in its own words. Nothing in it imports a framework.
+    active: [core]
+  - say: "**Driving adapters** call in: a SwiftUI view, an App Intent, a unit test. The core can't tell them apart."
+    send: [ui->usecase, intent->usecase, test->usecase]
+  - say: The use case calls its ports, not any particular technology.
+    send: [usecase->payport, usecase->storeport]
+  - say: "**Driven adapters** implement the ports. Their arrows point *inwards*: the SwiftData adapter imports the core, never the other way round. Swap one for a fake and the core doesn't change."
+    send: [stripe->payport, swiftdata->storeport]
+    state: { stripe: ok, swiftdata: ok }
+```
+
+## Compared with layered
+
+| | Layered | Hexagonal, onion, clean |
+| --- | --- | --- |
+| Domain depends on | The data layer's interfaces | Nothing outside the core |
+| Who owns the repository protocol | The data layer | The domain |
+| Swapping storage or a vendor | Touches the domain if the interface changes | Write a new adapter |
+| Testing the rules | Fake the layer below | Fake the ports; the core runs with no frameworks |
+| Code you write | Less | More: ports, adapters, mapping between models |
+| Risk | Business rules shaped by the database | Ceremony: ports with one adapter forever, mapping layers that copy fields |
+
+For a small app whose domain is "show what the server returns", inverting every dependency is mostly ceremony. It pays off when the rules are valuable and outlive the technology: pricing, eligibility, sync and conflict rules, anything you'd want to run unchanged after replacing the backend, the database or the UI framework.
+
+<Callout kind="interview">
+
+**Say:** the rule, not the rings. "The domain owns the protocols it needs, and the infrastructure implements them, so the rules don't import SwiftData or the payment SDK." Then say where you'd stop: "For read-only screens I wouldn't add a use case and a mapping layer."
+
+**Ask:** how long the app will live, how much real logic it has, and which technologies are likely to change.
+
+**Red flags:** reciting the four rings without being able to say which way an import points; one protocol and one implementation for every class "for testability"; copying identical structs between three layers for no reason.
+
+</Callout>
+
+<Callout kind="gotcha" title="Swift gotcha: the protocol has to live in the core's module">
+
+Writing `protocol OrderStorePort` doesn't invert anything on its own. If the protocol sits in the `Persistence` module, the core still has to `import Persistence` to use it, and the arrow still points outwards. The port must be declared in the core's module, and the adapter's module imports the core. Check the `dependencies:` in `Package.swift`: that's where the direction is real.
+
+</Callout>
+
+```cards
+- id: dependency-rule
+  front: "What is the dependency rule shared by hexagonal, onion and clean?"
+  back: "Source code dependencies point only inwards, towards the domain. The core defines the interfaces it needs; frameworks and infrastructure implement them."
+- id: ports-adapters
+  front: "Port vs adapter?"
+  back: "A port is an interface the core defines in its own terms (`PaymentPort`). An adapter connects a real technology to it: driving adapters call into the core (UI, tests), driven adapters implement its ports (SDKs, storage)."
+- id: layered-difference
+  front: "What's the one difference from classic layering?"
+  back: "In layering, the domain depends on the data layer's interfaces. Here the domain owns those interfaces and the data layer depends on the domain."
+```
+
+```quiz
+- id: q1
+  type: mcq
+  prompt: "Which `Package.swift` dependencies follow the dependency rule?"
+  options:
+    - "`Checkout` → `Persistence`, where `Persistence` declares `OrderStore` and implements it"
+    - "`Persistence` → `Checkout`, where `Checkout` declares `OrderStorePort` and `Persistence` implements it"
+    - "`Checkout` and `Persistence` both depend on `Utilities`, which declares every protocol"
+    - "`Checkout` → `SwiftData`, so the domain can use `@Model` types directly"
+  answer: 1
+  explain: "The core declares the port and the adapter's module imports the core. In the first option the core still depends on persistence; a shared `Utilities` module only hides the coupling."
+- id: q2
+  type: sort
+  prompt: "Driving or driven adapter?"
+  buckets: [Driving (calls into the core), Driven (implements a port)]
+  items:
+    - [A SwiftUI checkout view, 0]
+    - [A Keychain-backed token store, 1]
+    - [A unit test of PlaceOrder, 0]
+    - [A wrapper around the payment provider's SDK, 1]
+    - ["An App Intent for \"Reorder my usual\"", 0]
+    - [A fake payment gateway used in tests, 1]
+  explain: "Driving adapters start work in the core; driven adapters are what the core uses through its ports. Tests can play both roles: the test drives, and its fakes are driven."
+- id: q3
+  type: truefalse
+  prompt: "Hexagonal architecture requires exactly six ports."
+  answer: false
+  explain: "The hexagon is only a drawing that leaves room for several ports. Cockburn's point is ports and adapters, however many you need."
+- id: q4
+  type: mcq
+  prompt: "A three-screen app shows a list from one endpoint and has no rules of its own. A teammate proposes entities, use cases, repositories, ports, adapters and mappers for each screen. Your view?"
+  options:
+    - "Agree: Clean Architecture is the professional standard"
+    - "Keep it simple: a view model and an API client behind one protocol is enough until real rules appear"
+    - "Put the networking in the views"
+    - "Agree, but only for the largest screen"
+  answer: 1
+  explain: "The inversion pays off when valuable rules must survive changing technology. With no rules, it adds files without adding protection. One protocol at the network boundary keeps it testable."
+- id: q5
+  type: recall
+  prompt: "In two or three sentences, explain to a teammate how a `PaymentPort` lets you change payment providers without touching checkout's rules."
+  model: "Checkout's rules depend only on `PaymentPort`, an interface the core defines in its own terms (charge an amount, get a receipt). Each provider gets an adapter in its own module that implements the port using that provider's SDK. Changing providers means writing a new adapter and wiring it in at the composition root; the use case and its tests don't change."
+```

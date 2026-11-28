@@ -1,0 +1,146 @@
+Once your app ships its own log events, `Logger`'s privacy annotations no longer protect anything: whatever is in a field reaches your backend. Write the formatter every event passes through before it leaves the device. Each field declares its privacy, and the formatter adds defence in depth: dangerous keys never leave, public strings are scanned for personal data, and every event stays within a size budget.
+
+`DiagLogRedactor.record(for:policy:) -> [String: Value]` and `DiagLogRedactor.jsonLine(for:) -> String`
+
+**Which fields are kept.** Go through `event.fields` in order:
+
+1. A field whose key, lowercased, contains any of `policy.deniedKeyFragments` (lowercased), or whose key is one of the reserved keys `event`, `level` and `dropped_fields`, is dropped and **counted**, whatever privacy it declared.
+2. A field declared `.dropped` is left out and **not** counted: the call site asked for that.
+3. A field whose key was already kept is dropped and counted: the first one wins.
+4. Once `policy.maxFields` fields are kept, every later field is dropped and counted.
+
+**What each kept field's value becomes.**
+
+| Privacy | Value in the record |
+| --- | --- |
+| `.public` int or bool | Unchanged |
+| `.public` string | `"<redacted>"` if it looks personal (below); otherwise unchanged, or cut to `maxStringLength` characters ending in `"…"` if it's longer |
+| `.hashed` | `"h:"` and the 64-bit FNV-1a hash of `salt`, `":"` and the value's text, as 16 lowercase hex digits. An int's text is its decimal digits; a bool's is `true` or `false`. |
+| `.redacted` | `"<redacted>"` |
+
+A public string **looks personal** if it contains an email address (some characters that aren't spaces or `@`, an `@`, then characters that aren't spaces or `@` with a `.` among them and at least one after it), or nine or more digits in a row, where a single space or dash may separate digits.
+
+**The record** has `"event"` (the event's name), `"level"`, one entry per kept field under its key, and `"dropped_fields"` with the count, but only when the count is more than 0.
+
+**The JSON line** is the record as one JSON object: keys sorted, no spaces, strings escaped, ints and bools as JSON numbers and booleans.
+
+## Examples
+
+With `Policy(salt: "s1")`, the defaults: denied fragments `password`, `token`, `secret`, `authorization` and `cookie`, 120 characters, 16 fields.
+
+| Field | In the record |
+| --- | --- |
+| `Field("attempts", .int(3), .public)` | `"attempts": .int(3)` |
+| `Field("email", .string("maneet@example.com"), .hashed)` | `"email": "h:5272c8dcde2de2f2"` |
+| `Field("store", .int(42), .hashed)` | `"store": "h:5e2b4a7ee226aa0f"` |
+| `Field("search", .string("red shoes"), .redacted)` | `"search": "<redacted>"` |
+| `Field("note", .string("card 4111 1111 1111 1111"), .public)` | `"note": "<redacted>"` |
+| `Field("note", .string("order 12345678"), .public)` | `"note": "order 12345678"`: only eight digits |
+| `Field("AuthToken", .string("eyJhbGciOi"), .public)` | left out, and `"dropped_fields": .int(1)` |
+| `Field("debug_dump", .string("…"), .dropped)` | left out, not counted |
+| Two fields with the key `screen` | the first one, and `"dropped_fields": .int(1)` |
+
+`jsonLine(for: ["level": .string("info"), "ok": .bool(true), "event": .string("a.b"), "n": .int(3)])` returns `{"event":"a.b","level":"info","n":3,"ok":true}`.
+
+## Constraints
+
+- Pure functions of the event and the policy: the same input always gives the same record, which is what makes hashed values useful for correlation.
+- Count characters, not bytes, when cutting strings, and never split a character.
+- FNV-1a 64-bit starts from `0xcbf29ce484222325` and, for each UTF-8 byte, XORs the byte in and multiplies by `0x100000001b3`, wrapping on overflow (`&*`).
+- FNV-1a keeps the kata deterministic and dependency-free, but it isn't a cryptographic hash, and short values like emails can be guessed by hashing candidates. Production code would use a keyed hash such as CryptoKit's `HMAC<SHA256>` with a secret salt.
+
+<Hints>
+<Hint>
+Do it in two passes. First decide which fields survive, counting the dropped ones in a single integer; then transform each survivor's value by its privacy. Mixing the two makes the counting rules hard to get right.
+</Hint>
+<Hint>
+Swift regex literals make the scan short: `/[^\s@]+@[^\s@]+\.[^\s@]+/` finds an email address and `/[0-9](?:[ -]?[0-9]){8,}/` nine or more digits with optional single separators. `text.contains(regex)` tests for a match anywhere.
+</Hint>
+<Hint>
+`JSONSerialization.data(withJSONObject:options:)` with `[.sortedKeys, .withoutEscapingSlashes]` writes exactly the line you need, once each `Value` is turned back into a `String`, `Int` or `Bool`.
+</Hint>
+</Hints>
+
+## Solutions
+
+<Approach title="Filter, then transform by privacy" time="O(total length of the fields)" space="O(number of fields)">
+
+```swift
+public static func record(for event: Event, policy: Policy) -> [String: Value] {
+    var dropped = 0
+    var seen = Set<String>()
+    var kept: [Field] = []
+    let fragments = policy.deniedKeyFragments.map { $0.lowercased() }
+
+    for field in event.fields {
+        let key = field.key.lowercased()
+        if fragments.contains(where: { key.contains($0) }) || reservedKeys.contains(field.key) {
+            dropped += 1
+        } else if field.privacy == .dropped {
+            continue
+        } else if seen.contains(field.key) {
+            dropped += 1
+        } else if kept.count == policy.maxFields {
+            dropped += 1
+        } else {
+            seen.insert(field.key)
+            kept.append(field)
+        }
+    }
+
+    var record: [String: Value] = ["event": .string(event.name), "level": .string(event.level)]
+    for field in kept {
+        record[field.key] = redact(field, policy: policy)
+    }
+    if dropped > 0 { record["dropped_fields"] = .int(dropped) }
+    return record
+}
+
+private static func redact(_ field: Field, policy: Policy) -> Value {
+    switch field.privacy {
+    case .redacted, .dropped:
+        return .string(redactedText)
+    case .hashed:
+        return .string(hashed(text(of: field.value), salt: policy.salt))
+    case .public:
+        guard case .string(let text) = field.value else { return field.value }
+        if looksPersonal(text) { return .string(redactedText) }
+        return .string(truncated(text, to: policy.maxStringLength))
+    }
+}
+
+private static func looksPersonal(_ text: String) -> Bool {
+    text.contains(/[^\s@]+@[^\s@]+\.[^\s@]+/) || text.contains(/[0-9](?:[ -]?[0-9]){8,}/)
+}
+
+private static func truncated(_ text: String, to limit: Int) -> String {
+    guard text.count > limit else { return text }
+    return String(text.prefix(max(0, limit - 1))) + "…"
+}
+
+private static func hashed(_ text: String, salt: String) -> String {
+    var hash: UInt64 = 0xcbf2_9ce4_8422_2325
+    for byte in "\(salt):\(text)".utf8 {
+        hash ^= UInt64(byte)
+        hash = hash &* 0x0000_0100_0000_01b3
+    }
+    let hex = String(hash, radix: 16)
+    return "h:" + String(repeating: "0", count: 16 - hex.count) + hex
+}
+
+public static func jsonLine(for record: [String: Value]) -> String {
+    let object: [String: Any] = record.mapValues { value -> Any in
+        switch value {
+        case .string(let text): text
+        case .int(let number): number
+        case .bool(let flag): flag
+        }
+    }
+    guard let data = try? JSONSerialization.data(withJSONObject: object, options: [.sortedKeys, .withoutEscapingSlashes]) else { return "{}" }
+    return String(decoding: data, as: UTF8.self)
+}
+```
+
+The order of the checks is the design. The deny list runs before anything else, so a call site that marks `authToken` as `.public` by mistake still can't leak it, and denied fields don't use up the field budget. Counting dropped fields, rather than silently discarding them, makes a misbehaving call site visible on the dashboard. The scan of public strings is deliberately crude and errs towards redacting: a false positive costs one unreadable field, while a false negative puts someone's card number in your log vendor's storage.
+
+</Approach>

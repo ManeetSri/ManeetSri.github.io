@@ -1,0 +1,339 @@
+## Why it matters
+
+Most bugs in shipped apps aren't in the happy path. They're in a transition nobody drew: the recording that resumes after a phone call when it shouldn't, the upload that retries after the user cancelled it. A state diagram puts every mode and every way between them on one page, where a product manager, a tester and you can all point at the missing arrow. An activity diagram does the same for a process with decisions and parallel steps. Both turn directly into Swift, and both come up whenever an interviewer asks "what states can this be in?"
+
+## State machine diagrams
+
+You built enum state machines in [Enum state machines](/design/learn/sd-functional-state-machines). A UML state machine diagram is the picture of one:
+
+- A **state** is a rounded rectangle: a mode in which the object behaves one way. Recording, Paused, Saving.
+- The **initial pseudostate** is a filled dot with an arrow to the first state. A **final state** is a dot inside a circle.
+- A **transition** is an arrow labelled `event [guard] / action`. The *event* triggers it, the *guard* must be true for it to fire, and the *action* runs as it fires: `ended [shouldResume] / resume engine`. All three parts are optional.
+- A state can list **internal activities**: `entry / start the timer`, `exit / stop the timer`, `do / write audio to disk`.
+- A **self-transition** (an arrow from a state back to itself) leaves and re-enters, so exit and entry run again. An *internal* transition, written inside the box, doesn't.
+
+### A voice recorder, walked event by event
+
+Recording audio on iOS has a mode that most first designs forget: an **interruption**. A phone call, a FaceTime call or an alarm takes the audio session away, and `AVAudioSession` posts an interruption notification with type `.began`, then later `.ended`, sometimes with a `.shouldResume` option. Step through the recorder's states:
+
+```visual states
+title: A voice recorder, including interruptions
+states:
+  - { id: idle, label: Idle, at: [0, 0] }
+  - { id: asking, label: Asking, at: [1, 0] }
+  - { id: recording, label: Recording, at: [2, 0] }
+  - { id: saving, label: Saving, at: [3, 0] }
+  - { id: saved, label: Saved, at: [4, 0] }
+  - { id: denied, label: Denied, at: [1, 1] }
+  - { id: interrupted, label: Interrupted, at: [2, 1] }
+  - { id: paused, label: Paused, at: [3, 1] }
+initial: idle
+final: [saved]
+transitions:
+  - [idle, asking, tapRecord]
+  - [asking, recording, granted]
+  - [asking, denied, refused]
+  - [denied, idle, dismiss]
+  - [recording, paused, pause]
+  - [paused, recording, resume]
+  - [recording, interrupted, began]
+  - [interrupted, recording, ended, shouldResume]
+  - [interrupted, paused, ended, not shouldResume]
+  - [recording, saving, stop]
+  - [paused, saving, stop]
+  - [saving, paused, saveFailed]
+  - [saving, saved, didSave]
+intro: "The recorder starts **Idle**. Every arrow below is a decision someone made; every missing arrow is one too."
+events:
+  - { event: tapRecord, say: "Tapping Record first asks for microphone permission. The **Asking** state exists because that prompt is asynchronous and the user can refuse." }
+  - { event: granted, say: "Permission granted: **Recording**." }
+  - { event: began, say: "A phone call arrives. The system takes the audio session, and the recorder must notice, or it will think it's recording silence." }
+  - { event: ended, guard: not shouldResume, say: "The call ends without `.shouldResume`, so the guard sends the recorder to **Paused**, not back to Recording. Resuming on its own would record the user's next conversation." }
+  - { event: resume, say: "The user resumes when they're ready." }
+  - { event: stop, say: "Stop: **Saving** writes the file and its metadata." }
+  - { event: saveFailed, say: "The disk is full. The failure goes back to **Paused**, so the recording is still there to save again. A diagram with no arrow out of Saving would have lost it." }
+  - { event: stop, say: "The user frees some space and stops again." }
+  - { event: didSave, say: "Saved, the final state: the recorder's work is done." }
+```
+
+### The same diagram, in Swift
+
+Each arrow becomes one `case` line. The guard becomes a condition on the event's data. Everything not listed is ignored, and listing the states explicitly instead of writing `default` means a new state can't silently ignore everything:
+
+```swift run title="The recorder's transitions"
+enum RecorderState {
+    case idle, asking, denied, recording, interrupted, paused, saving, saved
+}
+
+enum RecorderEvent {
+    case tapRecord, granted, refused, dismiss
+    case pause, resume, stop
+    case began, ended(shouldResume: Bool)
+    case didSave, saveFailed
+}
+
+/// One line per arrow on the diagram. A pair that isn't listed is an event the state ignores.
+func next(_ state: RecorderState, on event: RecorderEvent) -> RecorderState? {
+    switch (state, event) {
+    case (.idle, .tapRecord): .asking
+    case (.asking, .granted): .recording
+    case (.asking, .refused): .denied
+    case (.denied, .dismiss): .idle
+    case (.recording, .pause): .paused
+    case (.paused, .resume): .recording
+    case (.recording, .began): .interrupted
+    case (.interrupted, .ended(let shouldResume)): shouldResume ? .recording : .paused
+    case (.recording, .stop), (.paused, .stop): .saving
+    case (.saving, .didSave): .saved
+    case (.saving, .saveFailed): .paused
+    case (.idle, _), (.asking, _), (.denied, _), (.recording, _), (.interrupted, _),
+         (.paused, _), (.saving, _), (.saved, _): nil
+    }
+}
+
+var state = RecorderState.idle
+let events: [RecorderEvent] = [
+    .tapRecord, .granted, .began, .ended(shouldResume: false), .resume,
+    .stop, .saveFailed, .stop, .didSave, .pause,
+]
+for event in events {
+    if let after = next(state, on: event) {
+        print("\(state) --\(event)--> \(after)")
+        state = after
+    } else {
+        print("\(state) ignores \(event)")
+    }
+}
+```
+
+```output
+idle --tapRecord--> asking
+asking --granted--> recording
+recording --began--> interrupted
+interrupted --ended(shouldResume: false)--> paused
+paused --resume--> recording
+recording --stop--> saving
+saving --saveFailed--> paused
+paused --stop--> saving
+saving --didSave--> saved
+saved ignores pause
+```
+
+The diagram and the switch are the same information in two forms. That's what makes the diagram worth keeping: a tester can read every line of it, and a reviewer can check the code against it one arrow at a time. The last line of output is the question to ask of every state: *should it ignore this event, or did we forget an arrow?*
+
+### Composite states: fewer arrows, different meaning
+
+Recording, Paused and Interrupted share behaviour: from any of them, Stop should save. UML lets you draw a **composite state** around them, with one `stop` arrow leaving its border. PlantUML writes it like this:
+
+```text title="recorder.puml"
+@startuml
+[*] --> Idle
+Idle --> Asking : tapRecord
+Asking --> Denied : refused
+Denied --> Idle : dismiss
+Asking --> Active : granted
+state Active {
+  [*] --> Recording
+  Recording --> Paused : pause
+  Paused --> Recording : resume
+  Recording --> Interrupted : began
+  Interrupted --> Recording : ended [shouldResume]
+  Interrupted --> Paused : ended [else]
+}
+Active --> Saving : stop
+Saving --> Paused : saveFailed
+Saving --> Saved : didSave
+Saved --> [*]
+@enduml
+```
+
+It's tidier, and it **changes the behaviour**: the arrow from the border means Stop now works from Interrupted too, which the flat diagram didn't allow. That may be what you want; the point is that redrawing a state diagram is a design decision, not a formatting one. Two related tools:
+
+- A **history pseudostate**, a circled H inside the composite, means "come back to whichever substate you were in". It's how you'd draw "after the save fails, return to where you were".
+- **Orthogonal regions**, separated by a dashed line inside one state, are independent machines running at once, such as a podcast app's *playback* state and its *download* state. In Swift they're two enums side by side, not one enum with every combination.
+
+## Activity diagrams
+
+An activity diagram is a flowchart with precise rules, for a **process**: what happens, in which order, with decisions and parallel work. Its parts:
+
+- **Actions** are rounded rectangles; arrows between them are the flow.
+- A **decision** is a diamond with guarded arrows out of it; a **merge** diamond joins the branches again.
+- A **fork** is a thick bar that splits the flow into parallel branches; a **join** bar waits for all of them.
+- **Swimlanes** (partitions) show who does each action: the user, the app, the system, the server.
+- The initial node is a filled dot, the final node a dot in a circle.
+
+Use one when the question is "what does this process do?" rather than "what mode is this object in?". A good iOS example is background refresh: the system wakes the app, the app does some work in parallel, and it must report back before its time runs out:
+
+```text title="background-refresh.puml"
+@startuml
+title News app: background refresh
+|System|
+start
+:Wake the app for an app refresh task;
+|App|
+:Schedule the next refresh;
+:Fetch the latest headlines;
+note right
+  If time runs out first, the expiration
+  handler cancels the fetch and the task
+  is reported as failed.
+end note
+if (New stories?) then (yes)
+  fork
+    :Save them to the cache;
+  fork again
+    :Reload the widget timelines;
+  end fork
+else (no)
+endif
+:Report the task complete;
+|System|
+:Suspend the app;
+stop
+@enduml
+```
+
+The swimlanes say who's responsible for each step, and the fork says which steps can run at once. In Swift, the fork is two child tasks and the join is the point where both have finished:
+
+```swift check ios title="Refresh.swift"
+import BackgroundTasks
+import WidgetKit
+
+protocol HeadlineSource: Sendable {
+    func latest() async throws -> [String]
+}
+
+protocol HeadlineCache: Sendable {
+    func newStories(in headlines: [String]) async -> [String]
+    func save(_ headlines: [String]) async
+}
+
+enum NewsRefresh {
+    static let identifier = "com.example.news.refresh"
+
+    /// The activity diagram, from "Schedule the next refresh" to "Report the task complete"
+    static func run(source: some HeadlineSource, cache: some HeadlineCache) async -> Bool {
+        schedule()
+        do {
+            let headlines = try await source.latest()
+            guard await !cache.newStories(in: headlines).isEmpty else { return true }
+            async let saved: Void = cache.save(headlines)   // fork: one branch
+            WidgetCenter.shared.reloadAllTimelines()         // fork: the other branch
+            await saved                                      // join
+            return true
+        } catch {
+            return false // includes cancellation when the system's time runs out
+        }
+    }
+
+    static func schedule() {
+        let request = BGAppRefreshTaskRequest(identifier: identifier)
+        request.earliestBeginDate = Date(timeIntervalSinceNow: 30 * 60)
+        try? BGTaskScheduler.shared.submit(request)
+    }
+}
+```
+
+With SwiftUI you'd call `run` from the scene's `.backgroundTask(.appRefresh(NewsRefresh.identifier))` modifier; when that closure returns, the task is reported complete, and when time runs out its work is cancelled. With UIKit you register a launch handler on `BGTaskScheduler`, set the task's `expirationHandler` and call `setTaskCompleted(success:)` yourself.
+
+## State or activity?
+
+They look alike and answer different questions:
+
+| | State diagram | Activity diagram |
+| --- | --- | --- |
+| Describes | One thing's modes over its lifetime | A process from start to finish |
+| Boxes are | Conditions that last (Recording) | Steps that happen (Fetch headlines) |
+| Arrows fire on | Events, often from outside | The previous step finishing |
+| Good for | Players, uploads, sessions, orders, connections | Launch sequences, background work, onboarding, checkout steps |
+| In Swift | An enum and a transition function | A function, with `async let` or task groups for forks |
+
+## Trade-offs
+
+| Way to describe behaviour | Shows every case | Readable by non-engineers | Checked by the compiler | When it wins |
+| --- | --- | --- | --- | --- |
+| State diagram | Yes, if you draw every arrow | Yes | No, but it maps one-to-one onto an enum | Anything with modes and events: players, uploads, sessions |
+| Composite states | Yes, with fewer arrows | Less so: borders change meaning | No | Machines with a dozen or more states sharing transitions |
+| Activity diagram | Every branch of a process | Yes, it's a flowchart | No | Processes with decisions, parallel steps and several actors |
+| A transition table (state × event) | Every pair, including ignored ones | Yes, as a spreadsheet | No | Reviewing completeness: empty cells are the questions |
+| The Swift enum alone | Yes, and exhaustively | No | Yes | Small machines the team reads in code |
+
+<Callout kind="interview">
+
+When a feature has a lifecycle (an upload, a call, an order, a ride), **draw its state diagram before its classes**: states, then events, then the failure arrows. **Say** the guard conditions out loud: "on `ended`, we only resume if the system says `shouldResume`". **Ask** what should happen to each event in each state, especially cancel and the app going to the background. **Red flags:** a happy path with no failure or cancel arrows, states that are really booleans combined (`isLoading && hasError`), and no final state, so nobody can say when the work is finished.
+
+</Callout>
+
+<Callout kind="gotcha" title="iOS gotcha: interruptions don't always end">
+
+`AVAudioSession` posts `.began` when an interruption starts, but there's no guarantee a matching `.ended` arrives: an app interrupted by a call may be suspended and never told. So Interrupted must not be a state you can only leave on `ended`. Add an arrow out of it for the app becoming active again, and decide what a recording that was interrupted and never resumed should become.
+
+</Callout>
+
+## Practice
+
+**State diagram lint** has you write the checks a reviewer runs on a state diagram (unreachable states, dead ends, ambiguous transitions) and render the diagram as Mermaid text, so a diagram in a pull request can be checked like code. **Component view of a podcast app** asks for the state diagram of an episode download, as part of designing who owns which state.
+
+```cards
+- id: state-transition-label
+  front: "What are the three parts of a UML transition label?"
+  back: "`event [guard] / action`: the event that triggers it, the condition that must hold for it to fire, and what runs as it fires. All three are optional."
+- id: state-missing-arrow
+  front: "What question does a state diagram make you ask of every state?"
+  back: "For each event, should this state handle it or ignore it? Every missing arrow is a decision, and the forgotten ones are where the bugs are."
+- id: composite-state-meaning
+  front: "What does drawing a transition from a composite state's border mean?"
+  back: "It fires from every substate inside it. Wrapping states in a composite can change behaviour, such as letting Stop work from Interrupted, so it's a design decision, not tidying."
+- id: state-vs-activity
+  front: "When do you draw an activity diagram instead of a state diagram?"
+  back: "When the question is what a process does, step by step, with decisions, parallel branches and several actors, rather than which modes one object can be in."
+```
+
+```quiz
+- id: q1
+  type: mcq
+  prompt: "A transition on a download's state diagram is labelled `failed [attempts < 3] / schedule retry`. When the download fails for the third time, what happens on this arrow?"
+  options:
+    - "It fires, and the retry is scheduled"
+    - "It doesn't fire, because the guard is false; another transition must handle the third failure, or the event is ignored"
+    - "It fires, but the action is skipped"
+    - "The state machine crashes"
+  answer: 1
+  explain: "A guard must be true for its transition to fire. With three attempts used, `attempts < 3` is false, so some other arrow, typically `failed [attempts = 3]` to a Failed state, has to exist, or the failure is silently ignored."
+- id: q2
+  type: sort
+  prompt: "State diagram or activity diagram: which suits each?"
+  buckets: [State diagram, Activity diagram]
+  items:
+    - ["An upload that can be queued, sending, paused, failed or done", 0]
+    - ["The steps of first-launch onboarding, with a branch for returning users", 1]
+    - ["A WebSocket connection that connects, drops and reconnects", 0]
+    - [What background refresh does when the system wakes the app, 1]
+    - ["An order that's placed, accepted, out for delivery or cancelled", 0]
+  explain: "Things with lasting modes that change on events are state diagrams: uploads, connections, orders. Processes made of steps, branches and parallel work are activity diagrams: onboarding and background refresh."
+- id: q3
+  type: multi
+  prompt: "Reviewing the voice recorder's diagram, which of these are real gaps worth raising? Choose all that apply."
+  options:
+    - "No arrow out of Interrupted for when the app becomes active again without an `ended` notification"
+    - "No arrow for what happens when the app moves to the background while Recording"
+    - "The states are drawn in different colours"
+    - "No way to cancel a recording without saving it"
+  answer: [0, 1, 3]
+  explain: "Each missing arrow is a behaviour nobody decided: interruptions that never end, backgrounding mid-recording, and discarding a take. Colours are presentation, not behaviour."
+- id: q4
+  type: truefalse
+  prompt: "Wrapping Recording, Paused and Interrupted in a composite state and drawing one `stop` arrow from its border describes exactly the same behaviour as the flat diagram."
+  answer: false
+  explain: "An arrow from the composite's border fires from every substate, so Stop now also works from Interrupted, which the flat diagram didn't allow. Redrawing changed the behaviour."
+- id: q5
+  type: mcq
+  prompt: "In the activity diagram for background refresh, what is the Swift equivalent of the fork and join around \"Save to the cache\" and \"Reload the widget timelines\"?"
+  options:
+    - "Two `if` statements one after the other"
+    - "Starting the save as a child task with `async let`, doing the reload, then awaiting the save"
+    - "A `switch` over the two actions"
+    - "A `DispatchQueue.main.async` call for each"
+  answer: 1
+  explain: "A fork starts branches that run at the same time, and a join waits for all of them. `async let` starts the save concurrently, and `await saved` is the join; a task group does the same for many branches."
+```

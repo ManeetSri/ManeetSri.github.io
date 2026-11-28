@@ -1,0 +1,329 @@
+## Why it matters
+
+Apps change most at their edges: the analytics vendor, the payment provider, the backend's next version, the OS that ships every September. The last three GRASP patterns decide where to put walls so that those changes stay small. They're behind two interview questions you should expect: "How would you integrate a third-party SDK?" and "How would you support two backends during a migration?"
+
+## Polymorphism: let each variant own its behaviour
+
+> When related alternatives vary by type, give the behaviour to the types themselves, through polymorphic operations, rather than testing the type with conditionals.
+
+The smell it removes is the same `if` or `switch` on "which kind is this?" repeated across the app: `if provider == .stripe` in checkout, in receipts, in refunds and in settings. Each new provider is a hunt through the codebase. With polymorphism, each variant is one type, responsible for its own behaviour, and adding a variant means adding a type.
+
+Swift gives you two tools, and [The expression problem: protocols vs enums](/design/learn/sd-solid-expression-problem) compares them in depth:
+
+- **A protocol** when the set of variants is open: new providers, new vendors, new card types are likely.
+- **An enum with `switch`** when the set is closed and you'd rather add operations, with the compiler checking every `switch` is exhaustive.
+
+GRASP's contribution isn't the mechanism. It's the assignment: the knowledge of "how vendor B wants its events" belongs to one vendor-B type, not to every caller.
+
+## Indirection: put something in between
+
+> Give a responsibility to an intermediate object that mediates between other components, so they aren't coupled directly.
+
+You've used indirection all through iOS:
+
+- A protocol between a view model and the network, so tests can substitute a stub.
+- A coordinator between screens, so a screen doesn't know which screen comes next (D20).
+- `NotificationCenter` between a producer and its observers.
+- A `Clock` between code and time, so tests can use a test clock instead of waiting.
+- An adapter between your app and a vendor's SDK.
+
+David Wheeler's line, "all problems in computer science can be solved by another level of indirection", is usually quoted with its corollary: *except the problem of too many levels of indirection.* Every hop is another file to read, a "jump to definition" that lands on a protocol, and a place for behaviour to hide. Indirection has to **buy** something: freedom to change one side alone, a test seam, or a boundary between teams.
+
+## Protected variations: wall off what's predicted to change
+
+> Identify points of predicted variation or instability, and assign responsibilities to create a stable interface around them.
+
+Larman calls this the root principle that most others serve. It's the same idea as David Parnas's 1972 paper on decomposing systems into modules: hide each **design decision likely to change** behind an interface. Polymorphism and indirection are two of the mechanisms; open–closed from [Open–closed: extending with protocols and enums](/design/learn/sd-solid-ocp) is the same goal seen from the other side.
+
+The important word is **predicted**. Larman separates two kinds of point:
+
+- **Variation points** exist now: the app already has two payment providers, or the backend runs v1 and v2 side by side during a migration. Protect these.
+- **Evolution points** are guesses about the future: "we might switch database one day." Be sparing, as [KISS, YAGNI and least astonishment](/design/learn/sd-principles-simplicity) argued, unless the wall is cheap.
+
+On iOS, these are usually worth a wall:
+
+- **Third-party SDKs** for analytics, crash reporting, ads, payments and maps. They churn: deprecations, privacy manifest requirements, vendor switches. A thin wall costs a day and repays itself at the first change.
+- **The backend API** and its versions, behind your networking layer (D33).
+- **The persistence technology**, as the store in [GRASP: low coupling, high cohesion and pure fabrication](/design/learn/sd-principles-grasp-balance) showed.
+- **OS-version differences**, which arrive every year.
+- **Time, randomness, locale and connectivity**, mostly so tests can control them.
+
+And these usually aren't: Foundation, the standard library, SwiftUI and UIKit themselves, and your own stable domain types. A protocol wrapping `UIView` protects you from a change that isn't coming and costs every reader a hop.
+
+## Worked example: analytics behind a stable interface
+
+Here are all three patterns in one small design. Features describe events in the app's own vocabulary; a tracker sits between features and vendors; one adapter per vendor does the translation.
+
+```swift run title="Features speak the app's language; adapters speak the vendors'"
+// The app's own vocabulary: designed from what features need, not from any vendor's API
+enum AnalyticsEvent {
+    case screenViewed(name: String)
+    case addedToCart(productID: String, quantity: Int)
+    case checkoutCompleted(totalPence: Int)
+
+    var name: String {
+        switch self {
+        case .screenViewed: "screen_viewed"
+        case .addedToCart: "added_to_cart"
+        case .checkoutCompleted: "checkout_completed"
+        }
+    }
+
+    var properties: [String: String] {
+        switch self {
+        case .screenViewed(let name): ["screen": name]
+        case .addedToCart(let id, let quantity): ["product_id": id, "quantity": "\(quantity)"]
+        case .checkoutCompleted(let total): ["total_pence": "\(total)"]
+        }
+    }
+}
+
+// Polymorphism: each provider is responsible for its own vendor's format
+protocol AnalyticsProvider {
+    func send(_ event: AnalyticsEvent)
+}
+
+struct VendorAAdapter: AnalyticsProvider {
+    func send(_ event: AnalyticsEvent) {
+        let properties = event.properties.sorted { $0.key < $1.key }.map { "\($0.key): \($0.value)" }
+        print("VendorA.logEvent(\(event.name), [\(properties.joined(separator: ", "))])")
+    }
+}
+
+struct VendorBAdapter: AnalyticsProvider {
+    func send(_ event: AnalyticsEvent) {
+        if case .screenViewed(let name) = event {
+            print("VendorB.screen(\(name))")          // vendor B has a separate screen API
+        } else {
+            let title = event.name.split(separator: "_").map { $0.prefix(1).uppercased() + $0.dropFirst() }
+            print("VendorB.track(\(title.joined(separator: " ")))")
+        }
+    }
+}
+
+// Indirection: features talk to this, never to a vendor; consent is checked in one place
+final class Analytics {
+    private let providers: [any AnalyticsProvider]
+    private let hasConsent: () -> Bool
+
+    init(providers: [any AnalyticsProvider], hasConsent: @escaping () -> Bool) {
+        self.providers = providers
+        self.hasConsent = hasConsent
+    }
+
+    func track(_ event: AnalyticsEvent) {
+        guard hasConsent() else { return }
+        for provider in providers {
+            provider.send(event)
+        }
+    }
+}
+
+let analytics = Analytics(providers: [VendorAAdapter(), VendorBAdapter()], hasConsent: { true })
+analytics.track(.screenViewed(name: "orders"))
+analytics.track(.addedToCart(productID: "p1", quantity: 2))
+```
+
+```output
+VendorA.logEvent(screen_viewed, [screen: orders])
+VendorB.screen(orders)
+VendorA.logEvent(added_to_cart, [product_id: p1, quantity: 2])
+VendorB.track(Added To Cart)
+```
+
+In a real app the adapters call the vendors' SDKs instead of printing, and they're the **only** files that import them. Now watch what a vendor change costs:
+
+```visual flow
+title: Replacing an analytics vendor
+groups:
+  - { id: adapters, label: Adapters, nodes: [adapterA, adapterB, adapterC] }
+nodes:
+  - { id: orders, label: Orders, kind: view, at: [0, 0] }
+  - { id: cart, label: Cart, kind: view, at: [0, 1] }
+  - { id: checkout, label: Checkout, kind: view, at: [0, 2] }
+  - { id: tracker, label: Analytics, at: [1.6, 1] }
+  - { id: adapterA, label: Vendor A adapter, at: [3, 0.3] }
+  - { id: adapterB, label: Vendor B adapter, at: [3, 1.3] }
+  - { id: adapterC, label: Vendor C adapter, at: [3, 2.3] }
+  - { id: vendorA, label: Vendor A SDK, kind: external, at: [4.3, 0.3] }
+  - { id: vendorB, label: Vendor B SDK, kind: external, at: [4.3, 1.3] }
+  - { id: vendorC, label: Vendor C SDK, kind: external, at: [4.3, 2.3] }
+edges:
+  - [orders, tracker]
+  - [cart, tracker]
+  - [checkout, tracker]
+  - [tracker, adapterA]
+  - [tracker, adapterB]
+  - [tracker, adapterC]
+  - [adapterA, vendorA]
+  - [adapterB, vendorB]
+  - [adapterC, vendorC]
+steps:
+  - say: "The cart calls `analytics.track(.addedToCart(...))`, in the app's own vocabulary. It doesn't know any vendor exists."
+    show: [cart, tracker]
+    send: cart->tracker
+  - say: "Every feature calls the same small interface. That's **indirection**: nothing in a feature points at a vendor."
+    send: [orders->tracker, checkout->tracker]
+  - say: "The tracker checks consent once and fans out. Each adapter owns its vendor's format: **polymorphism** instead of `if vendor == …` across the app."
+    send: [tracker->adapterA, tracker->adapterB]
+  - say: "Only the adapters import vendor SDKs."
+    send: [adapterA->vendorA, adapterB->vendorB]
+  - say: "Vendor B is being retired. With SDK calls scattered through features, this would touch hundreds of files."
+    state: { adapterB: error, vendorB: error }
+    label: { vendorB: retired }
+  - say: "Here it's one new adapter and one line where the tracker is built. No feature changed: **protected variations**."
+    hide: [adapterB, vendorB]
+    send: [tracker->adapterC, adapterC->vendorC]
+    state: { adapterC: ok, vendorC: ok }
+```
+
+### Design the wall from your side
+
+The interface is only stable if **you** define it, from what your features need. That's [Dependency inversion: the policy owns the abstraction](/design/learn/sd-solid-dip) applied to vendors. Compare two interfaces:
+
+```swift check title="Two walls, one of which protects nothing"
+// Mirrors one vendor's API: its names, its untyped parameters, its limits
+protocol EventLogging {
+    func logEvent(_ name: String, parameters: [String: Any]?)
+    func setUserProperty(_ value: String?, forName name: String)
+}
+
+// Describes what the app needs, in the app's terms
+enum CheckoutStep: String, Sendable {
+    case basket, delivery, payment
+}
+
+protocol CheckoutAnalytics: Sendable {
+    func checkoutStepViewed(_ step: CheckoutStep)
+    func checkoutCompleted(totalPence: Int, itemCount: Int)
+}
+```
+
+The first is a vendor's API copied into a protocol. Its event names are untyped strings, and when the next vendor has a different model of user properties, the "abstraction" changes too. The second can sit in front of any vendor, and it's also a better API for the features: typed, small, and impossible to misspell.
+
+## Trade-offs
+
+Integrating a third-party SDK:
+
+| Option | Cost now | Cost of a vendor change | Testability | What leaks | Wins when |
+| --- | --- | --- | --- | --- | --- |
+| Call the SDK from features directly | Lowest | Every call site | Needs the SDK in tests | Vendor types everywhere | A throwaway prototype |
+| App-owned interface with one adapter per vendor | Low | One adapter | A fake provider records events | Nothing, if the interface is designed from the app's needs | Almost always: analytics, crash reporting, payments, ads |
+| A protocol that mirrors the SDK's API | Medium | Looks like one file, but the mirror changes with the vendor | A fake provider | The vendor's concepts, under your name | Rarely |
+| A plugin registry that loads providers by configuration | High | A configuration change | Good | Little | You're building an SDK that others extend (D65) |
+
+<Callout kind="interview">
+
+**What to say:** for any SDK, "features depend on an interface we own, in our vocabulary; one adapter per vendor imports the SDK; consent and privacy checks live in the tracker, in one place". Add that SDKs are initialised lazily, off the launch path, because many do work on start.
+
+**What to ask:** "Do we ever need two vendors at once?" During a migration, you usually do. Fan-out in the tracker makes that a configuration choice rather than a project.
+
+**Red flags interviewers listen for:** vendor imports in feature modules; wrapping UIKit or Foundation "in case they change"; and an interface copied from the vendor's documentation.
+
+</Callout>
+
+<Callout kind="gotcha" title="iOS gotcha: if #available scattered across views">
+
+Every September brings APIs you'll adopt with a fallback. Written inline in forty views, each adoption is forty edits now and forty more when you raise the deployment target. OS versions are a predicted variation point, so give each difference one home:
+
+```swift check ios title="One home for an OS-version difference"
+import SwiftUI
+
+extension View {
+    /// Floating controls get Liquid Glass on iOS 26 and later, and a material before that
+    @ViewBuilder
+    func floatingControlBackground() -> some View {
+        if #available(iOS 26, *) {
+            glassEffect(.regular, in: .capsule)
+        } else {
+            background(.ultraThinMaterial, in: .capsule)
+        }
+    }
+}
+```
+
+When the minimum becomes iOS 26, you delete one branch in one file.
+
+</Callout>
+
+## Practice
+
+In the kata [Compose a playback queue](/design/practice/sd-kata-principles-playback-queue), the track order is a protected variation point behind a protocol (the tests plug in an ordering of their own), while the closed set of repeat modes stays an enum.
+
+```cards
+- id: polymorphism
+  front: "What does GRASP's polymorphism pattern ask you to do?"
+  back: "Give behaviour that varies by type to the types themselves, instead of repeating `if` or `switch` on \"which kind is this?\" across the app."
+- id: indirection
+  front: "When does a layer of indirection earn its place?"
+  back: "When it buys something: freedom to change one side alone, a test seam, or a team boundary. Otherwise it's a hop that hides behaviour."
+- id: protected-variations
+  front: "What is protected variations?"
+  back: "Find the points predicted to change, such as vendor SDKs, API versions or OS differences, and put a stable interface around each one."
+- id: own-the-wall
+  front: "Why should an SDK wrapper be designed from the app's needs, not the vendor's API?"
+  back: "A wrapper that mirrors the vendor changes whenever the vendor does, so it protects nothing. An interface in the app's own vocabulary fits any vendor."
+```
+
+```quiz
+- id: q1
+  type: multi
+  prompt: "Which are usually worth putting behind a stable interface you own? Choose all that apply."
+  options:
+    - "The crash-reporting SDK"
+    - "`UITableView`"
+    - "The current date and time, for code with expiry rules"
+    - "Swift's `Array`"
+    - "The payment provider's SDK"
+  answer: [0, 2, 4]
+  explain: "Vendor SDKs change and get replaced, and time needs a seam so tests can control it. UIKit and the standard library aren't going to change under you in a way a wrapper would help with, and wrapping them costs every reader."
+- id: q2
+  type: mcq
+  prompt: "Your app must call v1 of the orders API for some users and v2 for others during a three-month migration. Which design protects the rest of the app best?"
+  options:
+    - "`if FeatureFlags.ordersV2` checks in every screen that loads orders"
+    - "An `OrdersService` protocol the screens use, with v1 and v2 implementations chosen once where dependencies are built"
+    - "Copy every orders screen into a v2 version"
+    - "Make v2 return v1's JSON so the app doesn't change"
+  answer: 1
+  explain: "Both versions exist now, a real variation point. One interface, two implementations and a single choice point mean screens never know which backend they talk to, and deleting v1 later is one file."
+- id: q3
+  type: truefalse
+  prompt: "A protocol that copies a vendor SDK's methods and parameter types, one for one, protects the app from a vendor change."
+  answer: false
+  explain: "It renames the vendor's API without hiding its model. When the next vendor differs, the protocol changes and so does every caller. Define the interface from the app's needs instead."
+- id: q4
+  type: output
+  prompt: "What does this print?"
+  code: |
+    protocol Shipping {
+        func cost(forWeightKg kg: Int) -> Int
+    }
+
+    struct Standard: Shipping {
+        func cost(forWeightKg kg: Int) -> Int { 300 + kg * 50 }
+    }
+
+    struct Express: Shipping {
+        func cost(forWeightKg kg: Int) -> Int { max(900, kg * 200) }
+    }
+
+    let options: [any Shipping] = [Standard(), Express()]
+    print(options.map { $0.cost(forWeightKg: 4) })
+  answer: "[500, 900]"
+  explain: "Each type owns its pricing rule: standard is 300 + 4 × 50 = 500, express is the larger of 900 and 800. The caller asks every option the same question and never checks which kind it has."
+- id: q5
+  type: mcq
+  prompt: "A teammate proposes wrapping SwiftUI's `Text` and `Button` in your own protocols \"in case SwiftUI changes\". What's the best response?"
+  options:
+    - "Agree: every framework is a variation point"
+    - "Disagree: SwiftUI isn't predicted to change in a way a wrapper would absorb, so it's a cost with no protection. Wrap your design system's components instead, if anything"
+    - "Agree, but only for `Button`"
+    - "Disagree, because protocols make SwiftUI slower"
+  answer: 1
+  explain: "Protected variations is about *predicted* change. Your own design system components, such as a `PrimaryButton`, are a real variation point; wrapping the framework underneath them is an evolution-point guess that costs every reader."
+- id: q6
+  type: recall
+  prompt: "Explain how polymorphism, indirection and protected variations work together when an app integrates an analytics SDK."
+  model: "Protected variations is the goal: the vendor is a predicted point of change, so it goes behind a stable interface. Indirection provides it: features call an app-owned tracker instead of the SDK. Polymorphism fills it: each vendor has an adapter conforming to one protocol, responsible for its own format, so swapping vendors means adding an adapter, not editing features."
+```

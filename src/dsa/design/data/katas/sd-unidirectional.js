@@ -1,2 +1,47 @@
 // Katas for D28 · Unidirectional architectures
-export default [];
+export default [
+    {
+        id: 'sd-kata-unidirectional-redux-store',
+        kind: 'problem',
+        title: 'A Redux-style store with middleware',
+        difficulty: 'medium',
+        patterns: ['architecture', 'state', 'patterns'],
+        lessons: ['sd-udf-flux-redux', 'sd-udf-effects', 'sd-udf-mvi-reswift'],
+        swiftTest: 'UnidirectionalReduxStoreTests',
+        lists: [],
+        minutes: 35,
+    },
+    {
+        id: 'sd-kata-unidirectional-cancellable-effects',
+        kind: 'problem',
+        title: 'Effects the store runs, cancellable by id',
+        difficulty: 'hard',
+        patterns: ['architecture', 'concurrency', 'state'],
+        lessons: ['sd-udf-effects', 'sd-udf-elm', 'sd-udf-tca-effects'],
+        swiftTest: 'UnidirectionalEffectStoreTests',
+        lists: [],
+        minutes: 45,
+    },
+    {
+        id: 'sd-kata-unidirectional-scoped-features',
+        kind: 'problem',
+        title: 'Scope child features into a parent',
+        difficulty: 'hard',
+        patterns: ['architecture', 'state', 'navigation'],
+        lessons: ['sd-udf-tca-scoping', 'sd-udf-tca-navigation'],
+        swiftTest: 'UnidirectionalFeatureScopeTests',
+        lists: [],
+        minutes: 40,
+    },
+    {
+        id: 'sd-kata-unidirectional-test-store',
+        kind: 'problem',
+        title: 'An exhaustive test store',
+        difficulty: 'hard',
+        patterns: ['testing', 'architecture'],
+        lessons: ['sd-udf-tca-testing'],
+        swiftTest: 'UnidirectionalExhaustiveTestStoreTests',
+        lists: [],
+        minutes: 45,
+    },
+];

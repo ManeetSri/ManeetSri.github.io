@@ -1,0 +1,258 @@
+## Why it matters
+
+When an order is placed, an app may need to refresh the orders badge, log analytics, update a widget, ask for a review and clear the basket. If checkout calls each of those directly, checkout depends on five features, and the sixth means editing checkout again. Event-driven architecture turns that inside out. It's behind `NotificationCenter`, Combine, analytics pipelines, push, and most backends at scale. Interviewers like it because it's easy to propose and hard to run well, and they listen for whether you know the hard part.
+
+## The idea: announce facts, don't give orders
+
+In an event-driven style, components communicate by **publishing events**: records that something *happened*. Other components **subscribe** to the events they care about and react. The constraint that defines the style: **the publisher doesn't know who, if anyone, is listening.**
+
+Three kinds of message are easy to confuse:
+
+| | Means | Named | Who decides what happens |
+| --- | --- | --- | --- |
+| **Event** | "This happened" | Past tense: `OrderPlaced`, `UserSignedOut` | Each subscriber |
+| **Command** | "Do this" | Imperative: `PlaceOrder`, `RefreshFeed` | The sender, who expects it done |
+| **Query** | "Tell me this" | A question: `currentUser()` | The sender, who waits for an answer |
+
+Events are the only one where the sender gives up control. That's both the benefit and the cost. If checkout *needs* the payment to succeed before it continues, that's a command or a query, an `await`ed call, not an event.
+
+## A typed event hub in Swift
+
+Here's a small hub built on `AsyncStream`. Each subscriber gets its own stream, because an `AsyncStream` is built for one consumer, not as a broadcast. Checkout publishes and moves on; analytics and the badge react, and neither knows about the other.
+
+```swift run title="Publishing facts, reacting independently"
+// Facts the app announces, named in the past tense
+enum AppEvent: Sendable {
+    case orderPlaced(id: String, pence: Int)
+    case signedOut
+}
+
+/// Gives every subscriber its own stream, and copies each published event into all of them
+actor EventHub {
+    private var subscribers: [AsyncStream<AppEvent>.Continuation] = []
+
+    func subscribe() -> AsyncStream<AppEvent> {
+        let (stream, continuation) = AsyncStream.makeStream(of: AppEvent.self)
+        subscribers.append(continuation)
+        return stream
+    }
+
+    func publish(_ event: AppEvent) {
+        for subscriber in subscribers {
+            subscriber.yield(event)
+        }
+    }
+
+    func finish() {
+        subscribers.forEach { $0.finish() }
+    }
+}
+
+let hub = EventHub()
+
+// Two features react to orders. Neither knows about the other, or about checkout.
+let analyticsEvents = await hub.subscribe()
+let analytics = Task {
+    var sent: [String] = []
+    for await event in analyticsEvents {
+        switch event {
+        case .orderPlaced(let id, let pence): sent.append("purchase \(id) value=\(pence)")
+        case .signedOut: sent.append("sign_out")
+        }
+    }
+    return sent
+}
+
+let badgeEvents = await hub.subscribe()
+let badge = Task {
+    var newOrders = 0
+    for await event in badgeEvents {
+        if case .orderPlaced = event { newOrders += 1 }
+        if case .signedOut = event { newOrders = 0 }
+    }
+    return newOrders
+}
+
+// Checkout publishes facts and moves on. It never learns who listened.
+await hub.publish(.orderPlaced(id: "A12", pence: 1850))
+await hub.publish(.orderPlaced(id: "A13", pence: 420))
+await hub.publish(.signedOut)
+await hub.publish(.orderPlaced(id: "A14", pence: 990))
+await hub.finish()
+
+for line in await analytics.value {
+    print("analytics:", line)
+}
+print("badge:", await badge.value, "new order")
+```
+
+```output
+analytics: purchase A12 value=1850
+analytics: purchase A13 value=420
+analytics: sign_out
+analytics: purchase A14 value=990
+badge: 1 new order
+```
+
+Each subscriber sees events in the order they were published, because each has its own stream fed in order. The streams buffer without limit by default; `makeStream(of:bufferingPolicy:)` with `.bufferingNewest(n)` caps memory for a slow subscriber, at the price of dropping events, which is a design decision, not a detail.
+
+## Watching it fan out
+
+```visual flow
+title: One event, many reactions
+nodes:
+  - { id: checkout, label: Checkout, kind: service, at: [0, 1] }
+  - { id: bus, label: Event bus, kind: queue, at: [2, 1] }
+  - { id: analytics, label: Analytics, kind: service, at: [4, 0] }
+  - { id: badge, label: Orders badge, kind: view, at: [4, 1] }
+  - { id: receipts, label: Receipts cache, kind: store, at: [4, 2] }
+  - { id: widget, label: Widget refresh, kind: service, at: [3, 3] }
+edges:
+  - [checkout, bus, OrderPlaced, { style: async }]
+  - [bus, analytics, { style: async }]
+  - [bus, badge, { style: async }]
+  - [bus, receipts, { style: async }]
+  - [bus, widget, { style: async }]
+steps:
+  - say: Checkout publishes `OrderPlaced`, a **fact** in the past tense. It doesn't know who listens, or whether anyone does.
+    show: [checkout, bus, analytics, badge, receipts]
+    send: checkout->bus
+  - say: The bus hands a copy to every subscriber. Each reacts in its own way and its own time.
+    send: [bus->analytics, bus->badge, bus->receipts]
+  - say: Adding a reaction means adding a subscriber. The widget refresh joins, and not a line of checkout changes.
+    show: [widget]
+    send: bus->widget
+    state: { widget: ok }
+  - say: "The cost: the receipts cache fails, and checkout never finds out. *Someone* must own that failure: retry it, log it, or park it for later."
+    state: { receipts: error }
+    label: { receipts: failed }
+```
+
+## Two topologies
+
+Mark Richards describes two ways to organise an event-driven system:
+
+- **Broker:** no one is in charge. Components publish to a bus, others react and may publish further events, and the overall flow *emerges*. Highly decoupled and easy to extend; hard to see the whole, and hard to handle an error halfway through a chain.
+- **Mediator:** a central coordinator receives the first event and drives the steps, telling each component what to do and tracking where the process is. Easier to follow, retry and reason about; the mediator becomes a component that knows everyone.
+
+Inside an app, the broker shape suits side effects (analytics, badges, cache invalidation). A multi-step flow with failure handling, such as checkout itself, wants a mediator, which in an app is usually an `async` function or a coordinator that calls each step and handles its errors.
+
+## What an event carries
+
+Martin Fowler separates a few things people mean by "event-driven":
+
+- **Event notification:** a thin event, `OrderPlaced(id: "A12")`. Subscribers who need details ask for them. Small and loosely coupled, but each subscriber may then call back.
+- **Event-carried state transfer:** the event carries the data, `OrderPlaced(order:)`, so subscribers needn't ask. Fewer calls, but the event's shape becomes a contract that many components depend on.
+- **Event sourcing:** the events *are* the stored state, and the current state is rebuilt by replaying them. You'll meet a preview in D13.
+
+On the backend the same ideas run through message brokers and queues (D45), where delivery guarantees become a real question: **at most once** (may lose events), **at least once** (may duplicate them, so handlers must be idempotent) or the "exactly once" that systems approximate with deduplication.
+
+## Event mechanisms on iOS
+
+| Mechanism | Typed | Delivery | Good for |
+| --- | --- | --- | --- |
+| `NotificationCenter` | Untyped `userInfo` (typed messages arrived in iOS 26) | Synchronous, on the posting thread | System events (keyboard, app lifecycle), loose app-wide signals |
+| Combine `PassthroughSubject` | Yes | Synchronous to each subscriber | Reactive pipelines, existing Combine code |
+| `AsyncStream` per subscriber | Yes | Asynchronous, buffered | Swift concurrency code, actors |
+| `@Observable` | Yes, but it's *state*, not events | Views re-render on change | "Something changed, show the latest", not "this happened" |
+| Darwin notifications | No payload at all | Across processes | Telling a widget or extension "look again" |
+
+Observation is worth a second look: it's the right tool when subscribers only need the *latest state* (a badge count). Events are right when each occurrence matters (an analytics purchase).
+
+## Trade-offs
+
+| | Direct call | Delegate or closure | App-wide event bus | Server-side broker |
+| --- | --- | --- | --- | --- |
+| Coupling | Caller knows callee | Callee knows a protocol | Publisher knows only the event type | Services know only the topic |
+| "Who handles this?" | Jump to definition | Find the conformer | Search every subscriber | Search every service |
+| Failure feedback | Immediate, typed | Immediate | None, unless designed | Retries, dead-letter queues |
+| Ordering | Obvious | Obvious | Per subscriber, if you design it | Per partition, at best |
+| Adding a reaction | Edit the caller | Edit the caller | Add a subscriber | Add a consumer |
+| Best for | One collaborator, needs an answer | One collaborator, callbacks | Cross-cutting side effects | Decoupling services and absorbing load |
+
+Direct calls win whenever the caller needs a result or must know about failure. Events win for reactions the publisher shouldn't have to know about. An app that uses events for everything ends up with flows no one can follow.
+
+<Callout kind="interview">
+
+**Say:** what's an event and what isn't. "Placing the order is an `await`ed call so checkout can show failure; *after* it succeeds, checkout publishes `OrderPlaced` for analytics and the badge."
+
+**Ask:** what happens if a subscriber is slow or fails; whether events must survive the app being killed (in-process events don't, so a purchase event for analytics needs writing to disk first); whether order matters.
+
+**Red flags:** request–reply done with events ("publish `PayRequested`, wait for `PayCompleted`"); a global bus with `[String: Any]` payloads; no idea of delivery guarantees; subscribers that never unsubscribe.
+
+</Callout>
+
+<Callout kind="gotcha" title="iOS gotcha: NotificationCenter is synchronous">
+
+`post(name:object:userInfo:)` calls every observer, one by one, on the posting thread, and returns only when they've all finished. A slow observer blocks the poster; an observer that updates UI crashes or races if the post came from a background thread. Pass `queue: .main` to `addObserver(forName:object:queue:using:)` when the observer touches UI, keep observers quick, and move slow work into a `Task` of its own.
+
+</Callout>
+
+## Practice
+
+The kata asks you to build a typed event bus with the properties real buses need: delivery by type, a subscription you must keep (like `AnyCancellable`), failures that don't stop other subscribers, and safe behaviour when a handler publishes, subscribes or cancels in the middle of a delivery. The review shows a checkout that leaned on an event bus for everything; finding what went wrong is a good test of this lesson.
+
+```cards
+- id: event-vs-command
+  front: "Event vs command?"
+  back: "An event says something happened (`OrderPlaced`) and the publisher doesn't care who reacts. A command says do this (`PlaceOrder`) and the sender expects it done, so it needs an answer or an error."
+- id: eda-constraint
+  front: "What is the event-driven style's defining constraint, and its main cost?"
+  back: "Publishers don't know their subscribers, so reactions can be added freely. The cost is traceability and failure handling: no one place shows what happens, and the publisher never hears about a subscriber's failure."
+- id: broker-mediator
+  front: "Broker vs mediator topology?"
+  back: "Broker: components react and publish with no one in charge, so flows emerge. Mediator: a coordinator drives the steps and handles errors. Brokers suit side effects; multi-step flows with failures want a mediator."
+- id: delivery
+  front: "At-least-once delivery means handlers must be what?"
+  back: "Idempotent: handling the same event twice must have the same effect as handling it once."
+```
+
+```quiz
+- id: q1
+  type: sort
+  prompt: "Event, command or query?"
+  buckets: [Event, Command, Query]
+  items:
+    - [SubscriptionRenewed, 0]
+    - [DownloadEpisode, 1]
+    - [PhotoUploaded, 0]
+    - [unreadCount(), 2]
+    - [ClearBasket, 1]
+    - [isFeatureEnabled(name), 2]
+  explain: "Events are past-tense facts that anyone may react to. Commands tell someone to act. Queries ask for an answer and change nothing."
+- id: q2
+  type: mcq
+  prompt: "Checkout must not show \"Order placed\" unless payment succeeded. A teammate proposes: publish `PaymentRequested`, then wait for a `PaymentSucceeded` event. What's the best design?"
+  options:
+    - "Fine: events decouple checkout from payments"
+    - "Call payments with `try await` and handle its error; publish `OrderPlaced` only after it succeeds"
+    - "Publish both events at once and let the UI sort it out"
+    - "Use NotificationCenter instead of the bus, because it's synchronous"
+  answer: 1
+  explain: "Checkout needs an answer and must react to failure, so this is a command, not an event. Request–reply over events adds timeouts, lost replies and correlation IDs for nothing. Events fit what happens *after* the order is placed."
+- id: q3
+  type: multi
+  prompt: "An analytics subscriber receives `PurchaseCompleted` events in-process. Which risks are real?"
+  options:
+    - "The app is killed before the batch uploads, and the purchase is never recorded"
+    - "If the subscriber throws, checkout shows an error automatically"
+    - "A slow subscriber on a synchronous bus delays the publisher"
+    - "A subscriber registered twice counts every purchase twice"
+  answer: [0, 2, 3]
+  explain: "In-process events die with the process unless written to disk first. Synchronous delivery runs subscribers inside the publisher's call. Duplicate subscriptions double-count. The publisher hears nothing about a subscriber's failure, which is the problem rather than a feature."
+- id: q4
+  type: mcq
+  prompt: "The orders badge needs to show how many orders are unshipped. Which tool fits best?"
+  options:
+    - "An `OrderPlaced` event, with the badge keeping its own running count"
+    - "An `@Observable` orders store that the badge reads `unshippedCount` from"
+    - "A Darwin notification"
+    - "Polling the server every second"
+  answer: 1
+  explain: "The badge needs the latest *state*, not each occurrence. Counting events drifts as soon as one is missed or duplicated, or an order ships elsewhere. Observation gives the current value every time."
+- id: q5
+  type: truefalse
+  prompt: "When a background task calls `NotificationCenter.default.post(name:object:)`, observers added without a queue run on the main thread."
+  answer: false
+  explain: "They run synchronously on the posting thread, here a background one. Ask for a queue when adding the observer, or hop to the main actor inside the handler."
+```

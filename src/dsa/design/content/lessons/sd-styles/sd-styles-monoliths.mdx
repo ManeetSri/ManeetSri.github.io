@@ -1,0 +1,246 @@
+## Why it matters
+
+"Monolith or microservices?" is one of the most argued questions in software, and most of the argument mixes up two separate things: how code is **divided into modules**, and how it's **deployed and run**. Pull them apart and the choice gets clearer, on the server and on the phone. Mobile engineers are asked about both: how to structure an app that 40 engineers work in, and what the backend behind it should look like.
+
+## Two separate questions
+
+1. **How many deployable units are there?** One (a monolith) or many (a distributed system), each released and run on its own.
+2. **How strong are the boundaries inside each unit?** None (any code can call any code) or strong (modules with interfaces that the compiler enforces).
+
+Cross the two and you get three shapes worth naming:
+
+| | One deployable | Many deployables |
+| --- | --- | --- |
+| **Weak boundaries** | Big ball of mud | Distributed ball of mud (the worst of both) |
+| **Strong boundaries** | **Modular monolith** | **Distributed system** (service-based, microservices) |
+
+A **big ball of mud** is where most codebases drift without effort: one deployable, and every part reaches into every other. A **modular monolith** is one deployable with real internal walls: each module owns its code and data and exposes a small interface. A **distributed** architecture puts those modules in separate processes that talk over a network, each deployed and scaled on its own.
+
+Notice what's in the bottom-left: you can get most of the *structural* benefits people want from microservices (ownership, independence, clear interfaces) without a network in between.
+
+## What a network between modules costs
+
+A function call between modules in one process takes nanoseconds and fails only if the code is wrong. A call between services crosses a network, and the **fallacies of distributed computing** (a list from Peter Deutsch and colleagues at Sun) are the assumptions that stop being true: the network is reliable; latency is zero; bandwidth is infinite; the network is secure; topology doesn't change; there is one administrator; transport cost is zero; the network is homogeneous.
+
+The first two compound. If a request passes through several services and each one occasionally fails, the chances multiply. Try it:
+
+```visual estimator
+title: Every hop is a chance to fail
+inputs:
+  - { id: services, label: Services one request passes through, min: 1, max: 20, step: 1, value: 5 }
+  - { id: fail, label: Chance one service fails a request, min: 0.01, max: 5, value: 0.1, scale: log, unit: "%" }
+  - { id: hop, label: Network time per hop, min: 0.5, max: 50, value: 2, scale: log, unit: ms }
+  - { id: daily, label: Requests a day, min: 1000, max: 1000000000, value: 10000000, scale: log }
+outputs:
+  - { id: chain, label: Requests that get through every service, formula: "(1 - fail / 100) ^ services * 100", unit: "%" }
+  - { id: failed, label: Failed requests a day, formula: daily * (1 - chain / 100), format: si }
+  - { id: single, label: The same work as one deployable, formula: "(1 - fail / 100) * 100", unit: "%" }
+  - { id: latency, label: Time spent on the network between services, formula: services * hop / 1000, format: duration }
+```
+
+Five services at 99.9% each give about 99.5% end to end, which is 50,000 failed requests a day at 10 million. Retries, timeouts, circuit breakers (D14) and idempotency (D45) bring that back, and that machinery is the real cost of distribution: code, monitoring, and people who understand it.
+
+## On the server
+
+### Modular monolith
+
+One codebase, one deployable, modules with enforced boundaries, often one database with each module owning its own tables. Shopify runs one of the largest Rails applications this way, with tooling that flags references across component boundaries that haven't been declared.
+
+- **Wins:** simple deployment and debugging (one stack trace), transactions across modules, refactoring with the compiler's help, low operating cost.
+- **Loses:** every team ships on the same release train; one module's memory leak can take down all of it; you scale everything together.
+
+### Distributed: service-based and microservices
+
+**Service-based** architecture splits the system into a handful of coarse services (Orders, Catalogue, Accounts), often still sharing a database. **Microservices** go further: many small services, each owning its data, deployed independently, usually one team per few services.
+
+- **Wins:** independent releases, independent scaling (scale the feed, not billing), fault isolation if you design for it, freedom of technology per service.
+- **Loses:** everything in the fallacies list; no transactions across services (you need sagas or eventual consistency); distributed tracing to debug anything; a platform team to run it all.
+
+The industry has swung both ways. Amazon's Prime Video team wrote in 2023 about moving a video-monitoring service from many distributed serverless steps into a single process, cutting its infrastructure cost by about 90%. The lesson isn't "microservices are bad". It's that distribution is a cost you pay for specific benefits, and that service had none it needed.
+
+**Conway's law** is the tie-breaker more often than technology: systems end up shaped like the organisations that build them. Microservices pay off when many teams need to release independently; with one team of eight, they mostly add network calls.
+
+## On the device
+
+An iOS app ships as **one binary through App Review**. You can't deploy the checkout feature on Tuesday and search on Thursday. So in deployment terms every app is a monolith, and the real choice is between a ball of mud and a **modular monolith**.
+
+### The modular monolith app
+
+Features become Swift packages (or frameworks) with explicit dependencies. A common shape splits each feature in two, so other features depend only on a small interface:
+
+```swift title="Package.swift (excerpt): a feature split into interface and implementation"
+// What other features may know about Profile: a protocol and a few value types
+.target(name: "ProfileInterface", dependencies: ["SharedKernel"]),
+// How Profile works: views, view models, repositories. Only the app target imports this.
+.target(name: "Profile", dependencies: ["ProfileInterface", "Networking", "DesignSystem"]),
+// Checkout can open a profile without depending on how Profile is built
+.target(name: "Checkout", dependencies: ["ProfileInterface", "Payments", "DesignSystem"]),
+```
+
+And the interface itself, which is all `Checkout` sees:
+
+```swift check ios title="ProfileInterface, and Checkout using it"
+import SwiftUI
+
+/// The only part of Profile other features may import
+public protocol ProfileEntry: Sendable {
+    @MainActor func profileScreen(for userID: String) -> AnyView
+}
+
+/// Checkout opens a profile through the interface; the app target injects the real implementation
+public struct SellerButton: View {
+    let profiles: any ProfileEntry
+    let sellerID: String
+    @State private var showsProfile = false
+
+    public init(profiles: any ProfileEntry, sellerID: String) {
+        self.profiles = profiles
+        self.sellerID = sellerID
+    }
+
+    public var body: some View {
+        Button("About the seller") { showsProfile = true }
+            .sheet(isPresented: $showsProfile) {
+                profiles.profileScreen(for: sellerID)
+            }
+    }
+}
+```
+
+The payoff is mostly about **people and build times**: a change to Profile's internals doesn't rebuild Checkout, each team owns its modules, and a small demo app target that depends only on `Profile` builds and runs that one feature in seconds. Airbnb, Spotify and Uber have all written about structuring large iOS apps like this. You'll go deep in D61.
+
+### You already run a distributed system
+
+The moment your app has a widget, a notification service extension or a watch app, it's several programs in several **processes**, and the fallacies come back on one phone:
+
+```visual flow
+title: One app, several processes
+nodes:
+  - { id: app, label: App target, kind: client, at: [0, 0] }
+  - { id: features, label: Feature modules, kind: service, at: [2, 0] }
+  - { id: core, label: Core modules, kind: service, at: [4, 0] }
+  - { id: widget, label: Widget, kind: view, at: [0, 2] }
+  - { id: container, label: App Group container, kind: store, at: [2, 2] }
+  - { id: nse, label: Notification extension, kind: service, at: [4, 2] }
+  - { id: apns, label: APNs, kind: external, at: [4, 4] }
+groups:
+  - { id: appProcess, label: App process, nodes: [app, features, core] }
+  - { id: widgetProcess, label: Widget process, nodes: [widget] }
+  - { id: nseProcess, label: Extension process, nodes: [nse] }
+edges:
+  - [app, features, calls]
+  - [features, core, calls]
+  - [features, container, writes, { style: data }]
+  - [widget, container, reads, { style: data }]
+  - [nse, container, writes, { style: data }]
+  - [apns, nse, push, { style: async }]
+steps:
+  - say: Inside the app process, modules call each other directly. It's fast and typed, and they fail together. This part is a **modular monolith**.
+    active: [appProcess]
+    send: app->features
+  - say: The widget is another process. It can't call your code; it reads what the app wrote to the shared App Group container.
+    send: [features->container, widget->container]
+  - say: A push arrives while the app isn't running. The notification service extension wakes up alone, with about 30 seconds and its own memory limit.
+    send: apns->nse
+  - say: It writes to the container, and the app reads it later. Two processes sharing files is a distributed system on one phone, with stale reads, two writers and file formats that must stay compatible across versions.
+    send: nse->container
+    state: { container: active }
+```
+
+The design rules are the ones from the server side, at a smaller scale: version anything written to the shared container, assume the other side may be an older or newer build mid-update, use file coordination or a database that handles two writers, and tell other processes to look again (`WidgetCenter.shared.reloadTimelines(ofKind:)`) rather than assuming they'll notice.
+
+## Trade-offs
+
+| | Big ball of mud | Modular monolith | Distributed |
+| --- | --- | --- | --- |
+| Getting started | Fastest | Some setup | Slowest: platform, deployment, tracing |
+| Change in one area breaks another | Often | Rarely, at a boundary | Rarely, but across a network |
+| Build time (app) | Everything rebuilds | Only what changed | Not applicable on device |
+| Independent release | No | No (one train) | Yes (server only) |
+| Independent scaling | No | No | Yes |
+| Failure modes | Bugs | Bugs | Bugs, timeouts, partial failure, inconsistency |
+| Debugging | One process | One process | Distributed tracing |
+| Fits | Prototypes, tiny teams | Most apps; most new backends | Many teams that must release and scale independently |
+
+Start with a modular monolith on both sides unless you have a specific reason not to. On the server, the reason is usually several teams blocked on one release train, or one part needing very different scaling. Good module boundaries make that later split far cheaper, because the seams already exist.
+
+<Callout kind="interview">
+
+**Say:** separate structure from deployment. "On the app, feature modules with interface targets, so squads don't step on each other. On the backend, I'd start as a modular monolith and split out the feed service if its load or release cadence diverges."
+
+**Ask:** how many teams, how often each needs to release, and whether any part has very different load.
+
+**Red flags:** microservices for a new product with one team; "micro-apps" on iOS that ship separately (they can't, through the App Store); forgetting that the widget and the app are different processes.
+
+</Callout>
+
+<Callout kind="gotcha" title="iOS gotcha: dozens of dynamic frameworks slow every launch">
+
+Each dynamic framework is loaded and bound by `dyld` at launch, so an app split into 80 dynamic frameworks can spend real time before `main`. Link feature modules statically (Xcode usually links Swift package libraries statically unless the product says `type: .dynamic`), or use mergeable libraries (Xcode 15) to keep dynamic linking in debug builds and merge them into the app binary for release.
+
+</Callout>
+
+## Practice
+
+The design exercise asks you to choose and justify the styles for a field-inspection app: the app's internal structure, what runs offline on the device, and what the backend should look like for a small team that will grow.
+
+```cards
+- id: two-questions
+  front: "Which two questions does \"monolith or microservices\" mix up?"
+  back: "How many deployable units there are, and how strong the boundaries inside each one are. A modular monolith is one deployable with strong boundaries."
+- id: chain-availability
+  front: "Five services in a request path, each 99.9% available. Roughly what end-to-end availability?"
+  back: "About 99.5% (0.999⁵). Failure chances multiply along the path, which is why distributed systems need timeouts, retries and breakers."
+- id: app-deployment
+  front: "Why is every iOS app a monolith in deployment terms?"
+  back: "It ships as one binary through App Review, so features can't be released separately. The choice on the device is between a ball of mud and a modular monolith."
+- id: extensions-distributed
+  front: "What makes an app with a widget a distributed system?"
+  back: "The widget runs in another process and shares data only through files or stores in an App Group container, so stale reads, two writers and version skew all apply."
+```
+
+```quiz
+- id: q1
+  type: sort
+  prompt: "Which shape is each?"
+  buckets: [Big ball of mud, Modular monolith, Distributed]
+  items:
+    - [One app target where any file can use any type, 0]
+    - [Feature packages with interface targets in one app, 1]
+    - [A Rails app with enforced component boundaries and one deploy, 1]
+    - [Orders and Catalogue services deployed separately, 2]
+    - [An app and its widget sharing an App Group container, 2]
+  explain: "Mud has no enforced boundaries. A modular monolith enforces boundaries inside one deployable. Separate processes talking through a network or shared files are distributed, even on one phone."
+- id: q2
+  type: estimate
+  prompt: "A request passes through 10 services, each succeeding 99.9% of the time. Roughly what percentage of requests get through all of them?"
+  answer: 99
+  unit: "%"
+  within: { percent: 1 }
+  explain: "0.999¹⁰ ≈ 0.990, so about 99%: one request in a hundred fails somewhere, ten times worse than any single service."
+- id: q3
+  type: mcq
+  prompt: "A start-up with six engineers is building its first backend for a marketplace app. Which shape fits best?"
+  options:
+    - "Twelve microservices, one per domain concept"
+    - "A modular monolith, with modules for listings, orders and accounts that could be split out later"
+    - "A big ball of mud: structure can come later"
+    - "One serverless function per endpoint"
+  answer: 1
+  explain: "Six people can't run twelve services well, and they gain nothing from independent deploys yet. Modules keep the seams so a later split is cheap; the ball of mud makes it expensive."
+- id: q4
+  type: mcq
+  prompt: "Your app's notification service extension decrypts a message and saves it to a shared store. Which assumption is safest?"
+  options:
+    - "The app is running, so it can be told in memory"
+    - "The extension and the app are always the same version"
+    - "The app may be suspended, not running, or mid-update, so the store must handle two writers and versioned data"
+    - "The extension can wait as long as it needs"
+  answer: 2
+  explain: "The extension is a separate process that runs on its own schedule with a time limit of about 30 seconds. Treat the shared store like a service boundary: versioned, safe for concurrent writers, read again by the app later."
+- id: q5
+  type: truefalse
+  prompt: "Splitting an iOS app into feature packages lets each team release its feature to the App Store independently."
+  answer: false
+  explain: "The app still ships as one binary, so modules improve ownership, build times and boundaries, not deployment. Only server-driven content and remote configuration change without a release."
+```

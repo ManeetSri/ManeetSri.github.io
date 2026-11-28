@@ -1,0 +1,122 @@
+A ticketing app holds seats while the customer pays. Every hold must end exactly once: confirmed (the seats are sold), released (they go back), or abandoned when the customer closes the screen, in which case they must go back too. Model the hold as a `~Copyable` value, so the compiler rules out confirming one hold twice, and the type's `deinit` guarantees abandoned seats return.
+
+`ConsumableSeatHold.BoxOffice` and `ConsumableSeatHold.Hold` (`~Copyable`), with `hold(_:for:) throws(HoldError) -> Hold`, `confirm() throws(HoldError) -> Receipt` and `release()`
+
+- **`BoxOffice(seats:)`** starts with every seat available. Each seat is always exactly one of `available`, `held` or `sold`. Its clock, `now`, starts at 0 and moves only when `advance(by:)` is called.
+- **`hold(_:for:)`** moves `count` seats from available to held, until `now + seconds`, and returns a `Hold`. Hold ids count up from 1. If fewer than `count` seats are available it throws `.soldOut` and changes nothing.
+- **`confirm()`** consumes the hold. Before its deadline (`now < expiresAt`) it moves the seats from held to sold and returns a `Receipt` with the hold's id. At or after the deadline it throws `.expired`, and the seats go back to available.
+- **`release()`** consumes the hold and gives its seats back.
+- **A hold that's never confirmed or released gives its seats back when its life ends.** No seat may ever be returned twice.
+
+## Examples
+
+| Steps, on a box office with 10 seats | available · held · sold |
+| --- | --- |
+| `hold(3, for: 60)` | 7 · 3 · 0 |
+| `hold(4, for: 60)`, then `confirm()` | 6 · 0 · 4 |
+| `hold(5, for: 60)`, then `release()` | 10 · 0 · 0 |
+| `hold(2, for: 60)` inside a function that returns without settling it | 10 · 0 · 0 |
+| `hold(4, for: 30)`, `advance(by: 30)`, `confirm()` | throws `.expired`; 10 · 0 · 0 |
+| `hold(11, for: 60)` | throws `.soldOut`; 10 · 0 · 0 |
+
+## Constraints
+
+- `Hold` stays `~Copyable`, and `confirm()` and `release()` stay `consuming`: that's what makes "settle at most once" a compile-time rule.
+- `BoxOffice` is a `Sendable` final class whose methods are synchronous. A `deinit` can't `await`, so the books can't live inside an actor; protect them with the `Mutex` from the Synchronization framework.
+- `hold(_:for:)` and `confirm()` use typed throws: callers can switch over `HoldError` without a `default`.
+
+<Hints>
+<Hint>
+Keep all four numbers (available, held, sold, now) and the last hold id in one private struct inside a `Mutex`, and do every change in a single `withLock`, so no reader ever sees a seat counted twice. `withLock` is generic over its closure's error type, so a closure marked `throws(HoldError)` can throw `.soldOut` straight out of it.
+</Hint>
+<Hint>
+Let `deinit` be the only place held seats go back. Then `release()` has nothing to do (consuming the hold ends its life, and `deinit` runs), and an expired `confirm()` only has to throw.
+</Hint>
+<Hint>
+A successful `confirm()` must stop its own `deinit` from releasing the seats it just sold. Give the hold a private `var settled = false` and set it before returning: a `consuming` method owns `self`, so it may change it. (`discard self` skips `deinit` too, but Swift only allows it in types whose stored properties need no cleanup, and a hold keeps a reference to its box office.)
+</Hint>
+</Hints>
+
+## Solutions
+
+<Approach title="deinit returns the seats; confirm marks the hold settled" time="O(1) per operation" space="O(1)">
+
+```swift
+public final class BoxOffice: Sendable {
+    private struct Books {
+        var available: Int
+        var held = 0
+        var sold = 0
+        var now = 0
+        var lastHoldID = 0
+    }
+
+    private let books: Mutex<Books>
+
+    public init(seats: Int) {
+        books = Mutex(Books(available: seats))
+    }
+
+    public var available: Int { books.withLock { $0.available } }
+    public var held: Int { books.withLock { $0.held } }
+    public var sold: Int { books.withLock { $0.sold } }
+    public var now: Int { books.withLock { $0.now } }
+
+    public func advance(by seconds: Int) {
+        books.withLock { $0.now += seconds }
+    }
+
+    public func hold(_ count: Int, for seconds: Int) throws(HoldError) -> Hold {
+        let placed = try books.withLock { (books) throws(HoldError) -> (id: Int, expiresAt: Int) in
+            guard count <= books.available else { throw .soldOut }
+            books.available -= count
+            books.held += count
+            books.lastHoldID += 1
+            return (books.lastHoldID, books.now + seconds)
+        }
+        return Hold(id: placed.id, seats: count, expiresAt: placed.expiresAt, office: self)
+    }
+
+    fileprivate func sell(_ seats: Int, expiresAt: Int) -> Bool {
+        books.withLock { books in
+            guard books.now < expiresAt else { return false }
+            books.held -= seats
+            books.sold += seats
+            return true
+        }
+    }
+
+    fileprivate func release(_ seats: Int) {
+        books.withLock { books in
+            books.held -= seats
+            books.available += seats
+        }
+    }
+}
+
+public struct Hold: ~Copyable {
+    public let id: Int
+    public let seats: Int
+    public let expiresAt: Int
+    private let office: BoxOffice
+    private var settled = false
+
+    public consuming func confirm() throws(HoldError) -> Receipt {
+        guard office.sell(seats, expiresAt: expiresAt) else { throw .expired }
+        settled = true
+        return Receipt(holdID: id, seats: seats)
+    }
+
+    public consuming func release() {}
+
+    deinit {
+        if !settled { office.release(seats) }
+    }
+}
+```
+
+What the compiler now guarantees, with no runtime checks: a hold can't be copied, so there's never a second value to confirm with; after `confirm()` or `release()` the variable is consumed, and using it again is a compile error ("used after consume"); and a hold whose life ends without either runs its `deinit`. Notice what *isn't* guaranteed. A crash or a killed app skips every `deinit`, so a real server expires holds on its own. And the customer's confirm request can still be retried over the network: `~Copyable` protects one process's memory, while across the network the server needs an idempotency key, which you'll meet in D34.
+
+The `Mutex` is a deliberate choice over an actor. Holds are released from `deinit`, which is synchronous, and every operation is a few integer updates with no waiting inside, which is exactly when a lock beats an actor. `Mutex` is itself `~Copyable` and makes the class `Sendable` without `@unchecked`.
+
+</Approach>

@@ -1,0 +1,310 @@
+## Why it matters
+
+Every SwiftUI screen answers one question many times a second: **when this value changes, which bodies have to run?** Too few, and the screen shows stale data. Too many, and a timer tick or a progress update re-runs half the app, frames drop and the battery drains. Knowing how SwiftUI tracks dependencies is what lets you put state where it belongs and fix a stutter in minutes instead of days. Senior interviews ask it directly ("walk me through what happens when a property changes") and indirectly ("this list stutters every second; why?").
+
+## From a change to new pixels
+
+An update moves through the same steps every time:
+
+1. **Something changes:** a `@State` value is set, a property of an `@Observable` model is written, an environment value changes, or a parent builds a child with different inputs.
+2. **SwiftUI marks the views that depend on it as invalid.** Nothing is re-evaluated yet.
+3. **Later in the same turn of the main run loop**, SwiftUI re-runs the bodies of the invalid views, parents before children. Changes made together in one event handler are **batched** into a single update.
+4. **For each child in a new body**, SwiftUI compares the new child struct with the old one. If its inputs are unchanged and none of its own dependencies changed, the child's body is **skipped**, and so is everything under it.
+5. **The differences** are applied to the rendering tree, and the next frame shows them.
+
+SwiftUI keeps this bookkeeping in a dependency graph that Apple's talks and tools call the **attribute graph**. You never touch it directly, but every choice about where to read a value changes its shape.
+
+Two words are worth keeping apart. **Re-evaluating** a body means running your `body` code and comparing the result. **Redrawing** means pixels change. A body can run and produce exactly what it did before, so nothing is redrawn, but the work still came out of the frame's budget on the main thread.
+
+## What counts as a dependency
+
+A view depends on four kinds of input.
+
+**Its stored properties.** When a parent's body runs it builds new child structs, and SwiftUI compares each one with the previous value, field by field. Plain values such as strings, numbers and small structs compare cheaply. A closure made fresh on every parent update can't be shown to be equal, so a view that stores one is usually treated as changed whenever its parent's body runs. If you need a custom comparison, conform the view to `Equatable` and apply `.equatable()`, and SwiftUI uses your `==`.
+
+**`@State` and `@Binding`.** Reading a state value in `body` makes the view depend on it; writing it invalidates the views that read it.
+
+**`@Observable` properties.** SwiftUI runs `body` inside observation tracking. Every observable property **read during `body`** becomes a dependency, property by property and instance by instance. A property read only inside a closure, such as a button's action or a `.task`, isn't a dependency, because it's read later, outside the tracking.
+
+**Environment values.** A view depends on the values it reads with `@Environment`.
+
+You can watch the observable rule work without SwiftUI at all. `withObservationTracking` is the same Observation API SwiftUI uses: it records which properties a closure reads and calls `onChange` once, immediately before the first of them changes.
+
+```swift run title="Tracking what a body reads"
+import Observation
+
+@Observable
+final class Basket {
+    var title = "Weekly shop"
+    var count = 0
+}
+
+let basket = Basket()
+
+// Stand-ins for two views' bodies: each reads one property
+func render(_ name: String, reading read: () -> Void) {
+    withObservationTracking(read) {
+        print("\(name) needs a new body")
+    }
+}
+
+render("Header") { _ = basket.title }
+render("Badge") { _ = basket.count }
+
+print("count changes")
+basket.count += 1
+print("count changes again")
+basket.count += 1
+print("title changes")
+basket.title = "Party"
+```
+
+```output
+count changes
+Badge needs a new body
+count changes again
+title changes
+Header needs a new body
+```
+
+Three things to notice. Changing `count` invalidated only the reader of `count`. Tracking is **one-shot**: the second change printed nothing, because SwiftUI re-registers by running the body again, and the stand-in here never did. And no view was told about a property it never read.
+
+In a real screen, the same rule decides which bodies run:
+
+```visual flow
+title: Only the readers of a property are invalidated
+nodes:
+  - { id: screen, label: ShopScreen, kind: view, at: [0, 1] }
+  - { id: header, label: Header, kind: view, at: [2, 0] }
+  - { id: badge, label: Badge, kind: view, at: [2, 1] }
+  - { id: footer, label: Footer, kind: view, at: [2, 2] }
+  - { id: title, label: basket.title, kind: store, at: [4, 0] }
+  - { id: count, label: basket.count, kind: store, at: [4, 1] }
+edges:
+  - [screen, header]
+  - [screen, badge]
+  - [screen, footer]
+  - [header, title, reads, { style: data }]
+  - [badge, count, reads, { style: data }]
+steps:
+  - say: "The first render runs every body. `ShopScreen` passes the `basket` object down without reading its properties."
+    show: [screen, header, badge, footer, screen->header, screen->badge, screen->footer]
+  - say: "While `Header` and `Badge` run, Observation records what each **reads**: one property each. `Footer` reads nothing from the basket."
+    show: [title, count, header->title, badge->count]
+  - say: "The user adds an item and `count` changes. Only `Badge` depends on it, so only `Badge` is invalidated."
+    state: { count: active, badge: active }
+    active: [badge->count]
+  - say: "`Badge`'s body runs again. `ShopScreen`, `Header` and `Footer` don't run at all: the parent never read `count`."
+    state: { count: null, badge: ok }
+    label: { badge: body runs }
+```
+
+`ObservableObject`, the older model, works differently: any `@Published` change fires the object's `objectWillChange`, and **every** view observing the object is invalidated, whatever it read. That difference is one of the main reasons to move to `@Observable`, which the legacy-wrappers lesson covers.
+
+## Read late: push fast-changing reads down
+
+Where you read a value decides how much re-runs when it changes. This workout screen reads a value that changes every second:
+
+```swift check ios group=workout title="WorkoutScreen.swift"
+import SwiftUI
+
+@MainActor
+@Observable
+final class WorkoutSession {
+    var name = "Tempo run"
+    var elapsed: Duration = .zero          // ticks every second
+    var splits: [Duration] = []
+}
+
+struct SplitsList: View {
+    let splits: [Duration]
+    var body: some View {
+        // Splits are only ever appended, so a position is a stable id here
+        List(splits.indices, id: \.self) { index in
+            Text("Split \(index + 1): \(splits[index].formatted())")
+        }
+    }
+}
+
+// Before: the screen's body reads `elapsed`, so the whole screen re-runs every tick
+struct WorkoutScreenBefore: View {
+    let session: WorkoutSession
+
+    var body: some View {
+        VStack {
+            Text(session.name).font(.headline)
+            Text(session.elapsed.formatted(.time(pattern: .minuteSecond)))
+                .font(.largeTitle.monospacedDigit())
+            SplitsList(splits: session.splits)
+        }
+    }
+}
+```
+
+Every tick invalidates `WorkoutScreenBefore`. Its body runs, rebuilds every child struct, and SwiftUI compares each of them. It's correct, but it's work that grows with the screen. Move the read into a leaf that owns it:
+
+```swift check ios group=workout
+struct ElapsedLabel: View {
+    let session: WorkoutSession
+
+    var body: some View {
+        Text(session.elapsed.formatted(.time(pattern: .minuteSecond)))   // the only reader of `elapsed`
+            .font(.largeTitle.monospacedDigit())
+    }
+}
+
+struct WorkoutScreen: View {
+    let session: WorkoutSession
+
+    var body: some View {
+        VStack {
+            Text(session.name).font(.headline)
+            ElapsedLabel(session: session)
+            SplitsList(splits: session.splits)
+        }
+    }
+}
+```
+
+`ElapsedLabel` receives the session itself, a reference that's identical on every update, so its stored input never changes. Only its own dependency on `elapsed` invalidates it, and the tick now re-runs one small body.
+
+That's a real design choice, not a free win. Passing **values** to a child (`SplitsList(splits:)`) makes it simple, reusable and trivially previewable, but the parent must read them, so they become the parent's dependencies. Passing the **model** keeps reads fine-grained at the cost of coupling the child to the model's type. Pass values for things that change rarely and the model, or a small observable piece of it, for things that change often.
+
+## Seeing it: `_printChanges` and Instruments
+
+Guessing is slow. Ask SwiftUI why a body ran:
+
+```swift check ios group=workout
+struct BadgeDebug: View {
+    let session: WorkoutSession
+
+    var body: some View {
+        let _ = Self._printChanges()          // debugging only: remove before shipping
+        Text("\(session.splits.count) splits")
+    }
+}
+```
+
+```text title="What you'll see"
+BadgeDebug: @self, @identity changed.
+BadgeDebug: @dependencies changed.
+```
+
+`@self` means the struct's stored properties changed, `@identity` means it's a new view, a name like `_isEditing` means that `@State` property changed, and `@dependencies` means an observed property or environment value did. `Self._logChanges()` (iOS 17 and later) writes the same reasons to the unified log, which is easier to filter. Both start with an underscore: they're unsupported debugging tools, not API to ship.
+
+For whole screens, profile with the **SwiftUI** template in Instruments. It shows how long each body takes and how often it runs; since Xcode 26 it also flags long body updates and draws a cause-and-effect graph from each state change to the updates it caused.
+
+## Batching, and the `await` between changes
+
+Changes made synchronously in one event handler are applied together: set three properties in a button's action and each affected body runs once. Suspension points split that up. In an async view-model method, changes before and after an `await` usually land in different updates:
+
+```swift
+func refresh() async {
+    isLoading = true                       // update 1: spinner appears
+    let fresh = try? await api.fetch()     // suspends: SwiftUI renders in between
+    items = fresh ?? items                 // these two are set together,
+    isLoading = false                      // so they land in one update
+}
+```
+
+That's usually what you want, but it explains the flicker when related properties change on different sides of an `await`. Set them together, or model them as one value (D19 does this with view-state enums).
+
+## Trade-offs
+
+| How a child gets its data | Child's body runs when… | Reuse and previews | Watch out for |
+| --- | --- | --- | --- |
+| Plain values (`let title: String`) | the parent runs and the value differs | Easiest | The parent reads the value, so it becomes the parent's dependency |
+| The observable model (`let session: WorkoutSession`) | a property the child reads changes | Needs a model or a fake | Couples the child to the model's type |
+| A `Binding` | the bound value changes | Good: `.constant(…)` in previews | Two-way, so the child can write |
+| A closure (`let onTap: () -> Void`) | usually every time the parent runs | Good | Defeats comparison; keep such views small and cheap |
+| An `Equatable` view with `.equatable()` | your `==` says it changed | Good | A wrong `==` means a stale screen |
+
+<Callout kind="interview">
+
+**Say:** "A change invalidates only the views that depend on it. SwiftUI re-runs those bodies, compares each child's inputs, skips the unchanged ones, and applies the difference. With `@Observable`, a dependency is a property the body actually read." Then show you can debug it: `_printChanges`, the SwiftUI instrument, then moving a read lower. **Ask:** "How often does this value change?" It decides where it's read. **Red flags:** "SwiftUI redraws the whole screen on every change", making every view `Equatable` by reflex, and a timer or scroll offset read at the root of a screen.
+
+</Callout>
+
+<Callout kind="gotcha" title="iOS gotcha: writing state while a body runs">
+
+Setting state from inside `body`, or from a computed property that `body` calls, triggers the runtime warning "Modifying state during view update, this will cause undefined behavior". The write invalidates a view in the middle of evaluating it, which can loop or show stale values. React to changes in `onChange(of:)`, `.task(id:)` or the model instead.
+
+</Callout>
+
+## Practice
+
+The **chat thread** review includes a once-a-second timer read at the top of a long list. Work out which bodies it re-runs, and what you'd move where.
+
+```cards
+- id: updates-cycle
+  front: "What happens, in order, when an observed property changes?"
+  back: "The views that read it are marked invalid; later in the run loop their bodies run, parents first; each child is compared with its previous value and skipped if unchanged; the differences are rendered."
+- id: updates-dependency
+  front: "With `@Observable`, what makes a property a view's dependency?"
+  back: "Reading it while `body` runs. Reads inside button actions or `.task` closures happen later, outside the tracking, so they aren't dependencies."
+- id: updates-push-down
+  front: "A value changes every second and is read at the top of a screen. What do you change?"
+  back: "Move the read into a small leaf view that receives the model and reads the value itself, so each tick re-runs one small body instead of the whole screen."
+```
+
+```quiz
+- id: q1
+  type: output
+  prompt: "What does this print?"
+  code: |
+    import Observation
+
+    @Observable
+    final class Player {
+        var title = "Intro"
+        var progress = 0.0
+    }
+
+    let player = Player()
+    withObservationTracking {
+        _ = player.title
+    } onChange: {
+        print("title view invalid")
+    }
+    withObservationTracking {
+        _ = player.progress
+    } onChange: {
+        print("progress bar invalid")
+    }
+    player.progress = 0.1
+    player.progress = 0.2
+    player.title = "Chapter 1"
+    print("done")
+  answer: "progress bar invalid\ntitle view invalid\ndone"
+  explain: "Each tracker fires once, immediately before the first change to a property it read. The second `progress` change finds no tracker left: SwiftUI would have re-run the body and registered again."
+- id: q2
+  type: mcq
+  prompt: "`LibraryScreen` passes its `library` model to `ShelfHeader` (which reads `library.name`) and to `DownloadBadge` (which reads `library.activeDownloads`). `LibraryScreen`'s own body reads neither. `activeDownloads` changes. Which bodies run?"
+  options:
+    - "All three, because they share the model"
+    - "`LibraryScreen` and `DownloadBadge`"
+    - "Only `DownloadBadge`"
+    - "None until the screen appears again"
+  answer: 2
+  explain: "Only views that read `activeDownloads` during their body depend on it. The parent passed the same reference and read nothing, so it isn't invalidated. With `ObservableObject` the answer would be every view observing `library`."
+- id: q3
+  type: multi
+  prompt: "Which of these make `model.query` a dependency of the view's body? Choose all that apply."
+  options:
+    - "`Text(model.query)` in `body`"
+    - "`if model.query.isEmpty { EmptyHint() }` in `body`"
+    - "`Button(\"Search\") { model.run(model.query) }`"
+    - "`.task { await model.search(model.query) }`"
+    - "`ResultsHeader(model: model)` in `body`, where `ResultsHeader` reads `query` in its own body"
+  answer: [0, 1]
+  explain: "Only reads that happen while this body runs count. The button action and the task read `query` later, outside the tracking. `ResultsHeader` reading it makes it a dependency of `ResultsHeader`, not of this view."
+- id: q4
+  type: truefalse
+  prompt: "A button's action sets three `@State` properties one after another, so the view's body runs three times."
+  answer: false
+  explain: "Synchronous changes in one event are batched into one update, so the body runs once. Changes separated by an `await` in an async method are a different story: they can land in separate updates."
+- id: q5
+  type: recall
+  prompt: "A long list stutters once a second. Describe how you'd find the cause and the likely fix."
+  model: "Add `let _ = Self._printChanges()` to the screen and a row, or record with the SwiftUI instrument, to see which bodies run each second and why. The usual cause is a value that ticks (a timer, `now`, progress) read high in the tree, so the whole screen and every row re-run. Move the read into a small leaf view, such as a label that reads the value itself or a `TimelineView`, so only that leaf updates."
+```

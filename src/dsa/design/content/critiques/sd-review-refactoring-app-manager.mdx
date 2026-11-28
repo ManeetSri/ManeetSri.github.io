@@ -1,0 +1,146 @@
+<Brief>
+
+Every screen of this shopping app talks to one object, `AppManager.shared`. It started as a place to keep the logged-in user, and three years later it holds the basket, preferences, analytics and error alerts too. Since the Swift 6 migration, support has seen crashes nobody can reproduce, and one customer reported checking out someone else's basket on a shared iPad. Review the file as you would a pull request.
+
+```swift check ios title="AppManager.swift"
+import UIKit
+
+struct User: Codable {
+    let id: String
+}
+
+struct CartItem: Codable {
+    let productID: String
+    let price: Double
+    let quantity: Int
+}
+
+final class AppManager: @unchecked Sendable {
+    static let shared = AppManager()
+
+    var currentUser: User?
+    var cart: [CartItem] = []
+    var prefersCompactLayout = false
+
+    private init() {}
+
+    func logIn(email: String, password: String, completion: @escaping @Sendable (Bool) -> Void) {
+        var request = URLRequest(url: URL(string: "https://api.example.com/login")!)
+        request.httpMethod = "POST"
+        request.httpBody = try? JSONEncoder().encode(["email": email, "password": password])
+        URLSession.shared.dataTask(with: request) { data, _, _ in
+            self.currentUser = data.flatMap { try? JSONDecoder().decode(User.self, from: $0) }
+            completion(self.currentUser != nil)
+        }.resume()
+    }
+
+    func logOut() {
+        currentUser = nil
+    }
+
+    func add(_ item: CartItem) {
+        cart.append(item)
+        NotificationCenter.default.post(name: Notification.Name("cartChanged"), object: nil)
+        track("add_to_cart")
+    }
+
+    func cartTotal() -> Double {
+        cart.reduce(0) { $0 + $1.price * Double($1.quantity) }
+    }
+
+    func track(_ event: String) {
+        print("analytics:", event, currentUser?.id ?? "anonymous")
+    }
+
+    @MainActor func showError(_ message: String) {
+        let scene = UIApplication.shared.connectedScenes.first as? UIWindowScene
+        let alert = UIAlertController(title: "Error", message: message, preferredStyle: .alert)
+        alert.addAction(UIAlertAction(title: "OK", style: .default))
+        scene?.windows.first?.rootViewController?.present(alert, animated: true)
+    }
+}
+
+final class CartViewController: UIViewController {
+    override func viewDidLoad() {
+        super.viewDidLoad()
+        title = "Basket (\(AppManager.shared.cart.count))"
+    }
+
+    @objc func checkout() {
+        guard AppManager.shared.currentUser != nil else {
+            AppManager.shared.showError("Please log in")
+            return
+        }
+        AppManager.shared.track("checkout_started")
+    }
+}
+```
+
+</Brief>
+
+```workspace
+template: critique
+minutes: 25
+```
+
+```findings
+- id: data-race
+  title: "`@unchecked Sendable` hides a data race on the user and the basket"
+  severity: high
+  lines: 26-28
+  detail: "URLSession calls the completion handler on a background queue, so line 27 writes `currentUser` while screens read it on the main thread (lines 61 and 65), and `cart` can be changed from any thread that holds the singleton. `@unchecked Sendable` tells Swift 6 to stop checking instead of making the type safe, so crashes and lost updates appear in the field and never in the debugger."
+- id: logout-leak
+  title: Logging out leaves the last user's basket behind
+  severity: high
+  lines: 32-34
+  detail: "`logOut()` clears only `currentUser`. The basket and the layout preference survive, so the next person to log in on the device (a shared iPad, a family phone) sees and can buy the previous person's basket. Every new piece of global state has to be remembered here and nothing reminds you; state that belongs to a session should live in an object created at login and thrown away at logout."
+- id: god-object
+  title: One type owns auth, the basket, preferences, analytics and alerts
+  severity: high
+  lines: 13-56
+  detail: "Every feature edits this file for a different reason, so it changes constantly, conflicts in every merge and can't be tested or reused in parts. Its pieces share almost no state: login uses `currentUser`, the basket uses `cart`, alerts use neither. Those are separate objects waiting to be extracted."
+- id: hidden-dependencies
+  title: Screens reach for the singleton instead of being given what they need
+  severity: medium
+  lines: 61-69
+  detail: "Nothing in `CartViewController`'s initialiser says it needs a session, a basket and analytics, so a preview or test can't give it a basket of its own. Tests that touch `AppManager.shared` share one instance, leak state into each other and pass or fail depending on order (and Swift Testing runs tests in parallel by default)."
+- id: money-double
+  title: Prices and totals are Doubles
+  severity: medium
+  lines: 42-44
+  detail: "`Double` can't represent most decimal amounts exactly (`0.1 + 0.2` isn't `0.3`), so summing a basket drifts by fractions of a penny and the app's total can disagree with the server's. Store money as `Decimal` or whole pence (line 9 as well)."
+- id: ui-from-model
+  title: A shared model object presents alerts
+  severity: medium
+  lines: 50-55
+  detail: "It picks the first connected scene, which on an iPad with several windows may not be the one the user is looking at, and `present` does nothing but log a warning when the root is already presenting something. It also makes everything that imports AppManager depend on UIKit. The screen that has the error should show it."
+- id: stale-title
+  title: The basket count in the title goes stale
+  severity: low
+  lines: 61
+  detail: "The title reads the global basket once, in `viewDidLoad`, and nothing updates it. Global state doesn't tell its readers when it changes unless each one subscribes by hand, and this screen doesn't, so adding an item from another screen leaves the wrong count on show."
+- id: stringly-names
+  title: Notification and event names are strings typed at each use
+  severity: low
+  lines: 38-39
+  detail: "`Notification.Name(\"cartChanged\")` and `\"add_to_cart\"` are retyped by every sender and observer. A typo compiles and silently never fires, and the compiler can't find every place an event is used. Declare them once as constants, or as an enum of events."
+```
+
+<ReferenceReview>
+
+**Most important first.** Two problems hurt customers today. The login completion writes shared state from a background queue, a data race that `@unchecked Sendable` hid from Swift 6. And `logOut()` leaves the basket behind, so one customer can see and buy another's: that's a privacy bug, not a style problem.
+
+**The design problem underneath** is a god object with global access. Its parts share almost no state, which is good news: they can come apart one at a time. Global access is why tests can't isolate it, why screens hide their dependencies, and why logout has to remember every field.
+
+**How I'd fix it, in small steps** (each one shippable, the app working after every merge):
+
+1. Make `AppManager` `@MainActor` and delete `@unchecked Sendable`. Rewrite `logIn` with `try await URLSession.shared.data(for:)` from a main-actor method. The compiler now points at every off-main access; fix them.
+2. Introduce a `UserSession` that holds the user and the basket, created at login and discarded at logout. `logOut()` becomes "drop the session", and the leak can't come back as fields are added.
+3. Extract `Basket` (the most used part) behind a small protocol. During the move, `AppManager.cart` forwards to it, so every call site keeps compiling. Switch it to `Decimal` or pence while it's on its own.
+4. Inject into screens with defaults first, `init(basket: Basket = AppManager.shared.basket)`, so nothing breaks. Then build the screens in the scene's composition root, pass real instances, and remove the defaults.
+5. Move alert presentation into the screens. Replace `"cartChanged"` with an `@Observable` basket the title observes, and analytics strings with an `AnalyticsEvent` enum behind an injected tracker.
+6. Add a lint rule that rejects new uses of `AppManager.shared` while the migration runs, and delete the type when the last use goes.
+
+**Tests to add:** logout gives the next session an empty basket; a basket of `0.10 + 0.20`-style prices totals exactly; the cart screen (or its view model) with an injected basket shows the right count and updates when it changes; each extracted service tested on its own instance, in parallel, with no shared state.
+
+</ReferenceReview>

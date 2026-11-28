@@ -1,0 +1,112 @@
+Most apps end up with the same three types for every kind of data: an API client that fetches orders, a store that keeps them on the device, and a repository that decides which to ask. Write them once, generically, so the compiler wires an `Order` API only to an `Order` store.
+
+`GenericRepositoryKit.InMemoryStore<Model>` and `GenericRepositoryKit.Repository<Remote, Local>` where `Remote.Model == Local.Model`
+
+The protocols are written for you: `Entity` (identifiable, equatable, sendable, with comparable ids), `RemoteSource` (`fetchAll()` and `fetch(id:)`) and `LocalStore` (an actor with `all()`, `model(id:)`, `upsert(_:)` and `replaceAll(with:)`).
+
+- **`InMemoryStore`** keeps at most one model per id. `all()` returns them sorted by id; `upsert(_:)` inserts or replaces; `replaceAll(with:)` leaves exactly the models it's given.
+- **`Repository.items(_:)`** follows a `FetchPolicy`:
+  - `.cacheFirst`: the cached list if it isn't empty; otherwise fetch, store and return.
+  - `.networkFirst`: fetch, store and return. If the fetch fails, return the cached list, or rethrow the error when nothing is cached.
+  - `.cacheOnly`: the cached list, even if empty. Never touches the network.
+- A list from the network **replaces** what the store held, because the server's list is the truth: an item deleted on the server must disappear from the device.
+- **`Repository.item(id:)`** returns the cached model without touching the network, or fetches it, upserts it and returns it. A fetch error reaches the caller.
+- Lists always come back from the store, so they're sorted by id.
+
+## Examples
+
+| Situation | Call | Result |
+| --- | --- | --- |
+| Empty store, server has articles 3, 1, 2 | `items(.cacheFirst)` | articles 1, 2, 3; one network call |
+| Same repository, called again | `items(.cacheFirst)` | articles 1, 2, 3; still one network call |
+| Store holds article 9, server has 1, 2, 3 | `items(.networkFirst)` | 1, 2, 3, and 9 is gone from the store |
+| Network fails, store holds article 3 | `items(.networkFirst)` | `[article 3]` |
+| Network fails, store empty | `items(.networkFirst)` | throws the network's error |
+| Store holds article 1 | `item(id: 1)` | the cached article; no network call |
+
+## Constraints
+
+- Keep `Repository` a `Sendable` struct with no stored state of its own: the store is the only cache.
+- Don't add cases to `FetchPolicy` or requirements to the protocols; the tests bring their own remote source.
+- The same `Repository` must work for any `Entity`: the tests use one with `Int` ids and one with `String` ids.
+
+<Hints>
+<Hint>
+`InMemoryStore` needs one stored property: a dictionary from `Model.ID` to `Model`. `Entity` guarantees the id is `Hashable` (from `Identifiable`) and `Comparable`, which is all `all()` needs to sort.
+</Hint>
+<Hint>
+Because of the `where Remote.Model == Local.Model` clause, a `[Remote.Model]` from `fetchAll()` *is* a `[Local.Model]`: you can pass it straight to `replaceAll(with:)` with no casts. Each call into the store is a call into an actor, so it needs `await`.
+</Hint>
+<Hint>
+Write one private `refresh()` that fetches, replaces and returns `await local.all()`. Then `.cacheFirst` calls it when the cache is empty, and `.networkFirst` calls it inside a `do`, falling back to the cache in the `catch`.
+</Hint>
+</Hints>
+
+## Solutions
+
+<Approach title="One where clause, three policies" time="O(n log n) per list (sorting)" space="O(n)">
+
+```swift
+public actor InMemoryStore<Model: Entity>: LocalStore {
+    private var byID: [Model.ID: Model] = [:]
+
+    public init(_ models: [Model] = []) {
+        for model in models { byID[model.id] = model }
+    }
+
+    public func all() -> [Model] { byID.values.sorted { $0.id < $1.id } }
+    public func model(id: Model.ID) -> Model? { byID[id] }
+    public func upsert(_ model: Model) { byID[model.id] = model }
+
+    public func replaceAll(with models: [Model]) {
+        byID = Dictionary(models.map { ($0.id, $0) }, uniquingKeysWith: { _, last in last })
+    }
+}
+
+public struct Repository<Remote: RemoteSource, Local: LocalStore>: Sendable where Remote.Model == Local.Model {
+    public typealias Model = Remote.Model
+    private let remote: Remote
+    private let local: Local
+
+    public init(remote: Remote, local: Local) {
+        self.remote = remote
+        self.local = local
+    }
+
+    public func items(_ policy: FetchPolicy) async throws -> [Model] {
+        switch policy {
+        case .cacheOnly:
+            return await local.all()
+        case .cacheFirst:
+            let cached = await local.all()
+            return cached.isEmpty ? try await refresh() : cached
+        case .networkFirst:
+            do {
+                return try await refresh()
+            } catch {
+                let cached = await local.all()
+                if cached.isEmpty { throw error }
+                return cached
+            }
+        }
+    }
+
+    public func item(id: Model.ID) async throws -> Model {
+        if let cached = await local.model(id: id) { return cached }
+        let fresh = try await remote.fetch(id: id)
+        await local.upsert(fresh)
+        return fresh
+    }
+
+    private func refresh() async throws -> [Model] {
+        try await local.replaceAll(with: remote.fetchAll())
+        return await local.all()
+    }
+}
+```
+
+The design lives in the signature. `Remote.Model == Local.Model` is a **same-type constraint**: it states a relationship between two associated types, and the compiler checks it wherever a repository is created. Try `Repository(remote: OrdersAPI(), local: InMemoryStore<Product>())` and it fails to compile, where an `any`-based design would fail at run time, if at all.
+
+The cost is that the repository's full type, `Repository<OrdersAPI, InMemoryStore<Order>>`, spreads into whatever stores it. Most apps stop that at the boundary: the view model holds `any OrderRepository`, a small protocol with the two methods, and only the app's composition root names the generic type.
+
+</Approach>

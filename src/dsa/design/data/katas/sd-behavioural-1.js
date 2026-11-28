@@ -1,2 +1,47 @@
 // Katas for D12 · Behavioural patterns I
-export default [];
+export default [
+    {
+        id: 'sd-kata-behavioural-1-observer-tokens',
+        kind: 'problem',
+        title: 'Observers that cancel themselves',
+        difficulty: 'medium',
+        patterns: ['patterns', 'state'],
+        lessons: ['sd-behavioural-observer', 'sd-behavioural-kvo-combine-observation'],
+        swiftTest: 'TickerBroadcastTests',
+        lists: [],
+        minutes: 25,
+    },
+    {
+        id: 'sd-kata-behavioural-1-interceptor-chain',
+        kind: 'problem',
+        title: 'An interceptor chain',
+        difficulty: 'medium',
+        patterns: ['patterns', 'networking'],
+        lessons: ['sd-behavioural-chain-of-responsibility'],
+        swiftTest: 'RequestRelayTests',
+        lists: [],
+        minutes: 30,
+    },
+    {
+        id: 'sd-kata-behavioural-1-undoable-commands',
+        kind: 'problem',
+        title: 'Commands that undo themselves',
+        difficulty: 'medium',
+        patterns: ['patterns', 'state'],
+        lessons: ['sd-behavioural-command'],
+        swiftTest: 'PackingListUndoTests',
+        lists: [],
+        minutes: 30,
+    },
+    {
+        id: 'sd-kata-behavioural-1-upload-strategies',
+        kind: 'problem',
+        title: 'Upload strategies for Low Data Mode',
+        difficulty: 'easy',
+        patterns: ['patterns', 'media'],
+        lessons: ['sd-behavioural-strategy'],
+        swiftTest: 'UploadResizePolicyTests',
+        lists: [],
+        minutes: 20,
+    },
+];

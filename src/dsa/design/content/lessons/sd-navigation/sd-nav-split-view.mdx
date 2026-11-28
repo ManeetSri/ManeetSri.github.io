@@ -1,0 +1,328 @@
+## Why it matters
+
+The same app runs on a 6-inch phone, a 13-inch iPad, a resizable Stage Manager window, a Mac and Apple Vision Pro, and on iPad its width can change while the user is in the middle of something: they drag Safari alongside it and your three columns become one. Navigation that was designed as "a stack of screens" breaks there; navigation designed as "a selection the layout displays" adapts for free. Interviewers ask "how does this work on iPad?" precisely because it exposes whether your navigation state is tied to one layout.
+
+## One app, many widths
+
+SwiftUI and UIKit describe the space they have with **size classes**: each axis is `compact` or `regular`. What matters for navigation is the horizontal one.
+
+| Where | Horizontal size class |
+| --- | --- |
+| iPhone in portrait; most iPhones in landscape | compact |
+| The largest iPhones in landscape | regular |
+| iPad full screen, or the larger side of Split View | regular |
+| iPad in Slide Over, or the narrow side of Split View | compact |
+| A Stage Manager window | either, and it changes as the user resizes it |
+
+So the honest requirement is not "an iPhone layout and an iPad layout". It's **one navigation state that can be shown at any width, and moved between widths at any moment**. Apple's containers are built for exactly that, if your state lets them.
+
+## NavigationSplitView: columns that collapse
+
+`NavigationSplitView` shows two or three columns: a **sidebar**, an optional **content** column, and a **detail**. Navigation between columns isn't pushing; it's **selection**. Choosing a department in the sidebar sets a selection, the content column shows that department's products, and choosing a product sets a second selection the detail column shows.
+
+In compact width the same split view **collapses into one stack**: the sidebar is the root, and each selection pushes the next column. Back clears the selection. You write one view; the layout follows the width.
+
+```visual flow
+title: One selection, two layouts
+nodes:
+  - { id: model, label: Selection, kind: store, at: [0, 1] }
+  - { id: columns, label: Three columns, kind: view, at: [2, 0], w: 3 }
+  - { id: stack, label: One stack, kind: view, at: [2, 2], w: 3 }
+edges:
+  - [model, columns, reads, { style: data }]
+  - [model, stack, reads, { style: data }]
+steps:
+  - say: "The model holds two values: the selected department and the selected product. Neither says anything about columns or pushes."
+    show: [model]
+    label: { model: "shoes, none" }
+  - say: "At regular width the split view shows three columns. The sidebar highlights Shoes; the content column lists shoes; the detail asks the user to choose."
+    show: [columns]
+    send: model->columns
+    label: { columns: "Departments | Shoes | choose one" }
+  - say: "Choosing a product sets the second selection, and the detail column shows it."
+    send: model->columns
+    label: { model: "shoes, 7", columns: "Departments | Shoes | Trail runners" }
+  - say: "The user drags Safari alongside, and the window becomes compact. The split view **collapses**: the same two values now mean a stack, Departments → Shoes → Trail runners."
+    hide: [columns]
+    show: [stack]
+    send: model->stack
+    label: { stack: "Departments → Shoes → Trail runners" }
+  - say: "Back in the stack doesn't pop a screen you own: it clears the product selection."
+    label: { model: "shoes, none", stack: "Departments → Shoes" }
+  - say: "Widen the window again and the columns are rebuilt from the same values. Nothing was lost, because nothing belonged to a layout."
+    hide: [stack]
+    show: [columns]
+    label: { columns: "Departments | Shoes | choose one" }
+```
+
+Here's that browser. The model holds the selections and the detail column's own path; the views only display them.
+
+```swift check ios title="BrowseView.swift"
+import SwiftUI
+
+struct Department: Identifiable, Hashable {
+    let id: String
+    let name: String
+}
+
+struct Product: Identifiable, Hashable {
+    let id: Int
+    let name: String
+    let departmentID: String
+}
+
+enum ProductRoute: Hashable, Codable {
+    case reviews(productID: Int)
+    case sizeGuide(productID: Int)
+}
+
+@MainActor @Observable
+final class BrowseModel {
+    let departments = [Department(id: "shoes", name: "Shoes"), Department(id: "bags", name: "Bags")]
+    let products = [
+        Product(id: 7, name: "Trail runners", departmentID: "shoes"),
+        Product(id: 8, name: "Canvas tote", departmentID: "bags"),
+    ]
+
+    // Selections are the navigation state. Changing one resets what depended on it.
+    var departmentID: Department.ID? {
+        didSet { if departmentID != oldValue { productID = nil } }
+    }
+    var productID: Product.ID? {
+        didSet { if productID != oldValue { detailPath = [] } }
+    }
+    /// Screens pushed inside the detail column, such as reviews for the selected product
+    var detailPath: [ProductRoute] = []
+
+    var productsInDepartment: [Product] {
+        products.filter { $0.departmentID == departmentID }
+    }
+}
+
+struct BrowseView: View {
+    @State private var model = BrowseModel()
+    // Which column is on top when collapsed; the sidebar is a better start on iPhone than an empty detail
+    @State private var compactColumn = NavigationSplitViewColumn.sidebar
+
+    var body: some View {
+        NavigationSplitView(preferredCompactColumn: $compactColumn) {
+            List(model.departments, selection: $model.departmentID) { department in
+                Text(department.name)
+            }
+            .navigationTitle("Shop")
+        } content: {
+            List(model.productsInDepartment, selection: $model.productID) { product in
+                Text(product.name)
+            }
+        } detail: {
+            // The detail column owns one stack for drilling further into the selected product
+            NavigationStack(path: $model.detailPath) {
+                Group {
+                    if let id = model.productID {
+                        Button("Reviews") { model.detailPath.append(.reviews(productID: id)) }
+                    } else {
+                        ContentUnavailableView("Choose a product", systemImage: "bag")
+                    }
+                }
+                .navigationDestination(for: ProductRoute.self) { route in
+                    switch route {
+                    case .reviews(let id): Text("Reviews for product \(id)")
+                    case .sizeGuide(let id): Text("Size guide for product \(id)")
+                    }
+                }
+            }
+        }
+    }
+}
+```
+
+Three design choices in there are the lesson:
+
+- **Selections, not pushes, between columns.** `List(_:selection:)` in a split view column drives the next column at regular width and pushes it at compact width. A `NavigationLink(value:)` in those lists sets the selection too.
+- **Dependent state resets with its parent.** Choosing another product clears `detailPath`; choosing another department clears the product. Without those two `didSet`s, a user who opened reviews for the trail runners and then tapped a tote would see the tote's detail with the trail runners' reviews pushed on top of it.
+- **Deeper navigation lives in the detail column's stack.** The split view handles the two levels of hierarchy; a `NavigationStack` inside the detail handles anything below the product. That's the one place a stack inside another container is right: one stack per column.
+
+## TabView in iOS 18: tabs that become a sidebar
+
+Split views suit **one hierarchy** browsed with a persistent list: mail, notes, files, settings. Many apps instead have **a few parallel places**: Home, Search, Basket, Account. iOS 18 rebuilt `TabView` for those apps:
+
+- **`Tab` values** with a selection value each, replacing `.tabItem`.
+- **`.tabViewStyle(.sidebarAdaptable)`**: an ordinary tab bar on iPhone; on iPad a compact tab bar at the top that the user can expand into a sidebar. On the Mac it's a sidebar.
+- **`TabSection`** groups tabs under a heading in the sidebar, for secondary places such as departments or collections that would crowd a tab bar.
+- **Customisation**: with `customizationID` and `TabViewCustomization`, users can reorder and hide tabs, and the app can save their choices.
+
+```swift check ios title="ShopTabs.swift"
+import SwiftUI
+
+enum ShopSection: Hashable {
+    case home, search, basket, department(String)
+}
+
+struct ShopTabs: View {
+    @State private var selection: ShopSection = .home
+    @AppStorage("shop.tabs") private var customization: TabViewCustomization
+
+    var body: some View {
+        TabView(selection: $selection) {
+            Tab("Home", systemImage: "house", value: ShopSection.home) {
+                Text("Home")   // each tab's content is its own NavigationStack in the real app
+            }
+            .customizationID("home")
+
+            Tab("Basket", systemImage: "bag", value: ShopSection.basket) {
+                Text("Basket")
+            }
+            .customizationID("basket")
+
+            Tab(value: ShopSection.search, role: .search) {
+                Text("Search")
+            }
+
+            // Secondary places: in the sidebar, hidden from the iPhone tab bar
+            TabSection("Departments") {
+                ForEach(["shoes", "bags"], id: \.self) { slug in
+                    Tab(slug.capitalized, systemImage: "tag", value: ShopSection.department(slug)) {
+                        Text(slug.capitalized)
+                    }
+                    .customizationID("department.\(slug)")
+                }
+            }
+            .defaultVisibility(.hidden, for: .tabBar)
+        }
+        .tabViewStyle(.sidebarAdaptable)
+        .tabViewCustomization($customization)
+    }
+}
+```
+
+Notice the selection type. `ShopSection` has a case with a value, `.department("shoes")`, so a deep link to a department can select its sidebar entry directly. Selection is navigation state like any other: a deep link sets it, restoration saves it.
+
+Each tab keeps its own `NavigationStack` and path, exactly as each tab owns a `UINavigationController` in UIKit. A tab's content can itself be a `NavigationSplitView`, which is how an app with a few top-level places can still show a list and detail side by side inside one of them on iPad.
+
+## UIKit: the split view controller
+
+`UISplitViewController(style: .doubleColumn)` or `.tripleColumn` (iOS 14) works the same way, with `setViewController(_:for:)` for `.primary`, `.supplementary` and `.secondary`. Two extra controls are worth knowing:
+
+- **A separate compact tree.** `setViewController(_:for: .compact)` gives compact width an entirely different hierarchy, say a tab bar controller, instead of collapsing the columns. It's flexible, and it doubles the navigation state you must keep in step when the width changes.
+- **Choosing what shows after collapsing.** By default the collapsed stack shows the secondary column. If nothing is selected that's an empty screen on an iPhone, so the delegate returns the primary column instead:
+
+```swift check ios title="Collapsing to the sidebar when nothing is selected"
+import UIKit
+
+final class BrowseSplitDelegate: NSObject, UISplitViewControllerDelegate {
+    var hasSelection: () -> Bool = { false }
+
+    func splitViewController(_ svc: UISplitViewController, topColumnForCollapsingToProposedTopColumn proposedTopColumn: UISplitViewController.Column) -> UISplitViewController.Column {
+        hasSelection() ? proposedTopColumn : .primary
+    }
+}
+```
+
+## Designing state that survives any width
+
+Every example above follows one rule: **navigation state describes what the user chose, never how it's laid out.** In practice:
+
+- Store **selections and paths**, not "is the detail visible" or "which column is on top". Visibility is derived from width and selection.
+- Keep **one model per window**, shared by every layout. Separate compact and regular state goes out of step the first time the width changes mid-task.
+- Make every selection **an id**, so a deep link or a restored snapshot can set it without the screens existing yet.
+- **Test the collapse.** Run on an iPad, open a product's reviews, drag another app alongside, then back. Most adaptive bugs show up in that thirty-second test.
+
+## Trade-offs
+
+| | Tab bar | `sidebarAdaptable` TabView | NavigationSplitView | Tabs containing split views |
+| --- | --- | --- | --- | --- |
+| Best for | 3–5 parallel places | parallel places, plus secondary ones in a sidebar on iPad | one deep hierarchy browsed from a list | a few places, one of them a list and detail |
+| iPad use of space | poor: a phone layout, stretched | good | very good | good |
+| State to manage | selected tab + a path per tab | the same, plus customisation | selections + a detail path | all of the above |
+| Compact width | as is | becomes a tab bar | collapses to one stack | each tab's split view collapses |
+| Examples | most shopping and social apps on iPhone | Music, TV, Podcasts on iPad | Mail, Notes, Files, Settings | a shop whose Browse tab shows departments beside products |
+
+A phone-first app with a few places starts with tabs, and `sidebarAdaptable` makes the iPad version respectable for one modifier. An app that *is* a hierarchy (a mailbox, a document library) is a split view at the root. Combine them when one of your places is itself a hierarchy worth seeing side by side.
+
+<Callout kind="interview">
+
+**What to say:** "Navigation state is selections and paths, per window, independent of layout. On iPad the Browse tab is a split view driven by the selected department and product; at compact width it collapses into a stack from the same state, so resizing loses nothing." Mention `sidebarAdaptable` for the tabs, and that changing a selection resets the state that depended on it.
+
+**What to ask:** is iPad a priority, or a scaled-up phone? Should the app support several windows (each then has its own navigation)? Is the content one hierarchy or several parallel places?
+
+**Red flags:** `if horizontalSizeClass == .regular` choosing between two navigation trees with separate state; a phone-only stack stretched across an iPad; storing "which column is visible"; forgetting to reset the detail path when the selection changes.
+
+</Callout>
+
+<Callout kind="gotcha" title="iOS gotcha: don't wrap a split view in a stack">
+
+`NavigationSplitView` manages its own stacks: it collapses into one on compact width. Putting it inside a `NavigationStack`, or pushing a split view onto a stack, gives you nested stacks, doubled bars and broken collapse. A split view belongs at the root of a window or a tab, with at most one `NavigationStack` per column inside it.
+
+</Callout>
+
+## Practice
+
+[Routing for a tabbed shopping app](/design/practice/sd-design-navigation-shop-routing) asks for the iPad version of a four-tab shop alongside its deep links and restoration. Decide which tab becomes a split view, what the selection state is, and how a link to a product lands on both an iPhone and an iPad in Split View.
+
+```cards
+- id: selection-not-push
+  front: "How does NavigationSplitView move between columns?"
+  back: "By selection. A list's selection in one column decides what the next column shows. At compact width the same selections become pushes in a single collapsed stack."
+- id: layout-independent-state
+  front: "What should adaptive navigation state contain?"
+  back: "What the user chose (selections as ids, and paths), per window, never how it's laid out. Visibility and columns are derived from the width and the selection."
+- id: reset-dependents
+  front: "What must happen when the selected item in a split view changes?"
+  back: "Reset the state that depended on it, such as the detail column's path, or the new item appears with the old item's screens pushed on top."
+- id: sidebar-adaptable
+  front: "What does `.tabViewStyle(.sidebarAdaptable)` give you?"
+  back: "An ordinary tab bar on iPhone, and on iPad a tab bar the user can expand into a sidebar, with TabSections for secondary places. It's a sidebar on the Mac."
+```
+
+```quiz
+- id: q1
+  type: mcq
+  prompt: "On an iPad the user has the trail runners open in the detail column. They drag Safari alongside, and your app becomes compact. What should they see?"
+  options:
+    - "The sidebar, since compact layouts start from the root"
+    - "A stack of Departments → Shoes → Trail runners, rebuilt from the same selections"
+    - "An empty detail screen until they choose again"
+    - "Whatever the iPhone layout last showed, kept in separate compact state"
+  answer: 1
+  explain: "A split view driven by selections collapses into a stack that represents those selections, so the user stays where they were. Separate compact state, or state tied to columns, is what loses their place."
+- id: q2
+  type: sort
+  prompt: "Which navigation structure fits each app best at its root?"
+  buckets: [Tabs, Split view]
+  items:
+    - ["A shop with Home, Search, Basket and Account", 0]
+    - ["A mail app: mailboxes, messages, a message", 1]
+    - ["A social app with Feed, Explore, Notifications and Profile", 0]
+    - ["A notes app with folders and notes", 1]
+    - ["The Settings app", 1]
+  explain: "Parallel places that users switch between suit tabs, made iPad-friendly with sidebarAdaptable. An app that is one hierarchy browsed from a list suits a split view at the root."
+- id: q3
+  type: bug
+  prompt: "After opening reviews for one product, choosing another product shows the new product with the old product's reviews pushed on top. Which line should change?"
+  code: |
+    @MainActor @Observable
+    final class BrowseModel {
+        var departmentID: String? {
+            didSet { if departmentID != oldValue { productID = nil } }
+        }
+        var productID: Int?
+        var detailPath: [ProductRoute] = []
+    }
+  answer: 6
+  explain: "`productID` changes without resetting `detailPath`, which belonged to the previous product. Give it the same kind of `didSet` the department has: `if productID != oldValue { detailPath = [] }`."
+- id: q4
+  type: mcq
+  prompt: "In UIKit, a collapsed split view shows an empty detail screen when an iPhone user opens the app with nothing selected. What's the fix?"
+  options:
+    - "Present the sidebar modally on launch"
+    - "Return `.primary` from `splitViewController(_:topColumnForCollapsingToProposedTopColumn:)` when nothing is selected"
+    - "Use two separate apps for iPhone and iPad"
+    - "Set `preferredDisplayMode` to `.secondaryOnly`"
+  answer: 1
+  explain: "When collapsing, the delegate chooses which column ends up on top. With no selection, the primary column (the list) is the useful one; with a selection, keep the proposed detail."
+- id: q5
+  type: truefalse
+  prompt: "A `NavigationStack` inside the detail column of a `NavigationSplitView` is a supported way to push screens below the selected item."
+  answer: true
+  explain: "One stack per column is the rule. The split view handles the levels of the hierarchy; the detail column's stack handles drilling further into the selected item. What isn't supported is a stack around the split view."
+```

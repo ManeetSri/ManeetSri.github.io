@@ -1,0 +1,338 @@
+## Why it matters
+
+Mobile networks drop packets, lifts swallow signals and servers restart, but most of those failures are **transient**: try again a moment later and it works. A good retry policy hides them from the user; a bad one turns a short server outage into a long one, because every phone that failed retries at once, again and again, and the recovering server is flattened by its own clients. Interviewers ask "the API is down for five minutes: what does your app do?" to see whether you know the difference, and whether you know which requests are safe to repeat at all.
+
+## Which failures deserve a retry
+
+A retry only helps if the next attempt can succeed. Sort errors by what they mean:
+
+| Failure | Retry? | Why |
+| --- | --- | --- |
+| `URLError` `.timedOut`, `.networkConnectionLost`, `.cannotConnectToHost` | Yes, with backoff | The network or server had a moment; the request may well succeed next time |
+| HTTP `408`, `502`, `503`, `504` | Yes, with backoff | A timeout, or an overloaded or restarting server |
+| HTTP `429`, or `503` with `Retry-After` | Yes, but after the time the server gave | You're over a limit; the server said when to come back |
+| HTTP `500` | Once at most, carefully | Often a bug for this particular request; it'll fail the same way |
+| HTTP `401` | No: refresh the token, then retry once | The credentials expired; [single-flight](/design/learn/sd-resilience-single-flight) handles the refresh |
+| HTTP `400`, `403`, `404`, `409`, `422`, a decoding error | No | The request itself is wrong; it'll fail identically every time |
+| `URLError(.cancelled)`, `CancellationError` | Never | The user or the app gave up; retrying does work nobody wants |
+| `URLError(.notConnectedToInternet)` | Not on a timer | Wait for connectivity instead of burning attempts |
+
+The last row deserves a design of its own. Retrying on a timer while the phone is in Airplane Mode drains attempts for nothing. Setting `waitsForConnectivity = true` on the `URLSessionConfiguration` makes a request wait for a connection instead of failing at once (bounded by `timeoutIntervalForResource`), and an `NWPathMonitor` can tell a sync queue when to resume.
+
+## Is it safe to retry? Idempotency
+
+An operation is **idempotent** if doing it twice has the same effect as doing it once. HTTP defines `GET`, `PUT` and `DELETE` as idempotent: reading twice, or setting the same value twice, changes nothing more. `POST` and `PATCH` aren't: `POST /orders` twice creates two orders.
+
+That matters because of the most dangerous failure in networking: the **ambiguous** one. A timeout doesn't tell you whether the server did the work. The request may have died on the way there, or the server may have saved the order and the response died on the way back. Retrying a non-idempotent request after an ambiguous failure can charge someone twice.
+
+The fix is an **idempotency key**: a unique id the client creates *once per user intent* (when the user taps Pay) and sends with every attempt at that intent. The server stores each key with its result for a while (Stripe keeps them for 24 hours) and answers a repeated key with the stored result instead of doing the work again. An IETF draft standardises the header as `Idempotency-Key`.
+
+```visual sequence
+title: A lost response, and the retry that doesn't double-charge
+participants:
+  - { id: app, label: App }
+  - { id: api, label: Orders API }
+  - { id: db, label: Database }
+messages:
+  - [app, api, "POST /orders · key k1", { say: "The user taps **Pay**. The app creates idempotency key `k1` for this purchase and sends it with the request." }]
+  - [api, db, save order 841 with k1, { say: "The server creates order 841 and stores the key alongside its result." }]
+  - { note: "The 201 is lost in a tunnel. The app only sees a timeout.", over: [app, api] }
+  - [app, api, "POST /orders · key k1", { say: "After a backoff the app retries, with the **same** key: it's the same purchase." }]
+  - [api, db, look up k1]
+  - [db, api, order 841, { reply: true }]
+  - [api, app, "201 · order 841", { reply: true, say: "The server recognises the key and returns the original result. Without it, this retry would have created a second order." }]
+```
+
+Three details make keys work in an app:
+
+- **One key per intent, not per attempt.** Generate it when the user acts, and reuse it for every retry of that action. A new key per attempt defeats the point.
+- **Persist it with the pending work.** If the app is terminated and the retry happens on the next launch, it must send the same key. Store it in the outbox alongside the request.
+- **The server must cooperate.** The key does nothing unless the backend stores and checks it. Say so in the design: it's an API contract.
+
+## Backoff: give the server room
+
+Retrying immediately is the worst schedule: a server that's down a millisecond ago is almost certainly still down. **Exponential backoff** waits longer after each failure, because each failure is more evidence that the problem isn't a blip. Retry *n* (counting from 0) waits `base × 2ⁿ`, up to a **cap**: with a base of 0.5 s and a cap of 8 s, that's 0.5, 1, 2, 4, 8, 8 seconds.
+
+Two limits keep it bounded:
+
+- **A maximum number of attempts**, often 3–5 in total. After that, the request fails and the app says so, or leaves the work in a queue for later.
+- **A deadline** for the whole operation. A user staring at a spinner doesn't care that retry four would have worked; you'll give retries a shared budget in the timeouts lesson.
+
+## Jitter: don't fail together, don't retry together
+
+Backoff alone has a flaw that only shows at scale. When a server restarts, every connected phone fails at the same moment. With identical backoff schedules, they all retry at the same moments too: a wave at 0.5 s, another at 1.5 s, another at 3.5 s. Each wave is as big as the original load, and it arrives exactly when the server is trying to recover. That's a **thundering herd**.
+
+**Jitter** randomises each wait so the fleet spreads out. With **full jitter**, retry *n* waits a random time between zero and the exponential delay. Step through it; the summary lists the no-jitter times that every phone without jitter would share:
+
+```visual retry
+title: "Full jitter: the same backoff, spread out"
+base: 0.5
+factor: 2
+cap: 8
+attempts: 6
+jitter: full
+seed: 3
+failUntil: 5
+```
+
+| Jitter | Retry n waits | Character |
+| --- | --- | --- |
+| None | Exactly `min(cap, base × 2ⁿ)` | Synchronised waves across the fleet |
+| Full | Random from 0 to that | Spreads the most; a retry can come almost at once |
+| Equal | Half of it, plus a random half | Never less than half the delay |
+| Decorrelated | Random from `base` to 3 × the previous wait, capped | Grows from its own history |
+
+AWS's analysis of these strategies (Marc Brooker's "Exponential Backoff and Jitter") found that no jitter was the clear loser, and that full jitter did the least total work, taking only slightly longer than decorrelated jitter. That's why full jitter is the usual default. Use equal jitter if a near-instant retry is unacceptable.
+
+## Retries multiply
+
+Every layer that retries multiplies the load of every layer below it. If the app makes 3 attempts, the API gateway makes 3 attempts at the service for each, and the service makes 3 attempts at its database for each, one user action can become 27 database calls during an outage, exactly when the database can least afford them.
+
+- **Retry at one layer.** On mobile that's usually the networking layer of the app (or the edge, for idempotent reads). Inner layers fail fast and report the failure up.
+- **Budget your retries.** Google's SRE book describes a per-client **retry budget**: retries may be at most about 10% of requests, so a healthy client retries freely and a client in a failing world stops adding load. On a phone, a simple version caps retries per minute across the whole API client.
+- **Obey the server.** `Retry-After` overrides your schedule. If it asks for an hour, a foreground request should fail and say so rather than wait.
+- **Stop retrying something that's clearly down.** That's a circuit breaker, the next lesson.
+
+## Retries in Swift
+
+The policy is two decisions: *whether* to retry this error, and *how long* to wait. Keep both in one value, and keep the loop that applies them separate, so it's the same everywhere. This version records its waits instead of sleeping, and leaves jitter out, so its output is repeatable:
+
+```swift run title="RetryPolicy.swift"
+import Foundation
+
+struct HTTPStatusError: Error {
+    let status: Int
+}
+
+struct RetryPolicy {
+    var maxAttempts = 4
+    var base = 0.5
+    var cap = 8.0
+
+    // No jitter here, so the output is the same every run; production code adds it
+    func delay(beforeRetry retry: Int) -> Double {
+        min(cap, base * pow(2, Double(retry)))
+    }
+
+    // Transient failures are worth another try; everything else fails the same way again
+    func shouldRetry(_ error: any Error) -> Bool {
+        if let urlError = error as? URLError {
+            return [.timedOut, .networkConnectionLost, .cannotConnectToHost].contains(urlError.code)
+        }
+        if let http = error as? HTTPStatusError {
+            return [408, 429, 502, 503, 504].contains(http.status)
+        }
+        return false
+    }
+}
+
+func withRetries<T: Sendable>(_ policy: RetryPolicy, sleep: @Sendable (Double) async throws -> Void, _ operation: @Sendable () async throws -> T) async throws -> T {
+    var retries = 0
+    while true {
+        do {
+            return try await operation()
+        } catch {
+            guard retries + 1 < policy.maxAttempts, policy.shouldRetry(error) else { throw error }
+            try await sleep(policy.delay(beforeRetry: retries))
+            retries += 1
+        }
+    }
+}
+
+// A fake upload endpoint that fails in a scripted way, and a log of the waits instead of real sleeps
+actor ScriptedServer {
+    private var script: [(any Error)?]
+    private(set) var attempts = 0
+
+    init(_ script: [(any Error)?]) {
+        self.script = script
+    }
+
+    func upload() throws -> String {
+        attempts += 1
+        if let failure = script.count > 1 ? script.removeFirst() : script[0] {
+            throw failure
+        }
+        return "uploaded"
+    }
+}
+
+actor Waits {
+    private(set) var seconds: [Double] = []
+    func record(_ delay: Double) { seconds.append(delay) }
+}
+
+func attempt(_ name: String, _ script: [(any Error)?]) async {
+    let server = ScriptedServer(script)
+    let waits = Waits()
+    do {
+        let result = try await withRetries(RetryPolicy(), sleep: { await waits.record($0) }) {
+            try await server.upload()
+        }
+        print("\(name): \(result) · attempts: \(await server.attempts) · waits: \(await waits.seconds)")
+    } catch {
+        print("\(name): gave up · attempts: \(await server.attempts) · waits: \(await waits.seconds)")
+    }
+}
+
+await attempt("Two blips", [URLError(.timedOut), URLError(.networkConnectionLost), nil])
+await attempt("Server down", [HTTPStatusError(status: 503)])
+await attempt("Not found", [HTTPStatusError(status: 404)])
+```
+
+```output
+Two blips: uploaded · attempts: 3 · waits: [0.5, 1.0]
+Server down: gave up · attempts: 4 · waits: [0.5, 1.0, 2.0]
+Not found: gave up · attempts: 1 · waits: []
+```
+
+The production version adds three things: full jitter, `Retry-After`, and a clock you can inject, so tests move time by hand instead of waiting. Cancellation comes almost free: `clock.sleep` throws when the caller's task is cancelled, which ends the loop.
+
+```swift check title="Retrying.swift"
+import Foundation
+
+/// An HTTP failure, with the server's Retry-After if it sent one
+struct HTTPFailure: Error {
+    let status: Int
+    let retryAfter: Duration?
+}
+
+struct RetryPolicy: Sendable {
+    var maxAttempts = 4
+    var base: Duration = .milliseconds(500)
+    var cap: Duration = .seconds(30)
+
+    /// How long to wait before retry number `retry` (from 0), or nil if this error isn't worth retrying
+    func delay<G: RandomNumberGenerator>(after error: any Error, retry: Int, using generator: inout G) -> Duration? {
+        switch error {
+        case is CancellationError:
+            return nil
+        case let failure as HTTPFailure where [408, 429, 502, 503, 504].contains(failure.status):
+            if let retryAfter = failure.retryAfter { return retryAfter } // the server knows best
+        case let urlError as URLError where [.timedOut, .networkConnectionLost, .cannotConnectToHost].contains(urlError.code):
+            break
+        default:
+            return nil
+        }
+        // Capped exponential backoff with full jitter: anywhere from zero to base × 2ⁿ
+        let ceiling = min(cap, base * (1 << min(retry, 20)))
+        return .seconds(Double.random(in: 0...(ceiling / .seconds(1)), using: &generator))
+    }
+}
+
+func withRetries<T: Sendable, C: Clock>(
+    _ policy: RetryPolicy,
+    clock: C,
+    _ operation: @Sendable () async throws -> T
+) async throws -> T where C.Duration == Duration {
+    var generator = SystemRandomNumberGenerator()
+    var retry = 0
+    while true {
+        do {
+            return try await operation()
+        } catch {
+            guard retry + 1 < policy.maxAttempts,
+                  let wait = policy.delay(after: error, retry: retry, using: &generator) else { throw error }
+            try await clock.sleep(for: wait) // throws if the caller is cancelled while waiting
+            retry += 1
+        }
+    }
+}
+```
+
+Where it lives: in the networking layer, wrapped around the HTTP client, so every feature gets the same policy and you can change it in one place. You'll build that as an interceptor in D33. Retry automatically only what's idempotent (or carries an idempotency key) and only where the user isn't waiting on a decision; for a failed user action, one quick automatic retry and then a clear "Try again" button is usually kinder than a long silent loop.
+
+## Trade-offs
+
+| Strategy | Server load during an outage | Recovery time for one client | Fleet behaviour | Wins when |
+| --- | --- | --- | --- | --- |
+| No retry | Lowest | The user retries by hand | Fine | Non-idempotent calls with no key; user-driven actions |
+| Immediate retries | Multiplied | Fast if it was a blip | A storm | Almost never |
+| Fixed delay | Multiplied, in waves | Predictable | Synchronised waves | Single clients, internal tools |
+| Exponential backoff | Falls over time | Slower as failures continue | Synchronised waves | Single clients |
+| Backoff with full jitter | Falls, and spread out | About the same | Smooth | The default for app networking |
+| Plus budget and breaker | Bounded | Fails fast when it's clearly down | Smooth and bounded | Large fleets, critical backends |
+
+<Callout kind="interview">
+
+**Say** the whole policy in one breath: "Retry only transient errors, with capped exponential backoff and full jitter, three or four attempts within a deadline; honour `Retry-After`; never retry cancellations; and only retry non-idempotent calls that carry an idempotency key, which the server must support." **Ask** which endpoints are idempotent and whether the API supports idempotency keys. **Red flags:** retrying in a tight loop, retrying `POST` without a key, retrying 4xx errors, and retries at every layer of the stack.
+
+</Callout>
+
+<Callout kind="gotcha" title="iOS gotcha: cancellation arrives as URLError, not CancellationError">
+
+When the task running `URLSession`'s `data(for:)` is cancelled, it throws `URLError(.cancelled)`, not `CancellationError`. A retry policy that only checks for `CancellationError` sees "a network error" and retries a request the user has just abandoned by leaving the screen. Treat both as "stop", and check `Task.isCancelled` before each new attempt.
+
+</Callout>
+
+<Callout kind="gotcha" title="iOS gotcha: a retry that outlives the app">
+
+A foreground request retrying with a 30-second cap can easily still be waiting when the user leaves the app, and then the app is suspended mid-backoff. For work that must eventually succeed, such as uploads and sent messages, don't rely on an in-memory retry loop: persist the work in an outbox, retry it on the next launch or from a background task, or hand big transfers to a background `URLSession`.
+
+</Callout>
+
+## Practice
+
+The kata **"Backoff schedule"** has you compute the delays, with each jitter strategy and a seeded random generator so tests can check them exactly. Then the review **"the 2 a.m. photo backup storm"** shows a service that retries ten times without waiting, repeats `POST`s with no idempotency key and starts every device at once. Name every way it turns a blip into an outage.
+
+```cards
+- id: what-to-retry
+  front: "Which failures are worth retrying automatically?"
+  back: "Transient ones: timeouts, lost connections, 408, 502, 503, 504, and 429 after Retry-After. Never 4xx request errors or cancellations; refresh on 401; wait for connectivity when offline."
+- id: idempotency-key
+  front: "How does an idempotency key make a POST safe to retry?"
+  back: "The client creates one key per user intent and sends it with every attempt. The server stores the key with its result and answers a repeat with the stored result instead of doing the work again."
+- id: full-jitter
+  front: "What is full jitter, and why does it matter?"
+  back: "Each retry waits a random time between zero and the exponential delay. It stops a fleet that failed together from retrying together in synchronised waves."
+- id: retry-amplification
+  front: "Why should only one layer retry?"
+  back: "Retries multiply: 3 attempts at each of three layers is 27 calls at the bottom during an outage. Retry in one place and have the others fail fast."
+```
+
+```quiz
+- id: q1
+  type: sort
+  prompt: "Should the networking layer retry each of these automatically?"
+  buckets: [Retry with backoff, "Don't retry", Do something else first]
+  items:
+    - [A GET that timed out, 0]
+    - [A 503 from a server that's restarting, 0]
+    - [A 422 saying the email address is invalid, 1]
+    - [URLError.cancelled after the user left the screen, 1]
+    - [A 401 because the access token expired, 2]
+    - [URLError.notConnectedToInternet in Airplane Mode, 2]
+  explain: "Timeouts and 503s are transient. A 422 will fail the same way every time, and a cancellation means nobody wants the answer. A 401 needs a token refresh before one retry, and offline needs a connection, not a timer."
+- id: q2
+  type: mcq
+  prompt: "`POST /payments` times out. The app retries with a new idempotency key, and the user is charged twice. What went wrong?"
+  options:
+    - "Payments should never be retried"
+    - "The key must be created once per payment and reused on every attempt; a new key makes the retry look like a new payment"
+    - "The app should have used PUT"
+    - "The timeout was too short"
+  answer: 1
+  explain: "The server can only recognise a repeat if the key is the same. Generate it when the user taps Pay, persist it with the pending payment, and send it on every attempt."
+- id: q3
+  type: trace
+  prompt: "Exponential backoff with base 1 s, factor 2 and cap 10 s, no jitter. List the waits before each of the first five retries, in seconds, separated by commas."
+  answer: "1, 2, 4, 8, 10"
+  explain: "Retry n waits min(10, 1 × 2ⁿ): 1, 2, 4, 8, and then 16 is capped to 10."
+- id: q4
+  type: estimate
+  prompt: "During an outage, the app makes up to 3 attempts per request, the gateway makes up to 3 attempts at the service per incoming request, and the service makes up to 3 attempts at the database per request it handles. How many database calls can one user action cause?"
+  answer: 27
+  unit: calls
+  within: { percent: 10 }
+  explain: "3 × 3 × 3 = 27. Each layer's attempts multiply the layer below. Retry at one layer and make the others fail fast."
+- id: q5
+  type: mcq
+  prompt: "A server restart disconnects 50,000 phones at the same instant. They all use exponential backoff with base 1 s and no jitter. What does the server see as it comes back up?"
+  options:
+    - "A steady trickle of reconnections"
+    - "Waves of about 50,000 requests at 1 s, 3 s, 7 s… after the restart, each arriving at once"
+    - "Nothing until the cap is reached"
+    - "Only the phones with good signal reconnect"
+  answer: 1
+  explain: "Identical schedules from an identical start make synchronised waves, each as large as the original load. Full jitter spreads every wave across its whole interval."
+```

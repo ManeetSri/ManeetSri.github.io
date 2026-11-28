@@ -1,0 +1,259 @@
+## Why it matters
+
+Some failures aren't errors at all: they're bugs. Throwing them makes every caller handle something impossible, and ignoring them lets the app carry on in a state nobody designed, sometimes writing bad data as it goes. Swift gives you `assert`, `precondition` and `fatalError` for these cases, and they behave differently in debug and release builds in ways that catch out experienced developers. "When would you crash your app on purpose?" is a real interview question, and "never" is the wrong answer.
+
+## A bug isn't something to throw
+
+The previous lesson's third kind, the **programmer error**, is a failure nobody at run time can act on: an index the code computed is out of range, a view model is in a state its own transitions can't reach, a function was called with an argument its contract forbids. Making these `throws` would push the problem onto callers who can do nothing sensible with it: every `catch` would need a branch for "the code is wrong".
+
+So programmer errors take a different route: **check the assumption, and stop when it's false**. The question is only how loudly, and in which builds.
+
+## Five tools, three build settings
+
+Swift's checks differ in what they do under each optimisation level. Xcode's Debug configuration builds with `-Onone`, Release with `-O`. The third level, `-Ounchecked`, is rare in apps but explains the design.
+
+| Call | Debug (`-Onone`) | Release (`-O`) | `-Ounchecked` |
+| --- | --- | --- | --- |
+| `assert(condition, message)` | Checks; stops with the message | **Not evaluated** | Not evaluated |
+| `assertionFailure(message)` | Stops with the message | **No effect** | The optimiser may assume it's never reached |
+| `precondition(condition, message)` | Checks; stops with the message | Checks; stops, **without the message** | Not checked; assumed true |
+| `preconditionFailure(message)` | Stops with the message | Stops, without the message | The optimiser may assume it's never reached |
+| `fatalError(message)` | Stops with the message | Stops with the message | Stops with the message |
+
+Read the table as three intentions:
+
+- **`assert`** is a development aid. It documents an assumption and catches violations while you work, then vanishes from the build users run. Don't put work in its condition that the program depends on: in release the condition isn't evaluated at all.
+- **`precondition`** is a contract that holds in production too. If it's violated, the app stops rather than continue with bad data. Since the release build drops the message, the crash report tells you *where* it failed but not the text.
+- **`fatalError`** is unconditional, in every build. It returns `Never`, so it also satisfies the compiler wherever a value is required.
+
+The language adds its own preconditions you don't write: force-unwrapping `nil`, an array index out of range, integer overflow, a failed `as!`, a `try!` that throws, and touching an `unowned` reference whose object is gone. All of them trap in debug and release builds alike. On an iPhone, any of these traps appears in the crash report as `EXC_BREAKPOINT (SIGTRAP)`, a signature you'll learn to recognise in the crash-reporting lesson.
+
+<Callout kind="note">
+
+On Apple platforms, the Swift runtime hands a `fatalError` message to the system crash reporter, so it can appear in the report's application-specific information. That's one reason to write `guard invariant else { fatalError("…") }` for the checks you most want to diagnose from the field: `precondition` keeps the check in release but drops its message. Never put user data in that message, since crash reports leave the device.
+
+</Callout>
+
+## Trap only on what your own code controls
+
+The most important rule about these tools is what they're **not** for: anything that comes from outside the app. User input, server responses, files, deep-link URLs, a value read from `UserDefaults` written by last year's version: all of these can be wrong without your code being wrong. They need validation and an error, never a trap.
+
+```swift check
+import Foundation
+
+struct Basket {
+    private(set) var lines: [String: Int] = [:]
+
+    // A contract for other code in the app: callers must never pass a negative quantity.
+    // A violation is a bug in the caller, so stop rather than store a negative basket.
+    mutating func set(_ sku: String, quantity: Int) {
+        precondition(quantity >= 0, "quantity must not be negative")
+        lines[sku] = quantity == 0 ? nil : quantity
+    }
+}
+
+enum QuantityInputError: Error {
+    case notANumber
+    case tooMany(limit: Int)
+}
+
+// The text field is input: the user can type anything, so this validates and throws
+func parseQuantity(_ text: String, limit: Int = 99) throws(QuantityInputError) -> Int {
+    guard let value = Int(text.trimmingCharacters(in: .whitespaces)), value >= 0 else { throw .notANumber }
+    guard value <= limit else { throw .tooMany(limit: limit) }
+    return value
+}
+```
+
+The two functions guard the same fact, a sensible quantity, in two different ways because the source differs. `parseQuantity` meets the outside world and reports a user-facing error. `set(_:quantity:)` is only ever called by your own code, after validation, so a negative value there means a bug upstream.
+
+A few common cases, sorted by the rule:
+
+| Situation | Who controls it | Use |
+| --- | --- | --- |
+| `URL(string: "https://api.example.com")!` | You: it's a literal | A force unwrap is fine; it either always works or fails on your first run |
+| `URL(string: textFromServer)!` | The server | Validate and throw |
+| A `switch` over your own enum that "can't" hit a case | You | `assertionFailure` plus a fallback, or `fatalError` if continuing is unsafe |
+| An unknown `"type"` string in the feed JSON | The server, which may add types before the app knows them | Skip the item, log it, count it |
+| `try! JSONEncoder().encode(settings)` for a struct of plain values | You: it can't fail for these types | Acceptable, but a `do`/`catch` that reports costs little |
+| `try! JSONDecoder().decode(Feed.self, from: data)` | The server | Never: a schema change crashes every user at once |
+| `required init?(coder:)` in a view you never load from a storyboard | You | `@available(*, unavailable)` turns misuse into a compile error, which beats a `fatalError` at run time |
+
+## Crash, or report and carry on?
+
+Within your own code, a broken assumption still leaves you a choice. Stopping the app is a real cost to a real person: they lose whatever they were doing. Carrying on is a risk: the app is now in a state nobody designed.
+
+**Stop** (`precondition`, `fatalError`) when continuing could do lasting damage:
+
+- writing data that's now known to be wrong, such as a ledger whose totals don't add up or a sync about to upload the wrong account's records;
+- security decisions, such as an auth state that says signed in with no user;
+- a corrupt in-memory structure that every later operation would read.
+
+A crash is loud, contained and gets reported with a stack trace. Silent corruption is quiet, spreads and may never be traced back.
+
+**Report and carry on** when the damage is local and there's an obvious safe fallback:
+
+- an unknown cell type: show an empty cell;
+- a badge count that came out negative: show no badge;
+- an analytics event with a missing field: drop the event.
+
+For these, stop in development and record a fault in production. A small helper makes the policy one line at each call site:
+
+```swift check
+import os
+
+extension Logger {
+    static let bugs = Logger(subsystem: "com.example.notes", category: "bugs")
+}
+
+/// A bug the app can survive. Stops in the debugger during development; in release builds it records a
+/// fault and returns. The message is a StaticString, so nobody can interpolate user data into it.
+func reportBug(_ message: StaticString, file: StaticString = #fileID, line: UInt = #line) {
+    assertionFailure("\(message)", file: file, line: line)
+    Logger.bugs.fault("\(message, privacy: .public) (\(file, privacy: .public):\(line))")
+}
+
+enum RowKind {
+    case note, folder, placeholder
+}
+
+func rowKind(for raw: String) -> RowKind {
+    switch raw {
+    case "note": return .note
+    case "folder": return .folder
+    default:
+        reportBug("unknown row kind")
+        return .placeholder
+    }
+}
+```
+
+In a real app `reportBug` would also send a non-fatal event to your crash-reporting service, so the bug shows up in the same dashboard as crashes, with a count. Two design choices in it are deliberate. The `StaticString` parameter makes it impossible to write `reportBug("bad row \(user.email)")`, so the message is always safe to mark `.public`. And `#fileID` records `Module/File.swift`, which identifies the place without leaking the full path of the build machine.
+
+## Testing your preconditions
+
+A precondition is part of a type's contract, so it deserves a test. Since Swift 6.2, Swift Testing can run a closure in a child process and expect it to crash:
+
+```swift check
+import Testing
+
+struct Ledger {
+    private(set) var balancePence = 0
+
+    mutating func withdraw(_ pence: Int) {
+        precondition(pence <= balancePence, "withdrawal larger than balance")
+        balancePence -= pence
+    }
+}
+
+@Test func overdrawingIsABug() async {
+    await #expect(processExitsWith: .failure) {
+        var ledger = Ledger()
+        ledger.withdraw(500)
+    }
+}
+```
+
+Exit tests need to start a process, so they run on macOS, Linux and Windows but not in the iOS simulator. That's one more reason to keep domain logic in a Swift package with no UIKit dependency: its invariants can be tested on a Mac in milliseconds. In an app target, test the observable behaviour around the check instead: that the validation in front of it rejects bad input, so the precondition can never fire.
+
+## Trade-offs
+
+| Response to a broken assumption | Data safety | What the user loses | Bug visibility | When it wins |
+| --- | --- | --- | --- | --- |
+| `precondition` / `fatalError`: stop | Highest: nothing more is written | Their current task | A crash report with a stack | Continuing could corrupt data or weaken security |
+| `assertionFailure` + fallback + fault report | Good if the fallback is truly safe | Usually nothing | A non-fatal report and a count | The damage is local and a sensible default exists |
+| `assert` alone | None in release | Nothing, until something odd happens | None in release | Cheap development checks of assumptions |
+| Ignore it (`try?`, a silent `default`) | Unknown | Possibly their data, later | None | Almost never |
+
+<Callout kind="interview">
+
+**Say:** "I trap only on assumptions my own code controls. Input from users, servers and files gets validated and becomes an error. For a broken invariant, I stop if continuing could corrupt data or security, and otherwise I assert in debug, fall back, and report a non-fatal in release."
+
+**Ask:** what's the blast radius if this state is wrong and we continue? Is there a safe default? Will we hear about it if it happens in production?
+
+**Red flags:** `assert` used to validate user input (it disappears in release); `try!` or `!` on server data; `fatalError` messages containing user data; and "we never crash", which usually means "we never find out".
+
+</Callout>
+
+<Callout kind="gotcha" title="Swift gotcha: assert's condition doesn't run in release">
+
+`assert(cache.removeExpired() > 0)` removes expired entries in debug builds only, because in release the whole condition is skipped. Anything with a side effect, including a call that updates state or logs, must happen outside the `assert`: compute the value first, then assert on it.
+
+</Callout>
+
+## Practice
+
+The **account screen review** includes a `try!` on a server response and an `assert` that's meant to validate input. Find them, say what each does in a release build, and what should replace it.
+
+```cards
+- id: trap-what-you-control
+  front: "When is trapping (precondition, fatalError, !) the right response?"
+  back: "Only for assumptions your own code controls. Anything from outside (user input, server data, files, URLs) gets validated and becomes an error."
+- id: assert-release
+  front: "What do `assert` and `precondition` do in a release (-O) build?"
+  back: "`assert` isn't evaluated at all. `precondition` still checks and stops the app, but without its message. `fatalError` always stops and keeps its message."
+- id: crash-or-continue
+  front: "How do you choose between stopping and reporting-and-continuing for a broken invariant?"
+  back: "Stop if continuing could corrupt data or weaken security. If the damage is local and there's a safe fallback, assert in debug, fall back, and report a non-fatal in release."
+```
+
+```quiz
+- id: q1
+  type: mcq
+  prompt: "A sign-up form checks `assert(!email.isEmpty, \"email required\")` before calling the API. What happens in the App Store build when a user leaves the field empty?"
+  options:
+    - "The app crashes with \"email required\""
+    - "The app crashes without a message"
+    - "Nothing: the check isn't evaluated, and the empty email is sent to the API"
+    - "The assert throws an error the form can catch"
+  answer: 2
+  explain: "Release builds use `-O`, where `assert` isn't evaluated. That's why validation of user input must be ordinary code that produces an error, not an assertion."
+- id: q2
+  type: sort
+  prompt: "How should each be handled?"
+  buckets: [Validate and throw, Report and fall back, Stop the app]
+  items:
+    - ["A deep link's product id isn't a number", 0]
+    - [The feed contains a card type this version doesn't know, 1]
+    - ["A sync is about to upload records whose owner id isn't the signed-in user's", 2]
+    - [A badge count computed from local data came out negative, 1]
+    - [The server's price field is a string instead of a number, 0]
+    - [The double-entry ledger's debits and credits no longer balance before a write, 2]
+  explain: "Deep links and server data are input: validate them. An unknown card type and a negative badge have safe fallbacks (skip, hide). Uploading another user's records or writing an unbalanced ledger would do lasting damage, so stopping is safer."
+- id: q3
+  type: truefalse
+  prompt: "In a release build, `precondition(x > 0, \"x must be positive\")` still stops the app when `x` is 0."
+  answer: true
+  explain: "`precondition` is checked in `-O` builds; only its message is dropped. Only `-Ounchecked` removes the check, and almost no app builds with it."
+- id: q4
+  type: bug
+  prompt: "This cache prunes itself in debug builds but grows without limit in the App Store build. Which line is the bug?"
+  code: |
+    final class ThumbnailCache {
+        private var entries: [String: Data] = [:]
+        private let limit = 200
+
+        func insert(_ data: Data, for key: String) {
+            entries[key] = data
+            assert(pruneIfNeeded() >= 0)
+        }
+
+        private func pruneIfNeeded() -> Int {
+            let excess = max(0, entries.count - limit)
+            entries.keys.prefix(excess).forEach { entries[$0] = nil }
+            return excess
+        }
+    }
+  answer: 7
+  explain: "`assert`'s condition isn't evaluated in release builds, so `pruneIfNeeded()` never runs there. Call it on its own line, then assert on the result if you want the check."
+- id: q5
+  type: mcq
+  prompt: "You want the text of a failed invariant check to reach the crash report from production. Which do you write?"
+  options:
+    - "`assert(invariant, \"…\")`"
+    - "`precondition(invariant, \"…\")`"
+    - "`guard invariant else { fatalError(\"…\") }`"
+    - "`assertionFailure(\"…\")`"
+  answer: 2
+  explain: "`assert` and `assertionFailure` do nothing in release, and `precondition` drops its message there. `fatalError` keeps the message in every build, and the Swift runtime passes it to the crash reporter. Keep user data out of it."
+```

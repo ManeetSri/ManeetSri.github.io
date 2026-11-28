@@ -1,0 +1,338 @@
+## Why it matters
+
+Most concurrency bugs come from one shape: two pieces of code touching the same mutable state at the same time. The **actor model** removes that shape by design: state has exactly one owner, and everyone else sends it messages. Swift built the idea into the language, so in an iOS codebase "make it an actor" is now the default answer to "how do we make this cache thread-safe?". Interviewers know that, which is why their follow-up is about **reentrancy**, the place where Swift's actors differ from the textbook and where most actor bugs live.
+
+## The actor model
+
+Carl Hewitt described actors in 1973, and Erlang, Akka and Orleans built whole systems on them. An **actor** is a unit of computation with three rules:
+
+1. **It owns its state.** Nothing outside the actor can read or write that state directly.
+2. **It communicates only by messages.** Others ask it to do things; it can reply, send messages to other actors and create new ones.
+3. **It handles one message at a time.** Messages wait in its **mailbox** until it's ready.
+
+Rule 3 is what makes rule 1 safe without locks. Because only one message runs at a time, the state is never touched by two pieces of code at once, so there's nothing to race.
+
+<Callout kind="analogy">
+
+A bank's ledger kept by a single clerk behind a counter. Customers queue and hand over slips; nobody else may touch the ledger. The clerk can't be in two places, so two withdrawals can never both read the same balance. The queue can get long, but the ledger is never wrong.
+
+</Callout>
+
+## Swift's actors
+
+In Swift, `actor` declares a reference type whose mutable state is **isolated**: the compiler only lets code running on the actor touch it. From outside, every call is a message: you `await` it, because the actor may be busy with another one.
+
+Start with a cache shared by many loading tasks. As a class, Swift 6 refuses to compile the concurrent use:
+
+```swift
+final class ThumbnailCache {
+    private var thumbnails: [URL: Data] = [:]
+
+    func store(_ data: Data, for url: URL) {
+        thumbnails[url] = data
+    }
+}
+
+func prefetch(_ urls: [URL], into cache: ThumbnailCache, download: @escaping @Sendable (URL) async -> Data) async {
+    await withTaskGroup(of: Void.self) { group in
+        for url in urls {
+            group.addTask {
+                let data = await download(url)
+                cache.store(data, for: url)
+            }
+        }
+    }
+}
+```
+
+```text title="What you'll see"
+error: passing closure as a 'sending' parameter risks causing data races between code in the current isolation context and concurrent execution of the closure
+note: closure captures 'cache' which is accessible to code in the current isolation context
+```
+
+Several child tasks would write to one dictionary at once: a data race, which in Swift 6 language mode is a compile error rather than an intermittent bug in production. Making the cache an actor fixes it with one keyword, and the call sites gain an `await`:
+
+```swift check title="ThumbnailCache.swift"
+import Foundation
+
+actor ThumbnailCache {
+    private var thumbnails: [URL: Data] = [:]
+
+    func thumbnail(for url: URL) -> Data? {
+        thumbnails[url]
+    }
+
+    func store(_ data: Data, for url: URL) {
+        thumbnails[url] = data
+    }
+}
+
+func prefetch(_ urls: [URL], into cache: ThumbnailCache, download: @escaping @Sendable (URL) async -> Data) async {
+    await withTaskGroup(of: Void.self) { group in
+        for url in urls {
+            group.addTask {
+                let data = await download(url)
+                await cache.store(data, for: url)
+            }
+        }
+    }
+}
+```
+
+What crosses into or out of an actor must be `Sendable` (safe to share between concurrent code): `URL` and `Data` are values, so they qualify. You'll meet the mechanics of isolation, `Sendable` and the main actor in D22; this lesson is about designing with them.
+
+### Where Swift differs from the textbook
+
+| | Classic actors (Erlang, Akka) | Swift actors |
+| --- | --- | --- |
+| A message is | A value put in a mailbox, usually fire-and-forget | A method call you `await`, with a return value or a thrown error |
+| Order | Messages from one sender arrive in order | No promise about the order of calls from different tasks |
+| While handling a message | Runs it to completion | **Re-entrant**: at every `await` inside a method, other calls may run |
+| Failure | Supervisors restart crashed actors | Errors are thrown back to the caller |
+| Where it runs | Often across machines | In-process (`distributed actor` exists for the cross-process case) |
+
+The third row is the one that changes how you write code.
+
+## Reentrancy: the price of never deadlocking
+
+When an actor method reaches an `await`, it suspends, and the actor doesn't sit idle waiting for it: it runs the next call in its queue. That's **reentrancy**. Swift chose it because the alternative deadlocks: if actor A awaits B while B awaits A, and neither may take another message until its current one finishes, both wait forever.
+
+The cost is that **an actor's state can change across any `await` in its own methods.** Each stretch of code between suspension points is atomic; the method as a whole isn't.
+
+Take a free plan that allows one PDF export. The obvious code checks the quota, awaits the server, then spends the quota:
+
+```visual timeline
+title: Two exports interleave at an await
+unit: ms
+lanes:
+  - { id: a, label: Export A }
+  - { id: quota, label: Quota actor }
+  - { id: b, label: Export B }
+spans:
+  - { lane: quota, from: 0, to: 10, label: "A: 1 left, OK", tone: active }
+  - { lane: a, from: 10, to: 120, label: awaiting the server, tone: wait }
+  - { lane: quota, from: 20, to: 30, label: "B: 1 left, OK", tone: active }
+  - { lane: b, from: 30, to: 140, label: awaiting the server, tone: wait }
+  - { lane: quota, from: 120, to: 130, label: "A: 1 → 0", tone: ok }
+  - { lane: quota, from: 140, to: 150, label: "B: 0 → −1", tone: error }
+steps:
+  - { at: 5, say: "Export A runs on the actor. One export is left, so its check passes." }
+  - { at: 15, say: "A **suspends** at `await server.export()`. The actor is free, so it takes the next call." }
+  - { at: 25, say: "Export B's check runs *now*, before A has spent anything: one left, so B passes too." }
+  - { at: 125, say: "A resumes and spends the quota: none left." }
+  - { at: 145, say: "B resumes and spends a quota it checked before A used it: **−1**. Both exports went through." }
+```
+
+Here it is in code. To make the interleaving happen every time rather than now and then, the fake server holds every request until the program opens it, after both exports have started:
+
+```swift run title="ExportQuota.swift"
+// A stand-in for the server: every call waits until the demo opens it,
+// so both exports are in flight at once, every time
+actor Server {
+    private var isOpen = false
+    private var waiting: [CheckedContinuation<Void, Never>] = []
+
+    func export() async {
+        if isOpen { return }
+        await withCheckedContinuation { waiting.append($0) }
+    }
+
+    func open() {
+        isOpen = true
+        waiting.forEach { $0.resume() }
+        waiting.removeAll()
+    }
+}
+
+actor ExportQuota {
+    private(set) var remaining: Int
+    private(set) var calls = 0
+    private let server: Server
+
+    init(remaining: Int, server: Server) {
+        self.remaining = remaining
+        self.server = server
+    }
+
+    // Bug: checks, suspends, then acts on a check that may no longer be true
+    func exportCheckingFirst() async -> Bool {
+        calls += 1
+        guard remaining > 0 else { return false }
+        await server.export()
+        remaining -= 1
+        return true
+    }
+
+    // Fix: claims the quota before the suspension point
+    func exportReservingFirst() async -> Bool {
+        calls += 1
+        guard remaining > 0 else { return false }
+        remaining -= 1
+        await server.export()
+        return true
+    }
+}
+
+func twoExports(reserving: Bool) async -> String {
+    let server = Server()
+    let quota = ExportQuota(remaining: 1, server: server)
+    async let first = reserving ? quota.exportReservingFirst() : quota.exportCheckingFirst()
+    async let second = reserving ? quota.exportReservingFirst() : quota.exportCheckingFirst()
+    while await quota.calls < 2 { await Task.yield() }
+    await server.open()
+    let succeeded = await [first, second].filter { $0 }.count
+    return "exports: \(succeeded), remaining: \(await quota.remaining)"
+}
+
+print("Check, then await:  ", await twoExports(reserving: false))
+print("Reserve, then await:", await twoExports(reserving: true))
+```
+
+```output
+Check, then await:   exports: 2, remaining: -1
+Reserve, then await: exports: 1, remaining: 0
+```
+
+The fixed version makes the check and the change one synchronous step. If the export can fail, the actor gives the quota back in a `catch`, the way a hotel releases a held room.
+
+Three habits keep re-entrant actors correct:
+
+- **Decide and record before you await.** Reserve the quota, mark the seat as held, store the in-flight task. Another caller arriving during the suspension then sees the decision.
+- **Re-check after you await.** Anything you read before the `await` may be stale afterwards. If you must read, await, then write, read again after.
+- **Share in-flight work instead of repeating it.** Two calls that both miss the cache and both download is the same bug with a different cost. Storing the download's `Task` before awaiting it is single-flight, the subject of a lesson later in this module.
+
+## Designing with actors
+
+### What should be an actor
+
+An actor is the right home for **mutable state that many tasks share and that outlives any one of them**: an image cache, a token store, a download manager, the one object that writes to a SQLite file. It's the wrong home for:
+
+- **State the UI renders.** That belongs to the main actor: an `@Observable` view model marked `@MainActor`, so updates happen where SwiftUI and UIKit read them.
+- **Values passed around.** A search query, a filter, a page of results: make them structs and copy them. Immutable values can't race.
+- **Tiny, hot, synchronous state.** A byte counter updated from a delegate callback doesn't need `await`. A `Mutex` from the Synchronization framework (iOS 18) keeps it synchronous:
+
+```swift check title="TransferStats.swift"
+import Synchronization
+
+// Synchronous, tiny and hot: a lock fits better than an actor
+final class TransferStats: Sendable {
+    private let bytes = Mutex(0)
+
+    func add(_ count: Int) {
+        bytes.withLock { $0 += count }
+    }
+
+    var total: Int {
+        bytes.withLock { $0 }
+    }
+}
+```
+
+### How big an actor should be
+
+Each actor is a serial queue. One giant `AppStateActor` that owns everything turns every part of the app into a queue behind every other part: the image cache waits for the analytics flush. Many tiny actors have the opposite problem: anything that must change two of them together is no longer atomic, because there's an `await` between the two changes.
+
+Draw actor boundaries around **invariants**: the rules that must always hold together. "A seat is either free or held by exactly one booking" lives in one actor. "Thumbnails" and "the auth token" share no rule, so they belong in separate actors.
+
+### Keeping actors responsive
+
+- **Keep the isolated part short.** Decode JSON or resize images in a `nonisolated` function or outside the actor, then hand the result in. Work done on the actor delays every other caller.
+- **Never block an actor.** A synchronous file read or `sleep` inside an actor method holds the actor and one of the few threads Swift concurrency runs on.
+- **Give callers batch methods.** A screen that calls `await cache.thumbnail(for:)` 60 times pays 60 trips onto the actor; `thumbnails(for: [URL])` pays one.
+- **Mark constants `nonisolated`.** A `let` holding a `Sendable` value can be read without `await`, and so can a method that touches only such values.
+
+## Trade-offs
+
+| Tool | Callers must `await` | Survives reentrancy bugs | Cost per access | Wins when |
+| --- | --- | --- | --- | --- |
+| `actor` | Yes | No: you design for it | An actor hop | Shared mutable state used by many tasks |
+| `@MainActor` type | From off the main actor | No: same rules | A hop to the main thread | UI state and view models |
+| `Mutex` or `OSAllocatedUnfairLock` | No | Not applicable: no `await` inside | Very small | Tiny synchronous state on hot paths |
+| Serial `DispatchQueue` | No (callbacks) | Yes, but nothing checks your isolation | A queue hop | Older code not yet on Swift concurrency |
+| Immutable values | No | Not applicable | Copies | Data passed between layers |
+
+Actors win on safety by default, since the compiler checks every access. Locks win on speed and synchronous APIs, but a lock held across an `await` doesn't compile with `Mutex`, and that's the point: locks are for short critical sections only.
+
+<Callout kind="interview">
+
+**Say** what the actor protects ("the token store is an actor, so refreshes and reads can't race") and how you handle reentrancy ("it stores the refresh task before awaiting it, so concurrent 401s share one refresh"). **Ask** which state the UI needs synchronously, because that decides what's `@MainActor` rather than an actor. **Red flags:** "it's an actor, so it's thread-safe" with a check before an `await` and a write after it; one actor for the whole app; heavy work inside actor methods.
+
+</Callout>
+
+<Callout kind="gotcha" title="Swift gotcha: an actor doesn't keep its calls in order">
+
+Two `Task { await store.save(x) }` blocks started one after the other aren't guaranteed to reach the actor in that order: the tasks are scheduled separately, and the actor runs whichever arrives first. If order matters (edits to a document, events in a log), send them from **one** task in sequence, or through an `AsyncStream` that a single consumer drains in order.
+
+</Callout>
+
+## Practice
+
+The kata **"Single-flight request group"** is an actor whose correctness rests entirely on reentrancy: several callers ask for the same key while the first is suspended, and they must find and join its work. Write it after the single-flight lesson.
+
+```cards
+- id: actor-rules
+  front: "What are the three rules of the actor model?"
+  back: "An actor owns its state, communicates only by messages, and handles one message at a time. The third rule is what makes the first safe without locks."
+- id: reentrancy
+  front: "What is actor reentrancy in Swift?"
+  back: "When an actor method suspends at an `await`, the actor runs other calls meanwhile. Each stretch between suspension points is atomic; the whole method isn't."
+- id: check-await-act
+  front: "How do you fix a check, `await`, act bug inside an actor?"
+  back: "Record the decision before the `await` (reserve, mark as held, store the in-flight task) and undo it on failure, or re-check the state after the `await`."
+- id: actor-boundaries
+  front: "How do you decide what goes in one actor?"
+  back: "Draw the boundary around an invariant: state that must change together lives in one actor. A single app-wide actor serialises everything; many tiny ones lose atomicity."
+```
+
+```quiz
+- id: q1
+  type: bug
+  prompt: "Two people can book the same seat. Which line is the suspension point that lets a second booking pass the check?"
+  code: |
+    actor SeatMap {
+        private var free: Set<String> = ["12A", "12B"]
+        func book(_ seat: String) async throws {
+            guard free.contains(seat) else { throw SeatTaken() }
+            try await api.reserve(seat)
+            free.remove(seat)
+        }
+    }
+  answer: 5
+  explain: "While `book` is suspended at `api.reserve`, the actor runs another `book(\"12A\")`, whose check still sees the seat as free. Remove the seat from `free` before awaiting, and put it back if the reservation fails."
+- id: q2
+  type: truefalse
+  prompt: "If one task calls `await log.append(\"a\")` and, a moment later, a different task calls `await log.append(\"b\")`, the actor always appends `a` before `b`."
+  answer: false
+  explain: "Separate tasks are scheduled independently, and the actor makes no promise about the order of calls from different tasks. Calls from a single task in sequence do arrive in order."
+- id: q3
+  type: sort
+  prompt: "What's the best home for each piece of state?"
+  buckets: [An actor, "@MainActor", A Mutex, A struct value]
+  items:
+    - [A cache of decoded images shared by many screens' loading tasks, 0]
+    - [The state a SwiftUI settings screen renders, 1]
+    - ["A running total of bytes received, updated synchronously from URLSession delegate callbacks", 2]
+    - ["A search query and its filters, handed from the screen to the repository", 3]
+    - [The one object that writes to the app's SQLite database, 0]
+  explain: "Shared, long-lived mutable state used by many tasks is an actor's job. UI state lives on the main actor. A hot synchronous counter is a lock's job. Data passed between layers should be an immutable value."
+- id: q4
+  type: multi
+  prompt: "An actor method reads its state, awaits a network call, then updates the state. Which designs stay correct when other calls run during the await? Choose all that apply."
+  options:
+    - "Record the decision (reserve, hold, mark in progress) before the await, and undo it on failure"
+    - "Read the state again after the await and decide then"
+    - "Store the in-flight `Task` before awaiting it, so other callers can await the same one"
+    - "Check at the start, await, then act on the result of the check"
+  answer: [0, 1, 2]
+  explain: "The last option is the bug: the check is stale by the time the method acts on it. The other three either make the decision visible to callers who arrive during the suspension, or base it on fresh state."
+- id: q5
+  type: mcq
+  prompt: "A team puts every piece of shared state (cache, auth token, analytics buffer, downloads) into one `AppStateActor`. What goes wrong first?"
+  options:
+    - "Data races, because one actor can't protect that much state"
+    - "Unrelated work queues behind itself: an analytics flush delays an image lookup"
+    - "Deadlocks, because the actor calls itself"
+    - "Nothing: one actor is the recommended design"
+  answer: 1
+  explain: "An actor handles one call at a time, so one actor for everything serialises the whole app. Split along invariants: thumbnails and the auth token share no rule, so they shouldn't share a queue."
+```

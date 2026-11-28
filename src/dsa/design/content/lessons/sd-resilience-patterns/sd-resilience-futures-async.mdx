@@ -1,0 +1,330 @@
+## Why it matters
+
+Every iOS codebase older than a few years has three generations of asynchronous code living side by side: completion handlers, a futures library (PromiseKit, or Combine's `Future`), and `async`/`await`. Knowing what each one gets right and wrong tells you how to migrate, what to wrap and what to leave alone. In interviews, "what does structured concurrency give you that promises don't?" separates people who've used `async`/`await` from people who understand it: the answer is cancellation and lifetimes, not nicer syntax.
+
+## From callbacks to futures
+
+A **completion handler** hands the result to a closure you pass in. It works, but three loads that depend on each other become a pyramid, every level handles its own errors, and nothing stops a function from calling its completion twice, or never:
+
+```swift
+loadUser { userResult in
+    switch userResult {
+    case .failure(let error): show(error)
+    case .success(let user):
+        loadTeam(for: user) { teamResult in
+            switch teamResult {
+            case .failure(let error): show(error)
+            case .success(let team):
+                loadProjects(for: team) { projectsResult in
+                    // ...and a third level of the same
+                }
+            }
+        }
+    }
+}
+```
+
+A **future** (often called a **promise**) turns "a result that will exist later" into a value you can hold, pass around and combine. Strictly, the *promise* is the write side, resolved exactly once by the producer, and the *future* is the read side; most libraries blur the two. JavaScript's `Promise`, PromiseKit and Combine's `Future` all follow the idea.
+
+Because a future is a value, you can build with it:
+
+- **Chain:** `then` (also called `flatMap`) starts the next step when this one succeeds, and errors skip down the chain to one handler.
+- **Combine:** `all` (or `zip`) waits for several; `race` (or `any`) takes the first.
+- **Recover:** `recover` (or `catch`) turns an error into a fallback value.
+
+The pyramid becomes a flat chain: `loadUser().then(loadTeam).then(loadProjects).catch(show)`. That was a real improvement, and it's why futures libraries spread through iOS codebases in the 2010s.
+
+## What futures don't fix
+
+### They start whether or not anyone is listening
+
+Most futures are **eager**: the work starts when the future is created. Combine's `Future` runs its closure immediately, even with no subscriber. An `async` function is **lazy**: nothing happens until it's called and awaited.
+
+```swift run title="EagerAndLazy.swift"
+import Combine
+
+func loadAvatar() async -> String {
+    print("async function: work starts")
+    return "avatar.png"
+}
+
+// A Combine Future starts its work the moment it's created, whether or not anyone subscribes
+let future = Future<String, Never> { promise in
+    print("Future: work starts")
+    promise(.success("avatar.png"))
+}
+print("Future created")
+
+// An async function does nothing until it's called and awaited
+let operation = { await loadAvatar() }
+print("Async operation created")
+let avatar = await operation()
+print("Got \(avatar)")
+```
+
+```output
+Future: work starts
+Future created
+Async operation created
+async function: work starts
+Got avatar.png
+```
+
+Eagerness surprises people in two ways. A future created in case it might be needed does the work anyway. And a future runs exactly once and remembers its result, so retrying it does nothing: Combine's `.retry(3)` on a `Future` re-subscribes to a result that already failed. Wrapping it in `Deferred { Future { … } }` makes each subscription start fresh.
+
+### They can't be cancelled
+
+A future is a value, and dropping a value doesn't stop the work behind it. Most futures libraries have no standard way to tell the producer "nobody wants this any more", so a screen that disappears leaves its requests running, and their results arrive at a view model nobody is looking at.
+
+### They have no lifetime
+
+Nothing ties a future's work to the code that started it. The request can outlive the screen, the user session, even the logged-in user. Every library invents its own rules for this, and every codebase breaks them somewhere.
+
+### Control flow becomes combinators
+
+Retry with a delay, loop until a page is empty, return early, wrap three steps in one error handler: in sequential code these are `for`, `return` and `do`/`catch`. With futures, each becomes a combinator or a recursive function, and the logic is harder to read than the pyramid it replaced.
+
+## async/await: futures built into the language
+
+`async`/`await` keeps what futures got right (values that arrive later, errors that flow to one place) and fixes the rest by making the compiler aware of the structure:
+
+- Code reads top to bottom, and loops, `return`, `try` and `catch` work as usual.
+- Calls are lazy, so nothing runs that nobody asked for.
+- **Structured concurrency** gives concurrent work a scope. Child tasks, created with `async let` or a task group, can't outlive the function that created them; when the parent is cancelled, every child is cancelled; when a child throws, the error reaches the parent.
+
+Every futures combinator has a structured equivalent:
+
+| Futures | Swift concurrency | Notes |
+| --- | --- | --- |
+| `then` / `flatMap` | Sequential `try await` | Plain code |
+| `all` / `zip` | `async let`, or a task group collecting results | If one child throws, the others are cancelled |
+| `race` / `any` | Task group: first `next()`, then `cancelAll()` | Losers are cancelled, and the group waits for them to stop |
+| `recover` / `catch` | `do` / `catch` | Including a fallback to cached data |
+| A shared, memoised future | A stored `Task` | Several callers `await task.value` |
+| Fire and forget | `Task { … }` | Unstructured: you own its lifetime |
+
+Here are `all` and `race`. The home screen needs a profile and a feed; there's no reason to wait for one before asking for the other. And of two mirrors, the first to answer wins:
+
+```swift run title="AllAndRace.swift"
+struct Profile: Sendable { let name: String }
+struct Feed: Sendable { let posts: Int }
+
+func loadProfile() async throws -> Profile { Profile(name: "Maneet") }
+func loadFeed() async throws -> Feed { Feed(posts: 20) }
+
+// "all": start both, then wait for both. Either failing cancels the other.
+func loadHome() async throws -> String {
+    async let profile = loadProfile()
+    async let feed = loadFeed()
+    let (who, page) = try await (profile, feed)
+    return "\(who.name): \(page.posts) posts"
+}
+
+// "race": the first mirror to answer wins, and the others are cancelled
+func fetch(from mirror: String, takes delay: Duration) async throws -> String {
+    do {
+        try await Task.sleep(for: delay)
+    } catch {
+        print("\(mirror) cancelled")
+        throw error
+    }
+    return mirror
+}
+
+func fastestMirror() async throws -> String {
+    try await withThrowingTaskGroup(of: String.self) { group in
+        group.addTask { try await fetch(from: "us-east", takes: .seconds(30)) }
+        group.addTask { try await fetch(from: "eu-west", takes: .zero) }
+        defer { group.cancelAll() }
+        guard let winner = try await group.next() else { throw CancellationError() }
+        return winner
+    }
+}
+
+print(try await loadHome())
+print("Fastest:", try await fastestMirror())
+```
+
+```output
+Maneet: 20 posts
+us-east cancelled
+Fastest: eu-west
+```
+
+Notice the order of the last two lines. "us-east cancelled" prints *before* the winner, because a task group doesn't return until every child has finished: the 30-second request was cancelled and stopped, not abandoned. That guarantee is what futures never had, and it's exactly what a timeout needs, as you'll see in the last lesson of this module.
+
+Running independent loads concurrently is the everyday win:
+
+```visual timeline
+title: Loading a home screen, one after the other vs with async let
+unit: ms
+lanes:
+  - { id: seqProfile, label: "Sequential: profile" }
+  - { id: seqFeed, label: "Sequential: feed" }
+  - { id: asyncProfile, label: "async let: profile" }
+  - { id: asyncFeed, label: "async let: feed" }
+spans:
+  - { lane: seqProfile, from: 0, to: 300, label: GET /me }
+  - { lane: seqFeed, from: 300, to: 700, label: GET /feed }
+  - { lane: asyncProfile, from: 0, to: 300, label: GET /me, tone: active }
+  - { lane: asyncFeed, from: 0, to: 400, label: GET /feed, tone: active }
+markers:
+  - { at: 400, label: async let done }
+  - { at: 700, label: sequential done }
+steps:
+  - { at: 0, say: "Sequential code awaits the profile before it even asks for the feed. With `async let`, both requests start at once." }
+  - { at: 300, say: "The profile arrives. The sequential version only now starts the feed." }
+  - { at: 400, say: "With `async let`, the screen is ready when the *slower* of the two finishes: **400 ms**." }
+  - { at: 700, say: "Sequentially it's the *sum*: **700 ms**. Use `async let` whenever the second request doesn't need the first one's answer." }
+```
+
+## Task: the one future Swift still has
+
+`Task { … }` starts **unstructured** work and returns a handle. `await task.value` reads the result and `task.cancel()` cancels it. It inherits the actor it was created on and its priority, but not a scope: nothing waits for it, and nothing cancels it unless you do.
+
+That makes a `Task` exactly a future, with a future's problems, and it's the right tool in three places:
+
+- **Starting async work from synchronous code:** a button's action, `viewDidLoad`, a delegate callback. In SwiftUI, prefer the `.task` modifier, which cancels the work when the view disappears.
+- **Sharing in-flight work:** store the `Task` so several callers can await the same result. You'll build this in the single-flight lesson.
+- **Work owned by an object:** a download manager keeps its tasks in a dictionary and cancels them when it's told to, or in `deinit`.
+
+Everywhere else, prefer `async let` and task groups, so the structure does the bookkeeping.
+
+## Migrating from callbacks and futures
+
+Migrate from the bottom up. Wrap the lowest-level callback APIs first, then convert the code that calls them, one layer at a time. A **checked continuation** is the adapter:
+
+```swift check title="ReceiptValidator+Async.swift"
+import Foundation
+
+// An older API with a completion handler
+final class ReceiptValidator: Sendable {
+    func validate(_ receipt: Data, completion: @escaping @Sendable (Result<Bool, any Error>) -> Void) {
+        completion(.success(!receipt.isEmpty))
+    }
+}
+
+extension ReceiptValidator {
+    // The async version: callers write `try await validator.validate(receipt)`
+    func validate(_ receipt: Data) async throws -> Bool {
+        try await withCheckedThrowingContinuation { continuation in
+            validate(receipt) { result in
+                // Exactly once, on every path: success, failure, and any early return
+                continuation.resume(with: result)
+            }
+        }
+    }
+}
+```
+
+Many Apple APIs already have async versions: Objective-C methods with a completion handler are imported as `async` automatically, which is why `try await URLSession.shared.data(from:)` and `await UNUserNotificationCenter.current().notificationSettings()` exist. For Combine, a publisher's `.values` property is an `AsyncSequence`, so `for await value in publisher.values` consumes it without a subscriber. In Xcode, **Refactor → Add Async Wrapper** writes the continuation for one of your own functions.
+
+The wrapper above doesn't support cancellation: if the caller is cancelled, the old API keeps going. When the underlying API can be cancelled (a `URLSessionTask`, a database query), connect them with `withTaskCancellationHandler`; you'll see it in the timeouts lesson.
+
+## Trade-offs
+
+| Style | Reads like | Cancellation | Lifetime | Composes | Wins when |
+| --- | --- | --- | --- | --- | --- |
+| Completion handlers | A pyramid | Only if hand-built | Unbounded | Poorly | Old APIs, and the last layer of a migration |
+| Futures (PromiseKit, Combine `Future`) | A chain | Rarely | Unbounded | Well, with combinators | Existing code in a Combine pipeline |
+| Structured `async`/`await` | Straight-line code | Automatic, to every child | Scoped to the caller | With ordinary control flow | Almost all new code |
+| Unstructured `Task` | A future | Manual, through the handle | Until it finishes or you cancel it | Through `task.value` | Crossing from sync code, and sharing work |
+
+<Callout kind="interview">
+
+**Say** what structure buys you: "Child tasks can't outlive the request handler, so when the user leaves the screen, cancelling one task cancels everything it started." Explain that you migrate bottom-up, with continuations at the boundary. **Ask** whether the codebase uses Combine for UI bindings, since that shapes where the async boundary goes. **Red flags:** a `Task { }` inside every function "to make it async", `Task.detached` as a default, and believing that dropping a `Task` handle cancels the task.
+
+</Callout>
+
+<Callout kind="gotcha" title="Swift gotcha: dropping a Task doesn't cancel it">
+
+Combine cancels a subscription when its `AnyCancellable` is released, so people expect the same of `Task`. It isn't so: a `Task` runs to completion even if nobody keeps the handle. A view model that starts `Task { for await … }` in `init` keeps that loop, and itself, alive after its screen is gone. Keep the handle and cancel it, or use SwiftUI's `.task`, which cancels when the view disappears.
+
+</Callout>
+
+<Callout kind="gotcha" title="Swift gotcha: resume a continuation exactly once">
+
+A `CheckedContinuation` resumed twice stops the app with `SWIFT TASK CONTINUATION MISUSE: … tried to resume its continuation more than once`. One that's never resumed leaves its caller suspended forever; the checked version logs `… leaked its continuation without resuming it` when it's discarded. Audit every path of the callback, including early returns and the error branch, and prefer `withCheckedThrowingContinuation` over the unsafe variant until profiling says otherwise.
+
+</Callout>
+
+## Practice
+
+The kata **"Timeout with cancellation"** is `race` in disguise: the operation races a timer in a task group, and the loser must be cancelled and stopped before the function returns. It belongs to the timeouts lesson, but if you've followed the `race` example above, you can write it now.
+
+```cards
+- id: eager-lazy
+  front: "What's the difference between an eager future and an async function?"
+  back: "An eager future (JavaScript's Promise, Combine's Future) starts its work when it's created and runs once. An async function does nothing until it's called and awaited, and each call runs it again."
+- id: structured-wins
+  front: "What does structured concurrency give you that futures don't?"
+  back: "Scope: child tasks can't outlive their parent, cancelling the parent cancels every child, child errors reach the parent, and the parent waits for its children to stop."
+- id: combinators
+  front: "What are `all` and `race` in Swift concurrency?"
+  back: "`all`: `async let` or a task group that collects every result. `race`: a task group where the first `next()` wins, then `cancelAll()` stops the rest."
+- id: task-is-future
+  front: "When is an unstructured `Task { }` the right tool?"
+  back: "Starting async work from synchronous code, sharing in-flight work between callers, and work owned by an object that cancels it. Dropping the handle doesn't cancel it."
+```
+
+```quiz
+- id: q1
+  type: output
+  prompt: "What does this print?"
+  code: |
+    import Combine
+
+    let future = Future<Int, Never> { promise in
+        print("A")
+        promise(.success(1))
+    }
+    print("B")
+    let work = { () async -> Int in
+        print("C")
+        return 2
+    }
+    print("D")
+    print(await work())
+  answer: |
+    A
+    B
+    D
+    C
+    2
+  explain: "The Future's closure runs as soon as it's created, so A prints first. The async closure runs only when it's awaited, after D."
+- id: q2
+  type: mcq
+  prompt: "A screen loads the user's profile and their notifications, which don't depend on each other. Each takes about 400 ms. Which version is ready in about 400 ms and cancels both if the screen goes away?"
+  options:
+    - "`let p = try await loadProfile()` then `let n = try await loadNotifications()`"
+    - "`async let p = loadProfile()`, `async let n = loadNotifications()`, then `try await (p, n)`, inside the view's `.task`"
+    - "Two `Task { }` blocks started in `onAppear` that write to the view model"
+    - "`Task.detached` for each, with their handles stored nowhere"
+  answer: 1
+  explain: "`async let` runs both at once, and as child tasks of the `.task` modifier's task they're cancelled when the view disappears. Sequential awaits take 800 ms; unstructured tasks run on after the screen is gone."
+- id: q3
+  type: match
+  prompt: "Match each futures combinator to its Swift concurrency equivalent."
+  pairs:
+    - ["`then` / `flatMap`", "A sequential `try await`"]
+    - ["`all` / `zip`", "`async let`, or a task group collecting results"]
+    - ["`race`", "A task group's first `next()`, then `cancelAll()`"]
+    - ["`recover`", "`do` / `catch` with a fallback value"]
+    - ["A shared, memoised future", "A stored `Task` that callers await"]
+  explain: "Every combinator becomes ordinary control flow or a structured task, which is why `async` code rarely needs a combinator library."
+- id: q4
+  type: truefalse
+  prompt: "A view model starts `Task { await self.listen() }` in its `init` and never stores the handle. When the screen closes and nothing else references the view model, the task is cancelled."
+  answer: false
+  explain: "A task runs until it finishes, whether or not anyone keeps its handle, and this one also keeps the view model alive through `self`. Store the handle and cancel it, or start the work from SwiftUI's `.task`."
+- id: q5
+  type: mcq
+  prompt: "A Combine pipeline wraps a network call in `Future { promise in … }` and adds `.retry(3)`. The first attempt fails. What happens?"
+  options:
+    - "The request is sent three more times"
+    - "The Future replays its stored failure: the request isn't sent again"
+    - "Combine waits with exponential backoff between attempts"
+    - "It doesn't compile, since Future can't be retried"
+  answer: 1
+  explain: "A Future runs its closure once, when it's created, and replays the result to every subscriber. `retry` re-subscribes and gets the same failure. `Deferred { Future { … } }` creates a new Future, and a new request, per subscription."
+```

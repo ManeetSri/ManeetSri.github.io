@@ -1,0 +1,342 @@
+## Why it matters
+
+Every tap, swipe, key press and menu command reaches your code through two mechanisms: **hit-testing**, which finds the view under a finger, and the **responder chain**, which carries events and commands up from there until something handles them. Most "my button doesn't respond" bugs are hit-testing, and most "how does ⌘C know what to copy?" questions are the responder chain. In [The responder chain](/design/learn/sd-behavioural-responder-chain) you met it as a pattern, chain of responsibility; this lesson is about how UIKit uses it to deliver events, and how to design screens so events end up in the right layer. Interviewers ask it as "walk me through what happens when the user taps a button".
+
+## Down, then up
+
+An event makes two journeys:
+
+1. **Down: hit-testing.** For a touch, UIKit asks the window which view is under the finger. The window asks its subviews, which ask theirs, until the deepest view that contains the point answers. That view, the **hit-test view**, receives the touch.
+2. **Up: the responder chain.** Every view, view controller, window, scene and the application is a `UIResponder`, and each has a `next` responder. An event or action that one responder doesn't handle goes to its `next`, and on up, until one handles it or it falls off the end.
+
+Touches start at the hit-test view. Keyboard events, menu commands, edit actions such as copy and paste, and actions sent to a `nil` target start at the **first responder**: the object currently in focus, such as the text field being typed in.
+
+## Hit-testing
+
+`hitTest(_:with:)` is a short recursive algorithm, and knowing its three rules explains almost every unresponsive control:
+
+- **A view that can't take touches is skipped, with everything inside it**: `isHidden` is true, `alpha` is below 0.01, or `isUserInteractionEnabled` is false.
+- **The point must be inside the view's bounds** (`point(inside:with:)`), or none of its subviews are asked, even ones that visibly hang outside it. `clipsToBounds` only changes what's drawn, not what's touchable.
+- **Subviews are asked front-most first**, the last subview first. The first one that returns a view wins; if none does, the view returns itself.
+
+This toy follows the same rules over a tiny screen: a list with one cell and its like button, a header with a menu that hangs below it, and a toast that ignores touches.
+
+```swift run title="Hit-testing, by hand"
+struct Point {
+    var x, y: Double
+}
+
+struct Rect {
+    var x, y, width, height: Double
+
+    func contains(_ point: Point) -> Bool {
+        point.x >= x && point.x < x + width && point.y >= y && point.y < y + height
+    }
+}
+
+final class Node {
+    let name: String
+    let frame: Rect // in its superview's coordinates
+    let subviews: [Node]
+    let isUserInteractionEnabled: Bool
+
+    init(_ name: String, _ frame: Rect, interactive: Bool = true, _ subviews: [Node] = []) {
+        self.name = name
+        self.frame = frame
+        self.isUserInteractionEnabled = interactive
+        self.subviews = subviews
+    }
+
+    // UIKit's algorithm, simplified: skip me if I can't take touches; if the point isn't in my
+    // bounds, nothing inside me is asked; otherwise ask subviews, front-most (last) first.
+    func hitTest(_ point: Point) -> Node? {
+        let bounds = Rect(x: 0, y: 0, width: frame.width, height: frame.height)
+        guard isUserInteractionEnabled, bounds.contains(point) else { return nil }
+        for subview in subviews.reversed() {
+            let local = Point(x: point.x - subview.frame.x, y: point.y - subview.frame.y)
+            if let hit = subview.hitTest(local) { return hit }
+        }
+        return self
+    }
+}
+
+let likeButton = Node("likeButton", Rect(x: 330, y: 18, width: 44, height: 44))
+let cell = Node("cell", Rect(x: 0, y: 100, width: 390, height: 80), [likeButton])
+let list = Node("list", Rect(x: 0, y: 0, width: 390, height: 844), [cell])
+let menu = Node("menu", Rect(x: 290, y: 36, width: 100, height: 120)) // hangs below the header
+let header = Node("header", Rect(x: 0, y: 0, width: 390, height: 44), [menu])
+let toast = Node("toast", Rect(x: 16, y: 760, width: 358, height: 60), interactive: false)
+let window = Node("window", Rect(x: 0, y: 0, width: 390, height: 844), [list, header, toast])
+
+for (x, y) in [(350.0, 140.0), (100, 140), (320, 40), (320, 120), (100, 780)] {
+    let hit = window.hitTest(Point(x: x, y: y))?.name ?? "nothing"
+    print("Tap at (\(Int(x)), \(Int(y))) → \(hit)")
+}
+```
+
+```output
+Tap at (350, 140) → likeButton
+Tap at (100, 140) → cell
+Tap at (320, 40) → menu
+Tap at (320, 120) → cell
+Tap at (100, 780) → list
+```
+
+The fourth tap is the classic bug. At (320, 120) the user can see the menu, but the menu hangs outside its header's 44-point bounds, so the header never asks it and the cell behind gets the tap. The fifth shows the opposite, used on purpose: the toast has `isUserInteractionEnabled` off, so taps pass straight through it to the list.
+
+Because the rules are overridable, two small views solve the most common problems. One gives a small control Apple's recommended 44 × 44 point tap target without changing how it looks; the other is an overlay that lets touches through everywhere except on its own controls:
+
+```swift check ios title="Bending hit-testing on purpose"
+import UIKit
+
+final class CompactButton: UIButton {
+    var minimumHitSize = CGSize(width: 44, height: 44)
+
+    override func point(inside point: CGPoint, with event: UIEvent?) -> Bool {
+        let dx = max(0, (minimumHitSize.width - bounds.width) / 2)
+        let dy = max(0, (minimumHitSize.height - bounds.height) / 2)
+        return bounds.insetBy(dx: -dx, dy: -dy).contains(point)
+    }
+}
+
+/// An overlay that passes touches through, except where one of its subviews is hit
+final class PassthroughView: UIView {
+    override func hitTest(_ point: CGPoint, with event: UIEvent?) -> UIView? {
+        let hit = super.hitTest(point, with: event)
+        return hit === self ? nil : hit
+    }
+}
+```
+
+For the hanging menu, the honest fix is structural: put the menu in a view that's big enough to contain it (often the window or the screen's root view), rather than overriding `point(inside:with:)` on the header.
+
+## Touches and gesture recognizers
+
+Once the hit-test view is known, its touches go to **gesture recognizers first**: those attached to the hit-test view and to each of its ancestors all see the touches before the view's own `touchesBegan`. When a recognizer recognises its gesture, by default (`cancelsTouchesInView`) the view gets `touchesCancelled` and the gesture's action runs instead.
+
+Three rules settle most conflicts:
+
+- **Controls win their default action.** A `UIButton` inside a view with a tap recognizer gets the tap: since iOS 6, a control's default action takes priority over an overlapping recognizer on its superview.
+- **Scroll views delay touches.** A `UIScrollView` waits a moment before delivering touches to its content (`delaysContentTouches`), to see whether the user is scrolling. That's why a button in a scroll view highlights late, and why a drag that starts on a button still scrolls.
+- **Recognizers can be ordered or combined.** `require(toFail:)` makes a single tap wait for a double tap to fail; the delegate's `gestureRecognizer(_:shouldRecognizeSimultaneouslyWith:)` lets a pinch and a rotation run together.
+
+## The chain upward
+
+UIKit gives every responder a `next` according to a few fixed rules:
+
+- A **view**'s next responder is its view controller if it's that controller's root view, and its superview otherwise.
+- A **view controller**'s next responder is its view's superview when it's a child in a container. If its view is the window's root view, it's the window; if it was presented, the presenting view controller.
+- A **window**'s next responder is its window scene (on iOS 13 and later), the scene's is `UIApplication`, and the application's is the app delegate, if the delegate is a `UIResponder`.
+
+Here's ⌘R pressed while the user types in a search field on an orders screen inside a navigation controller:
+
+```visual flow
+title: A key command walking up the responder chain
+nodes:
+  - { id: field, label: Search field, kind: view, at: [0, 0] }
+  - { id: root, label: Root view, kind: view, at: [2, 0] }
+  - { id: vc, label: OrdersViewController, kind: client, at: [4, 0], w: 1.4 }
+  - { id: nav, label: Navigation controller, kind: client, at: [4, 2], w: 1.4 }
+  - { id: window, label: Window, kind: view, at: [2, 2] }
+  - { id: app, label: "Scene, app, delegate", kind: service, at: [0, 2], w: 1.2 }
+edges:
+  - [field, root, next]
+  - [root, vc, next]
+  - [vc, nav, via superviews]
+  - [nav, window, next]
+  - [window, app, next]
+steps:
+  - say: "The search field is the **first responder**, so the key command's search starts there."
+    show: [field]
+    active: [field]
+  - say: "The field doesn't handle `refresh(_:)`, so it goes to `next`: its superview, then up to the screen's root view."
+    send: field->root
+  - say: "A root view's next responder is its **view controller**. It lists ⌘R in `keyCommands` and implements `refresh(_:)`, so the search stops here."
+    send: root->vc
+    state: { vc: ok }
+    label: { vc: handled }
+  - say: "Had it not, the search would continue up the chain: through the navigation controller, the window, the window scene, `UIApplication` and the app delegate. Unhandled, it's dropped."
+    show: [nav, window, app]
+```
+
+The design point is that **focus decides who answers**, with no wiring. On iPad with a keyboard, ⌘R on the orders screen refreshes orders; on a different screen in a different window, the same key command refreshes that screen, because each first responder starts a different walk. Menus in the iPad menu bar, edit actions like Copy and Delete, and ⌘-key shortcuts all work this way.
+
+```swift check ios title="A command that's only available when it makes sense"
+import UIKit
+
+final class OrdersViewController: UIViewController {
+    private var isLoading = false
+
+    override var keyCommands: [UIKeyCommand]? {
+        [UIKeyCommand(title: "Refresh", action: #selector(refresh(_:)), input: "r", modifierFlags: .command)]
+    }
+
+    @objc func refresh(_ sender: Any?) {
+        isLoading = true
+        // Ask the view model to reload; it clears isLoading when it's done
+    }
+
+    // Asked before the command is offered, so the menu item and shortcut grey out while loading
+    override func canPerformAction(_ action: Selector, withSender sender: Any?) -> Bool {
+        if action == #selector(refresh(_:)) { return !isLoading }
+        return super.canPerformAction(action, withSender: sender)
+    }
+}
+```
+
+`canPerformAction(_:withSender:)` is answered by whichever responder would handle the action, so availability follows focus too. For app-wide menus, override `buildMenu(with:)` on a responder high in the chain (usually the app delegate) and let screens enable or disable the commands through `canPerformAction` and `validate(_:)`.
+
+### The first responder and the keyboard
+
+A text field or text view becomes first responder when the user taps it, or when you call `becomeFirstResponder()`. While it is, the keyboard shows and key events start there; `resignFirstResponder()` (or `view.endEditing(true)` for anything inside a view) hides it. For keeping content above the keyboard, constrain it to `view.keyboardLayoutGuide` (iOS 15 and later) instead of observing keyboard notifications and doing the maths yourself:
+
+```swift check ios title="Content that sits on top of the keyboard"
+import UIKit
+
+final class ComposeViewController: UIViewController {
+    private let messageField = UITextField()
+
+    override func viewDidLoad() {
+        super.viewDidLoad()
+        messageField.borderStyle = .roundedRect
+        messageField.translatesAutoresizingMaskIntoConstraints = false
+        view.addSubview(messageField)
+        NSLayoutConstraint.activate([
+            messageField.leadingAnchor.constraint(equalTo: view.layoutMarginsGuide.leadingAnchor),
+            messageField.trailingAnchor.constraint(equalTo: view.layoutMarginsGuide.trailingAnchor),
+            messageField.bottomAnchor.constraint(equalTo: view.keyboardLayoutGuide.topAnchor, constant: -8),
+        ])
+    }
+}
+```
+
+## Where events should end up
+
+UIKit delivers an event to a view. Your architecture decides how far it goes from there. A useful rule: **views turn gestures into intent; something outside the view decides what the intent means.** A cell knows "the like button was tapped". It shouldn't know that liking needs a network call, an optimistic update and an analytics event.
+
+```swift check ios title="A cell reports intent; the screen decides"
+import UIKit
+
+final class PostCell: UICollectionViewListCell {
+    var onLike: (() -> Void)?
+
+    private(set) lazy var likeButton = UIButton(
+        configuration: .plain(),
+        primaryAction: UIAction(title: "Like", image: UIImage(systemName: "heart")) { [weak self] _ in
+            self?.onLike?()
+        }
+    )
+}
+```
+
+The cell registration sets `onLike` to call the view model with the post's identifier. The cell can then be reused anywhere, and the decision lives where it can be tested.
+
+What you shouldn't do is the opposite: walk `next` from a cell until you find a view controller of a particular type and call a method on it. It works on the screen it was written for, silently does nothing anywhere else, and hides a dependency the compiler can't see. The responder chain is right when **focus** should decide who handles something; when you know who should handle it, say so with a closure or a delegate.
+
+## Trade-offs
+
+| How a view reports an event | Coupling | Who handles it | Testable without UIKit | Best for |
+| --- | --- | --- | --- | --- |
+| Closure or `UIAction` handler | Low: the view knows nothing about the handler | Whoever set the closure | Yes, call the closure | Cells and reusable views |
+| Delegate protocol owned by the view | Low, and the API is explicit | One delegate | Yes, with a fake delegate | Views with several related events |
+| Target–action to an explicit target | Medium: the target's selector | The target | Partly | Simple controls on one screen |
+| Responder chain (`nil` target, key commands, menus) | Very low, but invisible | Whatever is in focus | Hard to follow | Commands that depend on focus: copy, delete, refresh |
+| `NotificationCenter` | None, and no structure | Anyone listening | Awkward | Truly global events, never taps |
+
+Prefer closures and delegates for events from a known place to a known handler. Use the responder chain where the right handler depends on focus, which is exactly what it was built for. Keep notifications for things like the app entering the background.
+
+<Callout kind="interview">
+
+**What to say:** "The window hit-tests down to the deepest view containing the point, skipping hidden or non-interactive views and anything outside its parent's bounds. Gesture recognizers see the touches first. Unhandled events and nil-targeted actions go up the responder chain: views, view controllers, the window, the scene, the application." Then the design rule: views report intent, and the responder chain is for focus-dependent commands.
+
+**What to ask:** does this need to work with a hardware keyboard or the iPad menu bar? Then commands should go through the responder chain.
+
+**Red flags:** fixing a dead button by bringing it to the front without understanding why; overriding `hitTest` without calling `super`; walking `next` to find a specific view controller; posting notifications for button taps.
+
+</Callout>
+
+<Callout kind="gotcha" title="iOS gotcha: image views and labels ignore touches">
+
+`UIImageView` and `UILabel` have `isUserInteractionEnabled` set to `false` by default, so a gesture recognizer you add to one never fires and taps fall through to whatever is behind. Set it to `true`, or better, use a `UIButton` with an image or a title: it brings highlighting, accessibility and a 44-point target for free.
+
+</Callout>
+
+## Practice
+
+The [product cell review](/design/practice/sd-review-uikit-product-cell) finds its view controller by walking the responder chain. Say what breaks when the cell appears on a second screen, and what you'd replace it with.
+
+```cards
+- id: two-journeys
+  front: "How does a tap reach your code?"
+  back: "Hit-testing goes down from the window to the deepest view containing the point; gesture recognizers on it and its ancestors see the touches first; unhandled events and actions then go up the responder chain through `next`."
+- id: hit-test-rules
+  front: "Which views does hit-testing skip?"
+  back: "Hidden views, views with alpha below 0.01, views with `isUserInteractionEnabled` false, and every subview of a view whose bounds don't contain the point, even subviews that visibly hang outside."
+- id: responder-chain-order
+  front: "What's the responder chain above a view controller pushed on a navigation controller?"
+  back: "Its view's superviews up to the navigation controller, then the window, the window scene, `UIApplication` and the app delegate."
+- id: chain-when
+  front: "When should an event go through the responder chain rather than a closure or delegate?"
+  back: "When focus should decide who handles it: key commands, menu items, copy, paste and delete. When you know the handler, use a closure or a delegate."
+```
+
+```quiz
+- id: q1
+  type: mcq
+  prompt: "A dropdown menu is added as a subview of a 44-point-tall header, and drawn hanging below it. Taps on the part below the header go to the list behind. Why?"
+  options:
+    - "The menu needs `clipsToBounds = true`"
+    - "Hit-testing never asks a subview about a point outside its superview's bounds"
+    - "The list is in front of the menu in the subview order"
+    - "The menu's gesture recognizer is being cancelled by the list's scroll view"
+  answer: 1
+  explain: "The header's `point(inside:with:)` says no, so its subviews aren't asked. `clipsToBounds` only affects drawing. Move the menu into a view that contains it, such as the screen's root view."
+- id: q2
+  type: multi
+  prompt: "Which of these views are skipped by hit-testing, along with all their subviews?"
+  options:
+    - "A view with `isHidden = true`"
+    - "A view with `alpha = 0.005`"
+    - "A view with `isUserInteractionEnabled = false`"
+    - "A view with `backgroundColor = .clear`"
+    - "A view with `clipsToBounds = false`"
+  answer: [0, 1, 2]
+  explain: "Hidden, nearly transparent (below 0.01) and non-interactive views can't receive touches. A clear background still receives them, which is why invisible overlays can swallow taps."
+- id: q3
+  type: order
+  prompt: "While typing in a text field on a screen pushed on a navigation controller, the user presses a key command that nothing in the app handles. Put the responders in the order UIKit asks them."
+  lines:
+    - "The text field (the first responder)"
+    - "The screen's root view"
+    - "The screen's view controller"
+    - "The navigation controller"
+    - "The window"
+    - "The window scene"
+    - "UIApplication"
+  explain: "Commands start at the first responder and follow `next`: views up to the root view, the view controller, its container, the window, the scene and the application, then the app delegate. Had any of them handled it, the walk would have stopped there."
+- id: q4
+  type: mcq
+  prompt: "You add a `UITapGestureRecognizer` to a `UIImageView` showing a product photo. Tapping it does nothing. What's the most likely cause?"
+  options:
+    - "Gesture recognizers only work on `UIControl` subclasses"
+    - "`UIImageView` has `isUserInteractionEnabled` false by default"
+    - "The recognizer must be added in `viewDidAppear`"
+    - "Image views cancel touches in their content"
+  answer: 1
+  explain: "Image views and labels don't take touches by default, so hit-testing skips them. Enable interaction, or use a button with an image, which also brings highlighting and accessibility."
+- id: q5
+  type: mcq
+  prompt: "An iPad app has a sidebar and a detail pane, both editable. The Delete key should delete whatever is selected in the pane the user is working in. What's the best design?"
+  options:
+    - "Each pane observes a `deleteKeyPressed` notification and checks whether it's visible"
+    - "The app delegate handles Delete and asks a global store which pane was tapped last"
+    - "Each pane's view controller declares the key command and implements the action; the responder chain picks the one in focus"
+    - "The split view controller handles Delete and forwards it to both panes"
+  answer: 2
+  explain: "This is exactly what the responder chain is for: the walk starts at the first responder, so the pane in focus answers, and `canPerformAction` can disable Delete when nothing is selected. The other designs rebuild focus tracking by hand."
+- id: q6
+  type: truefalse
+  prompt: "A `UIButton` sits inside a view that has a `UITapGestureRecognizer`. Tapping the button runs the recognizer's action instead of the button's."
+  answer: false
+  explain: "Since iOS 6, a control's default action wins over an overlapping gesture recognizer on its superview, so the button's action runs. Taps elsewhere in the view still go to the recognizer."
+```

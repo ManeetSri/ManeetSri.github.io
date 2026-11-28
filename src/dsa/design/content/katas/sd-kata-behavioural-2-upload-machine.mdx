@@ -1,0 +1,110 @@
+A photo upload in a social app can be paused, can fail on a train and retry when the signal returns, can resume from the bytes the server already has (iOS 17's resumable uploads make that possible), and can be cancelled at any moment. Write the state machine behind it: it takes events and returns the effects for the app to perform, and never touches the network or a timer itself.
+
+`ResumableUploadMachine.Machine.send(_:) -> [Effect]`
+
+The machine starts `.idle` and allows `maxAttempts` attempts in total. Each row is one transition; `a` is the current attempt and `s` the bytes sent.
+
+| State | Event | Next state | Effects |
+| --- | --- | --- | --- |
+| `.idle` or `.failed` | `.start` | `.uploading(attempt: 1, sent: 0)` | `.beginUpload(attempt: 1, fromByte: 0)` |
+| `.uploading(a, s)` | `.progress(sent: n)` | `.uploading(a, n)` | none |
+| `.uploading(a, s)` | `.pause` | `.paused(a, s)` | `.suspendUpload` |
+| `.paused(a, s)` | `.resume` | `.uploading(a, s)` | `.beginUpload(attempt: a, fromByte: s)` |
+| `.uploading(a, s)`, a below `maxAttempts` | `.networkFailed` | `.waitingToRetry(a + 1, s)` | `.scheduleRetry(afterSeconds: 2ᵃ⁻¹)` |
+| `.uploading(a, s)`, a equals `maxAttempts` | `.networkFailed` | `.failed(reason: "Gave up after attempt a")` | `.notifyFailed(reason:)` with the same reason |
+| `.waitingToRetry(a, s)` | `.retryTimerFired` | `.uploading(a, s)` | `.beginUpload(attempt: a, fromByte: s)` |
+| `.uploading` or `.paused` | `.finished(remoteID: id)` | `.completed(remoteID: id)` | `.notifyCompleted(remoteID: id)` |
+| `.idle` | `.cancel` | `.cancelled` | none |
+| `.uploading` or `.paused` | `.cancel` | `.cancelled` | `.cancelUpload` |
+| `.waitingToRetry` | `.cancel` | `.cancelled` | `.cancelRetryTimer` |
+
+Any other event leaves the state as it is and returns no effects.
+
+## Examples
+
+| Events (from `.idle`, `maxAttempts` 3) | Final state | Effects of the last event |
+| --- | --- | --- |
+| `start`, `progress(400)`, `pause`, `resume` | `.uploading(attempt: 1, sent: 400)` | `[.beginUpload(attempt: 1, fromByte: 400)]` |
+| `start`, `networkFailed` | `.waitingToRetry(attempt: 2, sent: 0)` | `[.scheduleRetry(afterSeconds: 1)]` |
+| `start`, `networkFailed`, `retryTimerFired`, `networkFailed` | `.waitingToRetry(attempt: 3, sent: 0)` | `[.scheduleRetry(afterSeconds: 2)]` |
+| `start`, `pause`, `finished("photo-82")` | `.completed(remoteID: "photo-82")` | `[.notifyCompleted(remoteID: "photo-82")]` |
+| `start`, `finished("p")`, `cancel` | `.completed(remoteID: "p")` | `[]` |
+| `resume` | `.idle` | `[]` |
+
+## Constraints
+
+- `maxAttempts` is at least 1. With 1, the first failure gives up.
+- `.failed` handles only `.start`, which begins a fresh first attempt. `.completed` and `.cancelled` handle nothing.
+- A `finished` that arrives while paused still completes: the server answered moments before the pause took effect, and the photo is stored.
+- Keep `send(_:)` synchronous and free of side effects beyond changing `state`. The tests drive it with plain values.
+
+<Hints>
+<Hint>
+Switch over the pair: `switch (state, event)`. Each row of the table becomes one `case`, and rows that share a result can share a case: `case (.idle, .start), (.failed, .start):`.
+</Hint>
+<Hint>
+Bind the data you need in the pattern, as in `case (.uploading(let attempt, let sent), .networkFailed):`, then use `guard attempt < maxAttempts else { … }` for the give-up branch. `1 << (attempt - 1)` is 2 to the power `attempt − 1`.
+</Hint>
+<Hint>
+End with a case that lists every state with `_`, such as `case (.idle, _), (.uploading, _), …:`, returning `[]`. Unlike `default`, it stops compiling when someone adds a state.
+</Hint>
+</Hints>
+
+## Solutions
+
+<Approach title="One switch over (state, event)" time="O(1) per event" space="O(1)">
+
+```swift
+public mutating func send(_ event: Event) -> [Effect] {
+    switch (state, event) {
+    case (.idle, .start), (.failed, .start):
+        state = .uploading(attempt: 1, sent: 0)
+        return [.beginUpload(attempt: 1, fromByte: 0)]
+
+    case (.uploading(let attempt, _), .progress(let sent)):
+        state = .uploading(attempt: attempt, sent: sent)
+        return []
+
+    case (.uploading(let attempt, let sent), .pause):
+        state = .paused(attempt: attempt, sent: sent)
+        return [.suspendUpload]
+
+    case (.paused(let attempt, let sent), .resume), (.waitingToRetry(let attempt, let sent), .retryTimerFired):
+        state = .uploading(attempt: attempt, sent: sent)
+        return [.beginUpload(attempt: attempt, fromByte: sent)]
+
+    case (.uploading(let attempt, let sent), .networkFailed):
+        guard attempt < maxAttempts else {
+            let reason = "Gave up after attempt \(attempt)"
+            state = .failed(reason: reason)
+            return [.notifyFailed(reason: reason)]
+        }
+        state = .waitingToRetry(attempt: attempt + 1, sent: sent)
+        return [.scheduleRetry(afterSeconds: 1 << (attempt - 1))]
+
+    // The server may answer moments before a pause takes effect: the photo is stored either way
+    case (.uploading, .finished(let remoteID)), (.paused, .finished(let remoteID)):
+        state = .completed(remoteID: remoteID)
+        return [.notifyCompleted(remoteID: remoteID)]
+
+    case (.idle, .cancel):
+        state = .cancelled
+        return []
+
+    case (.uploading, .cancel), (.paused, .cancel):
+        state = .cancelled
+        return [.cancelUpload]
+
+    case (.waitingToRetry, .cancel):
+        state = .cancelled
+        return [.cancelRetryTimer]
+
+    case (.idle, _), (.uploading, _), (.paused, _), (.waitingToRetry, _), (.failed, _), (.completed, _), (.cancelled, _):
+        return []
+    }
+}
+```
+
+The whole behaviour of the upload fits on one screen, and a reviewer can check it against the table row by row. Combining patterns with the same body (`resume` from paused and the retry timer from waiting both begin an attempt from the bytes sent) keeps the rules from drifting apart. Because effects are returned rather than performed, the shell that owns a `URLSession` and a timer stays thin, and every test here runs in microseconds with no network.
+
+</Approach>

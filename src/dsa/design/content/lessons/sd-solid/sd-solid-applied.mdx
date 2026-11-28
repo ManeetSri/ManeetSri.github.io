@@ -1,0 +1,492 @@
+## Why it matters
+
+Knowing five definitions doesn't tell you where to start on a real view controller. This lesson takes one checkout screen, the kind every shopping app has, and applies the principles in the order that keeps the app working at every step: pin the behaviour, pull out the rules, open the part that varies, give the screen dependencies it owns, then make sure every implementation keeps its promises. It's also the shape of a strong answer to the interview classic, "here's a massive view controller; how would you improve it?"
+
+## The starting point
+
+The screen loads the basket, works out delivery and promotions, takes payment, stores the receipt and moves to the confirmation screen. It works, and it's the file everyone is afraid to touch:
+
+```swift check ios title="CheckoutViewController.swift (before)"
+import UIKit
+
+struct BasketLine: Codable, Sendable {
+    let name: String
+    let pence: Int
+    let quantity: Int
+}
+
+struct Basket: Codable, Sendable {
+    let id: String
+    let lines: [BasketLine]
+}
+
+final class APIClient: Sendable {
+    static let shared = APIClient()
+    func basket() async throws -> Basket { Basket(id: "b1", lines: []) }
+    func charge(basketID: String, pence: Int, cardToken: String) async throws -> String { "receipt-1" }
+    func searchProducts(_ query: String) async throws -> [String] { [] }
+    func updateAddress(_ address: String) async throws {}
+    // …and forty more endpoints
+}
+
+final class CheckoutViewController: UIViewController {
+    private let totalLabel = UILabel()
+    private let promoField = UITextField()
+    private var basket: Basket?
+
+    override func viewDidLoad() {
+        super.viewDidLoad()
+        Task {
+            basket = try? await APIClient.shared.basket()
+            totalLabel.text = String(format: "£%.2f", Double(total()) / 100)
+        }
+    }
+
+    func total() -> Int {
+        let subtotal = basket?.lines.reduce(0) { $0 + $1.pence * $1.quantity } ?? 0
+        let delivery = subtotal >= 4_000 ? 0 : 399
+        switch promoField.text?.uppercased() {
+        case "WELCOME10": return subtotal * 90 / 100 + delivery
+        case "FREEDELIVERY": return subtotal
+        default: return subtotal + delivery
+        }
+    }
+
+    func payTapped(cardToken: String) {
+        guard let basket else { return }
+        Task {
+            do {
+                let receipt = try await APIClient.shared.charge(basketID: basket.id, pence: total(), cardToken: cardToken)
+                UserDefaults.standard.set(receipt, forKey: "lastReceipt")
+                navigationController?.pushViewController(UIViewController(), animated: true)
+            } catch {
+                totalLabel.text = "Payment failed"
+            }
+        }
+    }
+}
+```
+
+Reading it with each principle's question:
+
+| Principle | The question | What this screen answers |
+| --- | --- | --- |
+| Single responsibility | Who asks for changes? | Finance (delivery threshold), marketing (promotions), payments, design (formatting), and whoever owns navigation |
+| Open–closed | What changes to add the next one? | Every promotion is a new `case` in the view, so marketing's weekly campaign needs a release |
+| Liskov substitution | Could a caller tell which implementation it got? | Nothing is substitutable yet: there's nothing to swap, which is part of the problem |
+| Interface segregation | How much of its dependency does it use? | Two of the API client's forty-odd endpoints |
+| Dependency inversion | Which way do dependencies point? | Straight down to `APIClient.shared` and `UserDefaults.standard`, so no rule can be tested without the network |
+
+## Step 0: pin the behaviour first
+
+Before moving anything, write **characterisation tests**: tests that record what the code does today, right or wrong, so the refactor can't change it by accident. Here that means the total for a handful of baskets and codes: under and over the £40 threshold, each promotion, an unknown code, a lower-case code. `total()` reads `promoField.text`, so the first test may have to set a text field on a real view controller. That awkwardness is the design telling you something, and it goes away in the next step. You'll meet characterisation tests properly in D15.
+
+## Step 1: pull the rules out (single responsibility)
+
+Move the pricing into a plain struct with no UIKit, no networking and no state of its own. It's the code finance and marketing care about, so it gets its own home and its own tests:
+
+```swift check group=checkout title="Checkout's rules, with no UIKit in sight"
+import Foundation
+
+struct BasketLine: Codable, Sendable {
+    let name: String
+    let pence: Int
+    let quantity: Int
+}
+
+struct Basket: Codable, Sendable {
+    let id: String
+    let lines: [BasketLine]
+    var subtotal: Int { lines.reduce(0) { $0 + $1.pence * $1.quantity } }
+}
+
+// Marketing's promotions: the kinds are a closed set the app understands; the codes and amounts arrive as data
+struct Promotion: Sendable {
+    enum Kind: Sendable {
+        case percentOff(Int)
+        case freeDelivery
+    }
+    let code: String
+    let kind: Kind
+}
+
+struct CheckoutPricing: Sendable {
+    var freeDeliveryFrom = 4_000
+    var deliveryPence = 399
+
+    func total(for basket: Basket, code: String?, promotions: [Promotion]) -> Int {
+        var items = basket.subtotal
+        var delivery = items >= freeDeliveryFrom ? 0 : deliveryPence
+        if let code, let promotion = promotions.first(where: { $0.code.caseInsensitiveCompare(code) == .orderedSame }) {
+            switch promotion.kind {
+            case .percentOff(let percent): items = items * (100 - percent) / 100
+            case .freeDelivery: delivery = 0
+            }
+        }
+        return items + delivery
+    }
+}
+```
+
+The characterisation tests move from the view controller to `CheckoutPricing` and still pass. For a £25.00 basket, no code gives 2,899p, `WELCOME10` gives 2,649p and `FREEDELIVERY` gives 2,500p, exactly as before. Notice what *isn't* here: a `PricingProtocol`. The pricing is pure, fast and owned by this feature; tests call it directly, so a protocol would add a name and buy nothing.
+
+## Step 2: open the part that varies (open–closed)
+
+Ask which direction of change is real. Promotions change weekly and marketing wants them live without App Review; the **kinds** of promotion (a percentage, free delivery) change a few times a year. So the open–closed answer here is two-layered:
+
+- the **kinds** are a closed `enum`, switched over exhaustively in one place. Adding "buy one get one free" is a small, compiler-checked change in an app release;
+- the **promotions themselves** are data from a promotions endpoint, decoded into `Promotion` values, with unknown kinds skipped as in the expression problem lesson. New codes, percentages and dates need no release at all.
+
+The `switch` on code strings in the view controller is gone. Nothing about the screen changes when marketing runs a campaign.
+
+## Step 3: give the screen roles it owns (interface segregation and dependency inversion)
+
+The screen doesn't need "the API client". It needs four things, so it declares four small protocols in the checkout module, in checkout's terms:
+
+```swift check group=checkout title="The roles checkout owns"
+struct Receipt: Sendable, Equatable {
+    let id: String
+    let pence: Int
+}
+
+enum PaymentError: Error, Equatable {
+    case declined
+    case cancelled
+    case needsAuthentication
+}
+
+protocol BasketLoading: Sendable {
+    func basket() async throws -> Basket
+}
+
+protocol PromotionsLoading: Sendable {
+    func activePromotions() async throws -> [Promotion]
+}
+
+/// The contract every processor keeps, real or fake:
+/// - it returns a receipt only if the money was taken, for exactly `pence`;
+/// - it throws a `PaymentError` when it wasn't: declined, cancelled by the person, or needing authentication;
+/// - charging again with the same `attemptID` never takes the money twice.
+protocol PaymentProcessing: Sendable {
+    func charge(basketID: String, pence: Int, attemptID: UUID) async throws -> Receipt
+}
+
+protocol ReceiptStoring: Sendable {
+    func save(_ receipt: Receipt) async
+}
+```
+
+Each protocol is a role sized to how checkout uses it (segregation), and each lives with the code that needs it and speaks its language (inversion). The forty endpoints are still on `APIClient`; checkout doesn't see them.
+
+## Step 4: write the contract down (Liskov substitution)
+
+The doc comment on `PaymentProcessing` is the most important text in the module. Card payments, Apple Pay and the fake in your tests are all substitutes for one another, and the screen is only correct if every one of them keeps those three promises:
+
+- **Apple Pay** must throw `.cancelled` when the person dismisses the sheet, not return a receipt for zero or swallow the cancellation.
+- **The card processor** must report a 3-D Secure challenge as `.needsAuthentication`, so the screen can present it, not as a generic failure.
+- **The fake** must be able to decline, cancel and time out. A fake that always succeeds passes every test and proves nothing about the failure paths, which are the ones that lose money.
+- **Every processor** must honour `attemptID`, so a retry after a timeout can't charge twice. That's what makes the "try again" button safe; you'll design idempotency properly in the backend part of the course.
+
+Write a contract test that runs against each processor, including the fake, as you did in the Liskov lesson.
+
+## The result
+
+The screen's model sequences the work and owns the screen's state. It's `@MainActor` because the view reads it; the pricing it calls is a plain struct that runs anywhere:
+
+```swift check group=checkout title="CheckoutModel: state and sequence, no rules and no frameworks"
+@MainActor final class CheckoutModel {
+    enum State: Equatable {
+        case loading
+        case ready(totalPence: Int)
+        case paying
+        case failed(String)
+    }
+
+    private(set) var state = State.loading { didSet { onChange?(state) } }
+    var onChange: ((State) -> Void)?
+    var onPaid: ((Receipt) -> Void)?
+
+    private let basketLoader: any BasketLoading
+    private let promotions: any PromotionsLoading
+    private let payments: any PaymentProcessing
+    private let receipts: any ReceiptStoring
+    private let pricing: CheckoutPricing
+    private var basket: Basket?
+    private var activePromotions: [Promotion] = []
+    private var code: String?
+    private var attemptID = UUID()
+
+    init(basketLoader: any BasketLoading, promotions: any PromotionsLoading, payments: any PaymentProcessing, receipts: any ReceiptStoring, pricing: CheckoutPricing = CheckoutPricing()) {
+        self.basketLoader = basketLoader
+        self.promotions = promotions
+        self.payments = payments
+        self.receipts = receipts
+        self.pricing = pricing
+    }
+
+    func load() async {
+        do {
+            basket = try await basketLoader.basket()
+            activePromotions = (try? await promotions.activePromotions()) ?? []
+            reprice()
+        } catch {
+            state = .failed("We couldn't load your basket.")
+        }
+    }
+
+    func apply(code: String?) {
+        self.code = code
+        reprice()
+    }
+
+    func pay() async {
+        guard let basket else { return }
+        let pence = pricing.total(for: basket, code: code, promotions: activePromotions)
+        state = .paying
+        do {
+            let receipt = try await payments.charge(basketID: basket.id, pence: pence, attemptID: attemptID)
+            await receipts.save(receipt)
+            attemptID = UUID()
+            onPaid?(receipt)
+        } catch PaymentError.cancelled {
+            reprice()
+        } catch {
+            state = .failed("The payment didn't go through.")
+        }
+    }
+
+    private func reprice() {
+        guard let basket else { return }
+        state = .ready(totalPence: pricing.total(for: basket, code: code, promotions: activePromotions))
+    }
+}
+```
+
+A few details carry a lot of weight. A failed promotions call degrades to "no promotions" rather than blocking checkout. Cancelling Apple Pay returns quietly to the ready state. The same `attemptID` is reused until a payment succeeds, so retrying after a timeout is safe. And navigation is a closure, `onPaid`, so whoever builds the screen decides what comes next.
+
+The view controller shrinks to layout and binding, and the app target supplies the details:
+
+```swift check ios group=checkout title="The view controller, the adapters and the composition root"
+import UIKit
+
+// The existing client, unchanged
+final class APIClient: Sendable {
+    static let shared = APIClient()
+    func basket() async throws -> Basket { Basket(id: "b1", lines: []) }
+    func promotions() async throws -> [Promotion] { [] }
+    func charge(basketID: String, pence: Int, attemptID: UUID) async throws -> Receipt { Receipt(id: "r1", pence: pence) }
+    // …and forty more endpoints
+}
+
+// Conformances live where both sides are visible. Two are empty: the methods already match
+extension APIClient: BasketLoading, PaymentProcessing {}
+extension APIClient: PromotionsLoading {
+    func activePromotions() async throws -> [Promotion] { try await promotions() }
+}
+
+struct DefaultsReceiptStore: ReceiptStoring {
+    func save(_ receipt: Receipt) async {
+        UserDefaults.standard.set(receipt.id, forKey: "lastReceiptID")
+    }
+}
+
+final class CheckoutViewController: UIViewController {
+    private let model: CheckoutModel
+    private let totalLabel = UILabel()
+
+    init(model: CheckoutModel) {
+        self.model = model
+        super.init(nibName: nil, bundle: nil)
+    }
+    required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
+
+    override func viewDidLoad() {
+        super.viewDidLoad()
+        model.onChange = { [weak self] state in self?.render(state) }
+        Task { await model.load() }
+    }
+
+    private func render(_ state: CheckoutModel.State) {
+        switch state {
+        case .loading: totalLabel.text = "Loading…"
+        case .ready(let pence): totalLabel.text = (Decimal(pence) / 100).formatted(.currency(code: "GBP"))
+        case .paying: totalLabel.text = "Paying…"
+        case .failed(let message): totalLabel.text = message
+        }
+    }
+}
+
+// The composition root: the only code that names concrete types
+@MainActor func makeCheckout(onPaid: @escaping (Receipt) -> Void) -> UIViewController {
+    let model = CheckoutModel(basketLoader: APIClient.shared, promotions: APIClient.shared, payments: APIClient.shared, receipts: DefaultsReceiptStore())
+    model.onPaid = onPaid
+    return CheckoutViewController(model: model)
+}
+```
+
+Here's the shape, and what happens when Apple Pay arrives:
+
+```visual flow
+title: The checkout screen after the refactor
+layers:
+  - { label: Checkout feature, rows: 0 }
+  - { label: Roles checkout owns, rows: 2 }
+  - { label: App target, rows: 4 }
+nodes:
+  - { id: vc, label: CheckoutViewController, kind: view, at: [0, 0] }
+  - { id: model, label: CheckoutModel, at: [2, 0] }
+  - { id: pricing, label: CheckoutPricing, at: [4, 0] }
+  - { id: loading, label: BasketLoading, at: [0, 2] }
+  - { id: paying, label: PaymentProcessing, at: [2, 2] }
+  - { id: storing, label: ReceiptStoring, at: [4, 2] }
+  - { id: api, label: APIClient, kind: external, at: [1, 4] }
+  - { id: applepay, label: ApplePayProcessor, kind: external, at: [3, 4] }
+  - { id: defaults, label: DefaultsReceiptStore, kind: store, at: [4.6, 4] }
+edges:
+  - [vc, model, binds]
+  - [model, pricing, total]
+  - [model, loading]
+  - [model, paying, charge]
+  - [model, storing]
+  - [api, loading, { style: data }]
+  - [api, paying, { style: data }]
+  - [applepay, paying, { style: data }]
+  - [defaults, storing, { style: data }]
+steps:
+  - say: The view controller only renders the model's state. It holds no rules and calls no services.
+    show: [vc, model]
+    send: vc->model
+  - say: "**Single responsibility**: the model asks `CheckoutPricing` for the total. It's a plain struct with no protocol, tested directly."
+    show: [pricing]
+    send: model->pricing
+  - say: "**Interface segregation and dependency inversion**: the model depends on small roles that checkout declares, in its own words."
+    show: [loading, paying, storing]
+    send: [model->loading, model->paying, model->storing]
+  - say: The app target supplies the details. `APIClient` conforms to two roles with empty extensions; it still has its forty other endpoints, and checkout never sees them.
+    show: [api, defaults]
+    send: [loading->api, paying->api, storing->defaults]
+  - say: "**Open–closed and Liskov**: Apple Pay is a new type that keeps the `PaymentProcessing` contract, including throwing `.cancelled`. Nothing above the adapters changes."
+    show: [applepay]
+    send: paying->applepay
+    state: { applepay: active, vc: ok, model: ok, pricing: ok, paying: ok }
+    label: { applepay: new }
+```
+
+## What we deliberately didn't do
+
+The refactor stopped short of several things that often get added in the name of SOLID:
+
+- **No protocol for `CheckoutPricing`.** It's pure and stable; tests call it directly.
+- **No use-case or interactor layer.** One screen with one model doesn't need a `PlaceOrderUseCase` that only forwards to `PaymentProcessing`. If a second screen (a one-tap reorder) needs the same sequence, extract it then.
+- **No generic `Repository<T>`.** Four specific roles say more than one generic one.
+- **No DI container.** One factory function wires the screen; that's enough until there are dozens.
+- **No new navigation framework.** `onPaid` hands the decision to whoever builds the screen; a coordinator can adopt it later.
+
+Each of these could be right in a larger app. None was needed to make the changes we expect cheap, which is the only test that matters.
+
+## Why this order
+
+Each step leaves the app shippable, and the order runs from least risky to most:
+
+1. **Characterisation tests** make every later step safe to check.
+2. **Pulling out pure rules** moves code without changing what it calls; it's almost mechanical.
+3. **Opening the variation point** removes the most frequent reason the screen changed.
+4. **Introducing owned roles** changes how dependencies are wired, so it comes once the rules are safe.
+5. **Writing contracts** matters most when the second implementation arrives, so it comes with the first substitute.
+
+Teams that start with step 4, introducing protocols for everything first, end up with abstractions shaped by the old code's accidents.
+
+## Trade-offs
+
+| Option | Effort | Risk | Testability afterwards | Wins when |
+| --- | --- | --- | --- | --- |
+| Leave it | None | Grows with every change | None | The screen is being replaced soon |
+| Extract the pure rules only (step 1) | An afternoon | Very low | The rules, fully | Quick wins; a rushed release |
+| The full sequence, steps 0–4 | A few days, in small pull requests | Low, with tests first | Rules, states and failure paths | The screen changes often and matters to revenue |
+| Rewrite it in a new architecture | Weeks | High: behaviour gets lost | High, eventually | Rarely; only with the old screen's tests as a safety net |
+
+<Callout kind="interview">
+
+**What to say** when handed a massive view controller: "First I'd pin today's behaviour with tests. Then I'd list who asks for changes to each part, and pull the pure rules out first because it's the safest move. Then I'd look for the most frequent change, here promotions, and make it data. Then I'd replace the singletons with small protocols the feature owns, and write the payment contract down, so the fake in tests and Apple Pay both keep it." Keep each step shippable and say so.
+
+**What to ask:** what changes most often in this screen, which bugs it has had, and whether there are tests. The answers set the order.
+
+**Red flags:** proposing a rewrite before tests; introducing a protocol per class, a use-case layer and a container for one screen; and refactoring without mentioning how you'd know behaviour didn't change.
+
+</Callout>
+
+<Callout kind="gotcha" title="Swift gotcha: code leaving a view controller loses its main-actor isolation">
+
+`UIViewController` is `@MainActor`, so everything inside it was implicitly main-actor isolated. When you move code out, decide its isolation on purpose. A model that holds the screen's state should be marked `@MainActor`. Pure rules like `CheckoutPricing` should be plain `Sendable` structs with no isolation, so they run anywhere and tests don't need the main actor. Service roles should be `Sendable` with `async` methods. Getting this wrong shows up as a wall of Swift 6 errors, or worse, as `@MainActor` stamped on everything so that pricing a large basket runs on the main thread.
+
+</Callout>
+
+## Practice
+
+Two reviews to practise on. **Review: the profile screen** is a view controller with a guest subclass: name each principle it breaks and plan the fix in this lesson's order. **Review: the upload service** applies the same thinking to a service rather than a screen: a shared singleton, a Wi-Fi-only subclass and a fat observer protocol.
+
+```cards
+- id: applied-order
+  front: "In what order should you apply SOLID to a massive view controller, and why?"
+  back: "Characterisation tests; extract pure rules (SRP); open the most frequent variation (OCP); replace concrete dependencies with small roles the feature owns (ISP, DIP); write the contracts substitutes must keep (LSP). Least risky first, each step shippable."
+- id: applied-not-everything
+  front: "Why doesn't the checkout refactor add a protocol for CheckoutPricing?"
+  back: "It's pure, fast, stable and owned by the feature, so tests call it directly. A protocol would add indirection without making any expected change cheaper."
+- id: applied-data-ocp
+  front: "How can a promotion system be open–closed in two layers?"
+  back: "The kinds of promotion are a closed enum handled exhaustively in one place (changed by a release), while the promotions themselves are data from the server (changed weekly, no release)."
+- id: applied-fake-contract
+  front: "Why must the fake payment processor in tests keep the PaymentProcessing contract?"
+  back: "Because the screen is only correct if every substitute keeps it. A fake that always succeeds never exercises declines, cancellations or timeouts, the paths that lose money."
+```
+
+```quiz
+- id: q1
+  type: order
+  prompt: "Put the refactoring steps for the checkout screen in a safe order."
+  lines:
+    - "Write characterisation tests for today's totals"
+    - "Move the pricing into a pure CheckoutPricing struct"
+    - "Turn the promotion switch into data with a closed set of kinds"
+    - "Replace APIClient.shared with roles the checkout module declares"
+    - "Write down the PaymentProcessing contract and test every processor against it"
+  explain: "Pin behaviour, then make the low-risk pure extraction, then remove the most frequent change, then rewire dependencies, then guard substitution as soon as there's more than one processor."
+- id: q2
+  type: sort
+  prompt: "Where does each piece end up after the refactor?"
+  buckets: [CheckoutViewController, CheckoutModel, CheckoutPricing, App target]
+  items:
+    - ["Setting the total label's text", 0]
+    - ["Free delivery over £40", 2]
+    - ["Reusing the attempt ID when a payment is retried", 1]
+    - ["extension APIClient: BasketLoading, PaymentProcessing {}", 3]
+    - ["Choosing which screen comes after payment", 3]
+    - ["Applying a percentage-off promotion", 2]
+  explain: "The view renders; the model sequences and holds state; the pricing holds the rules; the app target holds the concrete types and the navigation decision passed in through `onPaid`."
+- id: q3
+  type: mcq
+  prompt: "Marketing runs a new promotion code every week. Product adds a new *kind* of promotion about twice a year. What's the best open–closed design?"
+  options:
+    - "A `switch` on codes in the pricing, updated each week"
+    - "A `PromotionRule` protocol, with a new conforming type each week"
+    - "Promotions as server data, with the kinds as a closed enum the app handles exhaustively"
+    - "A JavaScript interpreter in the app so marketing can ship any rule"
+  answer: 2
+  explain: "The weekly change (codes, amounts, dates) becomes data and needs no release. The rare change (a new kind) is a small, compiler-checked enum change in a release. A protocol per week still needs a release; an interpreter trades safety and App Review risk for flexibility nobody asked for."
+- id: q4
+  type: truefalse
+  prompt: "After the refactor, a fake `PaymentProcessing` that always returns a receipt is enough to test the checkout model."
+  answer: false
+  explain: "The model's most important behaviour is in its failure paths: declines, cancellations and timeouts. A fake must be able to produce each one, as the contract says, or those paths go untested."
+- id: q5
+  type: multi
+  prompt: "Which of these did the refactor deliberately leave out? Choose all that apply."
+  options:
+    - "A protocol for CheckoutPricing"
+    - "A PlaceOrderUseCase that forwards to PaymentProcessing"
+    - "Characterisation tests"
+    - "A DI container"
+    - "A written contract for PaymentProcessing"
+  answer: [0, 1, 3]
+  explain: "The pricing protocol, the forwarding use case and the container would each add indirection without making an expected change cheaper. The tests and the contract are what make the refactor safe."
+```

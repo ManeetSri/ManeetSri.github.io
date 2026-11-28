@@ -1,0 +1,145 @@
+<Brief>
+
+A year ago the team built one list screen for every list in the app, configured per screen. Orders and Favourites use it today, and a third screen, Saved addresses, is next. Meanwhile support reports blank rows, duplicated orders and a favourites screen that "uses data like crazy" when it's empty. Review it as you would a pull request that adds the third screen.
+
+```swift check ios title="GenericListViewController.swift"
+import UIKit
+
+struct Order { let number: String; let total: Double }
+struct Product { let name: String; let price: Double }
+
+protocol ListDataProvider { func fetch(page: Int, completion: @escaping ([Any]) -> Void) }
+protocol ListPlugin { func listWillAppear(_ list: GenericListViewController) }
+
+enum ListKind { case orders, favourites }
+
+struct ListConfiguration {
+    var kind: ListKind
+    var title: String
+    var providerKey: String
+    var showsSearch = false
+    var plugins: [any ListPlugin] = []
+}
+
+@MainActor
+final class ProviderRegistry {
+    static let shared = ProviderRegistry()
+    private var providers: [String: any ListDataProvider] = [:]
+    func register(_ provider: any ListDataProvider, for key: String) { providers[key] = provider }
+    func provider(for key: String) -> any ListDataProvider { providers[key]! }
+}
+
+final class GenericListViewController: UITableViewController {
+    let configuration: ListConfiguration
+    private var rows: [Any] = []
+    private var page = 0
+
+    init(configuration: ListConfiguration) {
+        self.configuration = configuration
+        super.init(style: .plain)
+        title = configuration.title
+    }
+
+    required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
+
+    var items: [Any] {
+        if rows.isEmpty { loadNextPage() }
+        return rows
+    }
+
+    func loadNextPage() {
+        let provider = ProviderRegistry.shared.provider(for: configuration.providerKey)
+        provider.fetch(page: page) { [weak self] newRows in
+            self?.rows += newRows
+            self?.page += 1
+            self?.tableView.reloadData()
+        }
+    }
+
+    override func tableView(_ tableView: UITableView, numberOfRowsInSection section: Int) -> Int {
+        items.count
+    }
+
+    override func tableView(_ tableView: UITableView, cellForRowAt indexPath: IndexPath) -> UITableViewCell {
+        let cell = UITableViewCell(style: .subtitle, reuseIdentifier: nil)
+        if configuration.kind == .orders, let order = items[indexPath.row] as? Order {
+            cell.textLabel?.text = "Order \(order.number)"
+            cell.detailTextLabel?.text = String(format: "£%.2f", order.total)
+        } else if configuration.kind == .favourites, let product = items[indexPath.row] as? Product {
+            cell.textLabel?.text = product.name
+            cell.detailTextLabel?.text = "£" + String(format: "%.2f", product.price)
+        }
+        if indexPath.row == rows.count - 1 { loadNextPage() }
+        return cell
+    }
+}
+```
+
+</Brief>
+
+```workspace
+template: critique
+minutes: 25
+```
+
+```findings
+- id: caller-identity
+  title: The shared screen branches on which screen it is
+  severity: high
+  lines: 60-66
+  detail: "`configuration.kind == .orders` and `== .favourites` mean the generic controller knows every caller, and each new list adds a branch here. A change for Favourites means retesting Orders. The two screens share a table and nothing else: this is the wrong abstraction, and Saved addresses would make it worse."
+- id: query-fetches
+  title: Reading `items` starts a request, so an empty list fetches forever
+  severity: high
+  lines: 40-43
+  detail: "A property that looks like a query has a side effect. UIKit calls `numberOfRowsInSection` whenever it likes; with no rows, each call fetches. An empty favourites list returns `[]`, reloads, reads `items` again and fetches the next page, without end: the data usage support hears about."
+- id: registry
+  title: A string-keyed provider registry that crashes on a typo
+  severity: high
+  lines: 19-25
+  detail: "Each screen has exactly one provider, so the registry is speculative generality. It turns a compile-time dependency into a run-time lookup: a misspelt key, or a screen shown before registration, crashes at `providers[key]!`. As a global singleton it also hides the dependency, so the screen can't be tested with a stub."
+- id: duplicate-pages
+  title: The same page can be requested and appended twice
+  severity: medium
+  lines: 45-52
+  detail: "Nothing records that a load is in flight, and `page` only advances when a response arrives. Reaching the last row twice, or `items` and `cellForRowAt` both asking, before the response lands requests the same page twice, and both copies are appended: the duplicated orders. There's also no end-of-list state, so the last row keeps requesting."
+- id: thread
+  title: Nothing says which thread the completion runs on
+  severity: medium
+  lines: 47-50
+  detail: "`fetch(page:completion:)` makes no promise. A provider built on URLSession calls back on a background queue, so `rows` changes and `reloadData()` runs off the main thread, racing with the table's own reads. An `async` loader called from main-actor code makes the hop explicit and checked."
+- id: any-rows
+  title: Rows are typed `[Any]` and recovered by casting
+  severity: medium
+  lines: 29
+  detail: "A provider that returns the wrong type, or a screen configured with the wrong key, produces rows whose `as?` cast fails, and the cell is left blank without an error: the blank rows in the bug reports. With a typed model per screen, the compiler would catch it."
+- id: money-duplication
+  title: The one real duplication, how money is shown, is written twice and differently
+  severity: medium
+  lines: 62-65
+  detail: "The screens share almost nothing, but they do share this app's way of showing prices, and it's implemented twice, with `Double` for money and a hard-coded pound sign that ignores the user's locale. That's the knowledge DRY is about: one formatter, using `Decimal` and `.formatted(.currency(code:))`, used by both."
+- id: unused-options
+  title: Options and hooks that nothing reads
+  severity: low
+  lines: 15-16
+  detail: "`showsSearch` and `plugins`, with the `ListPlugin` protocol on line 7, are read nowhere. They were added for features someone expected; they cost every reader time and promise behaviour that doesn't exist. Delete them, and add search to the screen that needs it, when it does."
+```
+
+<ReferenceReview>
+
+**Most important first.** Two problems hurt users today. Reading `items` **fetches**, so an empty list requests page after page without end, and loads can **overlap**, so pages are appended twice. Both come from mixing a query with a command, and from a paging state that doesn't know a request is in flight. Close behind: the **registry** turns a typo into a crash.
+
+**The design problem underneath** is a wrong abstraction. Orders and Favourites looked alike a year ago, so they were merged into a configurable screen. Since then each difference became a flag or an `if kind ==`, the rows lost their types to `[Any]`, and the real shared knowledge, how prices look, was never shared at all. Adding Saved addresses would add a third branch to every method.
+
+**How I'd fix it, in small steps:**
+
+1. Pin today's behaviour with snapshot tests of both screens with a few pages of stub data, so the refactor can't change what users see.
+2. **Go back to duplication.** Copy the controller into `OrdersViewController` and `FavouritesViewController`. In each copy, delete the other screen's branch and replace `[Any]` with `[Order]` or `[Product]`. Each copy gets shorter and typed.
+3. **Inject the loader** through `init`, typed per screen: `let loadPage: (Int) async throws -> [Order]`, built at the composition root. Delete `ProviderRegistry`; the crash goes with it.
+4. **Make loading a command.** Load the first page from `viewDidLoad` and later pages from `tableView(_:willDisplay:forRowAt:)` or prefetching, never from a data-source method. Data-source methods become pure queries over `rows`.
+5. **Extract what's really shared**, now that two honest copies sit side by side: a small `Pager<Item>` that knows the next page, whether a load is in flight and whether the end was reached; and one money formatter used by both. Neither has a branch for any screen.
+6. Delete `ListConfiguration`, `ListPlugin`, `showsSearch` and `plugins`. Saved addresses becomes a third small controller that uses `Pager` and its own cell.
+
+**Tests to add:** `Pager` never runs two loads at once, appends pages in order, and stops after an empty page; each screen's first load happens once even when the table asks for its row count repeatedly; an empty response shows the empty state and makes no further requests; the money formatter for a few values and locales.
+
+</ReferenceReview>

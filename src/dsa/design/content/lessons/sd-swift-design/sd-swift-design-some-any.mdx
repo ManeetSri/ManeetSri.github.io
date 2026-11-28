@@ -1,0 +1,295 @@
+## Why it matters
+
+Every time you write a protocol where a type would go, you're choosing between three tools: a generic (`some P` or `<T: P>`), an existential (`any P`), or a hand-written type eraser. The choice decides whether a hot loop is fast, whether you can use `==` or put values in a `Set`, how readable an API is, and whether SwiftUI can tell your views apart. Since Swift 5.7, `any` works with every protocol and `some` works in parameters too, so the decision comes up constantly. Senior engineers are expected to say what each option costs, not only that one is "faster".
+
+## Two different promises
+
+You met both keywords in the DSA course's [some vs any](/dsa/learn/swift-some-any). In one sentence each:
+
+- **`some Shape`** is *one particular type*, known to the compiler and hidden from the code using it. In a return type the implementation picks it; in a parameter the caller does, exactly like a generic parameter.
+- **`any Shape`** is *a box* that can hold a value of any conforming type, and a different one each time it's assigned.
+
+Everything else in this lesson follows from that difference: one keeps the type and hides its name, the other throws the type away and keeps only the protocol.
+
+## What an existential is made of
+
+`any Shape` is a real value with a fixed layout, called an **existential container**: three words of inline storage for the value, a pointer to the value's type metadata, and one pointer to a **protocol witness table** (the table of the conformer's implementations) for each protocol in the type. A value that fits in the three words is stored inline. A bigger one is moved into a heap allocation, and the container points to it.
+
+```swift run
+protocol Shape { func area() -> Double }
+protocol Named { var name: String { get } }
+protocol Cell: AnyObject { func reload() }
+
+struct Square: Shape {
+    var side: Double
+    func area() -> Double { side * side }
+}
+
+struct Panel: Shape {
+    var x, y, width, height: Double
+    func area() -> Double { width * height }
+}
+
+print("Square:", MemoryLayout<Square>.size)
+print("Panel:", MemoryLayout<Panel>.size)
+print("any Shape:", MemoryLayout<any Shape>.size)
+print("any Shape & Named:", MemoryLayout<any Shape & Named>.size)
+print("any Cell:", MemoryLayout<any Cell>.size)
+print("any Error:", MemoryLayout<any Error>.size)
+```
+
+```output
+Square: 8
+Panel: 32
+any Shape: 40
+any Shape & Named: 48
+any Cell: 16
+any Error: 8
+```
+
+Read the numbers on a 64-bit device:
+
+- **`any Shape` is 40 bytes:** 24 of buffer, 8 for the type, 8 for the witness table. A `Square` fits in the buffer. A `Panel`, at 32 bytes, doesn't, so storing one in `any Shape` allocates a heap box, with its reference counting.
+- **Each extra protocol adds a witness table pointer:** `any Shape & Named` is 48.
+- **A class-only protocol needs no buffer:** `any Cell` is a reference plus a witness table, 16 bytes.
+- **`any Error` is special:** always a single pointer to a box, so a thrown error is one word wide whatever its type.
+
+So an `[any Shape]` of 1,000 panels is 40 KB of containers *plus* 1,000 heap allocations, where `[Panel]` is 32 KB in one contiguous buffer.
+
+## What a call through the box costs
+
+Step through `shape.area()` on an `any Shape` holding a `Panel`, and then the same call through a generic:
+
+```visual flow
+title: Calling area() through any Shape, and through a generic
+nodes:
+  - { id: call, label: shape.area(), kind: client, at: [0, 1] }
+  - { id: box, label: existential container, kind: store, at: [2, 1] }
+  - { id: heap, label: heap box, kind: store, at: [2, 3] }
+  - { id: table, label: witness table, kind: store, at: [4, 1] }
+  - { id: impl, label: Panel.area(), kind: service, at: [4, 3] }
+edges:
+  - [call, box, any Shape]
+  - [box, heap, value, { style: data }]
+  - [box, table, lookup]
+  - [table, impl, calls]
+  - [call, impl, specialised, { style: async }]
+steps:
+  - say: "`let shape: any Shape = Panel(...)` makes a 40-byte **container**: three words of storage, the value's type and a pointer to `Panel`'s witness table."
+    send: call->box
+    label: { box: 40 bytes }
+  - say: "A `Panel` is 32 bytes, more than the 24-byte buffer, so it lives in a **heap box** that the container points to: one allocation, and reference counting on every copy."
+    send: box->heap
+    state: { heap: wait }
+  - say: "To call `area()`, Swift reads the witness table to find `Panel`'s implementation. The optimiser can't inline a call it can't see."
+    send: box->table
+  - say: "Then it calls through the table. Correct and flexible, and a few nanoseconds slower than a direct call."
+    send: table->impl
+  - say: "Through `func total<S: Shape>(_ shapes: [S])`, the optimiser specialises for `Panel`: the call goes straight to `Panel.area()`, usually inlined, and `[Panel]` stores values inline with no boxes."
+    send: call->impl
+    state: { impl: ok }
+```
+
+Put the costs in proportion. Dynamic dispatch and a possible allocation matter in **hot paths**: layout code run for every glyph, image processing per pixel, parsing tens of thousands of records. They don't matter at **architecture boundaries**. A view model calling `try await repository.load()` through `any FeedLoading` adds nanoseconds to a call that then waits 200 ms for the network. Choose by what each tool can *do* first, and by performance only where you've measured that it matters.
+
+## What a box can't do
+
+The bigger costs of `any` are in what it can't express.
+
+- **It forgets the type.** A function returning `any Shape` gives the caller a box. If they need `Panel`'s `width`, they cast, and casts can fail.
+- **Associated types are erased.** On a plain `any Repository`, a method returning `[Model]` returns `[Any]`, and a method *taking* a `Model` can't be called at all. A primary associated type constraint (`any Repository<Order>`) brings them back.
+- **An existential doesn't conform to its own protocol.** `any Hashable` isn't `Hashable`, so `Set<any Hashable>` doesn't compile. `any Identifiable` isn't `Identifiable`, so `List(items)` with `[any FeedItem]` fails, while `ForEach(items, id: \.id)` works when the protocol pins `ID` to a concrete type. The one exception is `any Error`, which the language makes conform to `Error`.
+
+<Callout kind="gotcha" title="Swift gotcha: [any P] isn't a [T] for any T">
+
+`func total<S: Shape>(_ shapes: [S])` can't take an `[any Shape]`: the error is "type 'any Shape' cannot conform to 'Shape'". A generic array needs one element type, and a mixed array doesn't have one. Either give the function an existential overload, or ask whether the array should be mixed at all.
+
+</Callout>
+
+## Opening a box: passing any to a generic
+
+Since Swift 5.7, passing a *single* `any P` value to a generic parameter `<T: P>` **opens** it: inside the function, `T` is the value's real type. It's how you call generic code, and `Self` requirements such as `==`, from an existential:
+
+```swift run
+func isEqual<T: Equatable>(_ lhs: T, _ rhs: any Equatable) -> Bool {
+    guard let rhs = rhs as? T else { return false }
+    return lhs == rhs
+}
+
+let a: any Equatable = 42
+let b: any Equatable = 42
+let c: any Equatable = "42"
+print(isEqual(a, b))
+print(isEqual(a, c))
+```
+
+```output
+true
+false
+```
+
+`a` is opened, so `T` is `Int`; `rhs as? T` checks that the other box holds an `Int` too, and then the comparison is an ordinary `Int == Int`. This one trick is what makes modern type erasers short.
+
+## some: hiding a type without erasing it
+
+`some` keeps everything `any` loses, because the compiler still knows the type:
+
+- **Return position** lets an implementation hide its type and change it later without breaking callers. SwiftUI's `var body: some View` is the famous case: the real type is something like `VStack<TupleView<(Text, Image)>>`, which you never write, and SwiftUI still gets every bit of it for diffing.
+- **Parameter position** is shorthand for a generic: `func draw(_ shape: some Shape)` is `func draw<S: Shape>(_ shape: S)`.
+- **The type is fixed.** Every `return` must produce the same concrete type. That's why SwiftUI's `@ViewBuilder` exists: it turns `if`–`else` branches into one conditional type, so a `some View` property can show different views.
+
+The limit shows up in dependency injection. A factory that returns `some ImageLoading` hides which loader it built, but the caller can't declare a stored property of that type without either inferring it from the factory call or becoming generic. Factories that feed long-lived objects usually return `any ImageLoading` for that reason.
+
+## Choosing, in order
+
+Ask these in order, and stop at the first yes:
+
+1. **Is the set of kinds closed and owned by you?** A payment method is a card, Apple Pay or PayPal. Use an **enum**: exhaustive `switch`, no boxes, and adding a case shows every place to update.
+2. **Does the caller need the exact type back, is it a hot path, or do you need `Self` requirements like `==`?** Use a **generic** or `some`.
+3. **Does it vary at run time, or is a long-lived object storing it as a dependency, or does a collection mix an open set of types?** Use **`any`**.
+4. **Must the erased value itself conform to a protocol (`Hashable`, `Identifiable`, `Codable`, `View`), or do you want a stable named type in a public API?** Write a **type eraser**.
+
+In Swift 6 language mode you may still write a plain protocol without `any` (`let shape: Shape`), although protocols with associated types have required it since Swift 5.7. The upcoming-feature flag `ExistentialAny` makes `any` mandatory everywhere, which some teams turn on so every existential is visible in code review.
+
+## Type erasure: when you still need it
+
+Before Swift 5.7, a protocol with associated types couldn't be used as a type at all, so libraries wrote erasers for everything: `AnySequence`, `AnyHashable`, Combine's `AnyPublisher`, SwiftUI's `AnyView`. Today the existential does most of that work, and a hand-written eraser is worth it only to **add something an existential can't have**. The modern shape stores the existential and adds the conformance:
+
+```swift check
+protocol FeedItem: Identifiable, Sendable where ID == String {
+    var title: String { get }
+}
+
+struct AnyFeedItem: Identifiable, Sendable {
+    let base: any FeedItem
+    var id: String { base.id }
+    var title: String { base.title }
+
+    init(_ base: any FeedItem) {
+        self.base = base
+    }
+}
+
+struct Banner: FeedItem {
+    let id: String
+    let title: String
+}
+
+let items = [AnyFeedItem(Banner(id: "b1", title: "Spring sale"))]
+let ids = items.map(\.id)
+```
+
+`AnyFeedItem` is `Identifiable`, so it works anywhere SwiftUI wants identifiable data, with no class hierarchy. Before writing one, check whether the API you're feeding takes a key path or a closure instead, like `ForEach(items, id: \.id)`: then you need no eraser at all.
+
+<Callout kind="gotcha" title="iOS gotcha: AnyView hides your view's structure">
+
+SwiftUI decides what changed by comparing view types and their positions in the hierarchy. `AnyView` erases the type, so SwiftUI can only compare the boxed types at run time, and when they differ it throws the old view away: its `@State` resets, transitions don't animate, and the whole subtree is rebuilt. Apple's guidance is to use `@ViewBuilder`, `some View` and conditional content instead, and keep `AnyView` for the rare case of a genuinely open set of view types, such as views supplied by plugins.
+
+</Callout>
+
+## Trade-offs
+
+| | Concrete type | Generic or `some` | `any` | Enum | Type eraser |
+| --- | --- | --- | --- | --- | --- |
+| **Speed** | fastest | fast, specialised | dynamic calls; big values boxed | fast `switch` | as `any`, plus a wrapper |
+| **Mixes types** | no | no | yes, an open set | yes, a closed set | yes |
+| **`Self` requirements (`==`)** | yes | yes | only by opening | yes | if you write them |
+| **Conforms to protocols** | yes | yes | no (except `any Error`) | yes | yes: its reason to exist |
+| **Spreads into callers** | no | yes, when stored | no | no | no |
+| **Hides the implementation** | no | yes, with `some` | yes | no | yes |
+
+A concrete type wins when there's only one. Generics and `some` win in hot paths and wherever the exact type matters. `any` wins for stored dependencies and open, mixed collections. An enum wins for closed sets. An eraser wins only when the erased value must conform to something.
+
+<Callout kind="interview">
+
+**Say:** "`some` when there's one concrete type I want to hide; `any` when it varies at run time or I'm storing a dependency; generics in hot paths; an enum when the set is closed; an eraser only to add a conformance like `Hashable`." Then explain why: the container, the witness table, the boxing.
+
+**Ask:** does the type vary at run time? Is the set of kinds closed? Is this a hot path, and has anyone measured it?
+
+**Red flags:** "`any` is slow, so I never use it", which ignores where the cost matters; `AnyView` around every branch; a hand-written eraser for a protocol with no associated types; not being able to say why `Set<any Hashable>` doesn't compile.
+
+</Callout>
+
+## Practice
+
+The **erased search filters** kata asks you to write a `Hashable` eraser for a protocol with an associated type, using existential opening for `==`. The **"flexible" catalog module** review is a module that made every one of this lesson's mistakes at once, and the bug they cause together.
+
+```cards
+- id: some-vs-any
+  front: "What's the difference between `some P` and `any P` in one line each?"
+  back: "`some P` is one specific type, known to the compiler and hidden from callers. `any P` is a box that can hold any conforming type, a different one each time."
+- id: existential-layout
+  front: "What's inside an `any P` value?"
+  back: "Three words of inline storage, a pointer to the value's type, and a witness table pointer per protocol: 40 bytes for one protocol. Values over 24 bytes are moved into a heap box."
+- id: self-conformance
+  front: "Why doesn't `Set<any Hashable>` compile?"
+  back: "Existentials don't conform to their own protocol (except `any Error`): `any Hashable` isn't `Hashable`. Use a type eraser, or a concrete or generic element type."
+- id: when-eraser
+  front: "When is a hand-written type eraser still worth it?"
+  back: "When the erased value must conform to a protocol (Hashable, Identifiable, Codable, View) or you want a stable named type in an API. Otherwise `any P<T>` does the job."
+```
+
+```quiz
+- id: q1
+  type: mcq
+  prompt: "On a 64-bit device, which value needs a heap allocation when you store it in an `any Shape`?"
+  options:
+    - "An 8-byte struct"
+    - "A 24-byte struct"
+    - "A 32-byte struct"
+    - "An instance of a class"
+  answer: 2
+  explain: "The container has three words, 24 bytes, of inline storage. Anything that fits is stored inline. A class instance is already on the heap, so the container holds its reference inline. Only the 32-byte struct is moved into a new heap box."
+- id: q2
+  type: mcq
+  prompt: "This doesn't compile: `func badge(isNew: Bool) -> some View { if isNew { return Text(\"New\") } else { return Image(systemName: \"star\") } }`. What's the best fix?"
+  options:
+    - "Return `AnyView` from both branches"
+    - "Mark it `@ViewBuilder` and remove the `return`s"
+    - "Change the return type to `any View`"
+    - "Wrap each branch in a `Group` and keep the `return`s"
+  answer: 1
+  explain: "`some View` needs one concrete type, and the branches have two. `@ViewBuilder` combines them into one conditional view type that SwiftUI can still diff. `AnyView` compiles but hides the structure, and `any View` can't be a view's body type."
+- id: q3
+  type: truefalse
+  prompt: "`Set<any Hashable>` compiles, because every value in it is `Hashable`."
+  answer: false
+  explain: "A `Set`'s element type must itself conform to `Hashable`, and the existential `any Hashable` doesn't conform to its own protocol. `AnyHashable` (a type eraser) or a custom eraser is the answer."
+- id: q4
+  type: sort
+  prompt: "Which tool fits each case best?"
+  buckets: [Enum, Generic or some, any, Type eraser]
+  items:
+    - ["A payment method: card, Apple Pay or PayPal", 0]
+    - [A layout function run for 10000 glyphs a frame, 1]
+    - [The analytics tracker a view model is given, 2]
+    - [Search filter chips kept in a Set, 3]
+    - [A public factory that hides which image loader it builds, 1]
+    - [Feature cards that other modules register at launch, 2]
+  explain: "Closed set: enum. Hot path or hidden single type: generic or `some`. Stored dependency or open mixed set: `any`. Needs a conformance such as `Hashable`: an eraser."
+- id: q5
+  type: output
+  prompt: "What does this print?"
+  code: |
+    protocol Animal { var sound: String { get } }
+    struct Dog: Animal { var sound: String { "woof" } }
+
+    func describe<A: Animal>(_ animal: A) -> String {
+        "\(A.self) says \(animal.sound)"
+    }
+
+    let pet: any Animal = Dog()
+    print(describe(pet))
+  answer: "Dog says woof"
+  explain: "Passing an `any Animal` to a generic parameter opens the box, so inside `describe` the type `A` is the value's real type, `Dog`, not the existential."
+- id: q6
+  type: mcq
+  prompt: "A row's `body` wraps each branch in `AnyView`. When the row's item changes from a book to a course, what does SwiftUI do?"
+  options:
+    - "Updates only the text that changed"
+    - "Sees a different boxed type, discards the old view and its state, and builds a new one"
+    - "Crashes, because the type changed"
+    - "Nothing, because `AnyView` never updates"
+  answer: 1
+  explain: "Through `AnyView`, SwiftUI can only compare the boxed types at run time. When they differ it replaces the subtree, so `@State` resets and transitions don't animate. With `@ViewBuilder` the two branches are known parts of one type."
+```

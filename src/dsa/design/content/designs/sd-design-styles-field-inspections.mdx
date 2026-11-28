@@ -1,0 +1,189 @@
+<Brief>
+
+You're the lead iOS engineer at a company that inspects gas and electrical installations in commercial buildings. You're designing the inspectors' iPad and iPhone app, and your main job in this exercise is to **choose and justify the architecture styles at every scale**, then show how the important flows work.
+
+How inspectors work:
+
+- About **1,200 inspectors**, each doing **4–8 inspections a day**, often in basements and plant rooms with **no signal for hours**.
+- An inspection is a **form of 40–200 questions** (yes/no, readings, free text, signatures) plus **10–60 photos**.
+- Once submitted, an inspection is a **legal record**. Regulators can ask for it, with who answered what and when, for **7 years**.
+- Regulations change, so the office **changes form templates about once a month**. Waiting for an App Store release each time isn't acceptable.
+
+What matters most, in the product owner's words: "never lose an inspector's work", "a full day offline", "we must be able to prove what was recorded", and "we change forms without a release".
+
+The teams: **4 iOS engineers today, growing to three squads (about 12 engineers) next year**: inspections, scheduling, and reports with customer sign-off. The backend has 3 engineers and an existing REST API for schedules and customers.
+
+Choose the styles for the system, the app's structure, its features and its key components, and say what each choice gives up. Spend about 45 minutes. Rough notes are fine.
+
+</Brief>
+
+```workspace
+template: feature
+minutes: 45
+```
+
+<ModelAnswer section="requirements">
+
+Questions that change the design: Can two inspectors work on the same inspection? (Assume no: one inspector per job.) Can a submitted inspection be changed? (Assume no: corrections are a new, linked amendment.) Do new *question types* also change monthly, or only the questions? (Assume questions monthly, new types a few times a year.) iPad and iPhone, or Mac too? (Assume iPad and iPhone.)
+
+- **Functional:** see today's schedule; open an inspection; answer questions with conditional logic ("if the boiler is gas, ask for the flue reading"); take and annotate photos; capture a customer signature; submit; see what's still syncing.
+- **Driving qualities**, made measurable:
+  - **No lost work:** every answer and photo is on disk within a second of being entered; nothing is lost if the app is killed, the battery dies or the device restarts.
+  - **Offline:** a full day (8 inspections, 60 photos each) with no network; everything syncs within minutes of reconnecting, including when the app is in the background.
+  - **Auditability:** for every answer: who, when (device and server time), which template version; submitted records are immutable.
+  - **Change without release:** new questions and templates reach devices within a day, as data.
+- **Secondary:** team autonomy as the squads form; fast enough on older iPads.
+- **Out of scope:** office web tools, report PDF layout, real-time collaboration.
+
+</ModelAnswer>
+
+<ModelAnswer section="estimates">
+
+- **Photos per inspector per day:** typical 6 inspections × 30 photos; worst 8 × 60 = 480 photos. Straight from the camera a HEIC is about 2–3 MB, so the worst day is ~1.4 GB. Resizing to a 2,048 px long edge (plenty for a report) gives ~0.5–0.8 MB: ~150 MB on a typical day, ~400 MB at worst.
+- **Upload on reconnect:** 150 MB at 10 Mbit/s is ~2 minutes; the worst day is ~5–6 minutes. It must keep going in the background.
+- **Answers:** 200 answers × ~100 bytes ≈ 20 KB per inspection, plus an audit log a few times that. Negligible next to photos.
+- **Fleet:** 1,200 × 6 = ~7,200 inspections and ~216,000 photos a day; ~110–170 GB of photos a day, roughly 50 TB a year and a few hundred TB over 7 years of retention. That's object storage with lifecycle tiers, not a database.
+- **Peak:** most devices reconnect between 4 and 6 pm; ~170 GB over two hours is ~25 MB/s inbound on average. Fine for object storage if devices upload **directly** to it with pre-signed URLs, not through the API servers.
+
+</ModelAnswer>
+
+<ModelAnswer section="architecture">
+
+Styles, one decision per scale:
+
+- **System: client–server, thick client.** The device is the **source of truth for drafts**: answers, photos and the audit log live on the device first and sync later. The server is the source of truth for schedules, templates, and **submitted** inspections, which it locks.
+- **Backend: modular monolith**, not microservices. Three backend engineers can't run many services well, and nothing needs independent scaling except photo storage, which goes straight to object storage. Modules: schedules, templates, inspections (with audit and locking), media. One async worker (a queue) builds report PDFs: a pipes-and-filters job (gather → render → sign → store).
+- **App structure: modular monolith** of Swift packages, feature-first: `Schedule`, `Inspection`, `Reports`, plus `FormEngine`, `Sync`, `Persistence`, `SharedKernel`, `DesignSystem`. Each squad owns its features; features talk through small interface modules.
+- **Data flow:** screens read from the local store; a sync engine moves changes to and from the server in the background, through an **outbox**.
+
+Device: Views → view models → local store ⇄ outbox → background URLSession → API and object storage. Server: API → modules → database; media → object storage; queue → PDF worker.
+
+</ModelAnswer>
+
+<ModelAnswer section="client">
+
+- **Screens: MVVM** with `@Observable` view models, layered inside each feature (view → view model → repository). The team knows it, it fits SwiftUI, and screen logic is tested by reading state.
+- **The form rules: a hexagonal core.** `FormEngine` is a pure Swift module with no UI or storage imports: given a template and the answers, it decides which questions are visible, which are required, and whether the form can be submitted. Those rules are the product's most valuable logic, they must behave identically on every device, and they're tested exhaustively with plain values. Ports for anything outside (clock, device ID).
+- **Question types: microkernel.** The form renderer is a core with a `QuestionRenderer` contract and a registry: yes/no, number with units, reading with tolerance, photo, signature, and so on. Templates (data) choose which types appear. New *questions* need no release; new *types* do, and an old app shows a fallback ("Update to answer this question") and blocks submission of that form rather than guessing.
+- **Events only for side effects.** A small typed event bus carries `InspectionSubmitted`, `PhotoCaptured` and `SyncFinished` to analytics, badges and the schedule refresh. The submit flow itself is direct `async` calls, so it's traceable and its errors reach the screen.
+- **Dependencies** wired in a composition root in the app target; the store, the sync engine and the clock are injected, so tests and previews run without devices or networks.
+
+</ModelAnswer>
+
+<ModelAnswer section="api">
+
+- `GET /templates?since=<version>`: templates the device hasn't got, each `{ id, version, minAppVersion, questions }`. Only ever added; old versions stay readable.
+- `GET /schedule?date=2026-11-28`: today's jobs, with the template id and version each must use.
+- `PUT /inspections/<id>`: the whole draft (answers, template version, audit entries since the last sync). The **id is a UUID made on the device**, so retries are idempotent. Answers `409` if the job was reassigned.
+- `POST /inspections/<id>/photos`: returns a pre-signed upload URL per photo; the device uploads directly to object storage, then confirms.
+- `POST /inspections/<id>/submit` with an `Idempotency-Key`: the server checks every required answer and photo has arrived, locks the record, stores a content hash and returns `submittedAt`. `422` lists what's missing.
+- `GET /config`: minimum supported app version and remote flags.
+
+Responses only add fields; the app decodes enums tolerantly.
+
+</ModelAnswer>
+
+<ModelAnswer section="data">
+
+On the device, in SQLite (SwiftData or GRDB):
+
+- `Inspection`: `id` (UUID), `jobID`, `templateID`, `templateVersion` (pinned when the inspection starts), `status` (draft, readyToSubmit, submitting, submitted), `updatedAt`.
+- `Answer`: `inspectionID`, `questionID`, value, `answeredAt`.
+- `AuditEntry` (append-only): `inspectionID`, sequence number, question, old and new value, inspector, device time. Never updated or deleted.
+- `Photo`: `inspectionID`, local file name, `uploadState`, remote key.
+- `OutboxItem`: the operations waiting to sync, in order.
+- `Template`: id, version, the question definitions as JSON.
+
+Photos are files in **Application Support** (not Caches, which iOS may purge), with file protection `completeUntilFirstUserAuthentication` so background uploads can read them while the device is locked. A local photo is deleted only after the server confirms the submitted record. On the server: a relational database for inspections and audit logs, object storage for photos and PDFs.
+
+</ModelAnswer>
+
+<ModelAnswer section="deepdive">
+
+**1. Never losing work.** No save button: each answer is written to SQLite as it changes, in the same transaction as its audit entry and an outbox item. A photo is written to disk *before* the UI shows it as taken. The outbox survives termination; on launch, the sync engine resumes it. Uploads use a background `URLSession`, so they continue while the app is suspended, and the system relaunches the app to report completion. Sync is a small pipeline: pending outbox item → resize photo → upload → confirm → mark done, each step retryable on its own with backoff.
+
+**2. Forms as data, safely.** An inspection is pinned to the template version it started with, so a template change mid-day never alters an inspection in progress. `FormEngine` evaluates conditions from the template, so new questions and rules ship as data. Each template carries `minAppVersion`: a device that's too old to render a template's question types keeps it out of new inspections and asks the inspector to update.
+
+**3. Proving what was recorded.** The append-only audit log records every change with a sequence number and device time; the server adds its receive time when it syncs (device clocks can be wrong). On submit, the server validates against the pinned template, locks the record and stores a hash of the answers, photos' hashes and log. Corrections become a new amendment linked to the original, never an edit.
+
+</ModelAnswer>
+
+<ModelAnswer section="failure">
+
+- **Offline all day:** everything works from the local store; a sync indicator shows what's waiting. Nothing is blocked except fetching templates and schedules for jobs not already downloaded, so the app downloads the next two days of jobs and their templates whenever it can.
+- **Uploads interrupted:** each photo upload is its own background task, retried with backoff; confirmation is idempotent by photo id. If the inspector force-quits the app, iOS cancels its background transfers, so the outbox re-creates them on the next launch.
+- **Job reassigned while offline:** submit returns `409`; the app keeps the local record, marks it "needs office review" and syncs it to a holding area rather than discarding work.
+- **Low storage:** warn before a job when free space is under, say, 2 GB; never delete unsent photos to make room.
+- **Device lost or stolen:** iOS data protection encrypts files at rest; the server can revoke the session; unsent work is the risk, so the UI nags when unsynced work is older than a day.
+- **App killed mid-submit:** submit is idempotent by key, so retrying after relaunch either completes it or returns the existing result.
+- **Old app versions:** the server's minimum version and `minAppVersion` per template keep incompatible builds from submitting forms they can't fully render.
+
+</ModelAnswer>
+
+<ModelAnswer section="tradeoffs">
+
+- **Thick client over balanced:** required by a day offline; costs a sync engine, local migrations and conflict handling. Kept small by having one inspector per job.
+- **Modular monolith app now, with four engineers:** more setup than one target, but the squads arrive next year and boundaries are far cheaper to draw now than to cut later. If the team stayed at four, I'd merge packages.
+- **Hexagonal only for `FormEngine`:** the rules justify it; the rest of the app uses plain layers, because ports everywhere would be ceremony.
+- **A plug-in registry for question types rather than a `switch`:** a switch is simpler while one squad owns the form; the registry pays off when the reports squad adds sign-off types, and its fallback handles templates from the future. Revisit if only one team ever adds types.
+- **Events only for side effects:** keeps the submit path traceable, which auditability needs; costs a little extra wiring.
+- **Backend modular monolith over microservices:** right for three engineers; split out media or templates later only if load or release cadence demands it.
+- **Evolution:** a web portal for customers would reuse the same API; real-time collaboration would need per-question merge rules, which the audit log already makes possible.
+
+</ModelAnswer>
+
+```rubric
+- id: qualities
+  label: Named the driving qualities and made them measurable
+  skill: requirements
+  look_for:
+    - No lost work, a day offline, auditability and change without release identified as the drivers
+    - Each turned into something testable (a day of work offline, sync within minutes, who/when/which version)
+    - Asked whether submitted records can change and whether two people can edit one inspection
+- id: sizing
+  label: Sized the photos and the sync
+  skill: estimation
+  look_for:
+    - Photos per day per inspector and their size, before and after resizing
+    - Upload time on reconnect, and the conclusion that it must run in the background
+    - Fleet-wide storage over 7 years pointing to object storage and direct uploads
+- id: per-scale
+  label: Chose a style at each scale and tied each to a quality
+  skill: architecture
+  look_for:
+    - Thick client with the device as source of truth for drafts, and the server for submitted records
+    - A modular monolith app structure justified by the coming squads
+    - A backend shape that fits a team of three (not microservices)
+    - Events kept to side effects, with the submit flow as direct calls
+- id: offline
+  label: Designed for never losing work
+  skill: offline
+  look_for:
+    - Writes on every change, photos on disk before they're shown, no save button
+    - An outbox that survives termination, and background URLSession uploads
+    - Idempotent sync and submit (device-generated ids, idempotency keys)
+- id: forms-as-data
+  label: Made forms changeable without a release, safely
+  skill: data
+  look_for:
+    - Templates as versioned data, with each inspection pinned to its template version
+    - A renderer for question types with a fallback, and a minimum app version per template
+    - Form rules in a framework-free module that's tested with plain values
+- id: tradeoffs
+  label: Named what each choice gave up, and when to revisit it
+  skill: tradeoffs
+  look_for:
+    - The cost of the thick client (sync, migrations) and of modularising early
+    - A trigger that would change a decision (team size, new question types, collaboration)
+```
+
+<Pitfalls>
+
+- Choosing one style for everything ("Clean Architecture") without tying each choice to a quality.
+- Treating offline as a cache: drafts are the source of truth on the device, not a copy of the server.
+- Running the submit flow over an event bus, so failures never reach the screen and the order of steps can't be audited.
+- Keeping photos in Caches, or with complete file protection that blocks background uploads while the device is locked.
+- Hard-coding the forms in Swift, so every regulation change waits for App Review.
+- Proposing microservices for a three-person backend team.
+
+</Pitfalls>

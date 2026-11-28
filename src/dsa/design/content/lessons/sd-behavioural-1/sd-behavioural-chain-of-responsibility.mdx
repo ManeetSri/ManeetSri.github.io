@@ -1,0 +1,330 @@
+## Why it matters
+
+Every request an app sends needs the same extras: an auth header, a log line, a retry when the server is overloaded, a timing metric. Write them into each call and they're copied into a hundred places; put them in one client method and it grows without end. A **chain of responsibility** gives each concern its own small handler and passes the request along the chain. You've already met Apple's version, the responder chain. The everyday versions are network interceptors and middleware, and "how would you add token refresh and logging without touching every endpoint?" comes up in almost every networking-layer interview.
+
+## Pass it along until it's handled
+
+The pattern links handlers in a sequence. A request enters at the front, and each handler either deals with it or passes it to the next one. The sender knows only the front of the chain, never which handler will act.
+
+It comes in two shapes, and it helps to name which one you mean:
+
+- **A pure chain:** exactly one handler takes the request, and the rest pass. The responder chain is one; so are deep-link routers tried in turn, or error presenters where the first that recognises an error shows it.
+- **A pipeline:** every handler may do something and pass the request on, and sees the response on the way back. Network interceptors, server middleware and Redux-style middleware all work this way.
+
+<Callout kind="analogy">
+Airport checks. Check-in, security and passport control each look at you in turn. Any of them can stop you, any can change something (a bag tag, a boarding stamp), and none needs to know the rest of the route. A pure chain is the help desk instead: you're passed along until someone can answer.
+</Callout>
+
+### A pure chain: routing deep links
+
+Each handler returns a route if it recognises the link, or `nil` to pass it on. The last one accepts anything, so the chain always ends somewhere sensible:
+
+```swift run title="Deep-link handlers, tried in turn"
+import Foundation
+
+enum Route: Equatable {
+    case product(id: String)
+    case order(id: String)
+    case web(URL)
+}
+
+/// One link in the chain: returns a route if it recognises the link, or nil to pass it on
+protocol DeepLinkHandler {
+    func route(for url: URL) -> Route?
+}
+
+struct ProductLinks: DeepLinkHandler {
+    func route(for url: URL) -> Route? {
+        let parts = url.pathComponents
+        guard parts.count == 3, parts[1] == "p" else { return nil }
+        return .product(id: parts[2])
+    }
+}
+
+struct OrderLinks: DeepLinkHandler {
+    func route(for url: URL) -> Route? {
+        let parts = url.pathComponents
+        guard parts.count == 3, parts[1] == "orders" else { return nil }
+        return .order(id: parts[2])
+    }
+}
+
+/// The end of the chain: anything nobody recognised opens in Safari
+struct OpenInBrowser: DeepLinkHandler {
+    func route(for url: URL) -> Route? {
+        .web(url)
+    }
+}
+
+/// Asks each handler in turn; the first one that recognises the link wins
+func route(_ url: URL, through handlers: [any DeepLinkHandler]) -> Route? {
+    for handler in handlers {
+        if let route = handler.route(for: url) {
+            return route
+        }
+    }
+    return nil
+}
+
+let chain: [any DeepLinkHandler] = [ProductLinks(), OrderLinks(), OpenInBrowser()]
+for link in ["https://shop.example/p/mug-42", "https://shop.example/orders/981", "https://shop.example/help"] {
+    print(route(URL(string: link)!, through: chain)!)
+}
+```
+
+```output
+product(id: "mug-42")
+order(id: "981")
+web(https://shop.example/help)
+```
+
+Adding a new kind of link means adding a handler to the array, not editing a growing `switch`. The price is that order now matters: a handler early in the list that's too greedy steals links from the ones after it. D20 builds a full router on this idea.
+
+## Interceptors: a chain that wraps
+
+For requests you want the pipeline shape. Each interceptor receives the request and `next`, the rest of the chain as a function. Inside `intercept` it can do any of four things:
+
+1. **Change the request** before calling `next`: add a header, sign it, rewrite the URL.
+2. **Answer by itself** without calling `next`: return a cached response, or throw because the device is offline.
+3. **Call `next` more than once:** retry after a failure.
+4. **Change what comes back:** map a status code to an error, record timing, decode an error body.
+
+Step through a request whose token has expired:
+
+```visual sequence
+title: A 401 handled inside the chain
+participants:
+  - { id: vm, label: View model }
+  - { id: auth, label: Auth }
+  - { id: log, label: Logging }
+  - { id: transport, label: Transport }
+  - { id: api, label: API }
+messages:
+  - [vm, auth, "send(GET /trips)"]
+  - [auth, log, "next (+ token)"]
+  - [log, transport, next]
+  - [transport, api, GET /trips]
+  - [api, transport, "401", { reply: true }]
+  - [transport, log, "401", { reply: true }]
+  - [log, auth, "401", { reply: true }]
+  - [auth, auth, refresh the token]
+  - [auth, log, "next (+ new token)"]
+  - [log, transport, next]
+  - [transport, api, GET /trips]
+  - [api, transport, "200", { reply: true }]
+  - [transport, log, "200", { reply: true }]
+  - [log, auth, "200", { reply: true }]
+  - [auth, vm, "200", { reply: true }]
+fragments:
+  - { kind: opt, label: status is 401, from: 7, to: 13 }
+steps:
+  - { upTo: 3, say: "The view model calls `send` once. Auth adds the token and calls `next`; logging records the request and calls `next`; the transport sends it." }
+  - { upTo: 6, say: "The token has expired. The `401` travels back through each layer in reverse order, and logging records it on the way." }
+  - { upTo: 7, say: "Auth recognises a 401 as its responsibility and refreshes the token, once." }
+  - { upTo: 13, say: "Then it calls `next` again. Everything after auth runs a second time, so logging sees two requests." }
+  - { upTo: 14, say: "The view model receives the `200`. It never learns there was a retry, which is the point." }
+```
+
+## Building the chain
+
+The chain is built once, by wrapping the transport in each interceptor from the **last to the first**, so the first one in the array ends up outermost. `reduce` does it in three lines. The same three interceptors in two orders show why order is a design decision:
+
+```swift run title="Interceptors folded around a transport"
+struct Request: Sendable {
+    var path: String
+    var headers: [String: String] = [:]
+}
+
+struct Response: Sendable {
+    var status: Int
+    var body: String
+}
+
+/// The rest of the chain, as seen from one interceptor
+typealias Next = @Sendable (Request) async throws -> Response
+
+protocol Interceptor: Sendable {
+    func intercept(_ request: Request, next: Next) async throws -> Response
+}
+
+struct Logging: Interceptor {
+    func intercept(_ request: Request, next: Next) async throws -> Response {
+        print("  → GET \(request.path)")
+        let response = try await next(request)
+        print("  ← \(response.status)")
+        return response
+    }
+}
+
+struct BearerToken: Interceptor {
+    let token: String
+
+    func intercept(_ request: Request, next: Next) async throws -> Response {
+        var request = request
+        request.headers["Authorization"] = "Bearer \(token)"
+        return try await next(request)
+    }
+}
+
+struct RetryOnce: Interceptor {
+    func intercept(_ request: Request, next: Next) async throws -> Response {
+        let response = try await next(request)
+        return response.status == 503 ? try await next(request) : response
+    }
+}
+
+/// A server that's overloaded for the first request it sees
+actor FlakyServer {
+    private var requests = 0
+
+    func handle(_ request: Request) -> Response {
+        requests += 1
+        guard request.headers["Authorization"] != nil else { return Response(status: 401, body: "") }
+        return requests == 1 ? Response(status: 503, body: "") : Response(status: 200, body: "3 trips")
+    }
+}
+
+/// Wraps the transport in each interceptor, last first, so the first one runs outermost
+func makeClient(_ interceptors: [any Interceptor], server: FlakyServer) -> Next {
+    let transport: Next = { request in await server.handle(request) }
+    return interceptors.reversed().reduce(transport) { next, interceptor in
+        { request in try await interceptor.intercept(request, next: next) }
+    }
+}
+
+print("Logging outside the retry:")
+let quiet = makeClient([Logging(), RetryOnce(), BearerToken(token: "abc")], server: FlakyServer())
+print("  got \(try await quiet(Request(path: "/trips")).body)")
+
+print("Logging inside the retry:")
+let chatty = makeClient([RetryOnce(), Logging(), BearerToken(token: "abc")], server: FlakyServer())
+print("  got \(try await chatty(Request(path: "/trips")).body)")
+```
+
+```output
+Logging outside the retry:
+  → GET /trips
+  ← 200
+  got 3 trips
+Logging inside the retry:
+  → GET /trips
+  ← 503
+  → GET /trips
+  ← 200
+  got 3 trips
+```
+
+Neither output is wrong. Outside the retry, logging records what the caller experienced; inside it, logging records every attempt. Rules of thumb for ordering:
+
+- **Outermost: what should see the whole call.** Metrics that time what the user waited, including retries; a single-flight layer that merges duplicate requests.
+- **Middle: what may repeat the call.** Retry, then auth inside it, so every attempt gets a valid token.
+- **Innermost: what should see each attempt exactly as sent.** Logging and request signing.
+- **Short-circuits early.** A cache or offline guard near the front saves the work of every layer after it.
+
+Write the order down once, where the client is built (the composition root, D21), so nobody has to reconstruct it from scattered code.
+
+## Middleware in the wild
+
+You'll recognise the same shape in tools you may use:
+
+- **Swift OpenAPI Generator's** runtime defines a `ClientMiddleware` protocol with an `intercept(_:body:baseURL:operationID:next:)` method, and generated clients take an array of them.
+- **Alamofire's** `RequestInterceptor` splits the job in two: a `RequestAdapter` changes each request, and a `RequestRetrier` decides whether a failed one runs again.
+- **Vapor's** `AsyncMiddleware` (server-side Swift) has `respond(to:chainingTo:)`.
+- **Unidirectional architectures** such as Redux run each action through middleware before the reducer, which is where logging and side effects live (D28).
+
+D33 builds a production interceptor chain for a networking layer, including single-flight token refresh.
+
+## Trade-offs
+
+| | Interceptor chain | Decorators (D11) | Everything in one client |
+| --- | --- | --- | --- |
+| Adding a concern | Add one value to an array | Wrap the client once more | Edit the client |
+| Seeing the order | One list in one place | Nesting order, wherever it's built | Fixed in code |
+| Changing it at runtime | Easy: build the array from config or flags | Possible, but clumsy | No |
+| Testing one concern | The interceptor with a fake `next` | The decorator with a fake inner client | Hard: everything runs together |
+| Cost | A closure call per layer; longer stack traces | The same | None |
+| Wins when | Several cross-cutting concerns, configured per environment | Two or three fixed wrappers | One concern in a small app |
+
+Decorators and interceptors are close relatives: an interceptor is a decorator reduced to one function, so a chain of them can be a plain array. Prefer the chain when concerns multiply or vary by build; a decorator is fine for one or two.
+
+<Callout kind="interview">
+**Say:** "Cross-cutting concerns go in interceptors: each one gets the request and `next`, so it can change the request, short-circuit, retry or change the response. The transport is last, and the order is defined once where the client is built."
+
+**Ask:** Which concerns must see every attempt, and which the overall result? Are any requests unsafe to repeat? (A retried `POST` that isn't idempotent charges the card twice; D14 and D33 deal with that.)
+
+**Red flags:** an interceptor that swallows errors silently; a retry layer that repeats non-idempotent requests; interceptors reaching into each other's state; no way to know the order without running the app.
+</Callout>
+
+<Callout kind="gotcha" title="Swift gotcha: interceptors share state across tasks">
+A chain is shared by every request in flight, so an interceptor that keeps state (the current token, a refresh in progress, a request counter) is touched by many tasks at once. Make interceptors `Sendable` value types, and keep mutable state in an actor they hold. Swift 6 enforces this: a class with a mutable `token` property won't compile as a `Sendable` interceptor.
+</Callout>
+
+## Practice
+
+**An interceptor chain** has you build the pipeline from this lesson and two interceptors: a default header and bearer-token auth that refreshes once on a 401.
+
+```cards
+- id: two-shapes
+  front: "What are the two shapes of chain of responsibility?"
+  back: "A pure chain, where exactly one handler takes the request (the responder chain, deep-link routers), and a pipeline, where every handler may act and pass it on (interceptors, middleware)."
+- id: interceptor-powers
+  front: "What can an interceptor do with `next`?"
+  back: "Change the request before calling it, skip it and answer itself, call it more than once, and change what comes back."
+- id: fold-order
+  front: "When you fold interceptors around a transport from last to first, which one runs outermost?"
+  back: "The first one in the array. It sees the request first and the response last."
+```
+
+```quiz
+- id: q1
+  type: mcq
+  prompt: "The chain has Retry, Auth and Logging. You add Metrics to record how long the *user* waited for each call, retries included. Where does it go?"
+  options:
+    - "First, outside Retry"
+    - "Between Retry and Auth"
+    - "Last, immediately before the transport"
+    - "It doesn't matter: every layer sees the same timing"
+  answer: 0
+  explain: "Only a layer outside Retry sees the whole call, from the first attempt to the final response. Inside Retry it would time each attempt separately."
+- id: q2
+  type: multi
+  prompt: "Which of these may an interceptor do?"
+  options:
+    - "Add a header, then call `next`"
+    - "Return a cached response without calling `next`"
+    - "Call `next` again after a 503"
+    - "Change the settings of the interceptor after it in the chain"
+  answer: [0, 1, 2]
+  explain: "An interceptor sees only the request and `next`. It may change, skip, repeat or post-process the call, but it doesn't know what the rest of the chain is, which is what keeps the layers independent."
+- id: q3
+  type: sort
+  prompt: "Pure chain or pipeline?"
+  buckets: ["Pure chain: one handler takes it", "Pipeline: every layer may act"]
+  items:
+    - [Deep-link handlers tried in turn, 0]
+    - ["Auth, logging and metrics around a request", 1]
+    - ["The responder chain finding who handles copy:", 0]
+    - [Redux-style middleware seeing every action, 1]
+    - [Error presenters where the first that recognises an error shows it, 0]
+  explain: "A pure chain stops at the first handler that accepts. A pipeline runs every layer, in both directions."
+- id: q4
+  type: truefalse
+  prompt: "When interceptors are folded from last to first around the transport, the first interceptor in the array ends up closest to the network."
+  answer: false
+  explain: "It's the reverse: the transport is wrapped by the last interceptor first, so the first one is the outermost layer. It sees the request first and the response last."
+- id: q5
+  type: bug
+  prompt: "With this interceptor in the chain, every request reaches the server twice. Which line is the bug?"
+  code: |
+    struct OfflineGuard: Interceptor {
+        let isOnline: @Sendable () -> Bool
+
+        func intercept(_ request: Request, next: Next) async throws -> Response {
+            guard isOnline() else { throw URLError(.notConnectedToInternet) }
+            let response = try await next(request)
+            return try await next(request)
+        }
+    }
+  answer: 7
+  explain: "It calls `next` again instead of returning the response it already has, so the rest of the chain runs twice. For a `POST`, that's a duplicate order. It should be `return response`."
+```

@@ -1,0 +1,149 @@
+<Brief>
+
+A shopping app with four tabs (Home, Search, Basket, Account) has grown its navigation one screen at a time. Marketing emails use `shop://product/42` and `shop://order/A1B2C3`; the website shares `https://shop.example.com/product/42` and `https://shop.example.com/orders/A1B2C3` as universal links. Support reports crashes from "some links", links that open the app on Home, and a basket that sometimes shows two checkouts. Review the navigation as you would a pull request: what's wrong, what matters most, and how you'd restructure it.
+
+```swift check ios title="ShopNavigation.swift"
+import UIKit
+
+extension Notification.Name {
+    static let openProduct = Notification.Name("openProduct")
+}
+
+@MainActor final class Basket { static let shared = Basket(); var productIDs: [Int] = [] }
+final class CheckoutViewController: UIViewController {}
+final class OrderViewController: UIViewController { var orderID = "" }
+
+final class ProductListViewController: UITableViewController {
+    var productIDs: [Int] = []
+
+    override func viewDidLoad() {
+        super.viewDidLoad()
+        NotificationCenter.default.addObserver(self, selector: #selector(openProduct(_:)), name: .openProduct, object: nil)
+    }
+
+    @objc func openProduct(_ note: Notification) {
+        let product = ProductViewController()
+        product.productID = note.userInfo?["id"] as! Int
+        navigationController?.pushViewController(product, animated: true)
+    }
+
+    override func tableView(_ tableView: UITableView, didSelectRowAt indexPath: IndexPath) {
+        let product = ProductViewController()
+        product.productID = productIDs[indexPath.row]
+        navigationController?.pushViewController(product, animated: true)
+    }
+}
+
+final class ProductViewController: UIViewController {
+    var productID = 0
+    private let basket = Basket.shared
+
+    @objc func addToBasketTapped() {
+        basket.productIDs.append(productID)
+        let tabs = view.window?.rootViewController as! UITabBarController
+        tabs.selectedIndex = 2
+        let basketStack = tabs.selectedViewController as! UINavigationController
+        basketStack.pushViewController(CheckoutViewController(), animated: true)
+    }
+}
+
+final class SceneDelegate: UIResponder, UIWindowSceneDelegate {
+    var window: UIWindow?
+
+    func scene(_ scene: UIScene, willConnectTo session: UISceneSession, options connectionOptions: UIScene.ConnectionOptions) {
+        guard let windowScene = scene as? UIWindowScene else { return }
+        window = UIWindow(windowScene: windowScene)
+        window?.rootViewController = UITabBarController()
+        window?.makeKeyAndVisible()
+    }
+
+    func scene(_ scene: UIScene, openURLContexts URLContexts: Set<UIOpenURLContext>) {
+        guard let url = URLContexts.first?.url else { return }
+        let parts = url.pathComponents
+        if url.host == "product" {
+            NotificationCenter.default.post(name: .openProduct, object: nil, userInfo: ["id": Int(parts[1])!])
+        } else if url.host == "order" {
+            let tabs = window?.rootViewController as! UITabBarController
+            tabs.selectedIndex = 3
+            let order = OrderViewController()
+            order.orderID = parts[1]
+            (tabs.selectedViewController as! UINavigationController).pushViewController(order, animated: true)
+        }
+    }
+
+    func scene(_ scene: UIScene, continue userActivity: NSUserActivity) {
+        guard let parts = userActivity.webpageURL?.pathComponents, parts.count > 2 else { return }
+        if parts[1] == "products" {
+            NotificationCenter.default.post(name: .openProduct, object: nil, userInfo: ["id": Int(parts[2]) ?? 0])
+        }
+    }
+}
+```
+
+</Brief>
+
+```workspace
+template: critique
+minutes: 30
+```
+
+```findings
+- id: crash-on-links
+  title: Any malformed link crashes the app
+  severity: high
+  lines: 21, 57-64
+  detail: "Links are untrusted input, but every parameter is force-unwrapped. `shop://product/abc` crashes on `Int(parts[1])!`; `shop://product` and `shop://order` crash on `parts[1]`, because for `shop://product/42` the path components are only `[\"/\", \"42\"]` and without an id there are none. Anyone who can get a user to tap a link can crash the app. Parse into a typed route that validates each field and returns nil."
+- id: cold-start
+  title: Links that launch the app are ignored
+  severity: high
+  lines: 48-53
+  detail: "When a link launches the app, it arrives in `connectionOptions.urlContexts` (schemes) or `connectionOptions.userActivities` (universal links), and `openURLContexts` and `continue` aren't called for it. This method never reads them, so every link tapped while the app isn't running opens Home: the 'opens on Home' reports."
+- id: two-parsers
+  title: Two parsers that already disagree
+  severity: high
+  lines: 69-74
+  detail: "Universal links are parsed separately from scheme links, and the copies have drifted: this one checks for `products` while the website sends `/product/42`, so product universal links never open; order universal links aren't handled at all; and a bad id becomes product `0` here but a crash in the other handler. One parser should turn both URL forms into the same typed route."
+- id: notification-navigation
+  title: Navigation by broadcast notification
+  severity: medium
+  lines: 16-22, 59, 72
+  detail: "Product links are posted to `NotificationCenter`, and whoever happens to be observing pushes. If the product list hasn't loaded (the user launched into another tab), nothing happens; with two iPad windows, every window's list pushes the product. Nobody owns the decision, and nothing can be tested without UIKit."
+- id: reaching-into-tabs
+  title: Screens and the scene delegate reach into the tab bar with magic indices
+  severity: medium
+  lines: 38-40, 61-65
+  detail: "`rootViewController as! UITabBarController`, `selectedIndex = 2` and `selectedViewController as! UINavigationController` hard-code the app's structure into a product screen and the scene delegate. Reorder the tabs, add onboarding as the root, or show the product somewhere without a tab bar, and it switches to the wrong tab or crashes. Navigation across tabs belongs to one coordinator or router that owns the tab bar."
+- id: push-behind-sheet
+  title: Order links push behind whatever is presented
+  severity: medium
+  lines: 61-65
+  detail: "If a sheet is up (an address form, a share sheet), the tab switch and the push happen underneath it, so the user sees nothing change. A deep link must dismiss what's presented first, then select the tab, then set the stack."
+- id: screens-push-each-other
+  title: Screens build the next screen and reach for singletons
+  severity: medium
+  lines: 20-21, 26-27, 34, 41
+  detail: "The list constructs `ProductViewController` in two places, the product screen pushes `CheckoutViewController` and takes `Basket.shared` itself. Screens can't be reused in another flow, previewed, or tested with a fake basket, and changing the flow means editing several screens. Screens should report outputs and receive their dependencies from a coordinator."
+- id: stacked-pushes
+  title: Pushes pile onto whatever is already on the stack
+  severity: low
+  lines: 41, 65
+  detail: "Each Add to basket pushes another checkout onto the Basket stack, so two taps (or a second visit) leave two checkouts with Back going from one to the other. The order link pushes on top of whatever Account was showing, so Back from the order goes to settings rather than the order list. Build the intended stack in one step with `setViewControllers(_:animated:)`."
+```
+
+<ReferenceReview>
+
+**Most important first.** Three high-severity problems, all about links. Any malformed link **crashes** the app, because untrusted input is force-unwrapped (`Int(parts[1])!`, `parts[1]` on a path with no id, `as! Int`); a crash anyone can trigger with a link is a security problem as well as a quality one. Links that **launch** the app are never handled, because `scene(_:willConnectTo:options:)` ignores its connection options, which explains "opens on Home". And the two link handlers have **already drifted**: product universal links never match (`products` versus `product`), order universal links aren't handled, and bad ids crash in one path and open product 0 in the other.
+
+**The design problem underneath** is that nobody owns navigation. Links are parsed in two places, broadcast through `NotificationCenter` to whichever screen happens to listen, and acted on by code that casts its way into the tab bar by index. Screens build each other and take singletons, so the flow is spread across every file and none of it can be tested.
+
+**How I'd fix it, in small steps:**
+
+1. Add an `AppRoute` enum (`.product(id:)`, `.order(id:)`, …) and one parser that accepts both URL forms, validates every field and returns `nil` on anything else. Unit-test it with good and bad links, and with a round trip from route to URL and back.
+2. Route every door through it: `willConnectTo` reads `connectionOptions.urlContexts` and `userActivities`, and `openURLContexts` and `continue` call the same entry handler, which holds a route until the UI is ready.
+3. Introduce an app coordinator that owns the tab bar controller (by tab identifier, not index) and a coordinator per tab owning its navigation controller. Its `open(_ route:)` dismisses anything presented, selects the tab and builds the stack with `setViewControllers(_:animated:)`.
+4. Delete the `openProduct` notification: the list reports a selected product through a closure, and the Home coordinator pushes it.
+5. Give screens their dependencies through their initialisers (`ProductViewController(productID:basket:)`) and outputs as closures (`onAddedToBasket`); the Basket coordinator decides whether to show checkout, once.
+
+**Tests to add:** the parser's table of links (including `shop://product`, `shop://product/abc`, and both hosts); the coordinator's `open(_:)` against a fake navigator for "a sheet is up", "already on the Account tab" and "signed out"; and a UI test that taps a link with the app terminated, which is the case that's broken today.
+
+</ReferenceReview>

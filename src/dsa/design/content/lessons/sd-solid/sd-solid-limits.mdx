@@ -1,0 +1,236 @@
+## Why it matters
+
+The opposite of a massive view controller is as common, and harder to fix: a codebase where every type has a protocol and an `Impl`, every tap goes through six layers, and adding one setting touches nine files. It usually comes from applying SOLID everywhere, in advance, as a rule. Knowing when a principle stops paying for itself is what separates a senior engineer from someone who has memorised the principles, and interviewers test it directly: "isn't this over-engineered?" deserves a better answer than yes or no.
+
+## What indirection costs
+
+Every abstraction the principles suggest (a protocol, a layer, a new type) has a price, even when it's worth paying:
+
+- **A name to invent and learn.** `SettingsRepository`, `SettingsDataSource` and `UpdateSettingUseCase` all have to mean something different, and everyone on the team has to learn which is which.
+- **A hop when reading.** In Xcode, Jump to Definition on a call through a protocol lands on the requirement, not on the code that runs. Each hop is another search for the implementation.
+- **Changes that cross it get bigger.** Adding a parameter means changing the protocol, the implementation, every fake and every caller. Abstraction makes changes *behind* it cheap and changes *through* it expensive.
+- **Wiring and fakes to maintain.** Every protocol needs a live instance at the composition root and usually a fake in tests, and both drift.
+- **Runtime cost.** Calls through `any P` are dynamically dispatched and may box their value. In app code this almost never matters; in a tight loop over thousands of elements it can, and generics (`some P`) avoid it.
+
+Here's what that looks like when it accumulates. A dark-mode switch, built "properly":
+
+```visual flow
+title: One switch, seven hops
+nodes:
+  - { id: view, label: SettingsView, kind: view, at: [0, 0] }
+  - { id: vm, label: SettingsViewModel, at: [1, 0] }
+  - { id: usecase, label: UpdateSettingUseCase, at: [2, 0] }
+  - { id: repo, label: SettingsRepository, at: [3, 0] }
+  - { id: impl, label: SettingsRepositoryImpl, at: [3, 2] }
+  - { id: source, label: SettingsDataSource, at: [2, 2] }
+  - { id: udsource, label: DefaultsDataSource, at: [1, 2] }
+  - { id: defaults, label: UserDefaults, kind: store, at: [0, 2] }
+edges:
+  - [view, vm]
+  - [vm, usecase]
+  - [usecase, repo]
+  - [repo, impl]
+  - [impl, source]
+  - [source, udsource]
+  - [udsource, defaults]
+  - [view, defaults, "@AppStorage", { style: data }]
+steps:
+  - say: The switch tells its view model, which calls a use case, which calls a repository **protocol**.
+    show: [view, vm, usecase, repo]
+    send: [view->vm, vm->usecase, usecase->repo]
+  - say: The repository's implementation calls a data source protocol, whose implementation finally writes to **UserDefaults**. Seven hops; four of them only pass the value along.
+    show: [impl, source, udsource, defaults]
+    send: [repo->impl, impl->source, source->udsource, udsource->defaults]
+    state: { vm: wait, usecase: wait, impl: wait, udsource: wait }
+  - say: Adding a "reduce motion" setting means touching every layer, plus a fake for each protocol. None of the layers holds a rule.
+    state: { vm: error, usecase: error, repo: error, impl: error, source: error, udsource: error }
+    label: { usecase: forwards, impl: forwards }
+  - say: "The whole feature, without the layers: `@AppStorage(\"darkMode\")` in the view. When there's no rule to protect, there's nothing for the layers to do."
+    state: { vm: null, usecase: null, repo: null, impl: null, source: null, udsource: null, view: ok, defaults: ok }
+    label: { usecase: null, impl: null }
+    show: [view->defaults]
+    send: view->defaults
+```
+
+The layers would earn their place the day there's a rule: settings that sync across devices, a setting the server can override, a migration between formats. Until then, they're cost.
+
+## Smells of over-abstraction
+
+These signs mean a principle was applied where no change pressure existed:
+
+- **A protocol with one conformer and no fake** that any test uses. The `FooProtocol` and `FooImpl` pair, where the `Impl` suffix exists only because the good name was taken by the protocol.
+- **Pass-through layers.** A use case whose body is `try await repository.save(setting)`, a repository that only calls a data source. If you can't describe a layer's job without saying "it calls the next layer", it has none.
+- **Speculative extension points.** A plugin system with one plugin, a generic parameter that's always the same type, a strategy protocol for a strategy nobody has asked to vary.
+- **Shrapnel.** One small feature spread across fifteen files of one method each, because "single responsibility" was read as "one function per type".
+- **Tests that mirror the wiring.** Mocks that check "the use case called the repository once with these arguments". They fail when you restructure and pass when the behaviour is wrong, so they protect the indirection rather than the product.
+
+The most common shape of all, side by side with what it replaces:
+
+```swift check title="Over-abstracted, and plain"
+import Foundation
+
+// Over-abstracted: three types, a protocol, one real implementation, and nothing that varies
+protocol DateFormattingServiceProtocol: Sendable {
+    func shortDate(_ date: Date) -> String
+}
+
+struct DateFormattingServiceImpl: DateFormattingServiceProtocol {
+    func shortDate(_ date: Date) -> String {
+        date.formatted(date: .abbreviated, time: .omitted)
+    }
+}
+
+enum DateFormattingServiceFactory {
+    static func make() -> any DateFormattingServiceProtocol { DateFormattingServiceImpl() }
+}
+
+// Plain: the platform already gives you the abstraction
+func orderDateText(_ date: Date) -> String {
+    date.formatted(date: .abbreviated, time: .omitted)
+}
+```
+
+`Date.formatted` is already a well-designed, stable, deep abstraction. Wrapping it adds three names and protects against nothing. If tests need a fixed locale or time zone, pass them as values; that's a seam, too.
+
+## The counter-arguments worth knowing
+
+SOLID isn't the only view of good design, and the best-known critiques sharpen your judgement:
+
+- **Deep modules.** John Ousterhout's *A Philosophy of Software Design* (2018) argues that the best modules are **deep**: a small interface hiding a lot of functionality, like `URLSession` or Core Data. Splitting everything into tiny single-purpose types creates shallow modules whose interfaces cost almost as much to learn as their implementations; he calls the habit "classitis". You met the idea in [Modules and interfaces: deep vs shallow](/design/learn/sd-modelling-interfaces). Single responsibility, read as "split by actor", and depth are compatible. Read as "split by verb", they collide.
+- **The wrong abstraction.** Sandi Metz's widely quoted line is that "duplication is far cheaper than the wrong abstraction". An abstraction made too early bakes in a guess about what varies, and every later change has to fight it. You'll meet this as AHA, "avoid hasty abstractions", in D05.
+- **Properties instead of principles.** Dan North's CUPID (2022) proposes properties to aim for rather than rules to obey: code that's composable, follows the Unix philosophy (does one thing well), is predictable, is idiomatic, and is domain-based. It's a useful second lens, because "is this idiomatic Swift?" catches over-abstraction that SOLID's questions don't.
+
+None of these says the principles are wrong. They say the principles are **tools with costs**, to be used where the change they protect against is real.
+
+## When SOLID earns its keep
+
+| Signal | Points towards abstraction | Points towards plain code |
+| --- | --- | --- |
+| Change history | This area changes often, in the same direction | It hasn't changed in a year |
+| Ownership | Several teams touch it | One person owns it |
+| Testing | Rules can't be tested without a device or network | It's pure, or trivial |
+| Third parties | A vendor SDK or API you may replace | Apple's stable frameworks used as designed |
+| Reuse | Shared by the app, a widget and a watch app | Used in one place |
+| Lifetime | Core product, years ahead | A spike, prototype or experiment behind a flag |
+| Audience | A public SDK with outside clients | Internal code you can change in one pull request |
+
+The right default for most app code is in the middle: **plain code, with seams added when a test or a second implementation needs one**. The rule of three is a good guide: write it once, copy it the second time if you must, and abstract on the third, when you can see what actually varies.
+
+## Undoing an abstraction
+
+Removing indirection is a refactor like any other, done in small steps with tests passing:
+
+1. **Inline a protocol with one conformer.** Delete the protocol, rename `FooImpl` to `Foo`, and fix the call sites. If a test needed the seam, replace the protocol with a closure the test can supply.
+2. **Collapse pass-through layers.** Have the caller call the layer below directly, then delete the empty layer.
+3. **Merge shrapnel.** Fold one-method types that always change together back into the type that uses them.
+4. **Replace mock-the-wiring tests** with tests of behaviour: given this input, the screen shows this state.
+
+Doing this is not "giving up on SOLID". It's applying the same question the principles ask, "what change does this make cheap?", and accepting the answer "none".
+
+## Before you add an abstraction
+
+Four questions, in order:
+
+1. **What change does it make cheaper?** Name it. "Flexibility" isn't a change.
+2. **Has that change happened, or is it planned?** A second implementation, a test that truly needs a fake, a vendor you're about to switch.
+3. **Is there a smaller seam?** A closure, a value parameter (`now: Date`), a generic parameter, or a concrete type that's already easy to test.
+4. **Can you describe the new layer's job without "calls the next one"?**
+
+## Trade-offs
+
+| Approach | Reading cost | Cost of expected changes | Cost of unexpected changes | Wins when |
+| --- | --- | --- | --- | --- |
+| Plain code, no seams | Lowest | Moderate to high | Moderate: one place to change | Small, stable, single-owner code |
+| Targeted abstraction where change is real | Moderate | Low | Moderate | Most product code |
+| Abstraction everywhere, up front | High | Low, if the guesses were right | High: every layer must change | Rarely; perhaps a framework with many outside clients |
+
+<Callout kind="interview">
+
+**What to say:** tie every abstraction to the change it protects against, and be willing to leave one out: "I wouldn't add a repository protocol for settings until there's sync or a second store; `@AppStorage` is enough today, and extracting a protocol later is a small refactor." When asked to review layered code, point to pass-through layers and single-conformer protocols, and propose removing them in small steps.
+
+**What to ask:** how often this area changes, who changes it, and what's painful today. Over-abstraction and under-abstraction have different symptoms; let the symptoms decide.
+
+**Red flags in both directions:** "every class should have a protocol for testability", and "SOLID is enterprise over-engineering". Both replace judgement with a slogan.
+
+</Callout>
+
+<Callout kind="gotcha" title="Swift gotcha: a protocol isn't the only seam">
+
+Swift gives you lighter ways to make code testable than a protocol per dependency. Pass values instead of services (`now: Date` rather than a `ClockProtocol` when you only need the time once). Inject a closure for a single operation. Use a generic parameter when the type is fixed per call site. Test pure functions directly. Reach for a protocol when several operations travel together or several implementations exist, not as the default way to write a test.
+
+</Callout>
+
+<Callout kind="gotcha" title="iOS gotcha: SwiftUI property wrappers are abstractions already">
+
+`@AppStorage`, `@Environment`, `@Query` and `@Observable` already put an abstraction between your view and the store behind it, and SwiftUI previews can feed them sample data. Wrapping `@AppStorage` in a repository and a use case to make a settings screen "testable" usually adds layers without adding a seam you'll use. Add the layers when a rule appears that deserves its own tests.
+
+</Callout>
+
+```cards
+- id: limits-costs
+  front: "Name four costs of adding an abstraction."
+  back: "A name to invent and learn; an extra hop when reading (Jump to Definition lands on the protocol); bigger changes when a change crosses it (protocol, implementation, fakes, callers); wiring and fakes to maintain. Rarely, runtime cost in hot loops."
+- id: limits-smells
+  front: "What are the common smells of over-abstraction?"
+  back: "A protocol with one conformer and no fake; pass-through layers; speculative extension points; one-method shrapnel types; tests that verify wiring instead of behaviour."
+- id: limits-deep
+  front: "How do deep modules relate to the single-responsibility principle?"
+  back: "They agree when you split by actor (one owner, a rich interface); they collide when you split by verb, which produces many shallow modules whose interfaces cost nearly as much as their implementations."
+- id: limits-questions
+  front: "What four questions should you ask before adding an abstraction?"
+  back: "What change does it make cheaper? Has that change happened or is it planned? Is there a smaller seam (closure, value, generic)? Can you describe the layer's job without \"calls the next one\"?"
+```
+
+```quiz
+- id: q1
+  type: bug
+  prompt: "Which line is the clearest sign that this layer shouldn't exist?"
+  code: |
+    struct UpdateSettingUseCase {
+        let repository: any SettingsRepository
+
+        func execute(_ setting: Setting) async throws {
+            try await repository.save(setting)
+        }
+    }
+  answer: 5
+  explain: "The whole body forwards the same argument to the next layer. There's no rule, no validation and no sequencing to protect, so the use case adds a name, a file and a hop for nothing. Call the repository directly until a rule appears."
+- id: q2
+  type: mcq
+  prompt: "A teammate proposes `AnalyticsServiceProtocol`, `AnalyticsServiceImpl` and `AnalyticsServiceFactory` for an app with one analytics vendor and no tests that check events. What's the best response?"
+  options:
+    - "Approve it: SOLID says every dependency needs a protocol"
+    - "Suggest a concrete `Analytics` type for now, and a protocol when a test needs to check events or a second vendor arrives"
+    - "Reject analytics abstractions entirely and call the vendor SDK from every screen"
+    - "Approve it, and add a use case layer too"
+  answer: 1
+  explain: "Keep the vendor SDK behind one concrete type you own (so screens don't import it), and add the protocol when a real need appears. Calling the SDK from every screen is the opposite mistake; three types for one implementation is speculative."
+- id: q3
+  type: multi
+  prompt: "Which situations favour adding the abstraction now? Choose all that apply."
+  options:
+    - "The payment provider is being switched next quarter"
+    - "The rules can only be tested on a device with a real network"
+    - "It's a two-week prototype to test an idea with users"
+    - "The same code is shared by the app, a widget and a watch app"
+    - "It feels cleaner"
+  answer: [0, 1, 3]
+  explain: "A planned vendor change, untestable rules and reuse across targets are real change pressure. A prototype will likely be thrown away, and \"cleaner\" isn't a change the abstraction makes cheaper."
+- id: q4
+  type: truefalse
+  prompt: "Removing a protocol that has one conformer and no test double goes against the dependency inversion principle."
+  answer: false
+  explain: "The principle protects policy from volatile detail. If nothing is being protected, the protocol is indirection without a purpose, and removing it applies the same judgement the principle asks for. It can come back the day it's needed."
+- id: q5
+  type: match
+  prompt: "Match each critique to its source."
+  pairs:
+    - ["Prefer deep modules; beware \"classitis\"", "John Ousterhout, A Philosophy of Software Design"]
+    - ["Duplication is cheaper than the wrong abstraction", "Sandi Metz"]
+    - ["Aim for properties such as composable, predictable and idiomatic", "Dan North, CUPID"]
+  explain: "Each argues for judgement over rules: depth over shallow splitting, patience before abstracting, and qualities to aim for rather than principles to obey."
+- id: q6
+  type: recall
+  prompt: "A reviewer says your new settings feature, built with `@AppStorage` directly in the view, \"breaks dependency inversion\". How would you answer?"
+  model: "There's no policy here to protect: the view reads and writes one value, and @AppStorage already abstracts the store. Layers would add names and hops without making any expected change cheaper. When a rule appears (sync across devices, a server override, a migration), I'd extract a small protocol owned by the settings feature and move the rule behind it, which is a quick refactor at that point."
+```

@@ -1,0 +1,85 @@
+The app comes back to the foreground and five screens refresh at once. Each request gets a `401`, each one asks the auth client for a new token, and the auth server receives five refresh calls. It rotates refresh tokens, so it sees one token used five times, takes that as theft, and signs the user out. Write the group that makes concurrent callers share one run of the work.
+
+`ResilienceSingleFlight.Group<Key, Value>`, with `run(_:_:) async throws -> Value` and `inFlight: Int`
+
+- `run(key, work)` starts `work` if nothing is running for `key`, and returns its result.
+- A call for a key that's already running doesn't start `work` again: it waits for the run in progress and gets the same value, or the same error.
+- Nothing is cached. Once a run has ended, with a value or an error, the next call for its key starts a fresh run.
+- Different keys never wait for each other.
+- Cancelling one caller doesn't cancel the work, because other callers may be waiting for it.
+- `inFlight` is the number of keys with work running.
+
+## Examples
+
+| What happens | Runs of `work` | What callers get |
+| --- | --- | --- |
+| 3 tasks call `run("refresh")` together | 1 | all three get `"token-1"` |
+| `run("avatar/1")` and `run("banner/1")` together | 2 | each gets its own result |
+| `run("refresh")`, it finishes, then `run("refresh")` again | 2 | `"token-1"`, then `"token-2"` |
+| 2 tasks call `run("refresh")` together and the work throws | 1 | both get the error; the next call runs again |
+| 2 callers share a run, and the first is cancelled | 1 | the second still gets the value; the work never sees cancellation |
+
+## Constraints
+
+- `Group` is an actor. Remember that it's re-entrant: while one call is suspended at an `await`, another call can run.
+- The work is `@Sendable` and may take any time; the tests hold it open until they've started every caller.
+- No timers and no polling: callers that join wait for the run in progress.
+
+<Hints>
+<Hint>
+Keep a dictionary from key to the `Task` doing the work. A `Task` is a handle any number of callers can `await` through `task.value`.
+</Hint>
+<Hint>
+Store the task in the dictionary *before* the first `await`. If you await first, every caller that arrives in the meantime finds the dictionary empty and starts its own run.
+</Hint>
+<Hint>
+Run the work in an unstructured `Task { try await work() }` rather than calling `work()` directly. Called directly, it would run inside the first caller's task and be cancelled with it.
+</Hint>
+<Hint>
+Remove the entry whether the work succeeded or threw. `Task` is `Equatable`, so you can check that the entry is still the one you added before removing it.
+</Hint>
+</Hints>
+
+## Solutions
+
+<Approach title="An actor holding one Task per key" time="O(1) per call" space="O(k) for k keys in flight">
+
+```swift
+public actor Group<Key: Hashable & Sendable, Value: Sendable> {
+    private var running: [Key: Task<Value, any Error>] = [:]
+
+    public init() {}
+
+    public var inFlight: Int {
+        running.count
+    }
+
+    public func run(_ key: Key, _ work: @escaping @Sendable () async throws -> Value) async throws -> Value {
+        if let existing = running[key] {
+            return try await existing.value
+        }
+        let task = Task { try await work() }
+        running[key] = task
+        do {
+            let value = try await task.value
+            forget(task, for: key)
+            return value
+        } catch {
+            forget(task, for: key)
+            throw error
+        }
+    }
+
+    private func forget(_ task: Task<Value, any Error>, for key: Key) {
+        if running[key] == task {
+            running[key] = nil
+        }
+    }
+}
+```
+
+The order of the three lines after the dictionary lookup is the whole kata. Create the task, store it, *then* await: between the lookup and the store there's no suspension point, so no other call can slip in.
+
+Because the work runs in its own task, cancelling a caller never reaches it. (The cancelled caller still waits for the shared result here; awaiting `task.value` doesn't return early when the waiter is cancelled.) Two refinements are common: let a cancelled waiter leave at once, and count waiters so the shared task is cancelled when the last one leaves, which suits expensive downloads nobody wants any more. For token refresh, finishing the work anyway is the safer choice: the next request will need the token.
+
+</Approach>

@@ -1,0 +1,368 @@
+## Why it matters
+
+A real app runs in several worlds: production, staging, a demo mode for App Store review, UI tests against a mock server, SwiftUI previews. Each world needs a **consistent set** of dependencies. Mix them, a demo API with the live payment client, and a reviewer's tap charges a real card. The abstract factory is the pattern for making a whole family of objects from one decision, and it's the shape behind most "how would you add a demo mode?" interview answers.
+
+## The shape
+
+The Gang of Four: *provide an interface for creating families of related or dependent objects without specifying their concrete classes.*
+
+- An **abstract factory**: a protocol with one `make` method per kind of product.
+- A **concrete factory** per family: `LiveFactory`, `DemoFactory`, `UITestFactory`.
+- An **abstract product** per kind: `AccountAPI`, `TokenStore`, `Analytics`.
+- **Concrete products**: the live and demo implementations of each.
+
+Client code holds a factory and only ever sees the product protocols. Choosing the factory chooses every product at once, so the products of one family can't end up next to products of another.
+
+### Factory method or abstract factory?
+
+They're easy to confuse, and interviewers check:
+
+| | Factory method | Abstract factory |
+| --- | --- | --- |
+| Makes | One product | A family of related products |
+| Who decides | A subclass or conformer of the creator | Whoever picks the factory object |
+| How it reaches the client | The creator calls its own method | The factory is passed to the client |
+| Typical iOS example | `layerClass`, `makeUIView(context:)` | Live, demo and test dependencies |
+
+An abstract factory is usually built *out of* factory methods: each `make` method is one.
+
+## A family of app dependencies
+
+Here's the demo-mode problem in miniature. The live family talks to the server, reads the Keychain and sends analytics. The demo family returns canned data, is signed in as a demo user, and drops analytics, so a reviewer's session doesn't pollute your dashboards.
+
+```swift run
+// The products: what screens need, as protocols
+protocol AccountAPI: Sendable {
+    func displayName(for userID: String) -> String
+}
+
+protocol TokenStore: Sendable {
+    var signedInUserID: String? { get }
+}
+
+protocol Analytics: Sendable {
+    func track(_ event: String) -> String
+}
+
+// The abstract factory: one method per product
+protocol DependencyFactory: Sendable {
+    var name: String { get }
+    func makeAccountAPI() -> any AccountAPI
+    func makeTokenStore() -> any TokenStore
+    func makeAnalytics() -> any Analytics
+}
+
+// The live family
+struct ServerAccountAPI: AccountAPI {
+    func displayName(for userID: String) -> String { "(GET /users/\(userID) on api.example.com)" }
+}
+struct KeychainTokenStore: TokenStore {
+    var signedInUserID: String? { "user-8812" }
+}
+struct ServerAnalytics: Analytics {
+    func track(_ event: String) -> String { "sent \(event)" }
+}
+struct LiveFactory: DependencyFactory {
+    let name = "live"
+    func makeAccountAPI() -> any AccountAPI { ServerAccountAPI() }
+    func makeTokenStore() -> any TokenStore { KeychainTokenStore() }
+    func makeAnalytics() -> any Analytics { ServerAnalytics() }
+}
+
+// The demo family, for App Store review: canned data, a demo user, no real analytics
+struct CannedAccountAPI: AccountAPI {
+    func displayName(for userID: String) -> String { userID == "demo" ? "Demo Reviewer" : "Unknown" }
+}
+struct DemoTokenStore: TokenStore {
+    var signedInUserID: String? { "demo" }
+}
+struct DroppingAnalytics: Analytics {
+    func track(_ event: String) -> String { "dropped \(event)" }
+}
+struct DemoFactory: DependencyFactory {
+    let name = "demo"
+    func makeAccountAPI() -> any AccountAPI { CannedAccountAPI() }
+    func makeTokenStore() -> any TokenStore { DemoTokenStore() }
+    func makeAnalytics() -> any Analytics { DroppingAnalytics() }
+}
+
+// The one decision, made once at launch
+func chooseFactory(launchArguments: [String]) -> any DependencyFactory {
+    launchArguments.contains("-demo") ? DemoFactory() : LiveFactory()
+}
+
+// A screen sees only protocols, so it can't mix families
+func profileHeader(using factory: any DependencyFactory) -> String {
+    let store = factory.makeTokenStore()
+    let api = factory.makeAccountAPI()
+    let analytics = factory.makeAnalytics()
+    guard let user = store.signedInUserID else { return "Signed out" }
+    return "\(factory.name): \(api.displayName(for: user)), \(analytics.track("profile_viewed"))"
+}
+
+print(profileHeader(using: chooseFactory(launchArguments: ["MyApp"])))
+print(profileHeader(using: chooseFactory(launchArguments: ["MyApp", "-demo"])))
+```
+
+```output
+live: (GET /users/user-8812 on api.example.com), sent profile_viewed
+demo: Demo Reviewer, dropped profile_viewed
+```
+
+What to notice:
+
+- `profileHeader` has no `if demo` anywhere. The decision was made once, in `chooseFactory`, and everything downstream follows from it.
+- The two families are **internally consistent**: the demo token store holds `"demo"`, which is exactly the user the canned API knows. Mixing `KeychainTokenStore` with `CannedAccountAPI` would show "Unknown", or worse, send a real user's token to a demo server.
+- In a real app, `chooseFactory` lives at the **composition root**: the `App` struct or scene delegate, the one place that knows the whole app. You'll build one in D21.
+
+```visual flow
+title: One decision at launch picks a whole family
+layers:
+  - { label: Live family, rows: [0, 1] }
+  - { label: Demo family, rows: [2, 3] }
+nodes:
+  - { id: root, label: App start-up, kind: client, at: [0, 1.5] }
+  - { id: live, label: Live factory, kind: service, at: [2, 0.5] }
+  - { id: liveAPI, label: Server account API, kind: external, at: [4, 0] }
+  - { id: liveStore, label: Keychain token store, kind: store, at: [4, 1] }
+  - { id: demo, label: Demo factory, kind: service, at: [2, 2.5] }
+  - { id: demoAPI, label: Canned account API, kind: service, at: [4, 2] }
+  - { id: demoStore, label: Demo token store, kind: store, at: [4, 3] }
+edges:
+  - [root, live, normal launch]
+  - [root, demo, "-demo"]
+  - [live, liveAPI]
+  - [live, liveStore]
+  - [demo, demoAPI]
+  - [demo, demoStore]
+steps:
+  - say: Start-up code makes **one** decision, from the launch arguments or the signed-in account.
+    show: [root]
+    state: { root: active }
+  - say: A normal launch picks `LiveFactory`, and every product it makes belongs to the live family.
+    send: root->live
+    show: [liveAPI, liveStore]
+  - say: "The live products work together: the Keychain's token is one the real server accepts."
+    send: [live->liveAPI, live->liveStore]
+    state: { liveAPI: ok, liveStore: ok }
+  - say: With `-demo`, start-up picks `DemoFactory` instead, and the whole family changes together.
+    reset: true
+    show: [root, demo]
+    send: root->demo
+    state: { root: active }
+  - say: Screens hold only the protocols, so no screen can pair the canned API with the real Keychain.
+    send: [demo->demoAPI, demo->demoStore]
+    state: { demoAPI: ok, demoStore: ok }
+```
+
+## A struct of closures as the factory
+
+Protocols and a type per family are the textbook shape. Swift code often prefers a **struct whose properties are factory closures**, the "environment" style you met in [Dependencies as closures and structs: the environment style](/design/learn/sd-functional-environment):
+
+```swift check
+protocol AccountAPI: Sendable {}
+protocol Analytics: Sendable {}
+struct ServerAccountAPI: AccountAPI {}
+struct CannedAccountAPI: AccountAPI {}
+struct ServerAnalytics: Analytics {}
+struct DroppingAnalytics: Analytics {}
+
+struct Dependencies: Sendable {
+    var makeAccountAPI: @Sendable () -> any AccountAPI
+    var makeAnalytics: @Sendable () -> any Analytics
+
+    static let live = Dependencies(
+        makeAccountAPI: { ServerAccountAPI() },
+        makeAnalytics: { ServerAnalytics() }
+    )
+
+    static let demo = Dependencies(
+        makeAccountAPI: { CannedAccountAPI() },
+        makeAnalytics: { DroppingAnalytics() }
+    )
+}
+
+// A test starts from a whole family and overrides one member
+func testDependencies(spy: some Analytics) -> Dependencies {
+    var dependencies = Dependencies.demo
+    dependencies.makeAnalytics = { spy }
+    return dependencies
+}
+```
+
+Less ceremony, and overriding one member for a test is a one-liner. The cost is the flip side of that convenience: nothing stops production code from assembling a mixed family either. Keep the named families (`.live`, `.demo`) as the only values production code builds, and leave member-by-member overrides to tests and previews.
+
+## Families checked at compile time
+
+So far each `make` method returns an existential, `any AccountAPI`, and the family is chosen at run time. Associated types let a family be fixed **at compile time** instead. A white-label app, one codebase shipped as several banks' apps, might describe each brand's components like this:
+
+```swift check ios
+import SwiftUI
+
+// A family of components for one brand of a white-label app
+protocol BrandComponents {
+    associatedtype PrimaryButton: View
+    associatedtype Card: View
+
+    func primaryButton(_ title: String, action: @escaping @MainActor () -> Void) -> PrimaryButton
+    func card(title: String, detail: String) -> Card
+}
+
+struct HarbourBank: BrandComponents {
+    func primaryButton(_ title: String, action: @escaping @MainActor () -> Void) -> some View {
+        Button(title, action: action)
+            .buttonStyle(.borderedProminent)
+            .tint(.teal)
+    }
+
+    func card(title: String, detail: String) -> some View {
+        VStack(alignment: .leading) {
+            Text(title).font(.headline)
+            Text(detail).foregroundStyle(.secondary)
+        }
+        .padding()
+        .background(.teal.opacity(0.1), in: RoundedRectangle(cornerRadius: 12))
+    }
+}
+
+struct SummitCredit: BrandComponents {
+    func primaryButton(_ title: String, action: @escaping @MainActor () -> Void) -> some View {
+        Button(action: action) {
+            Text(title.uppercased()).bold().frame(maxWidth: .infinity)
+        }
+        .buttonStyle(.bordered)
+        .tint(.indigo)
+    }
+
+    func card(title: String, detail: String) -> some View {
+        HStack {
+            Text(title)
+            Spacer()
+            Text(detail).bold()
+        }
+        .padding()
+        .overlay(Rectangle().stroke(.indigo))
+    }
+}
+
+// The screen is written once, against the family
+struct PaymentSummary<Brand: BrandComponents>: View {
+    let brand: Brand
+    let total: String
+    let pay: @MainActor () -> Void
+
+    var body: some View {
+        VStack(spacing: 16) {
+            brand.card(title: "Total", detail: total)
+            brand.primaryButton("Pay", action: pay)
+        }
+    }
+}
+
+#Preview {
+    PaymentSummary(brand: HarbourBank(), total: "£24.00") {}
+}
+```
+
+The compiler now knows the exact view types, so there's no existential boxing and SwiftUI sees concrete, diffable view structure. The price, from [some vs any, existential cost and type erasure](/design/learn/sd-swift-design-some-any), is that every screen using the family becomes generic over `Brand`, and choosing a brand **at run time** needs an existential or a type-erased wrapper again.
+
+Be honest about whether you need a family of **types** at all. Most white-label apps pick the brand per app target at build time, and most brand differences are values: colours, fonts, corner radii, copy. A `Theme` struct of design tokens, injected through the SwiftUI environment, covers that without any generics. Reserve component families for brands whose components genuinely differ in structure.
+
+## The axis that's hard to extend
+
+An abstract factory makes one kind of change cheap and another expensive:
+
+- **A new family** (a UI-test family, a third brand) is one new conformance. Nothing else changes.
+- **A new kind of product** (every family now needs a `makePushRegistrar()`) means a new protocol requirement and an implementation in **every** factory.
+
+So the pattern fits when families vary more often than the list of products. It's the expression problem again, from [The expression problem: protocols vs enums](/design/learn/sd-solid-expression-problem). A protocol extension can provide a default `make` method to soften it, but a default that quietly returns a live product inside the demo family is exactly the mixing the pattern exists to prevent. Prefer the compile error.
+
+## Trade-offs
+
+| | `if isDemo` checks where needed | Abstract factory (protocol + types) | Struct of factory closures | Generic families (`associatedtype`) | DI container (D21) |
+| --- | --- | --- | --- | --- | --- |
+| Families stay consistent | No: each check can disagree | Yes, by construction | Only if you build named families | Yes, checked by the compiler | Depends on registration |
+| Adding a family | Edit every check | One conformance | One static value | One conformance | New registrations |
+| Adding a product | Easy | Edit every factory | Edit every family value | Edit every conformance | Easy |
+| Overriding one member in tests | Awkward | A new type | One assignment | A new type | Easy |
+| Run-time switching | Yes | Yes | Yes | Needs type erasure | Yes |
+| Best for | Never more than one or two flags | Environments with a fixed set of services | Most Swift apps | White-label UI that differs in structure | Large apps with many services |
+
+<Callout kind="interview">
+
+**What to say:** for "add a demo mode for App Store review", describe a demo family chosen once at the composition root: canned API responses, a pre-signed-in demo account, analytics and crash reporting tagged or dropped, and payments that **cannot** reach a real provider because the demo family has no live payment client in it.
+
+**What to ask:** "Should demo data persist between launches? Can reviewers trigger real side effects, such as emails or push notifications? Is demo mode reachable in the shipped binary, and how is it switched on?"
+
+**Red flags:** `if isDemo` scattered through view models; a default implementation that falls back to a live product; reading launch arguments deep inside a service rather than once at start-up.
+
+</Callout>
+
+<Callout kind="gotcha" title="iOS gotcha: launch arguments ship to production">
+
+`ProcessInfo.processInfo.arguments` is how UI tests (`app.launchArguments = ["-uiTesting"]`) and schemes switch families, and it works in release builds too. Anything keyed on a launch argument is reachable in the App Store binary by anyone who can launch the app with arguments. Keep test-only families behind `#if DEBUG`, or behind a signal that can't be spoofed, such as a server-side flag on the review account.
+
+</Callout>
+
+<Callout kind="gotcha" title="Swift gotcha: factories cross actors">
+
+The composition root usually builds the factory on the main actor, then hands it to services that run elsewhere. In Swift 6 that means the factory, and anything its closures capture, must be `Sendable`. Declare it on the protocol (`protocol DependencyFactory: Sendable`) or mark the closures `@Sendable`, as above, and the compiler checks every family for you.
+
+</Callout>
+
+```cards
+- id: af-definition
+  front: "What does an abstract factory create, and what does it guarantee?"
+  back: "A family of related products, one `make` method per kind. Choosing the factory chooses every product at once, so products from different families can't be mixed."
+- id: af-vs-fm
+  front: "How does an abstract factory differ from a factory method?"
+  back: "A factory method makes one product, decided by a subclass or conformer of the creator. An abstract factory is an object passed to the client that makes several related products."
+- id: af-hard-axis
+  front: "Which change is expensive with an abstract factory?"
+  back: "Adding a new kind of product: every factory must implement it. Adding a new family is one new conformance."
+- id: af-values
+  front: "When is a family of types overkill for theming?"
+  back: "When brands differ only in values such as colours, fonts and radii. A theme struct of design tokens in the environment is simpler; component families are for brands that differ in structure."
+```
+
+```quiz
+- id: q1
+  type: mcq
+  prompt: "Your app needs a demo mode for App Store review. Which design keeps demo and live behaviour from ever mixing?"
+  options:
+    - "An `isDemo` flag in `UserDefaults` that each service checks"
+    - "A `DemoFactory` chosen once at start-up that makes every dependency, with no live payment client in it"
+    - "A `#if DEMO` compilation condition around each network call"
+    - "A separate demo server, with the app unchanged"
+  answer: 1
+  explain: "One decision at the composition root picks the whole family, so no service can be live while another is in demo. Scattered checks can disagree, compilation conditions need a separate build, and a demo server alone still leaves real payments, analytics and push live in the app."
+- id: q2
+  type: sort
+  prompt: "Factory method or abstract factory?"
+  buckets: ["Factory method", "Abstract factory"]
+  items:
+    - ["`UIView.layerClass` choosing the backing layer", 0]
+    - ["A `DependencyFactory` with live, demo and UI-test conformances", 1]
+    - ["`makeUIView(context:)` in a `UIViewRepresentable`", 0]
+    - ["A `BrandComponents` protocol making buttons, cards and headers per bank", 1]
+    - ["A `FeedLoader` subclass overriding `makeSource()` in a test", 0]
+  explain: "Factory methods make one product, decided by the type that implements them. Abstract factories make a consistent family and are passed to the code that needs them."
+- id: q3
+  type: truefalse
+  prompt: "With an abstract factory, adding a third family (say, a UI-test family) requires editing the existing live and demo factories."
+  answer: false
+  explain: "A new family is one new conformance; existing factories don't change. What *does* touch every factory is adding a new kind of product."
+- id: q4
+  type: mcq
+  prompt: "A white-label app ships as four banks' apps. The brands differ in colours, fonts and corner radius, and nothing else. What should the screens be written against?"
+  options:
+    - "A generic `BrandComponents` protocol with an associated type per component"
+    - "A `Theme` struct of design tokens, injected through the environment"
+    - "A subclass of every view controller per bank"
+    - "`if bank == .harbour` checks in each view"
+  answer: 1
+  explain: "When the differences are values, a struct of tokens is the simplest correct family. Generic component families are worth their cost only when brands differ in structure, such as a different layout for the same card."
+- id: q5
+  type: recall
+  prompt: "Your `DependencyFactory` protocol gains `makePushRegistrar()`. A teammate suggests a protocol-extension default that returns the live registrar, so the demo and UI-test factories needn't change. What would you say?"
+  model: "That default silently puts a live product into the demo and UI-test families: reviewers' and tests' devices would register for real push notifications. The point of the pattern is that a family is consistent by construction, so I'd rather take the compile errors and write a no-op or fake registrar for each non-live family. If adding products is frequent, that's a sign the factory is too big and should be split by feature."

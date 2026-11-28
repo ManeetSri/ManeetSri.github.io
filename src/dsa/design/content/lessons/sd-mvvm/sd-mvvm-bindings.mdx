@@ -1,0 +1,310 @@
+## Why it matters
+
+MVVM assumes a **binding**: something that tells the view when the view model's state changes. SwiftUI has one built in. UIKit never did, so every UIKit codebase that adopted MVVM built its own, from a single closure to a reactive framework. The choice decides how screens leak, whether they flash half-updated states, and how painful a later move to SwiftUI or Observation will be. Interviewers who hear "MVVM in UIKit" will ask how the view finds out.
+
+## Binding, in both directions
+
+A binding has two halves:
+
+- **State to view:** when the view model's state changes, the view re-renders.
+- **Events to view model:** when the user acts, the view calls an intent. For text fields this makes a loop: the field's text goes in, and the view model's idea of the text may come back out.
+
+The view model never calls the view, so the first half needs a mechanism the view subscribes to. The four common ones, from the simplest: a closure, a box per property, Observation, and Combine (the next lesson).
+
+## One closure, one render
+
+The smallest binding that works is a single closure that hands over the **whole** state:
+
+```swift check ios group=closure title="SignUpScreen.swift"
+import UIKit
+
+@MainActor
+final class SignUpViewModel {
+    struct State: Equatable {
+        var email = ""
+        var emailError: String?
+        var isSubmitEnabled = false
+    }
+
+    /// The view's listener. Setting it delivers the current state at once, so the view never starts blank.
+    var onChange: ((State) -> Void)? {
+        didSet { onChange?(state) }
+    }
+
+    private(set) var state = State() {
+        didSet { if state != oldValue { onChange?(state) } }
+    }
+
+    func emailChanged(_ email: String) {
+        var next = state                       // build the whole new state…
+        next.email = email
+        let looksValid = email.contains("@") && email.contains(".")
+        next.emailError = email.isEmpty || looksValid ? nil : "Enter an email like name@example.com."
+        next.isSubmitEnabled = looksValid
+        state = next                           // …and publish it once
+    }
+}
+
+final class SignUpViewController: UIViewController {
+    private let viewModel: SignUpViewModel
+    private let emailField = UITextField()
+    private let errorLabel = UILabel()
+    private let submitButton = UIButton(configuration: .filled())
+
+    init(viewModel: SignUpViewModel) {
+        self.viewModel = viewModel
+        super.init(nibName: nil, bundle: nil)
+    }
+
+    required init?(coder: NSCoder) { nil }
+
+    override func viewDidLoad() {
+        super.viewDidLoad()
+        // Layout omitted
+        emailField.addAction(UIAction { [weak self] action in
+            guard let field = action.sender as? UITextField else { return }
+            self?.viewModel.emailChanged(field.text ?? "")
+        }, for: .editingChanged)
+
+        viewModel.onChange = { [weak self] state in
+            self?.render(state)
+        }
+    }
+
+    /// Sets everything, every time: calling it twice with the same state changes nothing
+    private func render(_ state: SignUpViewModel.State) {
+        if emailField.text != state.email, emailField.markedTextRange == nil {
+            emailField.text = state.email
+        }
+        errorLabel.text = state.emailError
+        errorLabel.isHidden = state.emailError == nil
+        submitButton.isEnabled = state.isSubmitEnabled
+    }
+}
+```
+
+Each detail there prevents a real bug:
+
+- **Build the next state, then assign once.** `state` has a `didSet`, and mutating `state.email` in place fires it. Three in-place mutations would mean three renders, the first two showing a new email with the old error. Publishing one complete value means the view only ever sees consistent screens.
+- **Replay on subscribe.** Setting `onChange` immediately delivers the current state. Without it, a view model that loaded before the view subscribed leaves the screen blank until the next change.
+- **Render is idempotent.** It sets every property from the state, so the order and number of calls don't matter.
+- **`[weak self]` in both closures.** The view controller owns the view model, and the view model owns `onChange`. If that closure captured the view controller strongly, nothing would ever be freed.
+- **`action.sender`, not `emailField`.** The field owns its action, so capturing `emailField` inside it would make the field keep itself alive. The action hands you its sender.
+
+The cost: one listener only, and the whole screen re-renders on every change. For a form or a detail screen that's nothing. For a list, the render applies a diffable snapshot, which works out the minimal change itself.
+
+## The two-way loop, slowly
+
+The text field is where bindings go wrong, because the value travels in a circle:
+
+```visual sequence
+title: Typing into a bound text field
+participants:
+  - { id: user, label: User }
+  - { id: field, label: Text field }
+  - { id: vc, label: View controller }
+  - { id: vm, label: View model }
+messages:
+  - [user, field, "types \"ada@\""]
+  - [field, vc, editingChanged]
+  - [vc, vm, "emailChanged(\"ada@\")"]
+  - [vm, vm, build next state]
+  - [vm, vc, "onChange(state)", { reply: true }]
+  - [vc, vc, "render(state)"]
+  - { note: "render skips the text: the field already shows it", over: [field, vc] }
+steps:
+  - { upTo: 1, say: "The user types. UIKit tells the view controller through the field's `editingChanged` action." }
+  - { upTo: 3, say: "The view controller passes the raw text to an **intent**. The view model validates and builds one complete new state." }
+  - { upTo: 5, say: "The state comes back through the binding, and `render` sets the error label and the button." }
+  - { upTo: 6, say: "Writing the text back would reset the cursor, and break input methods such as Japanese, whose half-composed text is **marked**. So `render` only writes when the text differs and nothing is marked." }
+```
+
+If the view model ever *changes* the text (formatting a card number into groups of four, say), writing it back is the point. Then move the cursor deliberately, or format on end-editing instead of on every keystroke.
+
+## A box per property
+
+Before Observation, many codebases bound each property separately with a small generic box:
+
+```swift check title="Box.swift"
+/// The pre-Observation pattern: one box per property, each with its own listeners
+@MainActor
+final class Box<Value> {
+    var value: Value {
+        didSet { listeners.forEach { $0(value) } }
+    }
+    private var listeners: [(Value) -> Void] = []
+
+    init(_ value: Value) {
+        self.value = value
+    }
+
+    func bind(_ listener: @escaping (Value) -> Void) {
+        listeners.append(listener)
+        listener(value)
+    }
+}
+
+@MainActor
+final class ProfileViewModel {
+    let name = Box("")
+    let isLoading = Box(false)
+    let errorMessage = Box<String?>(nil)
+}
+```
+
+It reads nicely (`viewModel.name.bind { [weak self] in self?.nameLabel.text = $0 }`) and has three problems that grow with the screen:
+
+- **Updates arrive one property at a time.** Finishing a load sets `isLoading` to false, then `name`. Between the two, the view shows "not loading, no name": an empty-state flash.
+- **Listeners are never removed.** There's no unbind, so a box that outlives its view keeps calling closures (harmlessly with `[weak self]`, expensively without).
+- **Order becomes an API.** Which box a view model sets first changes what users see in between.
+
+If you inherit boxes, migrate screen by screen to one state value. And don't name a new one `Observable`: since Swift 5.9 that's the Observation framework's protocol, and the clash produces baffling errors.
+
+## Observation in UIKit
+
+`@Observable` view models work with UIKit too, with two levels of help.
+
+**By hand, from iOS 17:** `withObservationTracking(_:onChange:)` runs a closure, records which observable properties it read, and calls `onChange` **once**, the next time any of them is about to change. Two details matter: `onChange` fires *before* the new value is stored (like `willSet`), and on whichever thread made the change. So re-render on the main actor's next turn, and register again each time:
+
+```swift check ios title="KeepRendering.swift"
+import UIKit
+import Observation
+
+@MainActor
+@Observable
+final class StopwatchModel {
+    var elapsedText = "0:00"
+}
+
+/// Runs `render` now, and again after any observable property it read changes
+@MainActor
+func keepRendering(_ render: @escaping @MainActor @Sendable () -> Void) {
+    withObservationTracking {
+        render()
+    } onChange: {
+        Task { @MainActor in keepRendering(render) }       // after the change has landed
+    }
+}
+
+final class StopwatchViewController: UIViewController {
+    private let model = StopwatchModel()
+    private let label = UILabel()
+
+    override func viewDidLoad() {
+        super.viewDidLoad()
+        keepRendering { [weak self] in
+            guard let self else { return }
+            label.text = model.elapsedText
+        }
+    }
+}
+```
+
+When the view controller is freed, the closure reads nothing, nothing is tracked, and the loop ends by itself.
+
+**Automatically, from iOS 26:** UIKit tracks observable reads made inside its own update methods, including `viewWillLayoutSubviews()`, `layoutSubviews()`, cells' `updateConfiguration(using:)` and the new `updateProperties()`, and runs that method again when a property it read changes. You write the `label.text = model.elapsedText` line in `viewWillLayoutSubviews()` and delete the helper. Apple made this on by default in iOS 26 and lets apps turn it on back to iOS 18 with the `UIObservationTrackingEnabled` key in Info.plist. It's the cleanest UIKit binding there has ever been, and it makes a UIKit screen and a SwiftUI screen able to share one `@Observable` view model unchanged.
+
+## Trade-offs
+
+| | One closure | Box per property | Delegate protocol | `withObservationTracking` | UIKit automatic tracking |
+| --- | --- | --- | --- | --- | --- |
+| Consistent screens | yes: one value | no: property by property | yes, with one `render` call | yes | yes |
+| Listeners | one | many | one | one per render closure | UIKit manages |
+| Leak risk | a strong capture | strong captures, no unbind | low (weak delegate) | low | none |
+| Works with SwiftUI too | no | no | no | yes, same view model | yes, same view model |
+| Availability | any | any | any | iOS 17 | iOS 26, or iOS 18 with the Info.plist key |
+| Wins for | small screens, any iOS | nothing new | presenter-like flows | iOS 17+ UIKit screens | new UIKit work on iOS 18+ |
+
+A delegate (`weak var delegate: SignUpViewModelDelegate?` with `didChange(state:)`) is the closure with a protocol around it: fine, but it nudges the view model back towards knowing its view, which is MVP.
+
+<Callout kind="interview">
+
+**What to say:** "UIKit has no binding, so the view model exposes one state value and the view subscribes: a closure that delivers the whole state and replays it on subscribe, captured weakly. On iOS 17 and later I'd make the view model `@Observable` and let observation tracking drive the render, which also lets a SwiftUI screen reuse it."
+
+**What to ask:** "What's the minimum iOS version, and is there an existing reactive framework?" A Combine or RxSwift codebase should stay consistent; a fresh iOS 18 app can use Observation.
+
+**Red flags:** per-property boxes with no unbind; renders that set only some properties; strong `self` in binding closures; writing text back into a field on every keystroke.
+
+</Callout>
+
+<Callout kind="gotcha" title="Swift gotcha: `didSet` fires on every in-place mutation">
+
+`state.email = email` on a property with a `didSet` runs the observer, and so does `state.items.append(item)`. Mutating a struct state three times publishes three versions, two of them half-finished. Build the next value in a local `var` and assign it once, or wrap the mutations in a method that publishes at the end.
+
+</Callout>
+
+<Callout kind="gotcha" title="iOS gotcha: `withObservationTracking` fires before the change">
+
+Its `onChange` runs as the property is about to change, so reading the model inside `onChange` gives the old value. It also runs only once per registration. Re-render and re-register from a `Task { @MainActor in … }`, which runs after the mutation completes.
+
+</Callout>
+
+## Practice
+
+**Review: the event view model that does everything** uses a one-closure binding the wrong way: its view model holds the view controller strongly, which is the leak support reported. Finding why the screen is never freed is a good test of this lesson's ownership rules.
+
+```cards
+- id: binding-halves
+  front: "What are the two halves of a binding in MVVM?"
+  back: "State to view (the view re-renders when the view model's state changes) and events to view model (the view calls intents). Text fields join them into a loop."
+- id: binding-one-value
+  front: "Why publish one state value rather than a box per property?"
+  back: "One value means every render sees a consistent screen. Per-property updates arrive one by one, so the view shows half-updated states in between."
+- id: binding-replay
+  front: "Why should a closure binding deliver the current state when it's set?"
+  back: "So a view that subscribes after the view model has already loaded renders at once, instead of staying blank until the next change."
+- id: binding-uikit-observation
+  front: "How does UIKit observe an @Observable view model?"
+  back: "By hand with withObservationTracking (iOS 17), re-registering after each change, or automatically from iOS 26 (iOS 18 with the UIObservationTrackingEnabled key) by reading the model in update methods like viewWillLayoutSubviews."
+```
+
+```quiz
+- id: q1
+  type: bug
+  prompt: "This view controller is never freed after it's dismissed. Which line causes it?"
+  code: |
+    override func viewDidLoad() {
+        super.viewDidLoad()
+        viewModel.onChange = { state in
+            self.render(state)
+        }
+        viewModel.load()
+    }
+  answer: 4
+  explain: "The view controller owns the view model, the view model owns `onChange`, and the closure captures `self` strongly: a cycle. Capture `[weak self]` and call `self?.render(state)`."
+- id: q2
+  type: mcq
+  prompt: "After a load finishes, users see a brief \"No results\" flash before the rows appear. The view model sets `isLoading.value = false`, then `items.value = rows`, each a separate box. What's the best fix?"
+  options:
+    - "Swap the two lines so `items` is set first"
+    - "Delay hiding the spinner by 100 ms"
+    - "Publish one state value (loading, loaded with rows, empty) and render it as a whole"
+    - "Render the empty state only when `items` has been empty for a second"
+  answer: 2
+  explain: "Swapping the lines moves the flash somewhere else, and delays hide it. The cause is that the screen is updated property by property; one complete state per change removes every in-between screen."
+- id: q3
+  type: multi
+  prompt: "Your `render(state)` runs on every keystroke in a bound email field. Which should it do? Choose all that apply."
+  options:
+    - "Set the error label and the button from the state"
+    - "Always set `emailField.text = state.email`"
+    - "Set the field's text only when it differs and nothing is marked"
+    - "Call `viewModel.emailChanged` with the field's text, to keep them in sync"
+  answer: [0, 2]
+  explain: "Writing the text unconditionally resets the cursor and breaks input methods that mark half-composed text. Calling the intent from render would make an endless loop: the intent changes state, which renders, which calls the intent."
+- id: q4
+  type: truefalse
+  prompt: "`withObservationTracking`'s `onChange` runs after the new value has been stored, so it can read the model and update the view directly."
+  answer: false
+  explain: "It runs before the change, like `willSet`, and only once. Schedule the re-render on the main actor's next turn and register again."
+- id: q5
+  type: mcq
+  prompt: "A new UIKit screen in an app that supports iOS 18 needs a binding. Which is the best default?"
+  options:
+    - "A `Box<T>` per property, as the older screens use"
+    - "An `@Observable` view model, read in `viewWillLayoutSubviews()`, with UIKit's observation tracking turned on"
+    - "A delegate protocol the view model calls"
+    - "NotificationCenter posts from the view model"
+  answer: 1
+  explain: "UIKit's automatic tracking is on by default in iOS 26 and can be enabled back to iOS 18 with the `UIObservationTrackingEnabled` Info.plist key. The same view model can later back a SwiftUI screen unchanged."
+```

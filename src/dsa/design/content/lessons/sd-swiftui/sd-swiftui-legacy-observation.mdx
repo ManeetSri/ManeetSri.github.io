@@ -1,0 +1,258 @@
+## Why it matters
+
+Most SwiftUI written before 2023 is built on `ObservableObject`, apps that still support iOS 16 must use it, and Combine pipelines hang off its `@Published` properties. You'll read it, fix it and migrate it for years. "What's the difference between `@StateObject` and `@ObservedObject`?" is one of the most common SwiftUI interview questions, because getting it wrong produces a famous bug: a model quietly re-created on every update, taking its data with it.
+
+## `ObservableObject` and `@Published`
+
+Before Observation, a SwiftUI model was a class conforming to `ObservableObject`, with `@Published` on each property that views should react to:
+
+```swift
+final class FeedModel: ObservableObject {
+    @Published var posts: [Post] = []
+    @Published var isLoading = false
+}
+```
+
+`ObservableObject` gives the class an `objectWillChange` publisher from Combine, and every `@Published` property sends on it **immediately before** it changes. SwiftUI subscribes to that publisher for each view holding the object in one of the wrappers below. The publisher says *that* something will change, never *what*, so **every** observing view is invalidated by **every** published change, whatever it reads.
+
+```swift run title="One publisher for every property"
+import Combine
+
+final class Basket: ObservableObject {
+    @Published var title = "Weekly shop"
+    @Published var count = 0
+}
+
+let basket = Basket()
+var invalidations = 0
+
+// What SwiftUI does for each view that observes the basket
+let subscription = basket.objectWillChange.sink { _ in
+    invalidations += 1
+    print("will change: count is still \(basket.count)")
+}
+
+basket.title = "Party"
+basket.count += 1
+basket.count += 1
+print("A view showing only the count was invalidated \(invalidations) times")
+subscription.cancel()
+```
+
+```output
+will change: count is still 0
+will change: count is still 0
+will change: count is still 1
+A view showing only the count was invalidated 3 times
+```
+
+Two things show here. The title change invalidated a view that never shows the title; with `@Observable` it wouldn't have, as the updates lesson measured. And the notification arrives **before** the new value is stored, so code that reads the object inside an `objectWillChange` subscriber sees the old value. SwiftUI copes by re-evaluating later in the run loop; your own subscribers have to do the same, for example with `receive(on: RunLoop.main)`.
+
+## The four wrappers
+
+| Wrapper | Meaning | Lifetime of the object |
+| --- | --- | --- |
+| `@StateObject` | This view **owns** the object | Created once per identity, kept until the identity ends |
+| `@ObservedObject` | This view **observes** an object someone else owns | Whatever the owner decides; the view doesn't keep it alive across rebuilds |
+| `@EnvironmentObject` | Find an object an ancestor injected with `.environmentObject(_:)` | The injector's |
+| `@Published` | Inside the object: this property announces its changes | n/a |
+
+The difference between the first two is the interview question, and the bug that comes with it looks innocent:
+
+```swift check ios title="FeedScreen.swift"
+import SwiftUI
+
+struct Post: Identifiable, Sendable {
+    let id: Int
+    let text: String
+}
+
+@MainActor
+final class FeedModel: ObservableObject {
+    @Published private(set) var posts: [Post] = []
+
+    func load() async {
+        try? await Task.sleep(for: .milliseconds(300))      // stands in for a request
+        posts = [Post(id: 1, text: "Hello")]
+    }
+}
+
+struct FeedScreen: View {
+    @ObservedObject var model = FeedModel()                 // the bug
+
+    var body: some View {
+        List(model.posts) { post in Text(post.text) }
+            .task { await model.load() }
+    }
+}
+```
+
+`@ObservedObject` doesn't own anything, so it doesn't store the object across rebuilds: every time `FeedScreen`'s struct is created, the default value runs and a brand-new, empty `FeedModel` replaces the one that had loaded. The feed empties whenever the parent updates, and the request runs again. On a busy parent that's a screen that flickers and hammers the server. The fix is one word: `@StateObject private var model = FeedModel()`.
+
+The rule fits in a sentence: **the view that creates the object uses `@StateObject`; every view it hands the object to uses `@ObservedObject`.**
+
+### Why `@StateObject` creates its object once
+
+`@StateObject`'s initialiser takes its value as an `@autoclosure`: Swift passes the expression `FeedModel()` as a closure, and SwiftUI calls it only when the identity begins. A plain property wrapper that takes the value itself gets a new object every time the struct is made. The difference is pure Swift, so you can see it without SwiftUI:
+
+```swift run title="Eager value or autoclosure"
+var modelsMade = 0
+
+@MainActor
+final class FeedModel {
+    init() { modelsMade += 1 }
+}
+
+@propertyWrapper
+struct EagerBox<Value> {              // takes the value: the expression runs at every init
+    var wrappedValue: Value
+    init(wrappedValue: Value) { self.wrappedValue = wrappedValue }
+}
+
+@propertyWrapper
+struct DeferredBox<Value> {           // takes an autoclosure, like StateObject
+    private let make: () -> Value
+    init(wrappedValue: @autoclosure @escaping () -> Value) { make = wrappedValue }
+    var wrappedValue: Value { make() }
+}
+
+@MainActor struct ScreenA { @EagerBox var model = FeedModel() }
+@MainActor struct ScreenB { @DeferredBox var model = FeedModel() }
+
+for _ in 1...3 { _ = ScreenA() }
+print("Eager: \(modelsMade) models for 3 view structs")
+modelsMade = 0
+for _ in 1...3 { _ = ScreenB() }
+print("Autoclosure: \(modelsMade) models for 3 view structs")
+```
+
+```output
+Eager: 3 models for 3 view structs
+Autoclosure: 0 models for 3 view structs
+```
+
+That's also the history behind the lifetimes lesson: `@State` used to behave like `EagerBox`, so `@State private var model = Model()` built throwaway models, and the Xcode 27 SDK's `@State` macro now defers the value the way `@StateObject` always did. (`DeferredBox` here makes a model on every read, which a real wrapper wouldn't; SwiftUI calls the closure once and stores the result.)
+
+`@StateObject` still has the seeded-state trap: `_model = StateObject(wrappedValue: FeedModel(userID: userID))` in `init` is evaluated once per identity, so a later `userID` is ignored. Reset with `.id(userID)` when the input should start a fresh model.
+
+## Same ideas, newer names
+
+| `ObservableObject` | Observation (iOS 17 and later) |
+| --- | --- |
+| `final class Model: ObservableObject` with `@Published var x` | `@Observable final class Model` with `var x` |
+| `@StateObject private var model = Model()` | `@State private var model = Model()` |
+| `@ObservedObject var model: Model` | `let model: Model`, or `@Bindable var model: Model` for bindings |
+| `@EnvironmentObject var model: Model` and `.environmentObject(model)` | `@Environment(Model.self) private var model` and `.environment(model)` |
+| `$model.x` through `@ObservedObject`'s projected value | `$model.x` through `@Bindable` |
+| `objectWillChange.send()` for manual changes | Not needed: reads and writes are tracked |
+| `model.$x` as a Combine publisher | No publisher: `didSet`, a stream the model exposes, or `Observations` (iOS 26), which D23 covers |
+
+## Migrating a codebase
+
+The two systems coexist happily, so migrate one model at a time:
+
+1. **Pick a model whose screens all target iOS 17 or later.** Leaf screens with one model are the easiest first steps.
+2. **Convert the class:** replace `ObservableObject` with `@Observable`, delete `@Published`, and mark caches and services `@ObservationIgnored`.
+3. **Convert its views:** `@StateObject` becomes `@State`, `@ObservedObject` becomes a plain property or `@Bindable`, and `@EnvironmentObject` becomes `@Environment(Model.self)`, with `.environment(model)` at the injection point.
+4. **Replace its Combine edges.** Anything that subscribed to `model.$query` (a debounce, say) loses its publisher. Move that logic into the model, behind a method or an async stream.
+5. **Look for updates that relied on coarseness.** A view that showed a value it reached through something unobservable, like `UserDefaults` read in a computed property, used to refresh by accident whenever any published property changed. Under Observation it stops updating, which is correct but surprising. Make the real source observable.
+
+Test the model before and after: its behaviour shouldn't change, only how views watch it.
+
+## Trade-offs
+
+| | `ObservableObject` | `@Observable` |
+| --- | --- | --- |
+| Minimum iOS | 13 | 17 |
+| What one change invalidates | Every view observing the object | Only views that read that property |
+| Boilerplate | `@Published` on each property, a wrapper in each view | The macro, and wrappers only to own or bind |
+| Nested models | Changes inside a child `ObservableObject` don't reach views observing the parent | Reads through nested observables are tracked |
+| Combine integration | Built in: every property is a publisher | None built in; bridge where you need it |
+| When it wins | iOS 16 support, and code that leans on Combine | Everything new on iOS 17 and later |
+
+<Callout kind="interview">
+
+**Say:** "`@StateObject` owns: SwiftUI creates the object once per view identity, through an autoclosure, and keeps it. `@ObservedObject` only observes an object owned elsewhere, so creating one inline gives you a new object on every rebuild. With Observation the same split is `@State` versus a plain property." Then mention granularity: `objectWillChange` invalidates every observer, Observation only readers. **Ask:** "What's our minimum iOS version?" It decides which system new code uses. **Red flags:** `@ObservedObject var model = Model()`, `@Published` changed from a background thread, and a migration plan that rewrites every model in one pull request.
+
+</Callout>
+
+<Callout kind="gotcha" title="iOS gotcha: publishing from a background thread">
+
+A `@Published` property set from a background thread triggers the runtime warning "Publishing changes from background threads is not allowed", and views may update late or tear. Marking the model `@MainActor` turns it into a compile-time error in Swift 6, which is where you want it.
+
+</Callout>
+
+<Callout kind="gotcha" title="iOS gotcha: a missing environment object crashes">
+
+`@EnvironmentObject` with no matching `.environmentObject(_:)` above it is a crash: "No ObservableObject of type … found". Previews and new presentation paths are where it bites. `@Environment(Model.self)` crashes the same way when nothing provided the model; declare it optional (`Model?`) when absence is legitimate.
+
+</Callout>
+
+## Practice
+
+The **contacts screen** review is built on `ObservableObject`, as plenty of production code still is. Start with the store's declaration, and decide what owns it.
+
+```cards
+- id: legacy-stateobject
+  front: "What's the difference between `@StateObject` and `@ObservedObject`?"
+  back: "`@StateObject` owns the object: created once per view identity (its initialiser takes an autoclosure) and kept alive. `@ObservedObject` only observes an object owned elsewhere; created inline, it's replaced on every rebuild."
+- id: legacy-granularity
+  front: "Why does an `ObservableObject` invalidate views that didn't read the changed property?"
+  back: "Its `objectWillChange` publisher only says something will change, not what, and every `@Published` change sends on it. So every observing view is invalidated."
+- id: legacy-migration
+  front: "How do the wrappers map when moving to `@Observable`?"
+  back: "`@StateObject` → `@State`, `@ObservedObject` → a plain property or `@Bindable`, `@EnvironmentObject` → `@Environment(Model.self)`, `.environmentObject` → `.environment`, and `@Published` disappears."
+```
+
+```quiz
+- id: q1
+  type: mcq
+  prompt: "A tab's root view declares `@ObservedObject var model = InboxModel()`. Users say the inbox sometimes empties and reloads by itself. Why?"
+  options:
+    - "`@ObservedObject` can't be used in a tab's root view"
+    - "Each time the parent rebuilds this struct, the default value creates a new, empty `InboxModel` that replaces the loaded one"
+    - "`InboxModel` isn't marked `@MainActor`, so its updates are dropped"
+    - "The tab's `onAppear` clears the model"
+  answer: 1
+  explain: "`@ObservedObject` doesn't own or store the object across rebuilds, so the inline default runs again. `@StateObject` creates it once per identity and keeps it."
+- id: q2
+  type: bug
+  prompt: "This screen loses its loaded data whenever its parent updates. Which line is the bug?"
+  code: |
+    struct OrdersScreen: View {
+        @EnvironmentObject var session: Session
+        @ObservedObject var model = OrdersModel()
+
+        var body: some View {
+            OrdersList(orders: model.orders)
+                .task { await model.load(for: session.user) }
+        }
+    }
+  answer: 3
+  explain: "The view creates the model, so it must own it with `@StateObject private var model = OrdersModel()`. The environment object is fine: an ancestor owns the session."
+- id: q3
+  type: match
+  prompt: "Match each `ObservableObject`-era declaration to its Observation equivalent."
+  pairs:
+    - ["`@StateObject private var model = Model()`", "`@State private var model = Model()`"]
+    - ["`@ObservedObject var model: Model`", "`let model: Model`, or `@Bindable` for bindings"]
+    - ["`@EnvironmentObject var model: Model`", "`@Environment(Model.self) private var model`"]
+    - ["`@Published var title = \"\"`", "`var title = \"\"` in an `@Observable` class"]
+  explain: "Ownership moves to `@State`, plain observation needs no wrapper, environment lookup takes the type, and every stored property is tracked."
+- id: q4
+  type: truefalse
+  prompt: "With an `ObservableObject` model, a view that shows only `model.count` is invalidated when `model.title` changes."
+  answer: true
+  explain: "`objectWillChange` fires for every `@Published` property and doesn't say which, so every view observing the object is invalidated."
+- id: q5
+  type: multi
+  prompt: "You're migrating `SearchModel` from `ObservableObject` to `@Observable`. Which of these need attention? Choose all that apply."
+  options:
+    - "A pipeline built on `model.$query.debounce(for: .milliseconds(300), scheduler: RunLoop.main)`"
+    - "Views that declare `@StateObject private var model = SearchModel()`"
+    - "A call to `objectWillChange.send()` after mutating a non-published cache"
+    - "Unit tests that call `model.search()` and check `model.results`"
+    - "`.environmentObject(model)` where the app injects it"
+  answer: [0, 1, 2, 4]
+  explain: "`$query` publishers disappear with `@Published`, `@StateObject` and `.environmentObject` need their Observation forms, and a manual `objectWillChange.send()` should become a tracked property. Tests of the model's behaviour should pass unchanged."
+```

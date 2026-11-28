@@ -1,0 +1,359 @@
+## Why it matters
+
+SwiftUI already redraws views from data, so a view model in SwiftUI has to justify itself in a way it never did in UIKit. When it does earn its place, `@Observable` makes it cheap: no `@Published`, no `objectWillChange`, and views that re-render only for the properties they read. The decisions that remain are the ones interviews probe: whether this screen needs a view model at all, who creates it and when, how the view's inputs reach it, and where its work runs.
+
+D18's [@Observable and @Bindable](/design/learn/sd-swiftui-observable) covered how Observation tracks reads and the four ways a view holds a model. This lesson builds on that to put a complete MVVM screen together.
+
+## Does this screen need a view model?
+
+A SwiftUI view with `@State` is already a small view model: it holds state and re-renders. Many screens are fine that way, or bound straight to shared models (the MV approach). A screen earns a view model when it has:
+
+- **Async work with states:** loading, loaded, empty, failed, refreshing.
+- **Rules worth testing:** validation, what's enabled when, optimistic updates and their rollback.
+- **Mapping:** domain values to display values, or several sources combined into one screen.
+- **Outcomes** that a coordinator should hear about.
+
+None of those can be tested in a SwiftUI `body`. All of them can be tested in a plain class.
+
+## The shape of an @Observable view model
+
+A workout history screen: it loads workouts, filters them by type, summarises the visible ones, pulls to refresh and deletes with a swipe.
+
+```swift check ios group=workouts title="WorkoutHistoryViewModel.swift"
+import SwiftUI
+
+struct Workout: Identifiable, Equatable, Sendable {
+    enum Kind: String, Sendable { case run, ride, swim }
+    let id: Int
+    let kind: Kind
+    let kilometres: Double
+}
+
+protocol WorkoutHistory: Sendable {
+    func recentWorkouts() async throws -> [Workout]
+    func delete(id: Int) async throws
+}
+
+@MainActor
+@Observable
+final class WorkoutHistoryViewModel {
+    enum Filter: String, CaseIterable, Identifiable {
+        case all, runs, rides, swims
+        var id: Self { self }
+    }
+
+    enum Content: Equatable {
+        case loading, loaded, empty
+        case failed(message: String)
+    }
+
+    var filter: Filter = .all                     // an input: the picker binds to it
+    private(set) var content: Content = .loading
+    private(set) var banner: String?
+    private var workouts: [Workout] = []          // the source of truth
+
+    private let history: any WorkoutHistory
+
+    init(history: any WorkoutHistory) {
+        self.history = history                    // nothing else: SwiftUI may call this many times
+    }
+
+    /// Derived, never stored: tracked through `workouts` and `filter`, so it can't go stale
+    var visible: [Workout] {
+        switch filter {
+        case .all: workouts
+        case .runs: workouts.filter { $0.kind == .run }
+        case .rides: workouts.filter { $0.kind == .ride }
+        case .swims: workouts.filter { $0.kind == .swim }
+        }
+    }
+
+    var summary: String {
+        let total = visible.reduce(0) { $0 + $1.kilometres }
+        return "\(visible.count) workouts · \(total.formatted(.number.precision(.fractionLength(1)))) km"
+    }
+
+    func load() async {
+        guard content == .loading else { return }  // appearing again doesn't reload
+        await fetch()
+    }
+
+    func refresh() async {
+        banner = nil
+        await fetch()
+    }
+
+    func delete(_ workout: Workout) async {
+        let before = workouts
+        workouts.removeAll { $0.id == workout.id }          // optimistic
+        do {
+            try await history.delete(id: workout.id)
+        } catch {
+            workouts = before                                // roll back
+            banner = "Couldn't delete that workout."
+        }
+    }
+
+    private func fetch() async {
+        do {
+            workouts = try await history.recentWorkouts()
+            content = workouts.isEmpty ? .empty : .loaded
+        } catch is CancellationError {
+            // The view went away: leave everything as it was
+        } catch {
+            if workouts.isEmpty {
+                content = .failed(message: "Couldn't load your workouts.")
+            } else {
+                banner = "Couldn't refresh. Showing your last workouts."
+            }
+        }
+    }
+}
+```
+
+The parts to notice:
+
+- **`@MainActor @Observable final class`.** Views read it on the main actor, so it lives there; every `await` suspends without blocking, and every write after it lands back on the main actor. No `DispatchQueue.main` anywhere.
+- **One source of truth, everything else derived.** `visible` and `summary` are computed. Observation tracks them through what they read, so a view showing `summary` updates when `filter` or `workouts` changes, and there's no copy to forget to update when a workout is deleted.
+- **`filter` is a plain `var`.** It's an input the view binds to directly. `content` and `banner` are `private(set)`: only the view model's own methods change them.
+- **`init` does nothing but store.** The next section explains why that matters more in SwiftUI than anywhere else.
+
+The view is thin:
+
+```swift check ios group=workouts title="WorkoutHistoryScreen.swift"
+struct WorkoutHistoryScreen: View {
+    @State private var model: WorkoutHistoryViewModel
+
+    init(history: any WorkoutHistory) {
+        _model = State(initialValue: WorkoutHistoryViewModel(history: history))
+    }
+
+    var body: some View {
+        List {
+            Picker("Show", selection: $model.filter) {
+                ForEach(WorkoutHistoryViewModel.Filter.allCases) { filter in
+                    Text(filter.rawValue.capitalized).tag(filter)
+                }
+            }
+            .pickerStyle(.segmented)
+
+            switch model.content {
+            case .loading:
+                ProgressView()
+            case .empty:
+                ContentUnavailableView("No workouts yet", systemImage: "figure.run")
+            case .failed(let message):
+                ContentUnavailableView(message, systemImage: "wifi.exclamationmark")
+            case .loaded:
+                Section(model.summary) {
+                    ForEach(model.visible) { workout in
+                        Text("\(workout.kind.rawValue.capitalized) · \(workout.kilometres, format: .number) km")
+                            .swipeActions {
+                                Button("Delete", role: .destructive) {
+                                    Task { await model.delete(workout) }
+                                }
+                            }
+                    }
+                }
+            }
+        }
+        .safeAreaInset(edge: .top) {
+            if let banner = model.banner { Text(banner).font(.footnote).padding(8) }
+        }
+        .task { await model.load() }
+        .refreshable { await model.refresh() }
+    }
+}
+```
+
+`$model.filter` works because `@State`'s projected value is a binding to the model, and bindings reach into an `@Observable`'s properties. A child view that receives the model would declare it `@Bindable var model` to do the same.
+
+## Who creates it
+
+`State(initialValue:)` and `@State private var model = Model()` both take a **value**, not a closure. So the expression that builds the view model runs **every time the view struct is created**, which is every time its parent's `body` runs. SwiftUI keeps the first instance for the view's lifetime and throws the later ones away. (The legacy `@StateObject` took an `@autoclosure` and ran it once, which is why this surprises people migrating.)
+
+That's harmless if `init` is cheap and does nothing. It's a bug if `init` starts a load, subscribes to notifications or opens a socket: each thrown-away instance has already done it. Three ways to be safe:
+
+1. **Keep `init` to storing dependencies,** and start work in `.task`. That's the default, and what the screen above does.
+2. **Let the creator own it.** A coordinator or parent builds the view model once, keeps it, and passes it in as a plain `let`. The view doesn't own it, so it must not wrap it in `@State`.
+3. **Create it lazily** in `.task` into an optional `@State`, when even construction is expensive. The cost is an optional in every read.
+
+## Work and its lifetime
+
+The `.task` modifier is the right place to start a screen's work: it runs when the view appears and **cancels** when it disappears. `.refreshable` awaits the function you give it and keeps the spinner up until it returns, so an `async` `refresh()` gets the right spinner for free.
+
+```visual sequence
+title: A load tied to the view's lifetime
+participants:
+  - { id: view, label: View }
+  - { id: task, label: ".task" }
+  - { id: model, label: View model }
+  - { id: repo, label: WorkoutHistory }
+messages:
+  - [view, task, appears]
+  - [task, model, "await load()"]
+  - [model, repo, "recentWorkouts()", { async: true }]
+  - [repo, model, "[Workout]", { reply: true }]
+  - [model, view, content and workouts change, { async: true }]
+  - { note: "body re-runs: it read content, visible and summary", over: view }
+  - [view, task, disappears]
+  - [task, model, cancelled, { async: true }]
+  - [repo, model, CancellationError, { reply: true }]
+steps:
+  - { upTo: 1, say: "The view appears and `.task` calls `load()`. The view model is on the main actor, but awaiting doesn't block it." }
+  - { upTo: 3, say: "The repository does the slow part elsewhere. Meanwhile the main actor is free: scrolling and taps carry on." }
+  - { upTo: 5, say: "The view model writes `workouts` and `content`. SwiftUI re-runs `body` because the last `body` **read** those properties." }
+  - { upTo: 8, say: "On a later visit the user leaves before the answer. `.task` cancels, the repository throws `CancellationError`, and the view model leaves its state alone: cancellation isn't failure." }
+```
+
+When the work should restart as an input changes, use `.task(id:)`: `.task(id: model.query) { await model.search() }` cancels the previous search before starting the next, which removes a whole class of out-of-order results. Unstructured `Task { }` blocks inside the view model have no such owner: nothing cancels them when the screen goes, so prefer `.task` and `async` methods, and keep a handle (marked `@ObservationIgnored`) when the view model must start one itself.
+
+## Where the work runs
+
+The view model is on the main actor, and that's right for its state. It isn't right for heavy computation: sorting 50,000 samples or decoding a large file in a main-actor method blocks scrolling just as it would in UIKit. Move the work into a `nonisolated` function and `await` it:
+
+```swift check ios title="Moving heavy work off the main actor"
+import Observation
+
+struct HeartRateSample: Sendable {
+    let beatsPerMinute: Int
+}
+
+struct ZoneSummary: Equatable, Sendable {
+    let minutesInZone: [Int]
+
+    /// Pure and Sendable in, Sendable out: safe to run on any thread
+    @concurrent
+    static func compute(from samples: [HeartRateSample]) async -> ZoneSummary {
+        var minutes = Array(repeating: 0, count: 5)
+        for sample in samples {
+            let zone = min(4, max(0, (sample.beatsPerMinute - 100) / 20))
+            minutes[zone] += 1
+        }
+        return ZoneSummary(minutesInZone: minutes)
+    }
+}
+
+@MainActor
+@Observable
+final class WorkoutDetailViewModel {
+    private(set) var zones: ZoneSummary?
+
+    func show(_ samples: [HeartRateSample]) async {
+        zones = await ZoneSummary.compute(from: samples)    // computed off the main actor, stored on it
+    }
+}
+```
+
+Why `@concurrent`? Swift changed the rule in 6.2. In Swift 6.0 and 6.1, every `nonisolated async` function runs on the global concurrent executor. With Swift 6.2's `NonisolatedNonsendingByDefault` setting, which Xcode 26 turns on for new projects as part of "Approachable Concurrency", a `nonisolated async` function runs on its **caller's** actor instead, so the main actor would do the maths after all. `@concurrent` says "run this on the concurrent executor" under either setting. (Xcode 26's new app targets also default to main-actor isolation, which makes `@MainActor` on the view model implicit there. Swift packages don't, so write it.)
+
+What not to do, and what [Review: an @Observable spending screen that races itself](/design/practice/sd-review-mvvm-spending-observable) is full of: `Task.detached` blocks that write the view model's properties, `@unchecked Sendable` to quiet the compiler, and `nonisolated(unsafe)` caches. Each one turns a compile-time error into a runtime race.
+
+## Inputs: bindings or intents
+
+The picker above binds straight to `$model.filter`. That's concise, and right when changing the value has no side effects beyond what derived properties compute. When a change must **do** something (validate, save a draft, start a search), there are two options:
+
+- **A `didSet` on the property.** Observation supports property observers, so `var query = "" { didSet { scheduleSearch() } }` works. It's compact, and it hides behaviour inside an assignment.
+- **An intent with a custom binding.** `TextField("Search", text: Binding(get: { model.query }, set: { model.queryChanged($0) }))` routes every change through one named method that a test can call. More typing, more explicit.
+
+Use bindings for values, intents for actions, and a `didSet` only when the side effect is small and obvious.
+
+## Trade-offs
+
+| | Views on shared models (MV) | `@Observable` view model per screen | `ObservableObject` view model | View model made by a coordinator |
+| --- | --- | --- | --- | --- |
+| Testable logic | in the shared models | yes, without views | yes | yes |
+| Re-render granularity | per property read | per property read | whole view on any `@Published` change | per property read |
+| Creation runs | n/a | on every view init: keep it cheap | once (`@StateObject`'s autoclosure) | once, by the creator |
+| Availability | iOS 17 for Observation | iOS 17 | iOS 13 | iOS 17 |
+| Wins for | screens with no state of their own | most SwiftUI screens | apps supporting iOS 16 | flows whose coordinator must reach the view model |
+
+<Callout kind="interview">
+
+**What to say:** "Screens with async state or rules get a `@MainActor @Observable` view model with private(set) state, derived properties computed rather than stored, intents as `async` methods, and dependencies through `init`. The view owns it in `@State`, starts work in `.task` so it's cancelled with the view, and binds simple inputs directly. Heavy work goes into `@concurrent` functions."
+
+**What to ask:** "What's the minimum iOS version?" Below 17, it's `ObservableObject`. "Does a coordinator need to talk to this view model?" Then the coordinator creates and owns it.
+
+**Red flags:** work in the view model's `init`; `Task.detached` writing to the view model; `@unchecked Sendable` on a view model; stored copies of derived values; a passed-in view model wrapped in `@State`.
+
+</Callout>
+
+<Callout kind="gotcha" title="Swift gotcha: the `@State` initialiser runs every time">
+
+`@State private var model = FeedViewModel(api: api)` builds a new `FeedViewModel` each time the view struct is created; SwiftUI keeps only the first. If `FeedViewModel.init` starts a `Task`, every parent re-render starts another fetch that nobody sees. Keep `init` free of work, and start it in `.task`.
+
+</Callout>
+
+<Callout kind="gotcha" title="iOS gotcha: mark bookkeeping `@ObservationIgnored`">
+
+Every stored property of an `@Observable` class is tracked, including a `private var searchTask: Task<Void, Never>?` or a cache. Assigning it then invalidates any view that happened to read it, and a computed property that touches it becomes a dependency. Mark bookkeeping `@ObservationIgnored` so only real state drives re-renders.
+
+</Callout>
+
+## Practice
+
+**Review: an @Observable spending screen that races itself** is a view model that gets almost every decision in this lesson wrong: it isn't on the main actor, writes its state from detached tasks, stores copies of derived values, and starts work in `init` under a `@State` that re-creates it.
+
+```cards
+- id: obs-earns
+  front: "When does a SwiftUI screen earn a view model?"
+  back: "When it has async work with states, rules worth testing, mapping from domain to display values, or outcomes a coordinator must hear. Otherwise @State or shared models are enough."
+- id: obs-init
+  front: "Why must an @Observable view model's init do no work when the view creates it with @State?"
+  back: "@State takes a value, so the initialiser runs every time the view struct is created. SwiftUI keeps the first instance; the others are thrown away after doing whatever init did."
+- id: obs-task
+  front: "Where should a SwiftUI screen start its view model's work, and why?"
+  back: "In .task (or .task(id:) for work tied to an input), which starts on appear and cancels on disappear, so the work has an owner and an end."
+- id: obs-concurrent
+  front: "How do you keep heavy computation off a main-actor view model?"
+  back: "Put it in a nonisolated function marked @concurrent and await it. In Swift 6.2 with NonisolatedNonsendingByDefault, plain nonisolated async functions run on the caller's actor."
+```
+
+```quiz
+- id: q1
+  type: mcq
+  prompt: "Every time the user scrolls the parent list, logs show `FeedViewModel` fetching again. The child view declares `@State private var model = FeedViewModel(api: api)`, and `FeedViewModel.init` starts the fetch in a `Task`. What's the fix?"
+  options:
+    - "Switch to `@StateObject`, which is the modern wrapper"
+    - "Move the fetch out of `init` into a `load()` method called from `.task`"
+    - "Mark the view model `@ObservationIgnored`"
+    - "Make the parent's list lazy"
+  answer: 1
+  explain: "`@State` evaluates the initialiser on every view init and keeps the first instance, so each thrown-away instance has already started a fetch. An `init` that only stores dependencies, plus work in `.task`, fixes it. `@StateObject` is the legacy wrapper for `ObservableObject`, not `@Observable`."
+- id: q2
+  type: multi
+  prompt: "Which belong as stored properties of the workout view model? Choose all that apply."
+  options:
+    - "The loaded workouts"
+    - "The selected filter"
+    - "The workouts that match the filter"
+    - "The summary line, \"12 workouts · 84.5 km\""
+    - "Whether the last refresh failed"
+  answer: [0, 1, 4]
+  explain: "Workouts, the filter and the refresh failure are facts. The filtered list and the summary are derived from them; computing them means they can never disagree with the workouts after a delete."
+- id: q3
+  type: truefalse
+  prompt: "In a project with Swift 6.2's `NonisolatedNonsendingByDefault` enabled, a `nonisolated async` function called from a main-actor view model runs on the main actor unless it's marked `@concurrent`."
+  answer: true
+  explain: "Under that setting, nonisolated async functions inherit their caller's isolation. `@concurrent` explicitly runs them on the concurrent executor, which is what heavy computation needs."
+- id: q4
+  type: mcq
+  prompt: "A search screen starts a search on every keystroke, and results for older queries sometimes replace newer ones. Which is the most SwiftUI-native fix?"
+  options:
+    - "`Task.detached` for each search, so they run in parallel"
+    - "`.task(id: model.query) { await model.search() }`, so a new query cancels the previous search"
+    - "A `DispatchQueue` that serialises the searches"
+    - "Sorting results by timestamp before showing them"
+  answer: 1
+  explain: "`.task(id:)` cancels the running task when the id changes and starts a new one, so an old search is cancelled before it can write its results. The view model should still check for cancellation before writing."
+- id: q5
+  type: sort
+  prompt: "How should each input reach the view model?"
+  buckets: [Bind directly, Through an intent]
+  items:
+    - ["A segmented filter that only changes what's shown", 0]
+    - ["A search field whose changes start a request", 1]
+    - ["A toggle that saves the setting to the server", 1]
+    - ["A sort order picker for a local list", 0]
+  explain: "Values whose only effect is recomputing derived properties can bind straight to the model. Changes that start work go through a named intent, so the side effect is visible and testable."
+```

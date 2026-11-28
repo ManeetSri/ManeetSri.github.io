@@ -1,0 +1,370 @@
+## Why it matters
+
+Every UIKit app is a tree of containers: a window, a tab bar controller, a navigation controller per tab, and screens pushed and presented on top. Which container a screen goes into decides what the back button does, whether the tab bar stays visible, what a swipe-down means and what happens when a notification wants to show something three levels deep. Most navigation bugs (a push that lands behind a sheet, a sheet that refuses to appear, a deep link that crashes on a force cast) come from not knowing who owns what in that tree. Interviewers ask "how would you structure navigation in this app?" early, and the answer starts here.
+
+## Three ways to move, three meanings
+
+UIKit gives you three ways to show a screen, and each one *means* something to the user. Apple's Human Interface Guidelines describe them this way, and users have learnt them from every app on their phone.
+
+| | Push | Present (modal) | Switch tab |
+| --- | --- | --- | --- |
+| Means | "More detail about what I tapped" | "A separate task: finish it or cancel it" | "A different part of the app" |
+| Container | `UINavigationController` | the presenting view controller | `UITabBarController` |
+| Getting back | back button or edge swipe | Cancel, Done, or a swipe down | tap another tab |
+| Example | product → reviews | add an address, sign in, compose | Home, Search, Basket, Account |
+
+A quick test decides most cases. If the user must **finish or abandon** it before carrying on, present it. If it's **deeper into the same thing**, push it. If it's a **place they'll switch between** and expect to find as they left it, make it a tab.
+
+The mistakes are mixing the meanings. A product page presented as a sheet loses the back stack: the user can't go from product to reviews to another product and back. A sign-in screen pushed onto a stack invites the user to tap Back halfway through. A "Basket" that's a pushed screen in every tab is five different baskets with five different back stacks.
+
+## The container tree
+
+Step through where each kind of navigation lives in a typical shopping app.
+
+```visual flow
+title: The container tree of a tabbed app
+nodes:
+  - { id: window, label: UIWindow, kind: client, at: [2, 0] }
+  - { id: tabs, label: Tab bar controller, kind: view, at: [2, 1] }
+  - { id: sheet, label: Address sheet, kind: view, at: [4, 1] }
+  - { id: home, label: Home stack, kind: view, at: [0, 2] }
+  - { id: basket, label: Basket stack, kind: view, at: [2, 2] }
+  - { id: account, label: Account stack, kind: view, at: [4, 2] }
+  - { id: product, label: Product 7, kind: view, at: [0, 3] }
+  - { id: reviews, label: Reviews, kind: view, at: [1.5, 3] }
+edges:
+  - [window, tabs, root]
+  - [tabs, home]
+  - [tabs, basket]
+  - [tabs, account]
+  - [home, product, push]
+  - [product, reviews, push]
+  - [tabs, sheet, present, { style: async }]
+steps:
+  - say: "The window's **root view controller** is the tab bar controller. There's exactly one root, and everything else hangs below it."
+    show: [window, tabs]
+    send: window->tabs
+  - say: "Each tab is its own **navigation controller**, with its own stack. The tab bar controller keeps all of them alive while you switch."
+    show: [home, basket, account]
+    active: [home, basket, account]
+  - say: "Tapping a product **pushes** onto the Home stack only. The other stacks don't know it happened."
+    show: [product]
+    send: home->product
+    label: { home: "2 screens" }
+  - say: "Reviews push on top. Back pops one screen at a time, all within Home."
+    show: [reviews]
+    send: product->reviews
+    label: { home: "3 screens" }
+  - say: "Switch to Basket and back: the Home stack is exactly where it was. That's the promise a tab makes."
+    active: [basket]
+  - say: "Adding an address is a separate task, so it's **presented** from the tab bar controller. It covers the tab bar and has its own navigation controller for Cancel and Save."
+    show: [sheet]
+    send: tabs->sheet
+    state: { sheet: active }
+  - say: "When it's dismissed, everything underneath is untouched: the same tab, the same three Home screens."
+    state: { sheet: null }
+    hide: [sheet]
+```
+
+That tree has two rules worth remembering, because breaking them causes most of the bugs in this lesson:
+
+1. **One navigation controller per tab**, never one navigation controller around the tab bar controller. Wrapping the tab bar in a stack means pushing a product hides the tab bar for good and every tab shares one back stack.
+2. **A modal flow gets its own navigation controller.** The address form, the sign-in flow and the checkout each live in a fresh `UINavigationController` that's presented. Their pushes stay inside the sheet, and dismissing it throws the whole flow away at once.
+
+Building the tree takes a few lines in the scene delegate. Since iOS 18, tabs are `UITab` values; each one builds its view controller when it's first needed.
+
+```swift check ios title="SceneDelegate.swift"
+import UIKit
+
+final class HomeViewController: UIViewController {}
+final class BasketViewController: UIViewController {}
+final class AccountViewController: UIViewController {}
+
+enum AppTab: String {
+    case home, basket, account
+}
+
+final class SceneDelegate: UIResponder, UIWindowSceneDelegate {
+    var window: UIWindow?
+
+    func scene(_ scene: UIScene, willConnectTo session: UISceneSession, options connectionOptions: UIScene.ConnectionOptions) {
+        guard let windowScene = scene as? UIWindowScene else { return }
+
+        let tabs = UITabBarController()
+        // Each tab gets its own navigation controller, so each keeps its own back stack
+        tabs.tabs = [
+            UITab(title: "Home", image: UIImage(systemName: "house"), identifier: AppTab.home.rawValue) { _ in
+                UINavigationController(rootViewController: HomeViewController())
+            },
+            UITab(title: "Basket", image: UIImage(systemName: "bag"), identifier: AppTab.basket.rawValue) { _ in
+                UINavigationController(rootViewController: BasketViewController())
+            },
+            UITab(title: "Account", image: UIImage(systemName: "person"), identifier: AppTab.account.rawValue) { _ in
+                UINavigationController(rootViewController: AccountViewController())
+            },
+        ]
+        // On iPad the tab bar can expand into a sidebar; on iPhone it's an ordinary tab bar
+        tabs.mode = .tabSidebar
+
+        let window = UIWindow(windowScene: windowScene)
+        window.rootViewController = tabs
+        window.makeKeyAndVisible()
+        self.window = window
+    }
+}
+```
+
+Before iOS 18 you assign `tabs.viewControllers` an array of navigation controllers instead, each with a `tabBarItem`. Both work; `UITab` adds identifiers you can select by, tab groups for the iPad sidebar, and user customisation.
+
+## The navigation stack is an array
+
+A `UINavigationController` is a container whose state is one array, `viewControllers`, bottom first. Every operation is a change to that array, and the controller animates from the old array to the new one:
+
+| Call | The array before → after |
+| --- | --- |
+| `pushViewController(reviews, animated:)` | `[home, product]` → `[home, product, reviews]` |
+| `popViewController(animated:)` | `[home, product, reviews]` → `[home, product]` |
+| `popToRootViewController(animated:)` | `[home, product, reviews]` → `[home]` |
+| `setViewControllers([home, orders, order], animated:)` | anything → exactly that |
+
+`setViewControllers(_:animated:)` is the one people forget, and it's the most useful for design. It builds a whole stack in one step, with **one** animation to the new top screen and a correct back stack underneath. Use it whenever the destination is more than one screen away: a deep link to an order (`[account, orders, order 42]`), or replacing a flow so Back can't return to it (after sign-in, `[welcome, signIn]` becomes `[home]`). Pushing three screens in a row instead plays three animations, and a push that starts while the previous one is still animating can be dropped.
+
+```swift check ios title="Building a stack in one step"
+import UIKit
+
+extension UINavigationController {
+    /// Shows `screens` above the root in one step: one animation, and a back stack that makes sense
+    func show(_ screens: [UIViewController], animated: Bool) {
+        guard let root = viewControllers.first else { return }
+        setViewControllers([root] + screens, animated: animated)
+    }
+}
+```
+
+Three more things belong to the stack:
+
+- **Each screen configures its own bar.** Title, buttons and the back button's text live on the screen's `navigationItem`, not on the navigation controller, so a screen looks the same in any stack.
+- **`hidesBottomBarWhenPushed`** hides the tab bar while a screen is on top, for screens that need the whole height (a full-screen photo, a checkout step). It's set on the screen being pushed, before the push.
+- **The system can pop without asking you.** The back button and the edge swipe pop a screen without calling any of your code. If something must happen when a screen leaves (finishing a flow, releasing an object that owns it), become the navigation controller's `delegate` and watch `navigationController(_:didShow:animated:)`. You'll build that properly in the lesson on coordinators in UIKit, later in this module.
+
+## Presenting: one at a time, from the top
+
+`present(_:animated:)` shows a view controller modally *from* another one, and the pair is linked: the presenter's `presentedViewController` is the sheet, and the sheet's `presentingViewController` is the presenter. Three rules decide whether a presentation works.
+
+**One presented controller per presenter.** A view controller that's already presenting something can't present a second thing. UIKit logs `Attempt to present … which is already presenting …` and shows nothing. To show an alert over a sheet, present it *from the sheet*: from the top of the presentation chain.
+
+**Not during a transition.** Presenting while another presentation or dismissal is still animating fails the same quiet way. Chain the second call in the first one's `completion`.
+
+**Dismissal belongs to the presenter.** Calling `dismiss(animated:)` on the presented controller forwards the call to its presenter, which dismisses it *and everything presented above it*. That's convenient for "close the whole flow" and surprising when you meant to close only an alert.
+
+Since iOS 13 the default style (`.automatic`) is a **page sheet** on iPhone: a card the user can swipe down. Since iOS 15 a sheet can stop at a medium height with `detents`, and since iOS 16 at custom heights. `.fullScreen` covers everything and can't be swiped away; use it for things like a camera or a media player, where the card shape would get in the way.
+
+A swipe-down is a dismissal your code didn't ask for, so a sheet with unsaved work must decide what a swipe means:
+
+```swift check ios title="An address sheet that protects unsaved edits"
+import UIKit
+
+final class AddressFormViewController: UIViewController {
+    var hasUnsavedChanges = false
+    var onFinish: (() -> Void)?
+}
+
+final class BasketViewController: UIViewController, UIAdaptivePresentationControllerDelegate {
+    private var form: AddressFormViewController?
+
+    func addAddressTapped() {
+        let form = AddressFormViewController()
+        form.onFinish = { [weak self] in self?.dismiss(animated: true) }
+
+        // A modal task gets its own navigation controller: its own bar, its own pushes
+        let navigation = UINavigationController(rootViewController: form)
+        if let sheet = navigation.sheetPresentationController {
+            sheet.detents = [.medium(), .large()]
+            sheet.prefersGrabberVisible = true
+        }
+        navigation.presentationController?.delegate = self
+        self.form = form
+        present(navigation, animated: true)
+    }
+
+    // Asked when the user starts to swipe the sheet down
+    func presentationControllerShouldDismiss(_ presentationController: UIPresentationController) -> Bool {
+        !(form?.hasUnsavedChanges ?? false)
+    }
+
+    // The swipe was refused: ask instead of silently throwing the edits away
+    func presentationControllerDidAttemptToDismiss(_ presentationController: UIPresentationController) {
+        let confirm = UIAlertController(title: "Discard this address?", message: nil, preferredStyle: .actionSheet)
+        confirm.addAction(UIAlertAction(title: "Discard", style: .destructive) { [weak self] _ in
+            self?.dismiss(animated: true)
+        })
+        confirm.addAction(UIAlertAction(title: "Keep editing", style: .cancel))
+        // Present from the top of the chain: the sheet, not this screen, which is already presenting
+        presentationController.presentedViewController.present(confirm, animated: true)
+    }
+
+    // Only for a swipe-down; dismiss(animated:) in code never calls it
+    func presentationControllerDidDismiss(_ presentationController: UIPresentationController) {
+        form = nil
+    }
+}
+```
+
+Two details in there catch people out. `presentationControllerDidDismiss` runs only for an interactive dismissal, so cleanup that must always happen can't live there alone. And the confirmation is presented from the sheet, because the basket screen is already presenting.
+
+`isModalInPresentation = true` is the blunter tool: no swipe at all, for moments like a payment in progress.
+
+## Tab bars: parallel places
+
+A `UITabBarController` keeps every tab's view controller alive and shows one at a time. Switching tabs changes nothing inside any tab, which is the whole point: the user left Home three screens deep and expects to find it that way.
+
+- **Tapping the selected tab again** pops that tab's navigation controller to its root. Users rely on this as "take me home", so don't fight it.
+- **Intercepting a tab.** The delegate's `tabBarController(_:shouldSelectTab:)` (iOS 18; `shouldSelect` with a view controller before that) lets you refuse a selection. Apps use it for a "Sell" or "Post" tab that presents a modal composer instead of switching.
+- **Keep to five or fewer.** On iPhone the bar shows at most five items; more fold into a "More" list that few users find.
+- **Selecting from code** (`selectedTab = tabs.tab(forIdentifier: "account")`) is how deep links and notifications get to the right place.
+
+## Getting anywhere from anywhere
+
+Put the three containers together and you can answer the question every push notification asks: *show order 42*, starting from whatever the user happens to be looking at. The order of the steps matters.
+
+```swift check ios title="Showing an order from anywhere"
+import UIKit
+
+final class OrdersViewController: UIViewController {}
+
+final class OrderViewController: UIViewController {
+    let orderID: String
+
+    init(orderID: String) {
+        self.orderID = orderID
+        super.init(nibName: nil, bundle: nil)
+    }
+
+    required init?(coder: NSCoder) { nil }
+}
+
+@MainActor
+func showOrder(_ orderID: String, in tabs: UITabBarController) {
+    let reveal = {
+        // 2. Switch to the tab that owns orders
+        tabs.selectedTab = tabs.tab(forIdentifier: "account")
+        guard let stack = tabs.selectedTab?.viewController as? UINavigationController,
+              let root = stack.viewControllers.first else { return }
+        // 3. Build the whole stack in one step, so Back goes to the order list
+        stack.setViewControllers([root, OrdersViewController(), OrderViewController(orderID: orderID)], animated: false)
+    }
+    // 1. Never push behind a sheet: close whatever is presented first, then reveal
+    if tabs.presentedViewController != nil {
+        tabs.dismiss(animated: true, completion: reveal)
+    } else {
+        reveal()
+    }
+}
+```
+
+Dismiss, then select, then set the stack. Do it in another order and you push onto a stack the user can't see, or try to present while a dismissal is animating. In a real app this function lives in a coordinator or router, not a free function, and that's where the next lessons go.
+
+## Trade-offs
+
+| | Push | Page sheet | Full-screen modal | New tab | Replace the root |
+| --- | --- | --- | --- | --- | --- |
+| Keeps context visible | yes, one tap back | partly: the screen behind shows | no | the other tab is kept | no |
+| User can leave without finishing | Back, any time | swipe down (unless you refuse) | only through your buttons | always | no |
+| Owns a back stack | shares the current one | its own, if you give it a navigation controller | its own | its own | starts fresh |
+| Typical use | detail, drill-down | short tasks: compose, filter, add | camera, player, onboarding | top-level sections | sign-in to signed-in, onboarding to main |
+
+Push for hierarchy, sheets for short self-contained tasks, full-screen for immersive or must-finish tasks, tabs for the app's main places, and a root swap for a change of mode (signed out to signed in) where nothing before it should be reachable.
+
+<Callout kind="interview">
+
+**What to say:** "The window's root is a tab bar controller; each tab owns a navigation controller with its own stack; modal tasks are presented from the top of the presentation chain in their own navigation controller. Deep links dismiss what's presented, select the tab, then set the stack in one call." Then name who decides all this, which is the subject of the coordinator and router lessons.
+
+**What to ask:** which screens can be reached from outside the app? Is iPad in scope (the tab bar becomes a sidebar)? Are there tasks that must not be abandoned halfway, like payment?
+
+**Red flags:** one navigation controller wrapping the tab bar controller; presenting from a controller that's already presenting; pushing a sequence of screens one by one for a deep link; casting `window?.rootViewController` deep inside a feature screen.
+
+</Callout>
+
+<Callout kind="gotcha" title="iOS gotcha: presentations fail quietly">
+
+A `present` from a controller that's already presenting, or during another transition, doesn't crash. It logs a line in the console and does nothing, so in production it looks like a button that sometimes doesn't work. Present from the top of the chain (walk `presentedViewController` until it's `nil`), and sequence presentations through completion handlers. Pushing the *same instance* twice is different: that one crashes, with "Pushing the same view controller instance more than once is not supported".
+
+</Callout>
+
+## Practice
+
+[Review: screens that push each other](/design/practice/sd-review-navigation-pushy-screens) is a shop where view controllers build and push each other, reach into the tab bar with force casts, and handle deep links in two places. Several of its findings are about this lesson's containers: pushing behind a sheet, and a screen that assumes it knows the window's root.
+
+```cards
+- id: push-present-tab
+  front: "How do you choose between push, present and a tab?"
+  back: "Push for more detail about what was tapped, present for a separate task the user finishes or cancels, a tab for a top-level place they switch between and expect to find as they left it."
+- id: one-nav-per-tab
+  front: "Where do navigation controllers go in a tabbed app?"
+  back: "One inside each tab, never one around the tab bar controller. Each modal flow also gets its own navigation controller, presented."
+- id: set-view-controllers
+  front: "Why use `setViewControllers(_:animated:)` for a deep link?"
+  back: "It builds the whole stack in one step: one animation to the new top and a correct back stack, instead of several pushes that animate one by one and can be dropped."
+- id: present-from-top
+  front: "Why does `present` sometimes do nothing?"
+  back: "The presenter is already presenting something, or a transition is still running. Present from the top of the presentation chain, and chain presentations in completion handlers."
+```
+
+```quiz
+- id: q1
+  type: sort
+  prompt: "In a shopping app, how should each screen be shown?"
+  buckets: [Push, Present, Tab]
+  items:
+    - ["The reviews for the product you're looking at", 0]
+    - ["Adding a new delivery address", 1]
+    - ["Your basket, reachable from anywhere", 2]
+    - ["Signing in before checkout", 1]
+    - ["A category inside the category you tapped", 0]
+    - ["Your account and orders", 2]
+  explain: "Drill-down detail is pushed. A self-contained task you finish or cancel (an address, a sign-in) is presented. Places you switch between and expect to find as you left them are tabs."
+- id: q2
+  type: mcq
+  prompt: "A sheet is showing on the Basket tab when a notification asks for order 42. The handler selects the Account tab and pushes the order. What does the user see?"
+  options:
+    - "The order, on the Account tab"
+    - "The sheet, still up: the tab switched and the push happened behind it"
+    - "A crash, because you can't switch tabs while presenting"
+    - "UIKit dismisses the sheet automatically, then shows the order"
+  answer: 1
+  explain: "The sheet is presented from the tab bar controller, so it covers every tab. The tab switch and the push both happen underneath it. Dismiss what's presented first, then select the tab and set the stack."
+- id: q3
+  type: bug
+  prompt: "Tapping Remove shows nothing, and the console says the controller is already presenting. Which line is the problem?"
+  code: |
+    final class BasketViewController: UIViewController {
+        func editTapped() {
+            let editor = UINavigationController(rootViewController: EditBasketViewController())
+            present(editor, animated: true)
+        }
+
+        // Called by the editor, which is still on screen
+        func confirmRemoval() {
+            let alert = UIAlertController(title: "Remove item?", message: nil, preferredStyle: .alert)
+            alert.addAction(UIAlertAction(title: "Remove", style: .destructive))
+            present(alert, animated: true)
+        }
+    }
+  answer: 11
+  explain: "The basket screen is already presenting the editor, so it can't present the alert too. Present it from the top of the chain: `presentedViewController?.present(alert, animated: true)`, or from the editor itself."
+- id: q4
+  type: truefalse
+  prompt: "`setViewControllers([root, orders, order], animated: true)` plays a push animation for each of the two new screens."
+  answer: false
+  explain: "It animates once, from the current top to the new top, and the back stack underneath is already in place. That's why it's the right call for deep links and for replacing a flow."
+- id: q5
+  type: multi
+  prompt: "Which are good reasons to give a presented flow its own `UINavigationController`? Choose all that apply."
+  options:
+    - "Its screens can push within the sheet, with their own back button"
+    - "It gets a navigation bar for Cancel and Save"
+    - "Dismissing it throws the whole flow away in one step"
+    - "It makes the sheet impossible to swipe away"
+  answer: [0, 1, 2]
+  explain: "A navigation controller gives the flow a bar and a stack of its own, and dismissal removes all of it at once. Refusing the swipe is a separate decision: `isModalInPresentation` or the presentation controller's delegate."
+```

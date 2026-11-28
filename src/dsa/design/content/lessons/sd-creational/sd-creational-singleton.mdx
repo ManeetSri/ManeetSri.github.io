@@ -1,0 +1,267 @@
+## Why it matters
+
+`URLSession.shared`, `UserDefaults.standard`, `UIApplication.shared`, `FileManager.default`: you use singletons, or things that look like them, in every app. They're also the pattern interviewers ask about most, usually as "what's wrong with singletons?" To answer well you need to know how Swift creates them, what Swift 6 demands of them, and the difference between a real singleton and a **shared default**, which is what most of Apple's are.
+
+## Two promises in one pattern
+
+The Gang of Four: *ensure a class only has one instance, and provide a global point of access to it.* That's two separate promises:
+
+1. **Uniqueness:** there is exactly one instance, and nobody can make another.
+2. **Global access:** any code, anywhere, can reach it by name.
+
+Keep them apart in your head. Uniqueness is sometimes exactly right: there is one audio session, one application object, one database file that must be opened once. Global access is what causes the trouble, as you'll see in [Why to avoid singletons, and testable alternatives](/design/learn/sd-creational-singleton-alternatives). Most good designs keep the first promise and drop the second.
+
+## Writing one in Swift
+
+```swift run
+final class Analytics: Sendable {
+    static let shared = Analytics()
+    private init() { print("Analytics created") }
+
+    func track(_ event: String) { print("track \(event)") }
+}
+
+print("App launched")
+print("First screen shown")
+Analytics.shared.track("tap")
+Analytics.shared.track("scroll")
+```
+
+```output
+App launched
+First screen shown
+Analytics created
+track tap
+track scroll
+```
+
+Three parts, each doing a job:
+
+- **`static let shared`.** Swift initialises static and global stored properties **lazily, on first access**, and guarantees the initialiser runs **exactly once**, even if several threads arrive at the same moment. On Apple platforms it's built on the same mechanism as `dispatch_once`, which is why Swift never needed the Objective-C `+sharedInstance` boilerplate. The output shows the laziness: `Analytics created` appears at the first use, not at launch.
+- **`private init()`** enforces uniqueness: nobody outside the type can call `Analytics()`.
+- **`final`** stops a subclass from adding a second, different kind of instance.
+
+Lazy and once-only are good properties, but "once" means the first caller **waits** for the initialiser, and "lazy" means you don't control *when* that is. If the initialiser is slow, the cost lands on whichever thread gets there first:
+
+```visual timeline
+title: Two threads reach an uninitialised static let
+unit: ms
+lanes:
+  - { id: main, label: Main thread }
+  - { id: bg, label: Background task }
+spans:
+  - { lane: main, from: 0, to: 8, label: scrolling, tone: ok }
+  - { lane: main, from: 8, to: 48, label: ImageCache.init reads its index, tone: error }
+  - { lane: bg, from: 20, to: 48, label: waits for init, tone: wait }
+  - { lane: main, from: 48, to: 60, label: scrolling, tone: ok }
+  - { lane: bg, from: 48, to: 56, label: uses cache, tone: ok }
+markers:
+  - { at: 16.7, label: frame }
+  - { at: 33.3, label: frame }
+steps:
+  - { at: 0, say: "The list is scrolling smoothly. Nothing has touched `ImageCache.shared` yet." }
+  - { at: 8, say: "The first cell reads `ImageCache.shared`, so its `init` runs **now**, on the main thread, and starts reading from disk." }
+  - { at: 20, say: "A background task reaches `ImageCache.shared` too. Swift guarantees a single initialisation, so it **blocks** until the first one finishes." }
+  - { at: 34, say: "Two frame deadlines pass while `init` is still reading: the scroll visibly hitches." }
+  - { at: 48, say: "`init` returns. Both threads get the same instance, and every later access is a cheap read." }
+  - { at: 60, say: "Keep singleton initialisers trivial, or create the instance deliberately at a quiet moment instead of on first use." }
+```
+
+You'll come back to this in [Lazy initialisation](/design/learn/sd-creational-lazy): lazy creation moves a cost, it doesn't remove it.
+
+## Swift 6: a singleton is a global
+
+A `static let` is global state that any thread can reach, so Swift 6's data-race checking applies to it. A singleton whose type isn't `Sendable` doesn't compile, and a mutable `static var` never does unless it's isolated to an actor:
+
+```swift
+final class ImageCache {
+    static let shared = ImageCache()
+    private var images: [String: [UInt8]] = [:]
+}
+
+final class Session {
+    static var current = Session()
+}
+```
+
+```text title="What you'll see"
+error: static property 'shared' is not concurrency-safe because non-'Sendable' type 'ImageCache' may have shared mutable state
+error: static property 'current' is not concurrency-safe because it is nonisolated global shared mutable state
+```
+
+The compiler is pointing at a real problem: two threads could mutate `images` at once. You have three honest ways to make a singleton safe, and they differ in who can call it and how:
+
+```swift check
+import Foundation
+import Synchronization
+
+// 1. Main-actor isolated: for state the UI owns
+@MainActor
+final class ThemeStore {
+    static let shared = ThemeStore()
+    private init() {}
+
+    var accentName = "teal"
+}
+
+// 2. An actor: every call from outside is async, and the actor serialises access
+actor ThumbnailCache {
+    static let shared = ThumbnailCache()
+    private var thumbnails: [URL: Data] = [:]
+
+    func thumbnail(for url: URL) -> Data? { thumbnails[url] }
+    func store(_ data: Data, for url: URL) { thumbnails[url] = data }
+}
+
+// 3. A Sendable class guarding its state with a Mutex: synchronous calls from any thread
+final class FeatureFlags: Sendable {
+    static let shared = FeatureFlags()
+    private let flags = Mutex<[String: Bool]>([:])
+
+    func isEnabled(_ name: String) -> Bool {
+        flags.withLock { $0[name] ?? false }
+    }
+
+    func set(_ name: String, enabled: Bool) {
+        flags.withLock { $0[name] = enabled }
+    }
+}
+
+func useThem() async {
+    let flagOn = FeatureFlags.shared.isEnabled("newCheckout")
+    let cached = await ThumbnailCache.shared.thumbnail(for: URL(string: "https://img.example.com/1.jpg")!)
+    let accent = await ThemeStore.shared.accentName
+    print(flagOn, cached == nil, accent)
+}
+```
+
+`Mutex` comes from the Synchronization module (iOS 18, macOS 15). There's also a dishonest way: `nonisolated(unsafe) static var shared` or `@unchecked Sendable` tell the compiler to stop checking, and promise that you synchronise access yourself. They exist for code the compiler can't reason about, such as state already protected by a lock it can't see. As a way to make an error go away, they're the singleton bug of the 2010s with the warning switched off, and reviewers rightly flag them. [Sendable and isolation as design constraints](/design/learn/sd-swift-design-sendable) covers the options in depth.
+
+## Apple's shared instances
+
+Look closely at Apple's "singletons" and most aren't singletons at all. They're **shared defaults**: a convenient instance of a type you're free to create yourself.
+
+| Shared instance | Really only one? | Can you make your own? | Worth knowing |
+| --- | --- | --- | --- |
+| `UIApplication.shared` | Yes: one per process | No: UIKit creates it at launch | Unavailable in app extensions |
+| `UIDevice.current` | Yes | No | Models the physical device |
+| `AVAudioSession.sharedInstance()` | Yes: the app's audio session | No | Configure it once, deliberately |
+| `UNUserNotificationCenter.current()` | Yes, for the app | No | |
+| `URLSession.shared` | No | `URLSession(configuration:delegate:delegateQueue:)` | No delegate, no background transfers, no custom configuration |
+| `FileManager.default` | No | `FileManager()` | Make your own if you need a delegate |
+| `NotificationCenter.default` | No | `NotificationCenter()` | Your own keeps tests and module events private |
+| `UserDefaults.standard` | No | `UserDefaults(suiteName:)` | App Groups need a suite |
+
+The second half of the table is the healthier design, and Apple uses it for a reason: the **type** isn't restricted to one instance; the **app** happens to share one. Tests can make a fresh `NotificationCenter()`, a widget can use `UserDefaults(suiteName: "group.com.example.app")`, and an upload feature can have its own `URLSession` with a delegate. Apple's own documentation for `URLSession.shared` lists its limits: you can't get data incrementally, customise connection behaviour much, do much authentication, or transfer in the background. A singleton that serves one common case, with a real initialiser for everything else, is a good API. A type you can **only** get as `.shared` locks every caller into the common case.
+
+Apple has also retired a singleton the platform outgrew. `UIScreen.main` made sense when an iPhone had one screen. With iPad multitasking, external displays and multiple scenes there is no single "the screen", so Apple long recommended finding the screen through context (`view.window?.windowScene?.screen`) or the trait collection, and formally deprecated `UIScreen.main` in iOS 26. A global "the X" is a bet that there will only ever be one X.
+
+Notice too what Apple did **not** make a singleton: `Logger` from the `os` framework is a struct you create per subsystem and category, `Logger(subsystem: "com.example.app", category: "sync")`. It's cheap to create, carries its own context, and there's no global logger to configure.
+
+## When a singleton is the right answer
+
+A true singleton, one instance enforced by the type, fits when:
+
+- it **models something there really is one of** in the process: the application, the device, the audio session, the hardware haptics engine, a database file that must be opened once;
+- **two instances would be a bug**, not just a waste, for example two Core Data stacks opening the same store file;
+- its state is either **global by nature** or **immutable after launch**.
+
+Even then, you can keep uniqueness without global access: create the one instance at start-up and **pass it in**. That's the next lesson.
+
+## Trade-offs
+
+| | `@MainActor` class | `actor` | `Sendable` class + `Mutex` | `nonisolated(unsafe)` | One instance created at start-up and passed in |
+| --- | --- | --- | --- | --- | --- |
+| Data-race safety | Checked | Checked | Checked | Your promise only | Whatever the type provides |
+| Calls from background code | `await` | `await` | Synchronous | Synchronous | Synchronous or `await` |
+| Good for | UI state: theme, navigation, haptics | Caches and stores with async work | Small, fast, synchronous state like flags | Bridging code the compiler can't see into | Almost everything else |
+| Testable | Poorly: one global instance | Poorly | Poorly | Poorly | Well: tests pass their own |
+
+<Callout kind="interview">
+
+**What to say:** "There are two promises: one instance, and global access. I keep the first when the thing really is unique, but I create it at the composition root and inject it, so code says what it depends on and tests can substitute it." Then mention Swift 6: a shared instance must be `Sendable` or actor-isolated.
+
+**What to ask:** "Would two instances be a bug, or just wasteful? Does anything need a different configuration, such as a background URL session?"
+
+**Red flags:** "singletons are always bad" with no nuance; `nonisolated(unsafe) static var shared` with no locking; a singleton with a public `init` (it's just a global variable); heavy work in a singleton's initialiser.
+
+</Callout>
+
+<Callout kind="gotcha" title="iOS gotcha: every extension gets its own singletons">
+
+A widget, a share extension or a notification service extension runs in **its own process**. `MyCache.shared` in the widget is a different object from `MyCache.shared` in the app, created separately and starting empty. Share data through an App Group container or `UserDefaults(suiteName:)`, never through a singleton. And `UIApplication.shared` is marked unavailable in extensions, so a shared framework that calls it won't build for one.
+
+</Callout>
+
+## Practice
+
+The **singletons and hidden construction** review asks you to find what's wrong with a profile screen built on `nonisolated(unsafe)` singletons, and the **testable review prompter** kata replaces a `.shared` prompter with one you can test.
+
+```cards
+- id: singleton-two-promises
+  front: "What two promises does the singleton pattern make, and which one causes most of the trouble?"
+  back: "Exactly one instance, and global access to it. Global access causes most of the trouble: hidden dependencies and shared mutable state."
+- id: static-let-semantics
+  front: "When is a `static let` initialised, and how many times?"
+  back: "Lazily, on first access, and exactly once, even when several threads arrive together. Callers that arrive during initialisation wait for it."
+- id: swift6-singleton
+  front: "What are the honest ways to make a singleton compile in Swift 6?"
+  back: "Isolate it to the main actor, make it an actor, or make it a `Sendable` class whose mutable state sits behind a `Mutex`. `nonisolated(unsafe)` only switches the checking off."
+- id: shared-default
+  front: "How do most of Apple's 'singletons' differ from the textbook pattern?"
+  back: "They're shared defaults: `URLSession`, `FileManager`, `NotificationCenter` and `UserDefaults` can all be created yourself. The app shares one instance; the type isn't restricted to one."
+```
+
+```quiz
+- id: q1
+  type: sort
+  prompt: "Which of these is a true singleton, and which a shared default you can also create yourself?"
+  buckets: ["True singleton", "Shared default"]
+  items:
+    - ["`UIApplication.shared`", 0]
+    - ["`URLSession.shared`", 1]
+    - ["`AVAudioSession.sharedInstance()`", 0]
+    - ["`NotificationCenter.default`", 1]
+    - ["`UserDefaults.standard`", 1]
+    - ["`UIDevice.current`", 0]
+  explain: "The application, the device and the audio session model things there's one of per process. Sessions, notification centres and defaults are ordinary types with a convenient shared instance."
+- id: q2
+  type: mcq
+  prompt: "In Swift 6, `static let shared = DownloadQueue()` fails because `DownloadQueue` is a class with mutable state. Background tasks call it synchronously today. What's the best fix?"
+  options:
+    - "Mark the property `nonisolated(unsafe)`"
+    - "Mark the class `@MainActor`, so background tasks hop to the main thread for every call"
+    - "Make the class `Sendable` and keep its mutable state inside a `Mutex`"
+    - "Change `static let` to `static var`"
+  answer: 2
+  explain: "A `Mutex` keeps the synchronous API and makes it genuinely safe. `nonisolated(unsafe)` hides the race; `@MainActor` would push background work onto the main thread; `static var` makes it worse (mutable global state)."
+- id: q3
+  type: output
+  prompt: "What does this print?"
+  code: |
+    final class Store: Sendable {
+        static let shared = Store()
+        private init() { print("init") }
+    }
+
+    print("start")
+    _ = Store.shared
+    _ = Store.shared
+    print("end")
+  answer: "start\ninit\nend"
+  explain: "A `static let` is created lazily on first access and only once, so `init` prints after `start`, and only once."
+- id: q4
+  type: truefalse
+  prompt: "A widget extension that reads `ImageCache.shared` sees the images the main app put there."
+  answer: false
+  explain: "Extensions run in their own process, so they get their own instance of every singleton. Share data through an App Group container instead."
+- id: q5
+  type: mcq
+  prompt: "Which is the strongest reason to make a type a true singleton, with a private initialiser?"
+  options:
+    - "Many screens need it, and passing it around is tedious"
+    - "Two instances would be a bug, such as two stacks opening the same database file"
+    - "It's expensive to create"
+    - "It has no state"
+  answer: 1
+  explain: "Uniqueness is worth enforcing when a second instance is actually wrong. Convenience is a reason for a shared instance, not for forbidding others; cost is a reason to create one carefully; stateless types can usually just be created freely."
