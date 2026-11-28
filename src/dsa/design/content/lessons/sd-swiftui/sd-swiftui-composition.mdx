@@ -1,0 +1,364 @@
+## Why it matters
+
+SwiftUI screens grow fast: a 300-line `body` of nested conditionals, a `.task` that fetches, maps and handles errors, formatting sprinkled through it all. Two tools keep a screen healthy: **composition**, small views with clear inputs, and a **model** that holds the logic you'd want to test. Knowing where to split, and when a screen has earned a view model, is what "how would you structure this screen?" is really asking, in interviews and in code review.
+
+## Three ways to split a body
+
+Each way of pulling code out of `body` behaves differently:
+
+```swift check ios group=split title="InboxHeader.swift"
+import SwiftUI
+
+@MainActor
+@Observable
+final class Inbox {
+    var unreadCount = 3
+    var title = "Inbox"
+}
+
+struct InboxScreen: View {
+    let inbox: Inbox
+
+    var body: some View {
+        VStack {
+            header                         // 1. computed property: still this body
+            badge(for: inbox.unreadCount)  // 2. @ViewBuilder function: still this body
+            UnreadBadge(inbox: inbox)      // 3. its own View struct: its own body
+        }
+    }
+
+    private var header: some View {
+        Text(inbox.title).font(.largeTitle)
+    }
+
+    @ViewBuilder
+    private func badge(for count: Int) -> some View {
+        if count > 0 {
+            Text("\(count) unread")
+        }
+    }
+}
+
+struct UnreadBadge: View {
+    let inbox: Inbox
+
+    var body: some View {
+        Text("\(inbox.unreadCount) unread").monospacedDigit()
+    }
+}
+```
+
+1. **A computed property** is part of the parent's body. It reads the same values, so it shares the parent's dependencies and runs whenever the parent does. It's purely organisation.
+2. **A `@ViewBuilder` function** is the same, with parameters. Here it also makes `unreadCount` a dependency of `InboxScreen`, because the screen reads it to call the function.
+3. **A separate `View` struct** gets its own identity, its own state and its own dependencies. SwiftUI can skip it when its inputs haven't changed, and you can preview it alone.
+
+Extract a struct when the piece has **its own state**, **its own dependencies** (especially fast-changing ones), is **reused**, or deserves **a preview** of its own. Use a computed property when you only want `body` to read better.
+
+## Containers that take content
+
+A reusable container takes its content as a generic view built with `@ViewBuilder`. **Store the built view, not the closure**:
+
+```swift check ios group=split
+struct SectionCard<Content: View>: View {
+    let title: String
+    @ViewBuilder let content: Content          // the result, built once by the caller
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            Text(title).font(.headline)
+            content
+        }
+        .padding()
+        .background(.quaternary, in: .rect(cornerRadius: 16))
+    }
+}
+
+struct DeliveryOptions: View {
+    var body: some View {
+        SectionCard(title: "Delivery") {
+            Text("Tomorrow, 7–9 am")
+            Text("Leave with a neighbour")
+        }
+    }
+}
+```
+
+`@ViewBuilder` on a stored property makes the memberwise initialiser accept a builder closure and store what it returns. Storing `let content: () -> Content` instead would call the closure inside `body` every time, and a closure can't be compared, so SwiftUI couldn't tell when the card's input was unchanged.
+
+Two more composition tools let callers change a component without forking it:
+
+- **Styles**, such as `ButtonStyle` and `LabelStyle`: `.buttonStyle(.borderedProminent)` restyles every button in a subtree through the environment. Your own components can offer the same with a style protocol.
+- **View modifiers** for reusable behaviour and decoration, which [SwiftUI view modifiers as decorators](/design/learn/sd-structural-swiftui-modifiers) covered.
+
+Since iOS 18, `Group(subviews:)` and `ForEach(subviews:)` let a container see the individual views it was given, so it can lay them out, count them or put separators between them without the caller's help.
+
+## Presentational and container views
+
+A dependable way to split a screen is by **what a view knows**:
+
+- **Presentational views** take values and closures, and own at most UI state such as "is this expanded". They know nothing about models, services or navigation. They preview with literal data, they're reusable, and they're trivial to snapshot-test.
+- **Container views** own or receive a model, start its work in `.task`, and pass plain values and callbacks down to presentational views. They're thin: wiring, not logic.
+
+That split keeps most of your view code free of dependencies, which is what makes previews cheap, as the last lesson of this module shows.
+
+## Where logic lives: model or view
+
+The question isn't "MVVM or not?" but, for each piece of logic, "would I want to test this?":
+
+- **Pure UI state** (expanded, focused, the scroll target) stays in the view as `@State`.
+- **Everything with rules**: loading and its states, error mapping, validation, derived flags such as `canSave`, optimistic updates and rollbacks. That goes in an `@Observable` model, where a unit test can reach it.
+
+A screen earns a model of its own when it **loads or saves asynchronously**, has **more than two or three states**, holds **rules you'd test**, or **coordinates several services**. A settings screen of toggles bound to a shared `Settings` model doesn't need one, and giving it one adds a layer that only forwards calls. Binding views straight to shared models and services is often called the **MV** approach; D26 and D27 compare it with MVVM in depth.
+
+### Keep the model free of views
+
+A screen model should import Foundation and Observation, not SwiftUI. That's more than tidiness:
+
+- **It decides what's shown, not how.** The model exposes `phase`, `canSave` and a message; the view picks the colour, the icon and the layout. A model holding `Color` or `some View` couples every rule to one design.
+- **It runs anywhere.** A model without SwiftUI types is tested on a Mac in milliseconds, and the same model can drive a widget, a CarPlay template or a UIKit screen during a migration.
+- **Navigation stays outside it,** at least as views: a model may say "show the receipt for order 42", but it doesn't build or push the receipt screen. D20 covers who owns navigation.
+
+The test is simple: if `import SwiftUI` disappeared from the model's file, would it still compile? If yes, the boundary is in the right place.
+
+## A screen, end to end
+
+Here's the shape put together: a protocol-backed service, a screen model, a thin container and presentational views. They share one code block for brevity; in an app the model lives in its own file, with no `import SwiftUI`.
+
+```swift check ios group=trips title="TripListScreen.swift"
+import SwiftUI
+
+struct Trip: Identifiable, Equatable, Sendable {
+    let id: String
+    var name: String
+    var startDate: Date
+}
+
+protocol TripService: Sendable {
+    func trips() async throws -> [Trip]
+    func deleteTrip(id: Trip.ID) async throws
+}
+
+@MainActor
+@Observable
+final class TripListModel {
+    enum Phase: Equatable {
+        case loading
+        case loaded([Trip])
+        case failed(String)
+    }
+
+    private(set) var phase: Phase = .loading
+    private let service: any TripService
+
+    init(service: any TripService) {
+        self.service = service                 // cheap, no side effects: safe however often it runs
+    }
+
+    func load() async {
+        do {
+            phase = .loaded(try await service.trips())
+        } catch is CancellationError {
+            // The screen went away: leave the state alone
+        } catch {
+            phase = .failed("Couldn't load your trips. Pull to try again.")
+        }
+    }
+
+    /// Removes the trip at once, and puts it back if the server refuses
+    func delete(_ id: Trip.ID) async {
+        guard case .loaded(let trips) = phase else { return }
+        phase = .loaded(trips.filter { $0.id != id })
+        do {
+            try await service.deleteTrip(id: id)
+        } catch {
+            phase = .loaded(trips)
+        }
+    }
+}
+
+// Container: owns the model, starts its work, passes values and callbacks down
+struct TripListScreen: View {
+    @State private var model: TripListModel
+
+    init(service: any TripService) {
+        // The service never changes for this screen, so seeding once per identity is right
+        _model = State(initialValue: TripListModel(service: service))
+    }
+
+    var body: some View {
+        Group {
+            switch model.phase {
+            case .loading:
+                ProgressView()
+            case .loaded(let trips):
+                TripList(trips: trips) { id in
+                    Task { await model.delete(id) }
+                }
+            case .failed(let message):
+                ContentUnavailableView("No trips", systemImage: "airplane", description: Text(message))
+            }
+        }
+        .task { await model.load() }
+        .refreshable { await model.load() }
+    }
+}
+
+// Presentational: values in, events out, no idea where trips come from
+struct TripList: View {
+    let trips: [Trip]
+    let onDelete: (Trip.ID) -> Void
+
+    var body: some View {
+        List {
+            ForEach(trips) { trip in
+                TripRow(trip: trip)
+            }
+            .onDelete { offsets in
+                offsets.map { trips[$0].id }.forEach(onDelete)
+            }
+        }
+    }
+}
+
+struct TripRow: View {
+    let trip: Trip
+
+    var body: some View {
+        VStack(alignment: .leading) {
+            Text(trip.name).font(.headline)
+            Text(trip.startDate, format: .dateTime.day().month().year())
+                .foregroundStyle(.secondary)
+        }
+    }
+}
+```
+
+Step through what happens when the user deletes a trip:
+
+```visual flow
+title: A delete, from swipe to server
+layers:
+  - { label: Views, rows: [0, 0] }
+  - { label: Logic, rows: [2, 2] }
+nodes:
+  - { id: row, label: TripList, kind: view, at: [0, 0] }
+  - { id: screen, label: TripListScreen, kind: view, at: [2, 0] }
+  - { id: model, label: TripListModel, kind: service, at: [2, 2] }
+  - { id: service, label: TripService, kind: external, at: [4, 2] }
+edges:
+  - [screen, row, "trips, onDelete"]
+  - [screen, model, "delete(id)"]
+  - [model, service, deleteTrip]
+steps:
+  - say: "The user swipes a row. `TripList` doesn't know what deleting means, so it calls its `onDelete` closure with the trip's id."
+    show: [row, screen, screen->row]
+    send: row->screen
+    state: { row: active }
+  - say: "The container forwards the event to the model. That's all the container does: wiring."
+    show: [model]
+    send: screen->model
+    state: { row: null, model: active }
+  - say: "The model removes the trip **at once** (an optimistic update) and asks the service to delete it."
+    show: [service]
+    send: model->service
+    state: { model: ok, service: wait }
+    label: { model: "phase: 2 trips" }
+  - say: "The new phase invalidates the screen; it builds `TripList` with two trips. If the service throws, the model puts the trip back, and the same path redraws it."
+    send: screen->row
+    state: { service: ok }
+    label: { row: 2 rows }
+```
+
+Every rule lives in `TripListModel`: what counts as loaded, what a failure shows, how a delete rolls back. A test drives it with a fake `TripService`, and `TripList` previews with three literal trips and an empty closure. The container is the only piece that needs both, and it's eight lines of switch.
+
+## The opposite failure: the massive view model
+
+Moving logic out of views can overshoot into one model per screen that does everything: loading, validation, formatting, analytics, navigation and three unrelated sections. Split it the way you'd split a view: a child model per independent section, services for logic other screens reuse, and formatting in small value types. D27 covers splitting view models in depth.
+
+## Trade-offs
+
+| Structure | Testable logic | Previews | Boilerplate | When it wins |
+| --- | --- | --- | --- | --- |
+| Everything in the view | Hardly: logic needs a running view | Need real services | Least | Static or trivial screens |
+| Views on shared models (MV) | In the shared models and services | Need those models, or fakes | Little | Screens that show and edit shared data with little flow of their own |
+| A model per screen | Yes, with fake services | Container needs a model; presentational views don't | A class per screen | Async loading, several states, rules worth testing |
+| Container plus presentational views | Same as the model it uses | Presentational views preview with literals | A few extra types | Any screen you'll reuse parts of, preview or snapshot |
+
+<Callout kind="interview">
+
+**Say:** "I split by what each view knows: presentational views take values and closures; a thin container owns the screen's model and starts its work in `.task`; the model holds every rule I'd test and talks to services through protocols. A static screen doesn't get a view model; one with async loading and several states does." **Ask:** "Which parts of this screen will we reuse, and what has to be tested?" **Red flags:** network calls and error mapping inside `.task` closures, a view model that only forwards to one service, view models that hold views or know about navigation, and 300-line bodies split into computed properties that still depend on everything.
+
+</Callout>
+
+<Callout kind="gotcha" title="Swift gotcha: `AnyView` to return different views from a helper">
+
+A helper that returns different view types on different paths doesn't compile as `some View`, and `AnyView` is the tempting fix. Mark the helper `@ViewBuilder` instead and write the branches as an `if` or `switch`; the result keeps its structure, so SwiftUI keeps its identities and comparisons.
+
+</Callout>
+
+## Practice
+
+The **profile editor model** kata is the model half of this lesson: a draft, validation, a save in flight and its failure, all tested without a view. The **podcast library** design exercise asks you to draw the whole data flow for a feature: which models exist, who owns each, and what each view receives.
+
+```cards
+- id: composition-extract
+  front: "When should you extract a separate `View` struct rather than a computed property?"
+  back: "When the piece has its own state, its own (especially fast-changing) dependencies, is reused or deserves its own preview. A computed property is still the parent's body: same dependencies, same updates."
+- id: composition-split
+  front: "What's the difference between presentational and container views?"
+  back: "Presentational views take values and closures and know nothing about models or services, so they preview with literals. Containers own or receive the model, start its work and wire values and callbacks down."
+- id: composition-model-when
+  front: "When does a SwiftUI screen earn its own view model?"
+  back: "When it loads or saves asynchronously, has more than a couple of states, holds rules worth testing, or coordinates several services. Otherwise bind views to shared models directly."
+```
+
+```quiz
+- id: q1
+  type: mcq
+  prompt: "To speed up a screen, you move its header into `private var header: some View`. The header shows `model.unreadCount`, which changes every few seconds. What changes when the count changes?"
+  options:
+    - "Only the header's code runs, because it's now separate"
+    - "Nothing: the whole screen's body still runs, because the computed property is part of it"
+    - "The header is skipped because it's a computed property"
+    - "SwiftUI caches the computed property until the screen reappears"
+  answer: 1
+  explain: "A computed property is organisation, not a new view: the screen's body reads `unreadCount` through it. Extract a `View` struct that receives the model and reads the count itself."
+- id: q2
+  type: multi
+  prompt: "Which of these suggest a screen deserves its own `@Observable` model? Choose all that apply."
+  options:
+    - "It loads data asynchronously and can fail"
+    - "It's a list of toggles bound to the shared settings model"
+    - "Its Save button depends on validation rules the product team keeps changing"
+    - "It combines results from the search service and the recent-searches store"
+    - "It shows a static About page"
+  answer: [0, 2, 3]
+  explain: "Async work with failure, rules worth testing and coordinating services are what a model is for. Toggles bound to a shared model, and static content, gain only a forwarding layer."
+- id: q3
+  type: mcq
+  prompt: "A reusable `SectionCard<Content: View>` takes its content. Which declaration is best?"
+  options:
+    - "`let content: () -> Content`, called inside `body`"
+    - "`@ViewBuilder let content: Content`, built once when the card is created"
+    - "`let content: AnyView`"
+    - "`@State var content: Content`"
+  answer: 1
+  explain: "Storing the built view keeps its type and lets SwiftUI compare the card's input. A stored closure runs on every body evaluation and can't be compared, `AnyView` erases the structure, and content isn't state."
+- id: q4
+  type: sort
+  prompt: "Where does each responsibility belong?"
+  buckets: [Presentational view, Container view, Screen model]
+  items:
+    - ["Laying out a trip's name and dates", 0]
+    - ["Calling `onDelete` with a trip's id when the user swipes", 0]
+    - ["Starting the load in `.task`", 1]
+    - ["Turning the model's phase into a list, spinner or empty state", 1]
+    - ["Restoring the trip if the delete request fails", 2]
+    - ["Deciding which message a failed load shows", 2]
+  explain: "Presentational views draw values and report events. The container wires the model to them. Every rule with a consequence lives in the model, where it can be tested."
+- id: q5
+  type: truefalse
+  prompt: "A presentational view must not have any `@State`."
+  answer: false
+  explain: "UI-only state such as whether a row is expanded is fine there. What a presentational view mustn't have is knowledge of models, services or navigation."
+```

@@ -1,0 +1,280 @@
+## Why it matters
+
+Previews look like a convenience, but they're also a design test. If a view can't be previewed without the network, a database and a signed-in user, it depends on all three, and every test, reuse and redesign will pay for that. Teams that design for previews end up with views driven by data, services behind protocols, and every state of every screen one click away. Interviewers ask "how do you make SwiftUI views easy to preview and test?" to find out whether you design that way or bolt it on.
+
+## What a preview needs is what the view depends on
+
+Try to preview two views from the composition lesson:
+
+- `TripRow(trip:)` needs one `Trip` value. Its preview is one line.
+- `TripListScreen(service:)` needs something that conforms to `TripService`. Because that's a protocol, a preview can hand it a fake that answers instantly, never answers, or fails.
+
+Now imagine a version of the screen that builds `URLSession.shared` requests inside `.task` and reads a token from the Keychain. Its preview shows a spinner forever, or crashes. Nothing about previews is broken; the preview is reporting a coupling. **When a preview is hard to write, change the view, not the preview.**
+
+## The `#Preview` macro
+
+```swift check ios group=previews title="TripPreviews.swift"
+import SwiftUI
+
+struct Trip: Identifiable, Equatable, Sendable {
+    let id: String
+    var name: String
+    var startDate: Date
+}
+
+extension Trip {
+    static let samples = [
+        Trip(id: "1", name: "Lisbon", startDate: .now),
+        Trip(id: "2", name: "A very long trip name that has to wrap onto a second line", startDate: .now),
+        Trip(id: "3", name: "Kyoto", startDate: .now),
+    ]
+}
+
+struct TripRow: View {
+    let trip: Trip
+
+    var body: some View {
+        VStack(alignment: .leading) {
+            Text(trip.name).font(.headline)
+            Text(trip.startDate, format: .dateTime.day().month().year())
+                .foregroundStyle(.secondary)
+        }
+    }
+}
+
+#Preview("Row", traits: .sizeThatFitsLayout) {
+    TripRow(trip: Trip.samples[0])
+}
+
+#Preview("Long name, largest text") {
+    TripRow(trip: Trip.samples[1])
+        .environment(\.dynamicTypeSize, .accessibility3)
+}
+
+#Preview("Right to left") {
+    List(Trip.samples) { TripRow(trip: $0) }
+        .environment(\.locale, Locale(identifier: "ar"))
+        .environment(\.layoutDirection, .rightToLeft)
+}
+```
+
+`#Preview` (Xcode 15) replaced `PreviewProvider` structs. Each one has a name, optional **traits** (`.sizeThatFitsLayout` for a component, `.landscapeLeft` for orientation), and a body that builds the view with whatever environment you want to check. The canvas's variants mode renders a preview across colour schemes, orientations or Dynamic Type sizes at once.
+
+## Interactive previews with `@Previewable`
+
+A control that edits a binding needs state to edit. `@Previewable` (Xcode 16, for iOS 17 and later) lets you declare it inside the preview:
+
+```swift check ios group=previews
+struct QuantityStepper: View {
+    @Binding var quantity: Int
+
+    var body: some View {
+        Stepper("Quantity: \(quantity)", value: $quantity, in: 1...10)
+    }
+}
+
+#Preview("Stepper") {
+    @Previewable @State var quantity = 2
+    QuantityStepper(quantity: $quantity)
+}
+```
+
+Before it, you wrote a throwaway wrapper view only to hold the `@State`, or passed `.constant(2)` and lost the interaction.
+
+## One preview per state, through fakes
+
+A container's states come from its model, and its model's states come from its service. A configurable fake service makes every state previewable:
+
+```swift check ios group=previews
+protocol TripService: Sendable {
+    func trips() async throws -> [Trip]
+}
+
+struct PreviewTripService: TripService {
+    enum Behaviour: Sendable {
+        case trips([Trip])
+        case fails
+        case neverFinishes
+    }
+
+    var behaviour: Behaviour
+
+    func trips() async throws -> [Trip] {
+        switch behaviour {
+        case .trips(let trips):
+            return trips
+        case .fails:
+            throw URLError(.notConnectedToInternet)
+        case .neverFinishes:
+            try await Task.sleep(for: .seconds(3600))
+            return []
+        }
+    }
+}
+
+@MainActor
+@Observable
+final class TripsModel {
+    enum Phase { case loading, loaded([Trip]), failed }
+    private(set) var phase = Phase.loading
+    private let service: any TripService
+
+    init(service: any TripService) {
+        self.service = service
+    }
+
+    func load() async {
+        do { phase = .loaded(try await service.trips()) } catch { phase = .failed }
+    }
+}
+
+struct TripsScreen: View {
+    @State private var model: TripsModel
+
+    init(service: any TripService) {
+        _model = State(initialValue: TripsModel(service: service))
+    }
+
+    var body: some View {
+        Group {
+            switch model.phase {
+            case .loading: ProgressView()
+            case .loaded(let trips) where trips.isEmpty: ContentUnavailableView("No trips yet", systemImage: "airplane")
+            case .loaded(let trips): List(trips) { TripRow(trip: $0) }
+            case .failed: ContentUnavailableView("You're offline", systemImage: "wifi.slash")
+            }
+        }
+        .task { await model.load() }
+    }
+}
+
+#Preview("Loaded") { TripsScreen(service: PreviewTripService(behaviour: .trips(Trip.samples))) }
+#Preview("Empty") { TripsScreen(service: PreviewTripService(behaviour: .trips([]))) }
+#Preview("Loading") { TripsScreen(service: PreviewTripService(behaviour: .neverFinishes)) }
+#Preview("Offline") { TripsScreen(service: PreviewTripService(behaviour: .fails)) }
+```
+
+Four previews, four states, no network. The same fake drives the model's unit tests. When a designer asks "what does the offline state look like?", the answer is a click, not a test phone in airplane mode.
+
+## Sharing expensive setup with `PreviewModifier`
+
+Some previews need a heavier fixture: an in-memory database, a sample library of 500 items, a configured player. Since iOS 18, a `PreviewModifier` builds that context **once** and shares it across every preview that uses it:
+
+```swift check ios group=previews
+@MainActor
+@Observable
+final class TripLibrary {
+    var trips: [Trip]
+
+    init(trips: [Trip]) {
+        self.trips = trips
+    }
+}
+
+struct SampleLibrary: PreviewModifier {
+    static func makeSharedContext() async throws -> TripLibrary {
+        TripLibrary(trips: Trip.samples)        // imagine decoding a large fixture here
+    }
+
+    func body(content: Content, context: TripLibrary) -> some View {
+        content.environment(context)
+    }
+}
+
+extension PreviewTrait where T == Preview.ViewTraits {
+    @MainActor static var sampleLibrary: Self = .modifier(SampleLibrary())
+}
+
+struct LibraryCount: View {
+    @Environment(TripLibrary.self) private var library
+
+    var body: some View {
+        Text("\(library.trips.count) trips")
+    }
+}
+
+#Preview("From the shared library", traits: .sampleLibrary) {
+    LibraryCount()
+}
+```
+
+It also solves the crash from the environment lesson: any view that needs `TripLibrary` from the environment gets it by adding one trait.
+
+## Trade-offs
+
+| Approach | Setup cost | Shows | Watch out for | When it wins |
+| --- | --- | --- | --- | --- |
+| Literal values into a presentational view | None | Layout, text, Dynamic Type, locales | Nothing | Rows, cards, components |
+| A container with a fake service | One fake per protocol | Every state the model can reach | Fakes drifting from real behaviour | Screens with loading, empty and failure states |
+| A `PreviewModifier` with shared context | One modifier, built once | Views that need shared models | Context shared between previews, so mutations leak | Heavy fixtures, environment objects |
+| Live services in previews | None up front | Whatever the network returns today | Slow, flaky, needs sign-in | Avoid |
+
+<Callout kind="interview">
+
+**Say:** "I treat previews as a coupling check. Presentational views take values, so they preview with literals; containers take services through protocols, so a fake gives me every state; shared fixtures go in a `PreviewModifier`. The same states become snapshot tests." **Ask:** "Which states does design need to sign off: empty, offline, long names, the largest text size?" **Red flags:** previews that hit the real network, only a happy-path preview, and `#if DEBUG` branches inside production views to make them previewable.
+
+</Callout>
+
+<Callout kind="gotcha" title="iOS gotcha: sample data can ship in your app">
+
+Sample JSON, images and fixture types in your app target end up in the App Store build. Put preview-only files in a development asset folder (Xcode's Development Assets setting, which archive builds leave out) and preview-only types behind `#if DEBUG`, or in a separate module the app target doesn't link in Release.
+
+</Callout>
+
+Previews show; they don't check. A preview that renders the wrong total looks fine to a tired reviewer, so keep the rules in the model's unit tests, and when a layout must never regress, turn its preview states into snapshot tests (D59).
+
+## Practice
+
+In the **podcast library** design exercise, the testing section asks for the fakes and fixtures that make every screen previewable. Name each state you'd preview, and the seam each one needs.
+
+```cards
+- id: previews-coupling
+  front: "What does it mean when a view is hard to preview?"
+  back: "It depends on something concrete: the network, a database, a signed-in user. Change the view so it takes values or protocol-typed services, rather than working around it in the preview."
+- id: previews-states
+  front: "How do you preview every state of a screen that loads data?"
+  back: "Give its model a fake service configured to return data, return nothing, fail or never finish, and write one `#Preview` per state."
+- id: previews-modifier
+  front: "What is `PreviewModifier` for?"
+  back: "Building an expensive preview context once (an in-memory store, a sample library) and sharing it across previews through a trait, often by putting it in the environment (iOS 18 and later)."
+```
+
+```quiz
+- id: q1
+  type: mcq
+  prompt: "A `ProfileScreen` preview only ever shows a spinner. The screen calls `URLSession.shared` and reads a token from the Keychain in its `.task`. What's the right fix?"
+  options:
+    - "Add `#if DEBUG` checks inside the screen to skip the request in previews"
+    - "Move the loading into a model that depends on a `ProfileService` protocol, and give previews a fake service"
+    - "Sign in on the simulator so the preview can reach the server"
+    - "Delete the preview; screens that load data can't be previewed"
+  answer: 1
+  explain: "The preview is reporting real coupling. A protocol-typed service lets previews and tests supply any state, and production code stays free of preview branches."
+- id: q2
+  type: blank
+  prompt: "Complete the preview so the stepper can be tapped in the canvas."
+  code: |
+    #Preview {
+        ___ @State var quantity = 1
+        QuantityStepper(quantity: $quantity)
+    }
+  answers: [["@Previewable"]]
+  explain: "`@Previewable` (Xcode 16) declares dynamic properties such as `@State` directly inside a `#Preview` body, so bindings work without a wrapper view."
+- id: q3
+  type: multi
+  prompt: "Which previews are worth writing for a search screen that loads results? Choose all that apply."
+  options:
+    - "Results loaded"
+    - "No results for the query"
+    - "Offline"
+    - "Still loading"
+    - "The largest accessibility text size with long result titles"
+    - "Against the production server, to see real data"
+  answer: [0, 1, 2, 3, 4]
+  explain: "Every state the model can reach, plus the layouts most likely to break, each from a fake. A live-server preview is slow and changes daily, so it can't show a specific state on demand."
+- id: q4
+  type: truefalse
+  prompt: "A full set of previews means a screen doesn't need snapshot or unit tests."
+  answer: false
+  explain: "Previews show; they don't assert. Unit tests check the model's rules, and snapshot tests turn preview states into checks that fail when a layout regresses."
+```

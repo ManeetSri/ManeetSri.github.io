@@ -1,0 +1,359 @@
+<Brief>
+
+You're building the **Library** of a podcast app in SwiftUI, on iOS 18 in Swift 6 language mode. The team has the feed parser, the audio engine and a background download service; your job is the **data flow**: which models exist, who owns each one and for how long, what every view receives, and how each change reaches exactly the views that need it.
+
+What it must do:
+
+- **Library tab:** every episode the user follows, newest first, with filter chips (All, Unplayed, Downloaded). Each row shows the title, show, duration, a played mark, and a download button that turns into a progress ring while downloading. Tap to play, swipe to remove a download.
+- **Downloads:** up to **3 at once**, each reporting progress about **10 times a second**. They continue when the user leaves the tab, and in the background. The Downloads tab's badge shows how many are running.
+- **Mini player:** a bar above the tab bar on every tab, with the episode playing and its elapsed time, updated twice a second.
+- **Episode detail:** description and personal notes the user can edit, saved on the device.
+
+What you know: heavy listeners follow 3,000 episodes or more. Each episode has a feed GUID that never changes. Scrolling must stay smooth on the oldest supported iPhone, at 60 Hz, while three downloads and the player are all updating. Design wants a preview of every row state, and the team wants the models tested without a simulator.
+
+Spend about 35 minutes. Write as if explaining your design to the engineer who'll build the views.
+
+</Brief>
+
+```workspace
+template: component
+minutes: 35
+```
+
+<ModelAnswer section="requirements">
+
+Questions worth asking first: must downloads survive the app being terminated (yes: a background `URLSession`, reattached at launch)? Is there one player for the whole app (yes)? Do played marks and notes sync between devices (not yet: local only, but don't design it out)? Are CarPlay or widgets coming? They'd need the same download and player state outside any view.
+
+- **Callers:** the Library and Downloads tabs, the episode detail, the mini player, and later CarPlay and widgets.
+- **Must:** one source of truth for episodes, downloads and playback; downloads and playback outlive every screen; a progress report or a clock tick re-renders only the view that shows it; the badge and the rows always agree with the downloader; every row state previewable; every model testable without views.
+- **The numbers that shape it:** 3 downloads × 10 reports a second is **30 updates a second**, plus 2 a second from the player. At 60 Hz a frame is 16.7 ms. If each update re-ran the list's body, re-compared 3,000 rows and re-ran every visible row, the main thread would spend a large share of every second frame on work that shows nothing new.
+- **Out of scope:** the audio engine, feed parsing and the download transport itself.
+
+</ModelAnswer>
+
+<ModelAnswer section="api">
+
+Four app-scoped `@Observable` models, all `@MainActor`, plus plain value types for what rows show. The key decision is **where fast-changing values live**: download progress and elapsed time each get their **own small observable**, so the only views that depend on them are the ring and the time label.
+
+```swift check ios group=podcast
+import SwiftUI
+
+/// The feed's GUID: stable for the life of the episode, so it's the row identity everywhere
+struct EpisodeID: Hashable, Sendable {
+    let guid: String
+}
+
+struct Episode: Identifiable, Equatable, Sendable {
+    let id: EpisodeID
+    var title: String
+    var show: String
+    var duration: Duration
+    var isPlayed: Bool
+}
+
+enum LibraryFilter: CaseIterable, Sendable {
+    case all, unplayed, downloaded
+}
+
+/// App-scoped: every saved episode, newest first. Changes when a feed refreshes or an episode is played.
+@MainActor @Observable final class Library {
+    private(set) var episodes: [Episode] = []
+
+    func markPlayed(_ id: EpisodeID) {
+        guard let index = episodes.firstIndex(where: { $0.id == id }) else { return }
+        episodes[index].isPlayed = true
+    }
+}
+
+/// One per running download. Only the row's progress ring reads `fraction`.
+@MainActor @Observable final class DownloadProgress {
+    let episodeID: EpisodeID
+    fileprivate(set) var fraction = 0.0
+
+    init(episodeID: EpisodeID) {
+        self.episodeID = episodeID
+    }
+}
+
+enum DownloadState {
+    case notDownloaded
+    case downloading(DownloadProgress)
+    case failed
+    case downloaded
+}
+
+/// App-scoped. `active` and `downloaded` change only when a download starts, ends or is removed.
+@MainActor @Observable final class DownloadCenter {
+    private(set) var active: [EpisodeID: DownloadProgress] = [:]
+    private(set) var failed: Set<EpisodeID> = []
+    private(set) var downloaded: Set<EpisodeID> = []
+
+    var activeCount: Int { active.count }
+
+    func state(of id: EpisodeID) -> DownloadState {
+        if let progress = active[id] { return .downloading(progress) }
+        if downloaded.contains(id) { return .downloaded }
+        return failed.contains(id) ? .failed : .notDownloaded
+    }
+
+    func start(_ id: EpisodeID) {
+        failed.remove(id)
+        active[id] = DownloadProgress(episodeID: id)
+        // … hands the job to the background URLSession
+    }
+
+    func remove(_ id: EpisodeID) {
+        downloaded.remove(id)
+        // … deletes the file
+    }
+}
+
+/// App-scoped. Elapsed time lives in its own object so only the time label depends on it.
+@MainActor @Observable final class PlaybackClock {
+    fileprivate(set) var elapsed: Duration = .zero
+}
+
+@MainActor @Observable final class Player {
+    private(set) var nowPlaying: Episode?
+    private(set) var isPlaying = false
+    let clock = PlaybackClock()
+
+    func play(_ episode: Episode) {
+        nowPlaying = episode
+        isPlaying = true
+    }
+}
+```
+
+How views use it: the Library screen reads `library.episodes` and `downloads.state(of:)`; a row gets an `Episode` value and a `DownloadState`; only `DownloadRing` reads `progress.fraction`; only `ElapsedLabel` reads `clock.elapsed`.
+
+</ModelAnswer>
+
+<ModelAnswer section="internals">
+
+**Ownership and injection.** The app root creates `Library`, `DownloadCenter` and `Player` once, in `@State`, and puts them in the environment, because many views at many depths need them (rows, the badge, the mini player, the detail). The Library screen is a thin **container**: it owns the filter, reads the models and hands rows **values and closures**. Rows are **presentational**, so they preview with literals.
+
+```swift check ios group=podcast
+/// Presentational: values and closures in, no models
+struct EpisodeRow: View {
+    let episode: Episode
+    let download: DownloadState
+    let onDownload: () -> Void
+
+    var body: some View {
+        HStack {
+            VStack(alignment: .leading) {
+                Text(episode.title).font(.headline)
+                Text(episode.show).foregroundStyle(.secondary)
+            }
+            Spacer()
+            switch download {
+            case .notDownloaded, .failed:
+                Button("Download", systemImage: "arrow.down.circle", action: onDownload).labelStyle(.iconOnly)
+            case .downloading(let progress):
+                DownloadRing(progress: progress)
+            case .downloaded:
+                Image(systemName: "checkmark.circle.fill")
+            }
+        }
+    }
+}
+
+/// The only view that reads `fraction`, so a progress report re-runs this body and nothing else
+struct DownloadRing: View {
+    let progress: DownloadProgress
+
+    var body: some View {
+        ProgressView(value: progress.fraction).progressViewStyle(.circular)
+    }
+}
+
+/// Container: reads the app-scoped models, owns the filter, passes values down
+struct LibraryScreen: View {
+    @Environment(Library.self) private var library
+    @Environment(DownloadCenter.self) private var downloads
+    @Environment(Player.self) private var player
+    @State private var filter = LibraryFilter.all
+
+    private var visible: [Episode] {
+        switch filter {
+        case .all: library.episodes
+        case .unplayed: library.episodes.filter { !$0.isPlayed }
+        case .downloaded: library.episodes.filter { downloads.downloaded.contains($0.id) }
+        }
+    }
+
+    var body: some View {
+        List(visible) { episode in
+            EpisodeRow(episode: episode, download: downloads.state(of: episode.id)) {
+                downloads.start(episode.id)
+            }
+            .contentShape(.rect)
+            .onTapGesture { player.play(episode) }
+            .swipeActions {
+                Button("Remove download", role: .destructive) { downloads.remove(episode.id) }
+            }
+        }
+    }
+}
+
+struct ElapsedLabel: View {
+    let clock: PlaybackClock
+
+    var body: some View {
+        Text(clock.elapsed.formatted(.time(pattern: .minuteSecond))).monospacedDigit()
+    }
+}
+
+/// Created once at the app root, for the whole process
+struct PodcastRoot: View {
+    @State private var library = Library()
+    @State private var downloads = DownloadCenter()
+    @State private var player = Player()
+
+    var body: some View {
+        TabView {
+            Tab("Library", systemImage: "books.vertical") {
+                NavigationStack { LibraryScreen() }
+                    .safeAreaInset(edge: .bottom) { MiniPlayerBar() }
+            }
+            Tab("Downloads", systemImage: "arrow.down.circle") {
+                NavigationStack { Text("Downloads") }
+                    .safeAreaInset(edge: .bottom) { MiniPlayerBar() }
+            }
+            .badge(downloads.activeCount)
+        }
+        .environment(library)
+        .environment(downloads)
+        .environment(player)
+    }
+}
+
+struct MiniPlayerBar: View {
+    @Environment(Player.self) private var player
+
+    var body: some View {
+        if let episode = player.nowPlaying {
+            HStack {
+                Text(episode.title).lineLimit(1)
+                Spacer()
+                ElapsedLabel(clock: player.clock)
+            }
+            .padding()
+            .background(.bar)
+        }
+    }
+}
+```
+
+**How a progress report flows.** The download service's `URLSession` delegate gets `didWriteData` on its delegate queue. It throttles there, passing on at most 10 reports a second and only when the value moved by 1%, then hops to the main actor and sets that download's `DownloadProgress.fraction`. Only `DownloadRing` reads `fraction`, so only its body runs. `active` (and with it the rows and the badge) changes only when a download starts or ends.
+
+**Identity.** The feed GUID is the `Episode.id`, so rows keep their identity across refreshes, filters and relaunches. Filtering happens on the data (`visible`), never with `if` inside the row builder, so `List` gets exactly one row per element and stays lazy. Filtering 3,000 structs takes well under a millisecond and only reruns when the library, the downloaded set or the filter changes, never on progress.
+
+**Mini player.** `MiniPlayerBar` reads `nowPlaying` (it changes when a new episode starts), while `ElapsedLabel` alone reads the clock. On iOS 26, `tabViewBottomAccessory` is the system home for a bar like this; on iOS 18, a `safeAreaInset` on each tab's root keeps it above the tab bar.
+
+**Detail notes.** The detail owns a **draft** of the notes in `@State`, seeded from the episode, with `.id(episode.id)` on the detail so a different episode gets a fresh draft. It saves on Done and when the view disappears, through the library, which is the only writer.
+
+</ModelAnswer>
+
+<ModelAnswer section="concurrency">
+
+| State | Owner | Lives for | Read by | Changes |
+| --- | --- | --- | --- | --- |
+| Episodes | `Library`, in the root's `@State` | The process | Library screen, detail | Feed refresh, played marks |
+| Filter | `LibraryScreen`'s `@State` | The screen's identity | That screen | The user taps a chip |
+| Running and finished downloads | `DownloadCenter` | The process | Rows' download state, the badge | Start, finish, remove: rare |
+| One download's progress | Its `DownloadProgress` | That download | Its ring only | Up to 10 times a second, throttled |
+| Now playing | `Player` | The process | Mini player, rows' "playing" mark | When playback starts or stops |
+| Elapsed time | `PlaybackClock` | The process | `ElapsedLabel` only | Twice a second |
+| Notes draft | Detail's `@State` | The detail's identity, reset by `.id(episode.id)` | The detail | Typing; saved on Done and disappear |
+
+Every model is `@MainActor`, so views read them safely and Swift 6 rejects writes from anywhere else. The work that isn't on the main actor stays outside the models: the download service is an actor wrapping the background session, and its delegate callbacks hop to the main actor only after throttling, so the main thread sees at most 30 small writes a second. No view holds work that must outlive it: downloads and playback belong to app-scoped models, and screens only observe them.
+
+</ModelAnswer>
+
+<ModelAnswer section="failure">
+
+- **A download fails:** the episode moves from `active` to `failed`, its row shows a retry button, and nothing else changes.
+- **The app is terminated mid-download:** the background session carries on. At launch, recreate the session with the same identifier, ask it for its tasks and rebuild `active`; handle `handleEventsForBackgroundURLSession` and call its completion handler.
+- **A late progress report** after completion or cancellation finds no entry in `active` and is dropped, so a finished row never flips back to a ring.
+- **Removing a download that's playing:** stop playback first, or refuse with a message; never delete the file under the player.
+- **An episode leaves the feed** while downloaded or playing: keep it until playback ends, then mark it so the library can tidy it up.
+- **The disk fills:** fail the download with a clear message and delete the partial file.
+- **A missing environment object** crashes the view that reads it. Inject at the root and in one preview trait, and keep the set of environment models small and listed in one place.
+
+</ModelAnswer>
+
+<ModelAnswer section="testing">
+
+- **Models without views:** `Library` filtering and played marks with fixture episodes; `DownloadCenter` against a fake download service that emits progress, completion and failure on demand, checking `active`, `failed`, `downloaded` and `activeCount`; the throttle with a `TestClock`; `Player` with a fake engine.
+- **A granularity test:** track `library.episodes` and `downloads.active` with `withObservationTracking`, deliver 50 progress reports, and expect neither to have fired. That one test stops a future change from writing progress into the list.
+- **Previews:** `EpisodeRow` with literals for every state (not downloaded, downloading at 40%, failed, downloaded, played, a long title at the largest text size); `LibraryScreen` with a `PreviewModifier` that builds a library of 3,000 episodes and a fake download centre with three downloads ticking.
+- **Performance:** a UI test that scrolls the 3,000-episode fixture while downloads run, recorded with the SwiftUI instrument, expecting progress to re-run ring bodies only.
+
+</ModelAnswer>
+
+<ModelAnswer section="tradeoffs">
+
+- **A separate observable per download, rather than a `progress` field on `Episode`:** one more type and a dictionary lookup, but a progress report re-runs one small view instead of the whole list, 30 times a second.
+- **Episodes as structs, not observable objects:** 3,000 objects would cost allocations and bring reference semantics, while episodes change rarely. A played mark re-running the list once is cheap.
+- **The environment for app-scoped models, rather than initialisers:** many views at many depths need them. The cost is dependencies you can't see in an initialiser and a crash if one is missing, which the root injection and a single preview trait contain.
+- **Presentational rows, with the ring as the one exception:** rows take values so they preview and test with literals; the ring takes its progress object, because that's what keeps updates local.
+- **`List` over `LazyVStack`:** it recycles rows and brings swipe actions.
+- **Rejected: one global store with a reducer.** It would give a single event log and easy time-travel debugging, but at this size it's more ceremony than Observation's fine-grained tracking. Revisit if sync between devices brings conflict rules worth centralising.
+- **Evolution:** CarPlay and widgets need downloads and playback outside SwiftUI, which is why those models hold no view types. Syncing played marks later adds a sync layer under `Library`; the views don't change.
+
+</ModelAnswer>
+
+```rubric
+- id: ownership
+  label: Gave every piece of state one owner with the right lifetime
+  skill: client
+  look_for:
+    - Downloads and playback owned by app-scoped models, never by a row or a screen
+    - The filter as the screen's own state
+    - The notes draft reset per episode (for example with `.id(episode.id)`) and saved through one writer
+- id: granularity
+  label: Kept fast-changing values away from the list
+  skill: performance
+  look_for:
+    - Progress in its own observable (or equivalent) read only by the progress view
+    - Elapsed time read only by a small label
+    - Progress throttled before it reaches the main actor
+    - The arithmetic, or an equivalent argument, for why per-report list updates would drop frames
+- id: identity
+  label: Used stable identity and kept the list lazy
+  skill: client
+  look_for:
+    - The feed GUID as the row id, never an index or a fresh UUID
+    - Filtering in the data, with one row per element, and `List` (or a lazy stack) for 3,000 rows
+- id: flow
+  label: Made the data flow explicit
+  skill: architecture
+  look_for:
+    - Models created once at the root and injected, with the reason for using the environment
+    - A container screen passing values and closures to presentational rows
+- id: failure
+  label: Handled background and failure cases
+  skill: offline
+  look_for:
+    - Reattaching to the background session after termination
+    - Failed downloads that don't disturb other rows, and late progress reports ignored
+- id: testing
+  label: Made it testable and previewable
+  skill: testing
+  look_for:
+    - Models tested with a fake download service, no views
+    - A test that progress doesn't invalidate the episode list
+    - Previews for each row state from literals, and a shared fixture for the full screen
+```
+
+<Pitfalls>
+
+- Putting `progress` on the `Episode` struct, so 30 reports a second re-run the whole list.
+- Owning a download in the row's or screen's `@State`, so it stops (or is orphaned) when the user scrolls or switches tab.
+- Using array indexes, or a `UUID()` made while mapping, as row ids.
+- Filtering with `if` inside the `ForEach`, which forces the list to build every row.
+- Injecting nothing at the root and finding out in a crash which view needed which model.
+
+</Pitfalls>

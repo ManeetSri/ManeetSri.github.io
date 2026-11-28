@@ -1,0 +1,274 @@
+## Why it matters
+
+Every control needs a value to show and a way to change it. `@State` and `@Binding` are SwiftUI's smallest tools for that, and the question behind them, **who owns this value?**, is the one you'll ask about every piece of state for the rest of the course. Most "the toggle shows on but the saved setting is off" bugs are two copies of one value drifting apart. Interviewers like to ask you to design a small reusable control, such as a rating picker, because whether it takes a binding or a value and a callback shows how you think about ownership.
+
+## `@State`: a value the view owns
+
+`@State` declares a value that this view **owns**. SwiftUI stores it outside the struct, tied to the view's identity, so it survives every rebuild. Reading it in `body` makes the view depend on it; writing it invalidates the views that read it.
+
+```swift check ios title="FilterBar.swift"
+import SwiftUI
+
+struct FilterBar: View {
+    @State private var isShowingFilters = false
+    @State private var searchText = ""
+
+    var body: some View {
+        HStack {
+            TextField("Search orders", text: $searchText)
+            Button("Filters", systemImage: "line.3.horizontal.decrease") {
+                isShowingFilters.toggle()
+            }
+        }
+        .sheet(isPresented: $isShowingFilters) {
+            Text("Filters for \"\(searchText)\"")
+        }
+    }
+}
+```
+
+Two habits make `@State` honest:
+
+- **Mark it `private`.** `@State` is initialised by the view that owns it, so nothing outside should set it. A non-private `@State var` invites a parent to "seed" it through `init`, which only works once, as the previous lesson showed.
+- **Keep it to view-local, transient UI state:** whether a section is expanded, the text in a field before it's submitted, which segment is selected, whether a sheet is showing, where to scroll. Data that another screen also shows, or that must outlive this view, belongs in a model. D19 sorts state into local, shared and app-wide properly.
+
+`View` is isolated to the main actor (since the iOS 18 SDK, the whole protocol is `@MainActor`), so in Swift 6 the compiler stops you touching a view's state from a background task.
+
+## `@Binding`: someone else's value
+
+A **binding** is a reference to a value that lives somewhere else: a getter and a setter, nothing more. A view with `@Binding` reads and writes the value as if it were its own, but it **owns nothing**. The `$` prefix on any `@State` property gives you a binding to it, and bindings reach into structure: `$settings.isMuted` is a binding to one property of a struct, and `ForEach($lines) { $line in … }` gives each row a binding to its element.
+
+```swift check ios title="BasketLineRow.swift"
+import SwiftUI
+
+/// A reusable control: it edits a quantity it doesn't own
+struct QuantityStepper: View {
+    @Binding var quantity: Int
+    var range: ClosedRange<Int> = 1...10
+
+    var body: some View {
+        HStack {
+            Button("Remove one", systemImage: "minus") { quantity -= 1 }
+                .disabled(quantity <= range.lowerBound)
+            Text("\(quantity)").monospacedDigit()
+            Button("Add one", systemImage: "plus") { quantity += 1 }
+                .disabled(quantity >= range.upperBound)
+        }
+        .labelStyle(.iconOnly)
+    }
+}
+
+struct BasketLine: Identifiable {
+    let id: String
+    var name: String
+    var quantity: Int
+}
+
+struct BasketView: View {
+    @State private var lines = [
+        BasketLine(id: "sku-1", name: "Oat milk", quantity: 2),
+        BasketLine(id: "sku-2", name: "Coffee beans", quantity: 1),
+    ]
+
+    var body: some View {
+        List {
+            ForEach($lines) { $line in
+                HStack {
+                    Text(line.name)
+                    Spacer()
+                    QuantityStepper(quantity: $line.quantity)
+                }
+            }
+            Text("\(lines.map(\.quantity).reduce(0, +)) items")
+        }
+    }
+}
+```
+
+There's exactly one copy of each quantity: the element in `lines`. The stepper writes through its binding, `BasketView`'s state changes, and every view that reads it, including the total, updates in the same pass.
+
+```visual sequence
+title: A write through a binding
+participants:
+  - { id: stepper, label: QuantityStepper }
+  - { id: binding, label: Binding }
+  - { id: state, label: "@State lines" }
+  - { id: ui, label: SwiftUI }
+messages:
+  - [stepper, binding, "quantity += 1", { say: "The user taps plus. The stepper writes to its binding as if the value were its own." }]
+  - [binding, state, "set lines[0].quantity", { say: "The binding's setter writes into `BasketView`'s state: the **only** copy of the value." }]
+  - [state, ui, invalidate readers, { async: true, say: "Every view that read `lines` is marked invalid: the basket and its total." }]
+  - [ui, ui, BasketView.body, { say: "On the next update the basket's body runs and builds a stepper with a binding to the new value." }]
+  - [ui, stepper, "quantity is 3", { reply: true, say: "The stepper and the total both show 3. Nothing had to be synchronised, because nothing was copied." }]
+```
+
+## One source of truth
+
+The commonest binding bug is a child that turns its binding back into state:
+
+```swift
+struct NotificationRow: View {
+    @State var isOn: Bool                       // a copy of the parent's value
+
+    var body: some View {
+        Toggle("Order updates", isOn: $isOn)    // flips the copy only
+    }
+}
+// Parent: NotificationRow(isOn: settings.orderUpdates)
+```
+
+The toggle moves, the parent's `settings` doesn't, and Save sends the old value. Worse, because state is seeded once per identity, the row also ignores any later change from the parent. Two sources of truth always drift. Declare `@Binding var isOn: Bool` and pass `$settings.orderUpdates`.
+
+A copy is right in one case: a **draft** that should reach the source only when the user says so, like an edit sheet with Cancel and Save. Then make the copy deliberate. Seed it once, edit it freely, and commit it explicitly with an `onSave(draft)` call, so nobody mistakes it for the real value.
+
+## Bindings you build yourself
+
+`Binding(get:set:)` adapts one value into another shape. It's handy where an API wants a `Bool` and you have an optional:
+
+```swift check ios title="SaveErrorAlert.swift"
+import SwiftUI
+
+struct SaveButton: View {
+    @State private var saveError: String?
+
+    var body: some View {
+        Button("Save") { saveError = "The server is unavailable." }
+            .alert("Couldn't save", isPresented: Binding(
+                get: { saveError != nil },
+                set: { isShowing in if !isShowing { saveError = nil } }
+            )) {
+                Button("OK", role: .cancel) {}
+            } message: {
+                Text(saveError ?? "")
+            }
+    }
+}
+```
+
+Use them sparingly. A hand-built binding is a pair of closures, so SwiftUI can't tell that it's unchanged (a child that takes it re-runs with its parent), and any logic inside it, such as clamping or saving, is hidden from tests. When the logic matters, put it in the model as a method or a property with a setter, and bind to that.
+
+`.constant(value)` makes a binding that ignores writes: useful in previews, and for showing an editable control read-only.
+
+## Binding, or value and callback?
+
+When you design a component, this is the decision that shapes its API:
+
+- **Take a `Binding`** when the component edits a value and the parent has nothing to decide: `Toggle`, `TextField`, `Stepper`, your `QuantityStepper`. It composes with `$` and needs no glue.
+- **Take a value and a callback** (`rating: Int, onRate: (Int) -> Void`) when the parent must stay in charge: it validates, calls the server, may refuse, or the interaction is an **event** ("retry tapped") rather than a new value. A like button whose request can fail is the classic case: the parent decides what the heart shows.
+
+Apple's own controls mix the two: values come in as bindings, and actions, like a button's, as closures.
+
+## Relatives worth knowing
+
+- **`@FocusState`** holds which field has keyboard focus, so focus becomes state you can set: `.focused($focusedField, equals: .email)`.
+- **`@SceneStorage`** saves a small value with the scene, such as the selected tab, and restores it when the system relaunches the scene; it's thrown away if the user closes the scene in the app switcher.
+- **`@AppStorage`** reads and writes `UserDefaults` and updates views when the value changes. It's convenient for small preferences, but it's **app-wide shared state** that looks local, and it's no place for secrets or large data.
+
+## Trade-offs
+
+| Where the value lives | Who can change it | Survives the view? | Testable without UI? | When it wins |
+| --- | --- | --- | --- | --- |
+| `@State` in the view | That view, and children it hands bindings to | No | No | Transient, local UI state |
+| `@Binding` in a child | The child, writing to the owner's value | n/a: owns nothing | Through the owner | Reusable controls that edit a value |
+| A value plus a callback | Only the owner, when the callback asks | n/a | Yes, the owner's logic | Changes the owner must approve, and events |
+| A deliberate draft copy | The child, until it commits | No | Partly | Edit-then-save forms with Cancel |
+| A model object | Whoever holds it | As long as its owner | Yes | Shared, persistent or async data (next lesson) |
+
+<Callout kind="interview">
+
+**Say:** "Each value has one owner. A child that edits it gets a binding, one that only shows it gets a value, and one that reports something gets a closure. I copy only for a draft, and then I commit explicitly." **Ask:** "Can the parent reject this change, or does it go to the server first?" If yes, a value and callback beats a binding. **Red flags:** a child copying its binding into `@State`, a non-private `@State` seeded from `init`, and business logic inside `Binding(get:set:)`.
+
+</Callout>
+
+<Callout kind="gotcha" title="Swift gotcha: `@State` only works inside a view">
+
+SwiftUI installs `@State` storage only for properties of views (and of a few SwiftUI types such as `App` and view modifiers). Put `@State` in a view model class and it never gets storage: SwiftUI warns that it's accessing State's value outside of being installed on a View, and the value never updates. Models use `@Observable` stored properties instead.
+
+</Callout>
+
+<Callout kind="gotcha" title="iOS gotcha: a text field writes on every keystroke">
+
+A `TextField` bound to a model property sets it on each character. If that property's setter saves to disk or starts a search, you save or search on every keystroke. Bind the field to plain state or a plain property, and save on `onSubmit`, on Save, or after a debounce in the model.
+
+</Callout>
+
+## Practice
+
+The **contacts screen** review has a detail form that edits a copy and a row that owns its own favourite flag. Decide, for each value, who should own it and what each child should receive.
+
+```cards
+- id: state-owner
+  front: "What does `@State` mean, and why make it `private`?"
+  back: "The view owns the value; SwiftUI stores it with the view's identity. `private` says only this view initialises and owns it, so nobody tries to seed it from outside, which only works once."
+- id: binding-meaning
+  front: "What is a `Binding`?"
+  back: "A getter and setter for a value owned elsewhere. The child reads and writes it but owns nothing, so there's still one source of truth."
+- id: binding-or-callback
+  front: "When should a component take a value and a callback instead of a binding?"
+  back: "When the parent must decide: validate, call the server, possibly reject, or when the interaction is an event rather than a new value."
+```
+
+```quiz
+- id: q1
+  type: sort
+  prompt: "Where should each value live?"
+  buckets: ["@State in the view", "A @Binding into the view", "A shared model"]
+  items:
+    - ["Whether a filter menu is open", 0]
+    - ["The text in a search field before it's submitted", 0]
+    - ["The value a reusable star-rating control edits", 1]
+    - ["A settings row's toggle for one field of the parent's settings", 1]
+    - ["The cart, shown in a tab badge and at checkout", 2]
+    - ["The signed-in user's profile, shown on three screens", 2]
+  explain: "Local, transient UI state is the view's own. A control that edits someone else's value gets a binding. Data several screens show, or that must outlive one view, belongs to a model."
+- id: q2
+  type: bug
+  prompt: "The toggle moves, but the saved setting never changes. Which line is the problem?"
+  code: |
+    struct PrivacyRow: View {
+        @State var isPublic: Bool
+
+        var body: some View {
+            Toggle("Public profile", isOn: $isPublic)
+        }
+    }
+
+    struct PrivacyScreen: View {
+        @State private var settings = PrivacySettings()
+        let onSave: (PrivacySettings) -> Void
+
+        var body: some View {
+            Form {
+                PrivacyRow(isPublic: settings.isPublic)
+                Button("Save") { onSave(settings) }
+            }
+        }
+    }
+  answer: 2
+  explain: "`PrivacyRow` copies the value into its own state, so the toggle edits the copy and `settings` never changes; Save sends the old value. Declare `@Binding var isPublic: Bool` and pass `$settings.isPublic`."
+- id: q3
+  type: mcq
+  prompt: "You're building a heart button for posts. Tapping it sends a request that can fail, and the server's answer is the truth. What should the button take?"
+  options:
+    - "`@Binding var isLiked: Bool`, so it can flip the parent's value directly"
+    - "`@State var isLiked: Bool` seeded from the post"
+    - "`isLiked: Bool` and an `onToggle: () -> Void` callback, with the parent deciding what to show"
+    - "A `Binding(get:set:)` whose setter sends the request"
+  answer: 2
+  explain: "The parent owns the decision: it can update optimistically, send the request and roll back on failure. A binding hides the request inside a setter, and a state copy drifts from the post."
+- id: q4
+  type: multi
+  prompt: "Which are reasonable uses of `Binding(get:set:)`? Choose all that apply."
+  options:
+    - "Turning an optional error into the `Bool` an alert's `isPresented` needs"
+    - "Saving to the server inside the setter on every change"
+    - "Exposing one case of an enum as a `Bool` for a `Toggle`"
+    - "Validating an email address and updating three other properties inside the setter"
+  answer: [0, 2]
+  explain: "Small shape adapters are what it's for. Side effects and business rules in a setter run on every write (every keystroke for a text field) and can't be tested apart from the view; put them in the model."
+- id: q5
+  type: truefalse
+  prompt: "A `@State` property declared inside an `@Observable` view model class works like one in a view."
+  answer: false
+  explain: "SwiftUI installs `@State` storage only for views and a few SwiftUI types. In a class it never updates, and SwiftUI warns at runtime. A model's stored properties are already observable."
+```

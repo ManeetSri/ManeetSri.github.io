@@ -1,0 +1,356 @@
+## Why it matters
+
+A real screen has state bigger than one view: data loaded from the network, rules about what can be saved, async work in flight. That state lives in a **model object**, and since iOS 17 the way SwiftUI watches one is the Observation framework and its `@Observable` macro. Two decisions shape every screen built on it: **ownership** (which view creates the model, which only reads it, which binds to it) and **granularity** (what change invalidates what). Interviewers expect you to name the four ways a view relates to a model, and to know why a list of 2,000 downloading episodes needs a different shape from a list of 20 settings.
+
+## What `@Observable` does to a class
+
+You met Observation as an observer pattern in [Observers in KVO, Combine and Observation](/design/learn/sd-behavioural-kvo-combine-observation). Here's what the macro generates, simplified:
+
+```swift
+@Observable final class Checkout {
+    var promoCode = ""
+}
+
+// …becomes, roughly:
+final class Checkout: Observable {
+    @ObservationIgnored private var _promoCode = ""
+    @ObservationIgnored private let _$observationRegistrar = ObservationRegistrar()
+
+    var promoCode: String {
+        get {
+            _$observationRegistrar.access(self, keyPath: \.promoCode)    // "someone read this"
+            return _promoCode
+        }
+        set {
+            _$observationRegistrar.withMutation(of: self, keyPath: \.promoCode) {   // "this is changing"
+                _promoCode = newValue
+            }
+        }
+    }
+}
+```
+
+Every stored property becomes a computed one that reports reads and writes to a registrar. SwiftUI runs `body` with tracking switched on, so the reads tell it exactly what this body depends on. The consequences follow directly:
+
+- **Tracking is per property and per instance.** A view that reads `checkout.total` doesn't update when `checkout.promoCode` changes.
+- **`let` properties are never tracked**, because they can't change.
+- **`@ObservationIgnored`** opts a stored property out: caches, injected services, anything views shouldn't react to.
+- **Computed properties are tracked through what they read.** `var canPay: Bool { !items.isEmpty && !isPaying }` makes a reader depend on `items` and `isPaying`.
+- **No wrapper is needed to observe.** Tracking comes from reading, not from a property wrapper on the view.
+
+The macro in current Swift toolchains also skips the notification when you assign an `Equatable` property the value it already holds; the first versions notified on every assignment, so treat it as a saving, not something to rely on.
+
+## Four ways a view relates to a model
+
+```visual flow
+title: One model, four relationships
+nodes:
+  - { id: screen, label: CheckoutScreen, kind: view, at: [0, 1] }
+  - { id: model, label: Checkout, kind: store, at: [2, 1] }
+  - { id: totals, label: TotalsView, kind: view, at: [4, 0] }
+  - { id: promo, label: PromoCodeField, kind: view, at: [4, 1] }
+  - { id: pay, label: PayButton, kind: view, at: [4, 2] }
+edges:
+  - [screen, model, "@State: owns"]
+  - [totals, model, "let: reads", { style: data }]
+  - [promo, model, "@Bindable: binds", { style: data }]
+  - [pay, model, "@Environment: finds", { style: data }]
+caption: The screen creates and keeps the model. Children read it, bind to it, or look it up in the environment, but only the screen owns it.
+```
+
+```swift check ios title="CheckoutScreen.swift"
+import SwiftUI
+
+@MainActor
+@Observable
+final class Checkout {
+    var items: [String] = ["Running shoes"]
+    var promoCode = ""
+    private(set) var isPaying = false
+
+    var canPay: Bool { !items.isEmpty && !isPaying }   // tracked through `items` and `isPaying`
+
+    func pay() async {
+        isPaying = true
+        defer { isPaying = false }
+        try? await Task.sleep(for: .seconds(1))         // stands in for the payment call
+        items = []
+    }
+}
+
+// 1. Owns it: creates the model and keeps it for as long as this view's identity lives
+struct CheckoutScreen: View {
+    @State private var checkout = Checkout()
+
+    var body: some View {
+        Form {
+            TotalsView(checkout: checkout)
+            PromoCodeField(checkout: checkout)
+            PayButton()
+        }
+        .environment(checkout)
+    }
+}
+
+// 2. Reads it: a plain property. Reading `items` in body is what tracks it.
+struct TotalsView: View {
+    let checkout: Checkout
+
+    var body: some View {
+        Text("\(checkout.items.count) items")
+    }
+}
+
+// 3. Binds to it: @Bindable turns properties into bindings for controls
+struct PromoCodeField: View {
+    @Bindable var checkout: Checkout
+
+    var body: some View {
+        TextField("Promo code", text: $checkout.promoCode)
+    }
+}
+
+// 4. Finds it in the environment, put there by an ancestor
+struct PayButton: View {
+    @Environment(Checkout.self) private var checkout
+
+    var body: some View {
+        Button("Pay") { Task { await checkout.pay() } }
+            .disabled(!checkout.canPay)
+    }
+}
+```
+
+A few details carry the design:
+
+- **Ownership means `@State`.** It's what keeps the model alive across rebuilds. Everywhere else, the model is passed in or found, and those views own nothing.
+- **Reading needs no wrapper.** `TotalsView` holds a plain `let`. Before Observation that would have needed `@ObservedObject`; now the body's reads are enough.
+- **`@Bindable` only for bindings.** Use it when a child needs `$checkout.promoCode` for a control. The owner doesn't need it: `@State`'s projected value is already a binding, so `$checkout.promoCode` works in `CheckoutScreen` too. For a model from the environment, declare a local one inside `body`: `@Bindable var checkout = checkout`.
+- **`PayButton` starts a `Task` from its action.** That's fine for a user's tap; work tied to a view's appearance belongs in `.task`, as the lifetimes lesson showed.
+
+## Models live on the main actor
+
+Views are main-actor isolated, and they read their models while `body` runs, so models should be too. Mark them `@MainActor @Observable final class`. Their async methods then run on the main actor, suspend while a service (an actor or a nonisolated client) does the slow work elsewhere, and resume on the main actor to write results. There's no `DispatchQueue.main.async` anywhere, and Swift 6 rejects code that writes a model's properties from another isolation domain.
+
+Since Xcode 26, new app targets default to main-actor isolation, which makes the annotation implicit there. Swift packages and older targets don't, so writing `@MainActor` keeps a model correct wherever it's compiled.
+
+## Granularity: an array of values or of objects?
+
+Observation tracks **properties**. An array is one property, however many elements it holds. That decides how far a small change spreads:
+
+```swift run title="Which rows does one change invalidate?"
+import Observation
+import Synchronization
+
+// Option 1: the list holds structs
+struct ChecklistItem {
+    var title: String
+    var isDone = false
+}
+
+@Observable
+final class ValueChecklist {
+    var items = [ChecklistItem(title: "Book flights"), ChecklistItem(title: "Renew passport"), ChecklistItem(title: "Pack")]
+}
+
+// Option 2: every item is an observable object of its own
+@Observable
+final class ChecklistTask {
+    var title: String
+    var isDone = false
+
+    init(title: String) {
+        self.title = title
+    }
+}
+
+@Observable
+final class ObjectChecklist {
+    var items = [ChecklistTask(title: "Book flights"), ChecklistTask(title: "Renew passport"), ChecklistTask(title: "Pack")]
+}
+
+// onChange is @Sendable, so the invalidated rows are recorded behind a Mutex
+let invalidated = Mutex<[Int]>([])
+
+func row(_ index: Int, reads read: () -> Void) {
+    withObservationTracking(read) {
+        invalidated.withLock { $0.append(index) }
+    }
+}
+
+func report(_ label: String) {
+    let rows = invalidated.withLock { rows in
+        defer { rows = [] }
+        return rows.sorted()
+    }
+    print("\(label): rows \(rows) need new bodies")
+}
+
+// Each row reads only its own item's isDone, as a row view's body would
+let values = ValueChecklist()
+for index in values.items.indices {
+    row(index) { _ = values.items[index].isDone }
+}
+values.items[1].isDone = true
+report("Array of structs")
+
+let objects = ObjectChecklist()
+for (index, task) in objects.items.enumerated() {
+    row(index) { _ = task.isDone }
+}
+objects.items[1].isDone = true
+report("Array of objects")
+```
+
+```output
+Array of structs: rows [0, 1, 2] need new bodies
+Array of objects: rows [1] need new bodies
+```
+
+With structs, ticking one item rewrites the `items` property, so everything that read `items` is invalidated. In a real list the parent's `ForEach` reads it, so its body runs and SwiftUI re-compares every row. With objects, the array itself never changed (it still holds the same three references), so only the row that read the changed object's `isDone` runs.
+
+That doesn't make objects always better:
+
+- **Structs** are simple: `Equatable` for free, easy to snapshot, test and send between actors, and a whole-list change is one assignment. For a list of 20 settings, or items that rarely change one at a time, the extra comparisons cost nothing you'll measure.
+- **Objects** win when individual items change **often** while the list is on screen: download progress, live scores, a timer per row. The cost is reference semantics (two screens editing the same object), more allocations, and mapping to and from your `Codable` types.
+- **A middle way** keeps the list as structs and moves the fast-changing part into its own observable, such as a `DownloadProgress` object per active download that only the progress bar reads.
+
+### Split a model by how often it changes
+
+The same thinking applies inside one model. Per-property tracking already keeps a player's `elapsed`, which ticks twice a second, away from views that only read `nowPlaying`. The risk is reading it **by accident**: one computed property such as `var subtitle: String { "\(title) · \(elapsed.formatted())" }`, read by a large view, and that view now ticks too.
+
+```swift check ios title="Player.swift"
+import Observation
+
+@MainActor
+@Observable
+final class PlaybackClock {
+    var elapsed: Duration = .zero        // changes twice a second
+}
+
+@MainActor
+@Observable
+final class Player {
+    var nowPlaying: String?              // changes when an episode starts
+    var isPlaying = false
+    let clock = PlaybackClock()          // a `let`: the reference itself never changes
+}
+```
+
+Moving the fast value into its own object makes the boundary visible in the types: reading the time means writing `player.clock.elapsed`, and a time label can be handed the clock alone. Split like this when a value changes many times a second and the model has many readers; for a model with one screen and slow changes, one class is simpler.
+
+## Testing a model without views
+
+An `@Observable` model is a plain class, so it needs no UI to test. Create it with fakes, call its methods, and check its properties:
+
+```swift
+@Test @MainActor func payingEmptiesTheBasket() async {
+    let checkout = Checkout()
+    #expect(checkout.canPay)
+
+    await checkout.pay()
+
+    #expect(checkout.items.isEmpty)
+    #expect(!checkout.canPay)
+}
+```
+
+This is the main architectural payoff of keeping logic in the model and the view thin: the rules a product manager cares about (when Pay is enabled, what happens after a failed save) are tested in milliseconds, with no simulator and no view hierarchy.
+
+## Trade-offs
+
+| Declaration in the view | Creates the model? | Keeps it alive? | Can make bindings? | Use it when |
+| --- | --- | --- | --- | --- |
+| `@State private var model = Model()` | Yes | Yes, for the view's identity | Yes, `$model.x` | This view owns a screen-scoped model |
+| `let model: Model` | No | No | No | A child shows parts of a model it's handed |
+| `@Bindable var model: Model` | No | No | Yes | A child edits the model's properties with controls |
+| `@Environment(Model.self) private var model` | No | No | Through a local `@Bindable` | Many views at different depths need the same model |
+
+<Callout kind="interview">
+
+**Say:** "With Observation, a view depends on the properties its body reads, per instance. The owning view holds the model in `@State`; children take it as a plain property, or `@Bindable` when they need bindings; shared models come from the environment. Models are `@MainActor`, and their logic is tested without views." **Ask:** "How often do individual items change while the list is on screen?" That decides values or objects. **Red flags:** holding a passed-in model in `@State` (it ignores the next model it's given), assuming any change re-renders every observer, which was `ObservableObject`'s behaviour, and logic in the view that should be in the model.
+
+</Callout>
+
+<Callout kind="gotcha" title="Swift gotcha: `@State` for a model you were given">
+
+`@State var model: EpisodeModel` with `_model = State(initialValue: model)` in `init` looks like ownership, but the view didn't create the model, and `@State` keeps only the first one: when the parent passes a different episode's model, this view keeps showing the old one. A model you're handed is a `let` (or `@Bindable`).
+
+</Callout>
+
+<Callout kind="gotcha" title="iOS gotcha: Observation needs iOS 17">
+
+`@Observable`, `@Bindable` and `@Environment(Model.self)` need iOS 17 or later. An app that still supports iOS 16 uses `ObservableObject` for those screens (the next lesson), or a back-port such as Point-Free's Perception library.
+
+</Callout>
+
+## Practice
+
+The **profile editor model** kata builds an `@Observable` model with a draft, validation, a save in flight and a failure path, and tests it without a single view. The **podcast library** design exercise asks you to choose granularity for 3,000 episodes with live download progress.
+
+```cards
+- id: observable-tracking
+  front: "What does a view depend on when it uses an `@Observable` model?"
+  back: "Exactly the properties its body read, on that instance. Other properties, `let`s and `@ObservationIgnored` properties don't invalidate it."
+- id: observable-four
+  front: "Name the four ways a view can hold an `@Observable` model."
+  back: "`@State` to own it, a plain `let` to read it, `@Bindable` to make bindings to it, and `@Environment(Model.self)` to find one an ancestor provided."
+- id: observable-granularity
+  front: "Why can an array of structs be costly for a list whose items change often?"
+  back: "The array is one property: changing one element invalidates everything that read the array, so the list re-runs and re-compares every row. Observable elements, or a separate observable for the fast-changing part, confine the update to one row."
+```
+
+```quiz
+- id: q1
+  type: match
+  prompt: "Match each declaration to what it means."
+  pairs:
+    - ["`@State private var model = Model()`", "Creates the model and keeps it for this view's identity"]
+    - ["`let model: Model`", "Reads a model it was handed; tracking still works"]
+    - ["`@Bindable var model: Model`", "Reads a model it was handed and can bind controls to its properties"]
+    - ["`@Environment(Model.self) private var model`", "Uses a model an ancestor put in the environment"]
+  explain: "Only `@State` owns. The other three describe how a view reaches a model someone else keeps alive."
+- id: q2
+  type: mcq
+  prompt: "A downloads screen lists 2,000 episodes. Up to three download at once, each reporting progress ten times a second. Which model keeps scrolling smooth?"
+  options:
+    - "`var episodes: [Episode]` of structs with a `progress` field, updated on each report"
+    - "Episodes as structs, plus a small observable `DownloadProgress` object per active download that only each row's progress bar reads"
+    - "An `ObservableObject` with `@Published var episodes`, refreshed by a timer every second"
+    - "Store progress in `@State` in each row, and have the row poll the downloader"
+  answer: 1
+  explain: "Each progress report then invalidates one progress bar. Writing progress into the array re-runs the list 30 times a second; a published array invalidates every observer; row state would die as rows scroll away, and polling wastes work."
+- id: q3
+  type: bug
+  prompt: "Opening a second episode still shows the first episode's notes. Which line causes it?"
+  code: |
+    struct EpisodeNotes: View {
+        @State private var model: EpisodeModel
+
+        init(model: EpisodeModel) {
+            _model = State(initialValue: model)
+        }
+
+        var body: some View {
+            TextEditor(text: $model.notes)
+        }
+    }
+  answer: 2
+  explain: "Declaring a model you were given as `@State` keeps only the first one for this identity, so the `init` on line 5 is ignored for every later episode. The view doesn't own it: declare `@Bindable var model: EpisodeModel` and assign `self.model = model`."
+- id: q4
+  type: multi
+  prompt: "`Library` is `@Observable`. Reading which of these in a body makes the view update when the underlying value changes? Choose all that apply."
+  options:
+    - "`var name: String`"
+    - "`let id: UUID`"
+    - "`@ObservationIgnored var thumbnailCache: [URL: Data]`"
+    - "`var isEmpty: Bool { episodes.isEmpty }`, a computed property"
+    - "`var episodes: [Episode]`"
+  answer: [0, 3, 4]
+  explain: "Stored `var`s are tracked, and a computed property is tracked through the stored properties it reads. A `let` never changes, and `@ObservationIgnored` opts a property out."
+- id: q5
+  type: truefalse
+  prompt: "Every view that reads an `@Observable` model must declare it with `@Bindable`, or it won't update."
+  answer: false
+  explain: "Updates come from the reads in `body`, whatever the declaration. `@Bindable` only adds the ability to make bindings like `$model.title`."
+```

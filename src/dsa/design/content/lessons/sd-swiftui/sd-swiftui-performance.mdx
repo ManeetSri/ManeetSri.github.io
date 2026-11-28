@@ -1,0 +1,239 @@
+## Why it matters
+
+SwiftUI is fast when its assumptions hold, and slow in a handful of predictable ways: identities that won't stay still, containers that build everything up front, bodies that do real work, and one fast-changing value that drags half the screen along with it. Each shows up as a **hitch**, a frame that missed its deadline and was shown twice. Users feel it as a stutter in exactly the screens they use most: feeds, chats and search. "A SwiftUI list of 5,000 items stutters; walk me through it" is a standard senior interview question, and the answer is a method, not a guess.
+
+## The frame budget
+
+The display asks for a new frame on a fixed beat: every 16.7 ms at 60 Hz, every 8.3 ms on a 120 Hz ProMotion display. In that time the main thread handles the event, runs every invalidated body, lays out what changed and commits the result; then the render server draws it. Anything that pushes the main thread past the deadline is a hitch.
+
+Play with the arithmetic. The numbers are illustrative (a simple body costs microseconds, one that sorts or formats can cost hundreds), but the shape is real: **cost per body times bodies per update**.
+
+```visual estimator
+title: Does one update fit in a frame?
+inputs:
+  - { id: hz, label: Display refresh rate, min: 60, max: 120, step: 60, value: 120, unit: Hz }
+  - { id: bodies, label: Bodies re-run by the update, min: 1, max: 5000, scale: log, value: 300 }
+  - { id: bodyMicros, label: Average cost of one body, min: 1, max: 500, scale: log, value: 20, unit: µs }
+  - { id: fixedMs, label: Layout and commit for the frame, min: 0.5, max: 6, step: 0.5, value: 2, unit: ms }
+outputs:
+  - { id: budget, label: Frame budget, formula: 1000 / hz, unit: ms }
+  - { id: bodyMs, label: Time spent in bodies, formula: bodies * bodyMicros / 1000, unit: ms }
+  - { id: total, label: Main-thread work for the frame, formula: bodyMs + fixedMs, unit: ms }
+  - { id: used, label: Share of the budget used, formula: total / budget * 100, unit: "%" }
+```
+
+At the starting values the update uses almost the whole 120 Hz budget. Cut the bodies from 300 to 30, which is what moving one read into a leaf view does, and it drops to about a third. Raise one body's cost to 200 µs, the price of sorting and formatting inside it, and even 30 bodies don't fit. Every fix in this lesson moves one of those two sliders.
+
+## Keep bodies cheap
+
+A body can run many times a second, so treat it as a pure, fast mapping from state to views. The usual offenders:
+
+- **Sorting, filtering or grouping a collection** on every evaluation.
+- **Creating formatters**: a `DateFormatter` or `NumberFormatter` per row per update.
+- **Decoding images** from `Data`, or resizing them, on the main thread.
+- **Reading files, `UserDefaults` or the Keychain.**
+
+Move the work to where the inputs change. Here a model keeps the visible list ready, so the body only reads it:
+
+```swift check ios title="MessageListModel.swift"
+import SwiftUI
+
+struct Message: Identifiable, Equatable, Sendable {
+    let id: String
+    var text: String
+    var sentAt: Date
+    var isArchived = false
+}
+
+@MainActor
+@Observable
+final class MessageListModel {
+    private(set) var visible: [Message] = []          // sorted and filtered once per change
+    private var all: [Message] = [] {
+        didSet {
+            visible = all.filter { !$0.isArchived }.sorted { $0.sentAt > $1.sentAt }
+        }
+    }
+
+    func receive(_ messages: [Message]) {
+        all.append(contentsOf: messages)
+    }
+
+    func archive(_ id: Message.ID) {
+        guard let index = all.firstIndex(where: { $0.id == id }) else { return }
+        all[index].isArchived = true
+    }
+}
+
+struct MessageList: View {
+    let model: MessageListModel
+
+    var body: some View {
+        List(model.visible) { message in
+            VStack(alignment: .leading) {
+                Text(message.text)
+                Text(message.sentAt, format: .dateTime.hour().minute())   // cached format style
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+        }
+    }
+}
+```
+
+`Text(_:format:)` and `.formatted()` use format styles that Foundation caches, so they're safe in a body; a new `DateFormatter()` per row isn't. For images, decode and downsample off the main thread (for example with `UIImage`'s `byPreparingThumbnail(ofSize:)`) and give the view a ready image.
+
+## Lazy containers
+
+A `VStack` inside a `ScrollView` builds **every** child when it appears: a 5,000-message thread runs 5,000 bodies before the first frame. `LazyVStack` builds rows as they approach the screen. `List` is lazy too, and because it's backed by a collection view it also **recycles** rows as they scroll away.
+
+| Container | Builds rows | Recycles rows | Comes with | When it wins |
+| --- | --- | --- | --- | --- |
+| `VStack` in a `ScrollView` | All at once | No | Full control | Short, fixed content: a settings card, a form of 10 fields |
+| `LazyVStack` in a `ScrollView` | As they near the screen | No | Full styling control, pinned headers | Long custom feeds where `List`'s look gets in the way |
+| `List` | As they near the screen | Yes | Swipe actions, selection, editing, separators | Long lists of rows, and the longest feeds |
+
+Lazy containers still need to know **every row's identity up front**, so they can work out the count, scroll positions and what changed, without building the rows. Two consequences:
+
+- **Ids must be cheap and stable.** The ids of all 5,000 elements are read on every update, so `id: \.self` on a large struct hashes 5,000 values each time.
+- **Keep the number of views per element constant.** A `ForEach` row that sometimes produces no view, `if !message.isArchived { MessageRow(message) }`, forces SwiftUI to build rows only to count them, which throws away the laziness. Filter the data in the model, as `visible` does above, and give each element exactly one row.
+
+## Identity costs, revisited
+
+The identity lesson's bugs are also performance bugs:
+
+- **Ids made while mapping** (`UUID()` in a row model built in a computed property) make every update look like a full replacement: every row is destroyed and rebuilt, and the scroll position is lost.
+- **`.id(refreshToken)` on a `List`** rebuilds the whole list each time the token changes.
+- **Branches in rows** (`if message.isPending { PendingBubble } else { Bubble }`) turn a state change into a removal and an insertion. One view with changing modifiers is cheaper and animates better.
+
+## Contain fast-changing values
+
+The most common SwiftUI stutter is **fan-out**: a value that changes many times a second, read high in the tree, so every change re-runs a large subtree. Timers, scroll offsets, download progress and playback position are the usual suspects. Three fixes, from simplest:
+
+- **Let the system update the text.** `Text(message.sentAt, style: .relative)` keeps "2 min ago" current by itself, with no state of yours ticking. `TimelineView(.periodic(from: .now, by: 1))` around only the label that needs a clock confines a ticking update to that label.
+- **Read the value in a leaf.** Pass the model to a small view that reads the fast property itself, as the updates lesson did with `ElapsedLabel`.
+- **Reduce scroll geometry to what you need.** Since iOS 18, `onScrollGeometryChange(for:of:action:)` transforms the geometry into a small value and calls you only when that value changes:
+
+```swift check ios title="CollapsingHeader.swift"
+import SwiftUI
+
+struct ArticleScreen: View {
+    let paragraphs: [String]
+    @State private var isHeaderCollapsed = false
+
+    var body: some View {
+        ScrollView {
+            LazyVStack(alignment: .leading, spacing: 12) {
+                ForEach(paragraphs.indices, id: \.self) { index in     // fixed text: positions never change
+                    Text(paragraphs[index])
+                }
+            }
+            .padding()
+        }
+        // Called when the Bool flips, not on every frame of scrolling
+        .onScrollGeometryChange(for: Bool.self) { geometry in
+            geometry.contentOffset.y > 60
+        } action: { _, collapsed in
+            withAnimation { isHeaderCollapsed = collapsed }
+        }
+        .safeAreaInset(edge: .top) {
+            Text("Release notes")
+                .font(isHeaderCollapsed ? .headline : .largeTitle)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .padding()
+                .background(.bar)
+        }
+    }
+}
+```
+
+Writing the raw `contentOffset` into state would re-run this body on every frame of every scroll; the transform turns that into a handful of updates.
+
+## Measure first
+
+Performance work without measurement is guessing, and SwiftUI guesses are often wrong. A method that holds up:
+
+1. **Reproduce it on a real device**, ideally the oldest one you support, in a **Release** build: Debug builds run your Swift much more slowly.
+2. **Record with Instruments' SwiftUI template.** It shows which bodies run, how often and for how long; since Xcode 26 it also lists long body updates and links each update to the change that caused it. Add the Hitches instrument to see which frames were late.
+3. **Find the biggest number**: the most expensive body, or the body that runs most often. `let _ = Self._printChanges()` in a suspect view tells you why it ran.
+4. **Fix one thing**, then measure again. Most stutters have one cause.
+
+<Callout kind="interview">
+
+**Say:** "First I'd measure: a Release build on an older device with the SwiftUI and Hitches instruments, to see which bodies run, how often and how long they take. The usual causes are unstable ids that rebuild rows, work inside bodies, eager stacks, and a fast-changing value read high up. The fixes are stable ids, precomputing in the model, `List` or a lazy stack, and moving the read into a leaf." **Ask:** "What changes while the list is on screen, and how often?" **Red flags:** "rewrite it in UIKit" before measuring, conforming every view to `Equatable` by reflex, `GeometryReader` in every row, and `.id(UUID())` to force refreshes.
+
+</Callout>
+
+<Callout kind="gotcha" title="iOS gotcha: `GeometryReader` in every row">
+
+`GeometryReader` takes all the space it's offered and makes its content depend on layout, so one in each row adds layout work and often breaks self-sizing. To read a size or position, use `onGeometryChange(for:of:action:)` (back-deployed to iOS 16), which reports a value you choose only when it changes.
+
+</Callout>
+
+## Practice
+
+The **stable row ids** kata makes identity cheap and stable: string ids that never collide, never change and never depend on `UUID()`, plus the diff a list would compute from them. The **chat thread** review packs most of this lesson into 50 lines: find each cost and the fix.
+
+```cards
+- id: perf-budget
+  front: "What's the frame budget on a 120 Hz display, and what has to fit in it?"
+  back: "About 8.3 ms (16.7 ms at 60 Hz) for the main thread's share: handling the event, running every invalidated body, layout and commit."
+- id: perf-levers
+  front: "What two numbers decide whether an update fits in a frame?"
+  back: "How many bodies it re-runs and how much each costs. Leaf reads and stable ids cut the first; precomputing in the model and cached format styles cut the second."
+- id: perf-lazy-rule
+  front: "Why should each `ForEach` element in a `List` produce exactly one view?"
+  back: "Lazy containers need the number of views up front. A row that may produce no view, or several, forces SwiftUI to build rows only to count them. Filter in the model instead."
+```
+
+```quiz
+- id: q1
+  type: estimate
+  prompt: "On a 120 Hz display, layout and commit take 2 ms of a frame. Each row's body costs 40 µs. About how many row bodies can one update re-run before it misses the frame?"
+  answer: 158
+  unit: bodies
+  within: { percent: 25 }
+  explain: "The budget is 1000 ÷ 120 ≈ 8.3 ms. Minus 2 ms leaves about 6.3 ms, and 6.3 ms ÷ 0.04 ms ≈ 158 bodies. A screen that re-runs every row of a long list on each tick blows straight through it."
+- id: q2
+  type: mcq
+  prompt: "A `List` shows 5,000 messages with `ForEach(messages) { message in if !message.isArchived { MessageRow(message: message) } }`. Opening it is slow. What's the best fix?"
+  options:
+    - "Wrap each row in `AnyView` so every element produces one view"
+    - "Switch to a `VStack` inside a `ScrollView`"
+    - "Filter out archived messages in the model and give `ForEach` only the visible ones"
+    - "Add `.id(UUID())` to the `List` so it rebuilds cleanly"
+  answer: 2
+  explain: "A row that may produce no view forces SwiftUI to build rows to count them, losing the laziness. Filtering in the model restores one view per element. A `VStack` builds all 5,000, and a fresh `.id` rebuilds everything on every update."
+- id: q3
+  type: multi
+  prompt: "Which of these belong outside a list row's body? Choose all that apply."
+  options:
+    - "Creating a `DateFormatter` to format the timestamp"
+    - "`Text(message.sentAt, format: .dateTime.hour().minute())`"
+    - "Sorting the thread's messages by date"
+    - "Decoding the sender's avatar from `Data` into a `UIImage`"
+    - "Reading a title string the model already prepared"
+  answer: [0, 2, 3]
+  explain: "Formatter creation, sorting and image decoding are real work on every evaluation; do them once, in the model or off the main thread. Format styles are cached, and reading a prepared value is what a body should do."
+- id: q4
+  type: order
+  prompt: "Put the steps for fixing a SwiftUI stutter in order."
+  lines:
+    - "Reproduce it on an older device in a Release build"
+    - "Record with the SwiftUI and Hitches instruments"
+    - "Find the most expensive or most frequent body update"
+    - "Use `_printChanges` on that view to see why it runs"
+    - "Fix that one cause"
+    - "Measure again"
+  explain: "Measure before changing anything, fix the biggest cause, and confirm with a second measurement. Debug builds and fast phones hide the problem."
+- id: q5
+  type: mcq
+  prompt: "A feed of 10,000 posts needs swipe-to-archive, selection in edit mode and smooth scrolling. Which container fits best?"
+  options:
+    - "`VStack` in a `ScrollView`"
+    - "`LazyVStack` in a `ScrollView`"
+    - "`List`"
+    - "`Grid`"
+  answer: 2
+  explain: "`List` is lazy, recycles rows like a collection view, and brings swipe actions, selection and editing with it. `LazyVStack` is lazy but doesn't recycle and has none of those built in; `VStack` and `Grid` build every row."
+```

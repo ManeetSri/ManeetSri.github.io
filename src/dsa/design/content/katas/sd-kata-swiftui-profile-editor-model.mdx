@@ -1,0 +1,99 @@
+An edit-profile form looks like pure UI, but nearly everything that can go wrong with it is logic: Save enabled with a blank name, a double tap that saves twice, an edit typed during a slow save that silently vanishes, "cancelled" flashing up as an error. Put all of it in an `@Observable` model, and test it without a single view. The SwiftUI form on top then only binds fields to `$model.draft.name`, disables Save with `canSave` and shows `errorMessage` in an alert.
+
+`ObservableProfileEditor.Model`: `nameError`, `hasUnsavedChanges`, `canSave`, `save() async` and `discardChanges()`
+
+The model is `@MainActor @Observable`. It starts with `saved` and `draft` both equal to the profile it's given, and talks to the server through a `ProfileSaving` service, which returns the profile as the server stored it.
+
+- **`nameError`:** `blankNameMessage` ("Enter a name") when the draft's name is empty once whitespace and newlines are trimmed; `longNameMessage` ("Use 30 characters or fewer") when the trimmed name is longer than `maximumNameLength` (30) characters; otherwise `nil`.
+- **`hasUnsavedChanges`:** the draft differs from the saved profile.
+- **`canSave`:** there are unsaved changes, the name is valid, and no save is in flight.
+- **`save()`:** does nothing unless `canSave`. Otherwise it sets `isSaving`, clears `errorMessage`, and sends the draft with its name trimmed. On success, `saved` becomes the profile the server returned, and so does `draft`, **unless the user edited the draft while the save was in flight**, in which case their newer draft stays. On failure it sets `errorMessage` to `saveFailedMessage` and keeps the draft. When the saver throws `CancellationError` or `URLError(.cancelled)`, or the task was cancelled, it shows no error. `isSaving` is false again when `save()` returns.
+- **`discardChanges()`:** puts the draft back to the saved profile and clears `errorMessage`.
+
+## Examples
+
+| Starting from `Ada`, saved | Then | Result |
+| --- | --- | --- |
+| Nothing | — | `canSave` is false: there's nothing to save |
+| Change the bio | — | `hasUnsavedChanges` and `canSave` are true |
+| Name `"   "` | — | `nameError` is "Enter a name", `canSave` is false |
+| Name `"  Ada Lovelace "`, Save | The server stores it | The saver received `"Ada Lovelace"`; `saved` and `draft` are the stored profile |
+| Bio `"Analyst"`, Save | The user types `"Analyst and poet"`, then the save succeeds | `saved.bio` is `"Analyst"`, `draft.bio` is `"Analyst and poet"`, still unsaved |
+| Save, then Save again before it finishes | — | The saver is called once |
+| Save | The saver throws `URLError(.notConnectedToInternet)` | `errorMessage` is set, the draft is kept, `canSave` is true for a retry |
+| Save | The saver throws `CancellationError()` | No error message |
+
+## Constraints
+
+- The model is isolated to the main actor, like every SwiftUI model; tests run on the main actor too.
+- Keep `nameError`, `hasUnsavedChanges` and `canSave` **computed** from stored properties. A test checks that a view reading `canSave` is invalidated when the draft changes, which works only if `canSave` reads what it depends on.
+- Don't import SwiftUI: the model must be testable on a Mac with nothing but Foundation and Observation.
+- Tests hold each save open until they finish or fail it, so they can look at the model mid-save.
+
+<Hints>
+<Hint>
+Derive everything from `draft`, `saved` and `isSaving`. `canSave` is one line: `hasUnsavedChanges && nameError == nil && !isSaving`.
+</Hint>
+<Hint>
+The model stays on the main actor across the `await`, and the user can type while it's suspended. Copy the draft into a local constant before the call, and after it, replace `draft` only if it still equals that copy.
+</Hint>
+<Hint>
+`defer { isSaving = false }` straight after setting it to true covers success, failure and cancellation. Catch `CancellationError` before the general `catch`, and `URLError` with `where error.code == .cancelled`.
+</Hint>
+</Hints>
+
+## Solutions
+
+<Approach title="Derived flags, and a save that remembers the draft it sent" time="O(1) per call, plus the name's length to trim it" space="O(1)">
+
+```swift
+public var nameError: String? {
+    let name = draft.name.trimmingCharacters(in: .whitespacesAndNewlines)
+    if name.isEmpty { return ObservableProfileEditor.blankNameMessage }
+    if name.count > ObservableProfileEditor.maximumNameLength { return ObservableProfileEditor.longNameMessage }
+    return nil
+}
+
+public var hasUnsavedChanges: Bool { draft != saved }
+
+public var canSave: Bool { hasUnsavedChanges && nameError == nil && !isSaving }
+
+public func save() async {
+    guard canSave else { return }
+    var sending = draft
+    sending.name = draft.name.trimmingCharacters(in: .whitespacesAndNewlines)
+    let draftWhenSent = draft
+    isSaving = true
+    errorMessage = nil
+    defer { isSaving = false }
+
+    do {
+        let stored = try await saver.save(sending)
+        saved = stored
+        if draft == draftWhenSent {
+            draft = stored
+        }
+    } catch is CancellationError {
+        // Cancelled, not failed
+    } catch let error as URLError where error.code == .cancelled {
+        // URLSession's way of saying the same
+    } catch {
+        if !Task.isCancelled {
+            errorMessage = ObservableProfileEditor.saveFailedMessage
+        }
+    }
+}
+
+public func discardChanges() {
+    draft = saved
+    errorMessage = nil
+}
+```
+
+Because the flags are computed, Observation tracks them through what they read: a Save button that reads `canSave` depends on `draft`, `saved` and `isSaving`, and nothing else. Storing `canSave` as its own property would work until someone forgot to update it.
+
+The `draftWhenSent` check is the part most implementations miss. A main-actor model doesn't block while it awaits; SwiftUI keeps delivering keystrokes, and they land in `draft`. Overwriting the draft with the server's copy would silently throw those edits away. Keeping them means the form stays "unsaved", which is the truth.
+
+Treating cancellation as silence matters in SwiftUI in particular: a save started from `.task` is cancelled when the sheet closes, and an alert saying "cancelled" would be both wrong and on a screen that's gone.
+
+</Approach>
