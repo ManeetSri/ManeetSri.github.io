@@ -22,12 +22,13 @@ const problemXp = (id, record, { practiceById, DIFFICULTIES }) => {
     return 0;
 };
 
-export const xpFrom = ({ lessons = {}, problems = {}, cards = {}, checkpoints = {}, mocks = {} }, course) => {
+export const xpFrom = ({ lessons = {}, problems = {}, designs = {}, cards = {}, checkpoints = {}, mocks = {} }, course) => {
     const lessonXp = Object.values(lessons).reduce((sum, record) => {
         const answers = Object.values(record.quiz ?? {}).filter((answer) => answer.firstTry).length;
         return sum + (record.completedAt ? XP.lesson : 0) + answers * XP.firstTryAnswer;
     }, 0);
-    const solvedXp = Object.entries(problems).reduce((sum, [id, record]) => sum + problemXp(id, record, course), 0);
+    // Design exercises and reviews score like problems: by difficulty, for their best status
+    const solvedXp = Object.entries({ ...problems, ...designs }).reduce((sum, [id, record]) => sum + problemXp(id, record, course), 0);
     const reviewXp = Object.values(cards).reduce((sum, card) => sum + (card.reviews ?? 0) * XP.review, 0);
     const checkpointXp = Object.values(checkpoints).filter((record) => record.passedAt).length * XP.checkpoint;
     return lessonXp + solvedXp + reviewXp + checkpointXp + Object.keys(mocks).length * XP.mock;

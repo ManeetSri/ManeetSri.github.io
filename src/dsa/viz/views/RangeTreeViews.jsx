@@ -2,11 +2,7 @@ import { useMemo } from 'react';
 import Player from '../Player.jsx';
 import TreeDiagram from './TreeDiagram.jsx';
 import { FENWICK_CODE, fenwickFrames, SEGMENT_CODE, segmentFrames } from '../algorithms/rangeTrees.js';
-
-const useStable = (value) => {
-    const key = JSON.stringify(value ?? null);
-    return useMemo(() => JSON.parse(key), [key]);
-};
+import { useStable } from '../useStable.js';
 
 const ItemsRow = ({ items, range, label = 'items', offset = 0 }) => (
     <div className="overflow-x-auto">

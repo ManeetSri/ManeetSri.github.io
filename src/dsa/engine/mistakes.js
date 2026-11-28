@@ -35,3 +35,19 @@ export const mockMistakes = (mocks) => Object.values(mocks)
     })
     .filter((mock) => mock.status !== 'solved' || mock.average < 2.5)
     .sort((a, b) => b.at - a.at);
+
+// Design exercises and reviews worth another look: not solved, a skill scored 2 or less, or findings missed
+export const designMistakes = (designs, practiceById, skillLabels = {}) => Object.entries(designs)
+    .filter(([id]) => practiceById[id])
+    .map(([id, record]) => {
+        const last = latestAttempt(record);
+        if (!last) return null;
+        const weakSkills = Object.entries(last.skills ?? {}).filter(([, score]) => score <= 2).map(([skill]) => skillLabels[skill] ?? skill);
+        const missedSome = Object.values(last.marks ?? {}).includes('missed');
+        const reason = last.status !== 'solved' ? (last.status === 'helped' ? 'partly there' : 'not there yet')
+            : weakSkills.length ? `weak on ${weakSkills.join(', ')}`
+                : missedSome ? 'missed findings' : null;
+        return reason ? { designId: id, reason, at: last.at } : null;
+    })
+    .filter(Boolean)
+    .sort((a, b) => b.at - a.at);

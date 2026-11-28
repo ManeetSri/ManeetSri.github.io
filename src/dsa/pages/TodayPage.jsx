@@ -61,7 +61,7 @@ const TodayPage = () => {
     const path = usePath();
     const { xp, rank, streak } = useStats();
     const now = useNow();
-    const plan = planToday({ path, lessons: state.lessons, problems: state.problems, cards: state.cards, minutesPerDay: profile.minutesPerDay, now, practiceById: course.practiceById, cardMinutes: course.cardMinutes });
+    const plan = planToday({ path, lessons: state.lessons, problems: { ...state.problems, ...state.designs }, cards: state.cards, minutesPerDay: profile.minutesPerDay, now, practiceById: course.practiceById, cardMinutes: course.cardMinutes });
     const progress = completion(path, state.lessons);
     const pace = projection({ path, progress: state.lessons, minutesPerDay: profile.minutesPerDay, daysPerWeek: profile.daysPerWeek, now });
     const next = plan.next;
@@ -148,7 +148,7 @@ const TodayPage = () => {
                                 <PlanRow done={false} icon={Award} to={links.checkpoint(checkpointDue.id)} title={`Checkpoint: ${checkpointDue.title}`} detail={`${checkpointDue.code} · 12 questions · about 10 min`} action="Take it" />
                             )}
                             {plan.practice.map(({ problem, done }) => (
-                                <PlanRow key={problem.id} done={done} icon={Code2} to={links.item(problem.id)} title={problem.title} detail={`${DIFFICULTIES[problem.difficulty].label} · ${formatMinutes(problem.minutes)}`} action="Solve" />
+                                <PlanRow key={problem.id} done={done} icon={Code2} to={links.item(problem.id)} title={problem.title} detail={`${DIFFICULTIES[problem.difficulty].label} · ${formatMinutes(problem.minutes)}`} action={{ design: 'Design', critique: 'Review' }[problem.kind] ?? 'Solve'} />
                             ))}
                             {itemsTotal === 0 && <li className="px-3 py-6 text-center text-sm text-muted">Nothing planned. Enjoy the day off, or open the path.</li>}
                         </ul>

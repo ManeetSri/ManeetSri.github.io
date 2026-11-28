@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { critiqueScore, ratingFromCritique, ratingFromRubric, rubricAverage, skillScores, statusFromCritique, statusFromRubric } from './exercises.js';
+import { critiqueScore, latestSkills, ratingFromCritique, ratingFromRubric, rubricAverage, skillScores, statusFromCritique, statusFromRubric } from './exercises.js';
 
 test('rubric ratings keep the DSA mock thresholds', () => {
     assert.equal(ratingFromRubric({ a: 4, b: 4 }, 'solved'), 'easy');
@@ -32,4 +32,13 @@ test('architecture reviews weigh findings by severity', () => {
     assert.equal(statusFromCritique(0.7), 'solved');
     assert.equal(statusFromCritique(0.5), 'helped');
     assert.equal(statusFromCritique(0.1), 'attempted');
+});
+
+test('each skill shows its most recent score', () => {
+    const designs = {
+        a: { attempts: { 1: { at: 1, skills: { data: 2, api: 3 } }, 5: { at: 5, skills: { data: 4 } } } },
+        b: { attempts: { 3: { at: 3, skills: { api: 1, offline: 2 } } } },
+        c: { attempts: { 4: { at: 4, marks: { x: 'found' } } } },
+    };
+    assert.deepEqual(latestSkills(designs), { data: 4, api: 1, offline: 2 });
 });

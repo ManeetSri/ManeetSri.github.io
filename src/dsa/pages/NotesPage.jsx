@@ -1,7 +1,7 @@
 import { Link } from 'react-router-dom';
 import { Bookmark, CircleAlert, Flag, NotebookPen } from 'lucide-react';
 import { useCourse } from '../course/context.js';
-import { mockMistakes, problemMistakes, quizMistakes } from '../engine/mistakes.js';
+import { designMistakes, mockMistakes, problemMistakes, quizMistakes } from '../engine/mistakes.js';
 import { useCourseStore } from '../store/store.js';
 import { formatDate } from '../ui/format.js';
 import { useConsoleMeta } from '../ui/hooks.js';
@@ -21,23 +21,25 @@ const LinkList = ({ items }) => (
 );
 
 const NotesPage = () => {
-    const { lessonById, moduleById, practiceById: problemById, links } = useCourse();
+    const { lessonById, moduleById, practiceById: problemById, links, skillLabels } = useCourse();
     useConsoleMeta('Notes', links.notes);
-    const { notes, lessons, problems, mocks } = useCourseStore();
+    const { notes, lessons, problems, designs, mocks } = useCourseStore();
 
     const lessonNotes = Object.entries(notes)
         .filter(([id, note]) => lessonById[id] && note.text?.trim())
         .sort(([, a], [, b]) => b.updatedAt - a.updatedAt);
-    const problemNotes = Object.entries(problems).filter(([id, record]) => problemById[id] && record.notes?.trim());
+    const problemNotes = Object.entries({ ...problems, ...designs }).filter(([id, record]) => problemById[id] && record.notes?.trim());
     const bookmarked = Object.entries(lessons).filter(([id, record]) => record.bookmarked && lessonById[id]).map(([id]) => lessonById[id]);
     const confusing = Object.entries(lessons).filter(([id, record]) => record.confusing && lessonById[id]).map(([id]) => lessonById[id]);
     const lessonLink = (lesson) => ({ to: links.lesson(lesson.id), title: lesson.title, detail: moduleById[lesson.module].code });
     const missedQuizzes = quizMistakes(lessons, lessonById);
     const shakyProblems = problemMistakes(problems, problemById);
+    const shakyDesigns = designMistakes(designs, problemById, skillLabels);
     const roughMocks = mockMistakes(mocks ?? {});
     const mistakes = [
         ...shakyProblems.map((entry) => ({ to: links.item(entry.problemId), title: problemById[entry.problemId].title, detail: entry.reason })),
-        ...roughMocks.map((mock) => ({ key: `mock-${mock.at}`, to: links.mock, title: `Mock: ${problemById[mock.problemId]?.title ?? mock.problemId}`, detail: `${mock.average.toFixed(1)} / 4${mock.weakest ? ` · weakest: ${mock.weakest}` : ''}` })),
+        ...shakyDesigns.map((entry) => ({ to: links.item(entry.designId), title: problemById[entry.designId].title, detail: entry.reason })),
+        ...roughMocks.map((mock) => ({ key: `mock-${mock.at}`, to: links.mock, title: `Mock: ${problemById[mock.problemId ?? mock.itemId]?.title ?? mock.problemId ?? mock.itemId}`, detail: `${mock.average.toFixed(1)} / 4${mock.weakest ? ` · weakest: ${mock.weakest}` : ''}` })),
         ...missedQuizzes.map((entry) => ({ to: links.lesson(entry.lessonId), title: lessonById[entry.lessonId].title, detail: `${entry.missed} missed first time${entry.stillWrong ? `, ${entry.stillWrong} still wrong` : ''}` })),
     ];
     const nothing = !lessonNotes.length && !problemNotes.length && !bookmarked.length && !confusing.length && !mistakes.length;

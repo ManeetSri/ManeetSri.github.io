@@ -2,8 +2,8 @@ import { useEffect, useRef, useState } from 'react';
 
 const SAVE_DELAY_MS = 700;
 
-// Saves a moment after typing stops, so every keystroke isn't a write
-export const AutosaveTextarea = ({ initial, onSave, label, placeholder, rows = 5, mono = false }) => {
+// Saves a moment after typing stops, so every keystroke isn't a write. `onInput` hears every change.
+export const AutosaveTextarea = ({ initial, onSave, onInput, label, placeholder, rows = 5, mono = false }) => {
     const [text, setText] = useState(initial ?? '');
     const [saved, setSaved] = useState(true);
     const timer = useRef(null);
@@ -21,6 +21,7 @@ export const AutosaveTextarea = ({ initial, onSave, label, placeholder, rows = 5
     }, []);
 
     const change = (value) => {
+        onInput?.(value);
         setText(value);
         unsaved.current = value;
         setSaved(false);

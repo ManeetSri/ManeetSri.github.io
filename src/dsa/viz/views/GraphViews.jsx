@@ -1,22 +1,13 @@
 import { useId, useMemo } from 'react';
 import Player from '../Player.jsx';
 import { ASTAR_CODE, astarFrames, edgeKey, graphFrames, graphProgram, GRID_CODE, gridFrames } from '../algorithms/graphs.js';
+import { ArrowMarker, clipCircle } from '../svg.js';
+import { EDGE_TONES, NODE_TONES } from '../tones.js';
+import { useStable } from '../useStable.js';
 
 const WIDTH = 560;
 const HEIGHT = 250;
 const RADIUS = 20;
-const NODE_TONES = {
-    idle: { fill: 'rgba(242,240,235,0.06)', stroke: 'rgba(242,240,235,0.35)', text: 'var(--color-paper)' },
-    frontier: { fill: 'rgba(93,216,255,0.15)', stroke: '#5DD8FF', text: '#5DD8FF' },
-    current: { fill: 'rgba(253,176,58,0.25)', stroke: 'var(--color-amber)', text: 'var(--color-amber)' },
-    done: { fill: 'rgba(48,209,88,0.18)', stroke: '#30D158', text: '#9FE6B0' },
-};
-const EDGE_TONES = { tree: '#30D158', used: 'var(--color-amber)', rejected: 'rgba(255,157,150,0.5)' };
-
-const useStable = (value) => {
-    const key = JSON.stringify(value ?? null);
-    return useMemo(() => JSON.parse(key), [key]);
-};
 
 const GraphDiagram = ({ graph, frame }) => {
     const marker = `graph-arrow-${useId().replace(/:/g, '')}`;
@@ -25,9 +16,7 @@ const GraphDiagram = ({ graph, frame }) => {
         <div className="overflow-x-auto">
             <svg viewBox={`0 0 ${WIDTH} ${HEIGHT}`} className="block w-full min-w-[420px]" role="img" aria-label={`Graph with ${graph.nodes.length} nodes and ${graph.edges.length} edges`}>
                 <defs>
-                    <marker id={marker} viewBox="0 0 10 10" refX="10" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
-                        <path d="M0,0 L10,5 L0,10 z" fill="rgba(242,240,235,0.55)" />
-                    </marker>
+                    <ArrowMarker id={marker} />
                 </defs>
                 {graph.edges.map(([a, b, weight]) => {
                     const from = position[a];
@@ -35,11 +24,13 @@ const GraphDiagram = ({ graph, frame }) => {
                     const length = Math.hypot(to.x - from.x, to.y - from.y);
                     const ux = (to.x - from.x) / length;
                     const uy = (to.y - from.y) / length;
+                    const start = clipCircle(from, to, RADIUS);
+                    const end = clipCircle(to, from, RADIUS + 2);
                     const tone = frame.edges[edgeKey(a, b, graph.directed)];
                     return (
                         <g key={`${a}-${b}`}>
                             <line
-                                x1={from.x + ux * RADIUS} y1={from.y + uy * RADIUS} x2={to.x - ux * (RADIUS + 2)} y2={to.y - uy * (RADIUS + 2)}
+                                x1={start.x} y1={start.y} x2={end.x} y2={end.y}
                                 stroke={EDGE_TONES[tone] ?? 'rgba(242,240,235,0.25)'} strokeWidth={tone === 'tree' ? 3 : 1.5} strokeDasharray={tone === 'rejected' ? '4 4' : undefined}
                                 markerEnd={graph.directed ? `url(#${marker})` : undefined}
                             />

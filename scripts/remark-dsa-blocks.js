@@ -6,20 +6,26 @@
 //   ```quiz            → <Quiz data="…">        YAML list of questions (see QUESTION_RULES)
 //   ```cards           → <Takeaways data="…">   YAML list of { id, front, back } flashcards
 //   ```visual <name>   → <Visual data="…">      optional YAML props for the visualiser
+//   ```workspace       (design exercises and reviews) the answer template: { template, omit?, minutes? }
+//   ```rubric          (design exercises) the criteria: [{ id, label, skill, look_for: [...] }]
+//   ```findings        (architecture reviews) what a review should find: [{ id, title, severity, detail, lines? }]
 //   ```swift title="…" → <CodeBlock data="…">   any other fence, with an ```output block after it attached
 //
 // A lesson's ```swift block marked `run` is a complete program. `npm run dsa:examples` (or design:examples)
 // copies it to <package>/Examples/<module>/<lesson>-<n>.swift and can check that it prints exactly its
 // ```output block. A block marked `check` (or `check ios`) is a fragment that's type-checked instead.
 //
-// Each file also exports `dsa`, a JSON string of its quiz questions, cards and section headings, which
-// the review queue and the table of contents read without rendering the lesson.
+// Each file also exports `dsa`, a JSON string of its quiz questions, cards and section headings (and for
+// design exercises its workspace, rubric and findings), which pages read without rendering the file.
 
 import { parse } from 'yaml';
 import { visit } from 'unist-util-visit';
 import { BIG_O_OPTIONS } from '../src/dsa/mdx/quiz/grading.js';
 import { VISUAL_NAMES } from '../src/dsa/viz/names.js';
+import { VISUAL_SCHEMAS } from '../src/dsa/viz/schemas.js';
 import { exampleFile, lessonLocation, parseMeta } from './dsa-content-lib.js';
+import { SKILLS } from '../src/dsa/design/data/skills.js';
+import { TEMPLATES, templateSections } from '../src/dsa/design/data/templates.js';
 
 const isString = (value) => typeof value === 'string' && value.trim().length > 0;
 const isStringList = (value, min) => Array.isArray(value) && value.length >= min && value.every(isString);
@@ -85,6 +91,38 @@ const checkCard = (card, seen) => {
     return null;
 };
 
+const SEVERITIES = ['high', 'medium', 'low'];
+
+const checkWorkspace = (value) => {
+    if (!value || typeof value !== 'object' || Array.isArray(value)) return 'must be a mapping with a template';
+    if (!TEMPLATES[value.template]) return `unknown template "${value.template}" (use ${Object.keys(TEMPLATES).join(', ')})`;
+    const ids = TEMPLATES[value.template].sections.map((item) => item.id);
+    const omit = value.omit ?? [];
+    if (!Array.isArray(omit) || omit.some((id) => !ids.includes(id))) return `omit lists sections of the ${value.template} template: ${ids.join(', ')}`;
+    if (value.minutes !== undefined && !(Number.isInteger(value.minutes) && value.minutes > 0)) return 'minutes must be a whole number';
+    return null;
+};
+
+const checkCriterion = (criterion, seen) => {
+    if (!criterion || !isString(criterion.id) || !isString(criterion.label)) return 'each criterion needs an id and a label';
+    if (seen.has(criterion.id)) return `duplicate criterion id "${criterion.id}"`;
+    seen.add(criterion.id);
+    if (!SKILLS[criterion.skill]) return `criterion "${criterion.id}" has unknown skill "${criterion.skill}" (use ${Object.keys(SKILLS).join(', ')})`;
+    if (!isStringList(criterion.look_for, 1)) return `criterion "${criterion.id}" needs look_for: what a strong answer covers`;
+    return null;
+};
+
+const checkFinding = (finding, seen) => {
+    if (!finding || !isString(finding.id) || !isString(finding.title) || !isString(finding.detail)) return 'each finding needs an id, title and detail';
+    if (seen.has(finding.id)) return `duplicate finding id "${finding.id}"`;
+    seen.add(finding.id);
+    if (!SEVERITIES.includes(finding.severity)) return `finding "${finding.id}" needs a severity: ${SEVERITIES.join(', ')}`;
+    if (finding.lines !== undefined && !/^\d+(-\d+)?$/.test(String(finding.lines))) return `finding "${finding.id}" lines must look like 12 or 12-18`;
+    return null;
+};
+
+const attributeOf = (node, name) => node.attributes?.find((attribute) => attribute.name === name)?.value;
+
 const parseLines = (spec) => (spec ?? '').split(',').filter(Boolean).flatMap((part) => {
     const [from, to = from] = part.split('-').map(Number);
     return Array.from({ length: to - from + 1 }, (_, index) => from + index);
@@ -146,6 +184,12 @@ export default function remarkDsaBlocks() {
         const headings = [];
         const location = lessonLocation(file.path);
         const runnable = [];
+        const path = String(file.path ?? '').replaceAll('\\', '/');
+        const isDesign = path.includes('/content/designs/');
+        const isCritique = path.includes('/content/critiques/');
+        let workspace = null;
+        let rubric = null;
+        let findings = null;
 
         visit(tree, 'heading', (node) => {
             if (node.depth !== 2) return;
@@ -182,10 +226,41 @@ export default function remarkDsaBlocks() {
                 return;
             }
 
+            if (node.lang === 'workspace' || node.lang === 'rubric' || node.lang === 'findings') {
+                if (!isDesign && !isCritique) file.fail(`A \`\`\`${node.lang} block belongs in a design exercise or architecture review`, node);
+                const value = parseYaml(node, file);
+                if (node.lang === 'workspace') {
+                    const problem = checkWorkspace(value);
+                    if (problem) file.fail(`\`\`\`workspace: ${problem}`, node);
+                    workspace = { template: value.template, minutes: value.minutes ?? TEMPLATES[value.template].minutes, sections: templateSections(value.template, value.omit) };
+                } else if (node.lang === 'rubric') {
+                    if (!Array.isArray(value) || value.length < 3) file.fail('A ```rubric block must list 3 or more criteria', node);
+                    const seen = new Set();
+                    value.forEach((criterion) => {
+                        const problem = checkCriterion(criterion, seen);
+                        if (problem) file.fail(`\`\`\`rubric: ${problem}`, node);
+                    });
+                    rubric = value;
+                } else {
+                    if (!Array.isArray(value) || value.length < 2) file.fail('A ```findings block must list 2 or more findings', node);
+                    const seen = new Set();
+                    value.forEach((finding) => {
+                        const problem = checkFinding(finding, seen);
+                        if (problem) file.fail(`\`\`\`findings: ${problem}`, node);
+                    });
+                    findings = value.map((finding) => ({ ...finding, lines: finding.lines === undefined ? undefined : String(finding.lines) }));
+                }
+                parent.children.splice(index, 1);
+                return index;
+            }
+
             if (node.lang === 'visual') {
                 const name = node.meta?.trim();
                 if (!VISUAL_NAMES.includes(name)) file.fail(`Unknown visualiser "${name}" (known: ${VISUAL_NAMES.join(', ')})`, node);
-                replace(element('Visual', { name, props: parseYaml(node, file) ?? {} }));
+                const props = parseYaml(node, file) ?? {};
+                const verdict = VISUAL_SCHEMAS[name]?.(props);
+                if (verdict !== undefined && verdict !== true) file.fail(`\`\`\`visual ${name}: ${verdict}`, node);
+                replace(element('Visual', { name, props }));
                 return;
             }
 
@@ -222,6 +297,30 @@ export default function remarkDsaBlocks() {
             if (codeBlock.data.payload.output === undefined) file.fail('A `run` block needs an ```output block straight after it', node);
         });
 
-        tree.children.push(exportNode({ questions, cards, headings }));
+        // A design exercise has a workspace, a rubric, and one model answer for each workspace section;
+        // an architecture review has a workspace, its findings and a reference review
+        if (isDesign || isCritique) {
+            if (!workspace) file.fail('A design exercise or review needs a ```workspace block');
+            if (isDesign && !rubric) file.fail('A design exercise needs a ```rubric block');
+            if (isCritique && !findings) file.fail('An architecture review needs a ```findings block');
+            const answered = [];
+            let reference = false;
+            visit(tree, 'mdxJsxFlowElement', (node) => {
+                if (node.name === 'ModelAnswer') answered.push(attributeOf(node, 'section'));
+                if (node.name === 'ReferenceReview') reference = true;
+            });
+            if (isCritique && !reference) file.fail('An architecture review needs a <ReferenceReview>');
+            if (isDesign) {
+                const ids = workspace.sections.map((item) => item.id);
+                const missing = ids.filter((id) => !answered.includes(id));
+                const unknown = answered.filter((id) => !ids.includes(id));
+                const twice = answered.filter((id, at) => answered.indexOf(id) !== at);
+                if (missing.length) file.fail(`Missing <ModelAnswer section="…"> for: ${missing.join(', ')}`);
+                if (unknown.length) file.fail(`<ModelAnswer> for sections the workspace doesn't have: ${unknown.join(', ')}`);
+                if (twice.length) file.fail(`More than one <ModelAnswer> for: ${twice.join(', ')}`);
+            }
+        }
+
+        tree.children.push(exportNode({ questions, cards, headings, ...(workspace ? { workspace } : {}), ...(rubric ? { rubric } : {}), ...(findings ? { findings } : {}) }));
     };
 }

@@ -4,11 +4,7 @@ import TreeDiagram from './TreeDiagram.jsx';
 import { dpFrames, dpProgram } from '../algorithms/dp.js';
 import { HUFFMAN_CODE, huffmanFrames } from '../algorithms/huffman.js';
 import { COMBINATION_SUM_CODE, combinationSumFrames, PERMUTATIONS_CODE, permutationsFrames, QUEENS_CODE, queensFrames, SUBSETS_CODE, subsetsFrames } from '../algorithms/backtracking.js';
-
-const useStable = (value) => {
-    const key = JSON.stringify(value ?? null);
-    return useMemo(() => JSON.parse(key), [key]);
-};
+import { useStable } from '../useStable.js';
 
 const hasCell = (cells, r, c) => cells.some(([row, col]) => row === r && col === c);
 

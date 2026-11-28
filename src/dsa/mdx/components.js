@@ -2,6 +2,7 @@ import CodeBlock from './CodeBlock.jsx';
 import Quiz from './quiz/Quiz.jsx';
 import Visual from './Visual.jsx';
 import { Approach, Callout, Hint, Hints, Takeaways } from './Blocks.jsx';
+import { Brief, ModelAnswer, Pitfalls, ReferenceReview } from './DesignBlocks.jsx';
 import {
     Anchor, Cell, H2, H3, HeaderCell, InlineCode, List, ListItem, OrderedList, Paragraph, Quote, Rule, Strong, Table, TableHead,
 } from './Markdown.jsx';
@@ -31,4 +32,8 @@ export const mdxComponents = {
     Hints,
     Hint,
     Approach,
+    Brief,
+    ModelAnswer,
+    Pitfalls,
+    ReferenceReview,
 };

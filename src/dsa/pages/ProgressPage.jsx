@@ -4,6 +4,7 @@ import { addDays, dayKey, startOfDay } from '../engine/dates.js';
 import { completion } from '../engine/path.js';
 import { minutesOn, RANKS } from '../engine/stats.js';
 import { badgesFor, longestStreak, masteryByPart } from '../engine/badges.js';
+import { latestSkills } from '../engine/exercises.js';
 import MasteryRadar from '../ui/MasteryRadar.jsx';
 import { useCourseStore, useProfile } from '../store/store.js';
 import { formatDate, formatMinutes } from '../ui/format.js';
@@ -66,6 +67,7 @@ const ProgressPage = () => {
     })).filter((entry) => entry.total > 0);
     const { goal } = useProfile();
     const mastery = masteryByPart({ lessons: state.lessons, problems: state.problems, goal }, course);
+    const skills = latestSkills(state.designs);
     const badges = badgesFor({ ...state, streak, bestStreak: longestStreak(days), goal }, course);
     const earnedCount = badges.filter((badge) => badge.isEarned).length;
     const answers = Object.values(state.lessons).flatMap((record) => Object.values(record.quiz ?? {}));
@@ -87,6 +89,16 @@ const ProgressPage = () => {
                 <MasteryRadar entries={mastery} />
                 <p className="mt-3 text-xs text-muted">Half lessons finished, a quarter first-try quiz accuracy, a quarter problems solved, counting your path only.</p>
             </Card>
+
+            {course.skillLabels && (
+                <Card className="mt-6 p-5">
+                    <h2 className="mb-4 flex items-center gap-2 font-semibold"><Radar size={17} aria-hidden="true" className="text-amber" /> Design skills</h2>
+                    {Object.keys(skills).length
+                        ? <MasteryRadar caption="Design skills" firstColumn="Skill" entries={Object.values(course.skillLabels).map((title, index) => ({ part: index + 1, title, value: (skills[Object.keys(course.skillLabels)[index]] ?? 0) / 4 }))} />
+                        : <p className="text-sm text-muted">Score a design exercise against its rubric and your skills show up here: requirements, API, data, offline, trade-offs and more.</p>}
+                    <p className="mt-3 text-xs text-muted">Your latest rubric score for each skill, out of 4.</p>
+                </Card>
+            )}
 
             <Card className="mt-6 p-5">
                 <h2 className="mb-4 flex items-center gap-2 font-semibold"><Award size={17} aria-hidden="true" className="text-amber" /> Badges <span className="font-mono text-xs font-normal text-muted">{earnedCount} of {badges.length}</span></h2>

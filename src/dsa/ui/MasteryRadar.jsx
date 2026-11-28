@@ -3,7 +3,9 @@ const SIZE = 300;
 const CENTRE = SIZE / 2;
 const RADIUS = 110;
 
-const MasteryRadar = ({ entries }) => {
+// entries: [{ part (short label on the chart), title, value 0–1, lessons?: { done, total } }]
+const MasteryRadar = ({ entries, caption = 'Mastery by part', firstColumn = 'Part' }) => {
+    const showLessons = entries.some((entry) => entry.lessons);
     const angle = (index) => (Math.PI * 2 * index) / entries.length - Math.PI / 2;
     const point = (index, value) => [CENTRE + Math.cos(angle(index)) * RADIUS * value, CENTRE + Math.sin(angle(index)) * RADIUS * value];
     const polygon = entries.map((entry, index) => point(index, Math.max(0.02, entry.value)).join(',')).join(' ');
@@ -25,15 +27,15 @@ const MasteryRadar = ({ entries }) => {
                 })}
             </svg>
             <table className="w-full text-left text-sm">
-                <caption className="sr-only">Mastery by part</caption>
+                <caption className="sr-only">{caption}</caption>
                 <thead className="font-mono text-xs text-muted">
-                    <tr><th className="py-1 font-medium">Part</th><th className="py-1 font-medium">Lessons</th><th className="py-1 text-right font-medium">Mastery</th></tr>
+                    <tr><th className="py-1 font-medium">{firstColumn}</th>{showLessons && <th className="py-1 font-medium">Lessons</th>}<th className="py-1 text-right font-medium">Mastery</th></tr>
                 </thead>
                 <tbody>
                     {entries.map((entry) => (
                         <tr key={entry.part} className="border-t border-line">
                             <td className="py-1.5"><span className="mr-2 font-mono text-xs text-muted">{entry.part}</span>{entry.title}</td>
-                            <td className="py-1.5 font-mono text-xs text-muted">{entry.lessons.done}/{entry.lessons.total}</td>
+                            {showLessons && <td className="py-1.5 font-mono text-xs text-muted">{entry.lessons.done}/{entry.lessons.total}</td>}
                             <td className="py-1.5 text-right font-mono">{Math.round(entry.value * 100)}%</td>
                         </tr>
                     ))}

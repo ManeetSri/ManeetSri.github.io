@@ -3,7 +3,8 @@
 // search, path engine and content checker. Modules live in ./parts/part-NN.js, one file per part.
 //
 // A lesson is ['id', 'Title', { options }], as in the DSA course. Every id in this course starts with
-// `sd-`, which is how the console knows a stored record belongs to this course.
+// `sd-`, which is how the console knows a stored record belongs to this course. A lesson is 'ready' when its
+// id is listed in ./ready/<module>.js (or its options say so); otherwise it's a stub.
 import part00 from './parts/part-00.js';
 import part01 from './parts/part-01.js';
 import part02 from './parts/part-02.js';
@@ -17,6 +18,7 @@ import part09 from './parts/part-09.js';
 import part10 from './parts/part-10.js';
 import part11 from './parts/part-11.js';
 import { practice } from './practice.js';
+import readyLessons from './ready.js';
 
 export const LEVELS = {
     beginner: 'Beginner',
@@ -72,7 +74,7 @@ export const modules = rawModules.map((module) => ({
         level: options.level ?? module.level,
         minutes: options.minutes ?? DEFAULT_MINUTES,
         tracks: options.tracks ?? module.tracks,
-        status: options.status ?? module.status ?? 'stub',
+        status: options.status ?? (readyLessons.has(id) ? 'ready' : module.status ?? 'stub'),
         // Every practice item for the lesson, whatever its kind
         problems: practice.filter((item) => item.lessons.includes(id)).map((item) => item.id),
         prereqs: options.prereqs ?? [],

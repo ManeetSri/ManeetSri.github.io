@@ -100,6 +100,51 @@ const ProblemCard = ({ card, onRate, now }) => {
     );
 };
 
+// A design exercise or architecture review, recalled: outline it from memory, then see what a strong answer covers
+const DesignRecallCard = ({ card, onRate, now }) => {
+    const { practiceById, links } = useCourse();
+    const item = practiceById[card.ref];
+    const content = useContent(card.kind, card.ref);
+    const [shown, setShown] = useState(false);
+    if (!item) return <EmptyState title="This exercise was retired"><Button size="sm" className="mt-3" onClick={() => onRate('easy')}>Skip it</Button></EmptyState>;
+    const data = content.status === 'ready' ? content.data : null;
+    const isCritique = card.kind === 'critique';
+    return (
+        <div className="space-y-4">
+            <Card className="p-5 sm:p-6">
+                <p className="font-mono text-xs text-muted">{isCritique ? 'Recall the review' : 'Recall the design'}</p>
+                <p className="mt-2 font-display text-2xl font-semibold tracking-tight">{item.title}</p>
+                {item.summary && <p className="mt-2 text-sm leading-relaxed text-muted">{item.summary}</p>}
+                <p className="mt-4 text-sm">{isCritique ? 'From memory, list the problems you’d flag and how you’d fix them.' : 'From memory, sketch your answer for each part:'}</p>
+                {!isCritique && data?.workspace && <p className="mt-1 text-sm text-muted">{data.workspace.sections.map((section) => section.title).join(' · ')}</p>}
+                <textarea rows={5} aria-label="Scratch space, not saved" placeholder="Scratch space. This isn’t saved." className="mt-3 w-full rounded-xl border border-line bg-white/[0.04] p-3 text-sm outline-none focus:border-amber" />
+                <div className="mt-3 flex flex-wrap gap-2">
+                    {!shown && <Button size="sm" variant="primary" onClick={() => setShown(true)} disabled={!data}>Show what a strong answer covers</Button>}
+                    <ButtonLink to={links.item(item.id)} size="sm">Open the full exercise <ArrowRight size={15} aria-hidden="true" /></ButtonLink>
+                </div>
+            </Card>
+            {shown && data && (
+                <Card className="p-5 sm:p-6">
+                    <p className="mb-3 font-semibold">{isCritique ? 'A strong review finds' : 'A strong answer covers'}</p>
+                    <ul className="space-y-3 text-sm">
+                        {isCritique
+                            ? (data.findings ?? []).map((finding) => <li key={finding.id}><span className="font-medium">{finding.title}</span> <Chip tone={finding.severity === 'high' ? 'red' : finding.severity === 'medium' ? 'amber' : 'neutral'}>{finding.severity}</Chip></li>)
+                            : (data.rubric ?? []).map((criterion) => (
+                                <li key={criterion.id}>
+                                    <p className="font-medium">{criterion.label}</p>
+                                    <ul className="mt-1 list-disc pl-5 text-muted">{criterion.look_for.map((point) => <li key={point}>{point}</li>)}</ul>
+                                </li>
+                            ))}
+                    </ul>
+                </Card>
+            )}
+            {shown && <RateButtons card={card} onRate={onRate} now={now} />}
+        </div>
+    );
+};
+
+const CARD_LABELS = { problem: 'Problem', question: 'Missed question', design: 'Design', critique: 'Review' };
+
 const ReviewPage = () => {
     const { links } = useCourse();
     useConsoleMeta('Review', links.review);
@@ -123,12 +168,12 @@ const ReviewPage = () => {
             {current ? (
                 <div key={current.id}>
                     <div className="mb-4 flex items-center gap-2">
-                        <Chip tone="amber">{current.kind === 'problem' ? 'Problem' : current.kind === 'question' ? 'Missed question' : 'Takeaway'}</Chip>
+                        <Chip tone="amber">{CARD_LABELS[current.kind] ?? 'Takeaway'}</Chip>
                         {current.lapses > 0 && <Chip tone="red">forgotten {current.lapses}×</Chip>}
                     </div>
-                    {current.kind === 'problem'
-                        ? <ProblemCard card={current} now={now} onRate={(rating) => review(current.id, rating)} />
-                        : <LessonCard card={current} now={now} onRate={(rating) => review(current.id, rating)} />}
+                    {current.kind === 'problem' && <ProblemCard card={current} now={now} onRate={(rating) => review(current.id, rating)} />}
+                    {(current.kind === 'design' || current.kind === 'critique') && <DesignRecallCard card={current} now={now} onRate={(rating) => review(current.id, rating)} />}
+                    {!['problem', 'design', 'critique'].includes(current.kind) && <LessonCard card={current} now={now} onRate={(rating) => review(current.id, rating)} />}
                 </div>
             ) : all.length === 0 ? (
                 <EmptyState icon={Layers} title="No cards yet">

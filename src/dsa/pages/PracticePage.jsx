@@ -1,4 +1,4 @@
-import { useState } from 'react';
+import { useMemo, useState } from 'react';
 import { Link, useNavigate } from 'react-router-dom';
 import { ArrowRight, CheckCircle2, Circle, CircleDot, Code2, Search, Shuffle } from 'lucide-react';
 import { useCourse } from '../course/context.js';
@@ -25,10 +25,13 @@ const Select = ({ label, value, onChange, options }) => (
 );
 
 const PracticePage = () => {
-    const { lessonById, lessons: allLessons, moduleById, DIFFICULTIES, LISTS, PATTERNS, practice: problems, links, practiceIntro, patternLabel } = useCourse();
+    const { lessonById, lessons: allLessons, moduleById, DIFFICULTIES, LISTS, PATTERNS, practice: problems, links, practiceIntro, patternLabel, kindLabels } = useCourse();
     useConsoleMeta('Practice', links.practice);
     const navigate = useNavigate();
-    const { problems: records, cards, lessons } = useCourseStore();
+    const { problems: problemRecords, designs, cards, lessons } = useCourseStore();
+    // Katas keep their attempts in `problems`, design exercises and reviews in `designs`; ids never overlap
+    const records = useMemo(() => ({ ...problemRecords, ...designs }), [problemRecords, designs]);
+    const [kind, setKind] = useState('');
     const [query, setQuery] = useState('');
     const [difficulty, setDifficulty] = useState('');
     const [pattern, setPattern] = useState('');
@@ -38,7 +41,8 @@ const PracticePage = () => {
     const now = useNow();
 
     const statusOf = (id) => records[id]?.status ?? 'new';
-    const due = (id) => cards[cardId.problem(id)] && isDue(cards[cardId.problem(id)], now);
+    const cardOf = (id) => cards[cardId.problem(id)] ?? cards[cardId.design(id)];
+    const due = (id) => Boolean(cardOf(id)) && isDue(cardOf(id), now);
 
     // Course order follows the first lesson each problem practises
     const lessonOrder = new Map(allLessons.map((lesson, index) => [lesson.id, index]));
@@ -52,6 +56,7 @@ const PracticePage = () => {
 
     const filtered = problems.filter((problem) => {
         if (query && !problem.title.toLowerCase().includes(query.toLowerCase())) return false;
+        if (kind && (problem.kind ?? 'problem') !== kind) return false;
         if (difficulty && problem.difficulty !== difficulty) return false;
         if (pattern && !problem.patterns.includes(pattern)) return false;
         if (list && !(problem.lists ?? []).includes(list)) return false;
@@ -123,6 +128,7 @@ const PracticePage = () => {
                         <input value={query} onChange={(event) => setQuery(event.target.value)} placeholder="Problem name" className="h-10 w-full rounded-xl border border-line bg-surface pl-9 pr-3 text-sm text-paper outline-none focus:border-amber" />
                     </span>
                 </label>
+                {kindLabels && <Select label="Kind" value={kind} onChange={setKind} options={kindLabels} />}
                 <Select label="Difficulty" value={difficulty} onChange={setDifficulty} options={Object.fromEntries(Object.entries(DIFFICULTIES).map(([key, value]) => [key, value.label]))} />
                 <Select label={patternLabel} value={pattern} onChange={setPattern} options={PATTERNS} />
                 <Select label="Status" value={status} onChange={setStatus} options={{ new: 'Not tried', attempted: 'Attempted', helped: 'Solved with help', solved: 'Solved', due: 'Due for a re-solve' }} />

@@ -38,3 +38,21 @@ test('mock mistakes are unfinished or low-scoring mocks, with the weakest criter
     const result = mockMistakes(mocks);
     assert.deepEqual(result.map((mock) => [mock.at, mock.weakest]), [[3, 'approach'], [2, 'communication']]);
 });
+
+import { designMistakes } from './mistakes.js';
+
+test('design mistakes flag unsolved attempts, weak skills and missed findings', () => {
+    const practiceById = { 'sd-a': { kind: 'design' }, 'sd-b': { kind: 'design' }, 'sd-c': { kind: 'critique' }, 'sd-d': { kind: 'design' } };
+    const designs = {
+        'sd-a': { attempts: { 1: { at: 1, status: 'helped' } } },
+        'sd-b': { attempts: { 2: { at: 2, status: 'solved', skills: { data: 2, api: 4 } } } },
+        'sd-c': { attempts: { 3: { at: 3, status: 'solved', marks: { race: 'found', leak: 'missed' } } } },
+        'sd-d': { attempts: { 4: { at: 4, status: 'solved', skills: { data: 3 } } } },
+        'sd-gone': { attempts: { 5: { at: 5, status: 'attempted' } } },
+    };
+    assert.deepEqual(designMistakes(designs, practiceById, { data: 'Data & storage' }), [
+        { designId: 'sd-c', reason: 'missed findings', at: 3 },
+        { designId: 'sd-b', reason: 'weak on Data & storage', at: 2 },
+        { designId: 'sd-a', reason: 'partly there', at: 1 },
+    ]);
+});

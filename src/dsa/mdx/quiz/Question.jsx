@@ -250,7 +250,7 @@ const Question = ({ question, number, previous, onResult, allowRetry = true }) =
     const isRecall = question.type === 'recall';
 
     return (
-        <fieldset className="rounded-2xl border border-line bg-surface p-4 sm:p-5">
+        <fieldset className="min-w-0 rounded-2xl border border-line bg-surface p-4 sm:p-5">
             <legend className="sr-only">Question {number}</legend>
             <div className="mb-3 flex flex-wrap items-center gap-2 font-mono text-xs text-muted">
                 {number !== undefined && <span>Q{number}</span>}

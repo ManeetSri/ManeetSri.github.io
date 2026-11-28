@@ -5,6 +5,7 @@ import { useCourse } from '../course/context.js';
 import { useContent } from '../content/index.js';
 import { isDone } from '../engine/path.js';
 import { mdxComponents } from '../mdx/components.js';
+import { DesignAnswerContext } from '../mdx/designContext.js';
 import { useActions, useCourseStore } from '../store/store.js';
 import { formatDate, formatDuration } from '../ui/format.js';
 import { useConsoleMeta } from '../ui/hooks.js';
@@ -20,6 +21,36 @@ const CRITERIA = [
     { id: 'communication', label: 'Communication', detail: 'Explained the thinking out loud as you went' },
 ];
 const LEVELS = ['Not yet', 'Getting there', 'Solid', 'Strong'];
+
+// A coding mock, as DSA has always had; a course can bring its own (course.mock), such as design interviews
+const PROBLEM_MOCK = {
+    kind: 'problem',
+    durations: DURATIONS,
+    criteria: CRITERIA,
+    eligible: (item) => (item.kind ?? 'problem') === 'problem',
+    intro: 'A random problem from topics you’ve finished, a timer, and no hints. Afterwards you score yourself against the same rubric interviewers use.',
+    empty: 'Finish a few lessons with practice problems first: mocks only use topics you’ve learned.',
+    noun: 'problem',
+};
+
+const HIDDEN_ANSWERS = { revealed: false, answers: {}, sections: [] };
+const ANSWER_KEY = 'maneet-mock-answer:';
+
+// What you write during a design mock stays in this tab until it's scored, then goes with the attempt
+const readAnswer = (id) => {
+    try {
+        return JSON.parse(sessionStorage.getItem(ANSWER_KEY + id)) ?? {};
+    } catch {
+        return {};
+    }
+};
+const writeAnswer = (id, answer) => {
+    try {
+        sessionStorage.setItem(ANSWER_KEY + id, JSON.stringify(answer));
+    } catch {
+        // Storage is blocked: the answer still lives in memory until the mock is saved
+    }
+};
 
 // During a mock the statement shows, but hints and solutions don't
 const HiddenSection = () => null;
@@ -48,15 +79,41 @@ const Statement = ({ problem }) => {
     return <Content components={mockComponents} />;
 };
 
-const Rubric = ({ problem, seconds, onSaved }) => {
+// The brief of a design exercise, with its model answer kept hidden, and boxes for each part of the answer
+const DesignMock = ({ item, answer, onChange }) => {
+    const content = useContent(item.kind, item.id);
+    if (content.status === 'loading') return <p className="flex items-center gap-2 text-muted"><LoaderCircle size={18} aria-hidden="true" className="animate-spin" /> Loading…</p>;
+    if (content.status !== 'ready') return <EmptyState title="The brief didn’t load" />;
+    const sections = content.data.workspace?.sections ?? [];
+    return (
+        <>
+            <DesignAnswerContext.Provider value={HIDDEN_ANSWERS}>
+                <content.Content components={mdxComponents} />
+            </DesignAnswerContext.Provider>
+            <Card className="mt-8 space-y-5 p-4">
+                {sections.map((section) => (
+                    <label key={section.id} className="block">
+                        <span className="font-medium">{section.title}</span>
+                        <span className="mb-2 block text-xs text-muted">{section.prompt}</span>
+                        <textarea value={answer[section.id] ?? ''} onChange={(event) => onChange({ ...answer, [section.id]: event.target.value })} rows={section.rows} className="w-full rounded-xl border border-line bg-white/[0.04] p-3 text-sm leading-relaxed outline-none focus:border-amber" />
+                    </label>
+                ))}
+            </Card>
+        </>
+    );
+};
+
+const Rubric = ({ problem, seconds, onSaved, mock, answer }) => {
+    const course = useCourse();
     const { recordMock } = useActions();
     const [status, setStatus] = useState('solved');
-    const [scores, setScores] = useState(() => Object.fromEntries(CRITERIA.map((criterion) => [criterion.id, 0])));
+    const [scores, setScores] = useState(() => Object.fromEntries(mock.criteria.map((criterion) => [criterion.id, 0])));
     const [notes, setNotes] = useState('');
     const complete = Object.values(scores).every((value) => value > 0);
 
     const save = () => {
-        recordMock({ problemId: problem.id, seconds, status, scores, notes: notes.trim() });
+        if (mock.kind === 'problem') recordMock({ problemId: problem.id, seconds, status, scores, notes: notes.trim() });
+        else recordMock({ course: course.id, kind: mock.kind, itemId: problem.id, seconds, status, scores, notes: notes.trim(), answer });
         onSaved();
     };
 
@@ -68,12 +125,14 @@ const Rubric = ({ problem, seconds, onSaved }) => {
             <fieldset>
                 <legend className="mb-2 font-medium">Outcome</legend>
                 <div className="flex flex-wrap gap-2">
-                    {[['solved', 'Solved it'], ['helped', 'Solved with a nudge'], ['attempted', 'Didn’t finish']].map(([value, label]) => (
+                    {(mock.kind === 'problem'
+                        ? [['solved', 'Solved it'], ['helped', 'Solved with a nudge'], ['attempted', 'Didn’t finish']]
+                        : [['solved', 'Covered it well'], ['helped', 'Got there with gaps'], ['attempted', 'Ran out of time or ideas']]).map(([value, label]) => (
                         <button key={value} type="button" aria-pressed={status === value} onClick={() => setStatus(value)} className={`h-10 rounded-full px-4 text-sm ${status === value ? 'bg-amber/20 text-amber ring-1 ring-amber' : 'bg-white/[0.06] text-muted hover:text-paper'}`}>{label}</button>
                     ))}
                 </div>
             </fieldset>
-            {CRITERIA.map((criterion) => (
+            {mock.criteria.map((criterion) => (
                 <fieldset key={criterion.id}>
                     <legend className="font-medium">{criterion.label}</legend>
                     <p className="mb-2 text-sm text-muted">{criterion.detail}</p>
@@ -96,15 +155,19 @@ const Rubric = ({ problem, seconds, onSaved }) => {
 };
 
 const MockPage = () => {
-    const { DIFFICULTIES, problemById, problems, links } = useCourse();
+    const course = useCourse();
+    const { DIFFICULTIES, practice, practiceById, links } = course;
+    const mock = course.mock ?? PROBLEM_MOCK;
     useConsoleMeta('Mock interview', links.mock);
-    const { lessons, problems: records, mocks } = useCourseStore();
+    const { lessons, problems: problemRecords, designs, mocks } = useCourseStore();
+    const records = mock.kind === 'problem' ? problemRecords : designs;
     const [duration, setDuration] = useState(45);
+    const [answer, setAnswer] = useState({});
     const [difficulty, setDifficulty] = useState('any');
     const [stage, setStage] = useState('setup');
     const [session, setSession] = useState(null);
 
-    const learned = useMemo(() => problems.filter((problem) => problem.lessons.some((id) => isDone(id, lessons))), [problems, lessons]);
+    const learned = useMemo(() => practice.filter((item) => mock.eligible(item) && item.lessons.some((id) => isDone(id, lessons))), [practice, mock, lessons]);
     const pool = learned.filter((problem) => difficulty === 'any' || problem.difficulty === difficulty);
     const history = Object.values(mocks).sort((a, b) => b.at - a.at);
 
@@ -113,6 +176,7 @@ const MockPage = () => {
         const fresh = pool.filter((problem) => records[problem.id]?.status !== 'solved');
         const choices = fresh.length ? fresh : pool;
         const problem = choices[Math.floor(Math.random() * choices.length)];
+        setAnswer(mock.kind === 'problem' ? {} : readAnswer(problem.id));
         setSession({ problem, startedAt: Date.now(), endsAt: Date.now() + duration * 60_000, seconds: 0 });
         setStage('running');
     };
@@ -133,29 +197,38 @@ const MockPage = () => {
                     <Button size="sm" variant="primary" onClick={finish}>I’m done</Button>
                 </div>
                 <h1 className="font-display text-[clamp(2rem,5vw,3rem)] font-semibold leading-tight tracking-tight">{session.problem.title}</h1>
-                <p className="mt-2 text-sm text-muted">Talk through your approach out loud before you write code. Hints and solutions are hidden until you finish.</p>
-                <div className="mt-6"><Statement problem={session.problem} /></div>
-                <Card className="mt-8 p-4">
-                    <SolutionEditor problem={session.problem} />
-                    <p className="mt-3 text-sm text-muted">Write it as you would in an interview, then press “I’m done”. Test it with <code className="font-mono text-amber">swift test --filter {session.problem.swiftTest}</code> afterwards, not during.</p>
-                </Card>
+                {mock.kind === 'problem' ? (
+                    <>
+                        <p className="mt-2 text-sm text-muted">Talk through your approach out loud before you write code. Hints and solutions are hidden until you finish.</p>
+                        <div className="mt-6"><Statement problem={session.problem} /></div>
+                        <Card className="mt-8 p-4">
+                            <SolutionEditor problem={session.problem} />
+                            <p className="mt-3 text-sm text-muted">Write it as you would in an interview, then press “I’m done”. Test it with <code className="font-mono text-amber">swift test --filter {session.problem.swiftTest}</code> afterwards, not during.</p>
+                        </Card>
+                    </>
+                ) : (
+                    <>
+                        <p className="mt-2 text-sm text-muted">Talk it through out loud as you write: clarify, sketch the big picture, then go deep. The model answer stays hidden until you’ve scored yourself.</p>
+                        <div className="mt-6"><DesignMock item={session.problem} answer={answer} onChange={(next) => { setAnswer(next); writeAnswer(session.problem.id, next); }} /></div>
+                    </>
+                )}
             </div>
         );
     }
 
     if (stage === 'rubric' && session) {
-        return <div className="mx-auto max-w-2xl"><Rubric problem={session.problem} seconds={session.seconds} onSaved={() => setStage('saved')} /></div>;
+        return <div className="mx-auto max-w-2xl"><Rubric problem={session.problem} seconds={session.seconds} mock={mock} answer={answer} onSaved={() => { writeAnswer(session.problem.id, {}); setStage('saved'); }} /></div>;
     }
 
     return (
         <div className="mx-auto max-w-3xl">
             <PageHeader eyebrow="Practise under interview conditions" title="Mock interview">
-                A random problem from topics you’ve finished, a timer, and no hints. Afterwards you score yourself against the same rubric interviewers use.
+                {mock.intro}
             </PageHeader>
 
             {stage === 'saved' && (
                 <Card className="mb-6 flex flex-wrap items-center gap-3 border-[#30D158]/40 p-5">
-                    <p className="flex-1">Saved, and the problem is scheduled for a re-solve. Now read the full solutions with fresh eyes.</p>
+                    <p className="flex-1">{mock.kind === 'problem' ? 'Saved, and the problem is scheduled for a re-solve. Now read the full solutions with fresh eyes.' : 'Saved, with your answer. Open the exercise to compare it with the model answer.'}</p>
                     <Link to={links.item(session.problem.id)} className="inline-flex items-center gap-1 text-amber hover:underline">Open {session.problem.title} <ArrowRight size={15} aria-hidden="true" /></Link>
                 </Card>
             )}
@@ -164,7 +237,7 @@ const MockPage = () => {
                 <div>
                     <p className="mb-2 text-sm font-medium">Time limit</p>
                     <div className="flex gap-2">
-                        {DURATIONS.map((minutes) => (
+                        {mock.durations.map((minutes) => (
                             <button key={minutes} type="button" aria-pressed={duration === minutes} onClick={() => setDuration(minutes)} className={`h-10 rounded-full px-4 font-mono text-sm ${duration === minutes ? 'bg-amber/20 text-amber ring-1 ring-amber' : 'bg-white/[0.06] text-muted hover:text-paper'}`}>{minutes} min</button>
                         ))}
                     </div>
@@ -177,9 +250,9 @@ const MockPage = () => {
                         ))}
                     </div>
                 </div>
-                <p className="text-sm text-muted">{pool.length} problem{pool.length === 1 ? '' : 's'} to draw from, all from lessons you’ve finished.</p>
+                <p className="text-sm text-muted">{pool.length} {mock.noun}{pool.length === 1 ? '' : 's'} to draw from, all from lessons you’ve finished.</p>
                 <Button variant="primary" disabled={!pool.length} onClick={start}>{stage === 'saved' ? <><RotateCcw size={16} aria-hidden="true" /> Start another</> : 'Start the mock'}</Button>
-                {!pool.length && <p className="text-sm text-muted">Finish a few lessons with practice problems first: mocks only use topics you’ve learned.</p>}
+                {!pool.length && <p className="text-sm text-muted">{mock.empty}</p>}
             </Card>
 
             {history.length > 0 && (
@@ -193,7 +266,7 @@ const MockPage = () => {
                                 <li key={mock.at} className="px-4 py-3 text-sm">
                                     <div className="flex flex-wrap items-center gap-3">
                                         <span className="font-mono text-xs text-muted">{formatDate(mock.at)}</span>
-                                        <Link to={links.item(mock.problemId)} className="flex-1 hover:text-amber">{problemById[mock.problemId]?.title ?? mock.problemId}</Link>
+                                        <Link to={links.item(mock.problemId ?? mock.itemId)} className="flex-1 hover:text-amber">{practiceById[mock.problemId ?? mock.itemId]?.title ?? mock.problemId ?? mock.itemId}</Link>
                                         <span className="font-mono text-xs text-muted">{formatDuration(mock.seconds)}</span>
                                         <Chip tone={average >= 3 ? 'green' : average >= 2 ? 'amber' : 'red'}>{average.toFixed(1)} / 4</Chip>
                                     </div>

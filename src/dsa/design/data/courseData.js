@@ -2,6 +2,7 @@
 import { GOALS, LEVELS, TRACKS, lessonById, lessons, moduleById, modules, modulesInPart, partByNumber, parts } from './curriculum.js';
 import { DIFFICULTIES, KIND_LABELS, LISTS, practice, practiceById, problemById, problems, TOPICS } from './practice.js';
 import { PLACEMENT_GROUPS } from './placement.js';
+import { SKILLS } from './skills.js';
 
 export const designData = {
     id: 'design',
@@ -26,6 +27,7 @@ export const designData = {
     practice,
     practiceById,
     kindLabels: KIND_LABELS,
+    skillLabels: SKILLS,
     placement: PLACEMENT_GROUPS,
     partBadges: ['Ready to Design', 'Principled', 'Pattern Spotter', 'Platform Native', 'Architect in Training', 'Data Wrangler', 'Backend Fluent', 'Cross-cutting Pro', 'Ship It', 'Team Scaler', 'Interview Ready', 'Architect'],
 };

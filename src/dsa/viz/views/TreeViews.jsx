@@ -3,11 +3,7 @@ import Player from '../Player.jsx';
 import TreeDiagram from './TreeDiagram.jsx';
 import { AVL_CODE, avlFrames, bstFrames, bstProgram, HEAP_CODE, HEAP_SORT_CODE, HEAPIFY_CODE, heapAsTree, heapFrames, heapifyFrames, heapSortFrames, TRIE_CODE, TRIE_REMOVE_CODE, trieFrames } from '../algorithms/trees.js';
 import { binaryTreeFrames, binaryTreeProgram } from '../algorithms/binaryTree.js';
-
-const useStable = (value) => {
-    const key = JSON.stringify(value ?? null);
-    return useMemo(() => JSON.parse(key), [key]);
-};
+import { useStable } from '../useStable.js';
 
 const Output = ({ values }) => (values ? (
     <p className="mt-3 font-mono text-xs text-muted">output: <span className="text-amber">{values.join(', ') || '—'}</span></p>

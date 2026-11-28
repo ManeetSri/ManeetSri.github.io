@@ -1,5 +1,5 @@
 import { Children, isValidElement } from 'react';
-import { AlertTriangle, ChevronRight, Info, Lightbulb, Repeat, Sparkles, Zap } from 'lucide-react';
+import { AlertTriangle, ChevronRight, Info, Lightbulb, MessagesSquare, Repeat, Sparkles, Zap } from 'lucide-react';
 import { Inline } from './inline.jsx';
 
 const CALLOUTS = {
@@ -8,6 +8,7 @@ const CALLOUTS = {
     gotcha: { icon: Zap, label: 'Swift gotcha', className: 'border-swift/50 bg-swift/[0.07]', iconClass: 'text-swift' },
     warning: { icon: AlertTriangle, label: 'Watch out', className: 'border-amber/50 bg-amber/[0.07]', iconClass: 'text-amber' },
     analogy: { icon: Sparkles, label: 'Analogy', className: 'border-violet-400/40 bg-violet-400/[0.06]', iconClass: 'text-violet-300' },
+    interview: { icon: MessagesSquare, label: 'In the interview', className: 'border-teal-400/40 bg-teal-400/[0.06]', iconClass: 'text-teal-300' },
 };
 
 // <Callout kind="gotcha" title="…">markdown</Callout>

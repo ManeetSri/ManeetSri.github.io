@@ -1,6 +1,7 @@
 // The design course as the console's pages see it
 import { makeLinks } from '../../course/links.js';
 import { designData } from './courseData.js';
+import { MOCK_CRITERIA } from './skills.js';
 
 export const designCourse = {
     ...designData,
@@ -40,6 +41,16 @@ export const designCourse = {
         placementIntro: 'Parts I to IV cover design foundations, patterns and iOS architecture. If you already work with them, a quick check can skip those modules.',
         zeroDetail: 'Begin with what makes software good. Nothing is assumed beyond some Swift.',
         setupPrompt: 'Pick your goal and pace, and optionally skip foundations you already know. It takes two minutes.',
+    },
+    // Mock interviews draw from design exercises marked for mocks, scored on the design rubric
+    mock: {
+        kind: 'design',
+        durations: [45, 60],
+        criteria: MOCK_CRITERIA,
+        eligible: (item) => item.kind === 'design' && item.mock,
+        intro: 'A random design exercise from topics you’ve finished, a timer, and no model answer. Afterwards you score yourself against the rubric interviewers use.',
+        empty: 'Finish a few lessons that have design exercises first: mocks only use topics you’ve learned.',
+        noun: 'design',
     },
     practiceIntro: 'Design exercises with model answers and rubrics, Swift katas with tests in the companion package, and architecture reviews.',
 };

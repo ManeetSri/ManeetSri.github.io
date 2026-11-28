@@ -28,7 +28,7 @@ export const courseBadges = (course) => {
             id: `solved-${count}`,
             title: { 10: 'Problem Solver', 50: 'Half Century', 100: 'Centurion Coder', 250: 'Problem Machine' }[count],
             detail: `Solve ${count} practice problems.`,
-            earned: ({ problems }) => Object.values(problems).filter((record) => record.status === 'solved').length >= count,
+            earned: ({ problems, designs = {} }) => [...Object.values(problems), ...Object.values(designs)].filter((record) => record.status === 'solved').length >= count,
         })),
         { id: 'checkpoint-1', title: 'Checkpoint Champion', detail: 'Pass your first module checkpoint.', earned: ({ checkpoints }) => Object.values(checkpoints).some((record) => record.passedAt) },
         { id: 'checkpoint-10', title: 'Module Master', detail: 'Pass 10 module checkpoints.', earned: ({ checkpoints }) => Object.values(checkpoints).filter((record) => record.passedAt).length >= 10 },

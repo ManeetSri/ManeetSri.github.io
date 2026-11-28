@@ -51,3 +51,13 @@ export const statusFromCritique = (score) => {
     if (score >= 0.4) return 'helped';
     return 'attempted';
 };
+
+// Your latest score for each design skill (1–4), across every scored design: what Progress charts
+export const latestSkills = (designs = {}) => {
+    const latest = {};
+    Object.values(designs).flatMap((record) => Object.values(record.attempts ?? {}))
+        .filter((attempt) => attempt.skills)
+        .sort((a, b) => a.at - b.at)
+        .forEach((attempt) => Object.assign(latest, attempt.skills));
+    return latest;
+};

@@ -1,4 +1,7 @@
 // Each visualiser loads only when a lesson shows it. Names must match viz/names.js.
+import { SCRIPT_VISUALS } from './script/views.js';
+import { SIM_VISUALS } from './sims/views.js';
+
 export const VISUALS = {
     binarySearch: () => import('./views/BinarySearchView.jsx'),
     answerSearch: () => import('./views/AnswerSearchView.jsx'),
@@ -26,4 +29,6 @@ export const VISUALS = {
     huffman: () => import('./views/ParadigmViews.jsx').then((module) => ({ default: module.HuffmanView })),
     segmentTree: () => import('./views/RangeTreeViews.jsx').then((module) => ({ default: module.SegmentTreeView })),
     fenwick: () => import('./views/RangeTreeViews.jsx').then((module) => ({ default: module.FenwickView })),
+    ...SCRIPT_VISUALS,
+    ...SIM_VISUALS,
 };

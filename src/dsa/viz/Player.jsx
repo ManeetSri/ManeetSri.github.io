@@ -17,7 +17,9 @@ const ControlButton = ({ label, onClick, disabled, children }) => (
 
 // Steps through a list of frames. It never plays on its own: the learner presses play or steps.
 // `children(frame)` draws the current frame, and `code` shows the Swift with the frame's line lit up.
-const Player = ({ frames, code, children, title }) => {
+// `renderMessage(message)` draws a frame's message (plain text by default). With `staticWhenSingle`, a
+// single frame shows as a still picture: no step count and no controls.
+const Player = ({ frames, code, children, title, renderMessage, staticWhenSingle = false }) => {
     const [index, setIndex] = useState(0);
     const [playing, setPlaying] = useState(false);
     const [speed, setSpeed] = useState(1);
@@ -26,6 +28,7 @@ const Player = ({ frames, code, children, title }) => {
     const atEnd = index >= frames.length - 1;
     // Playback stops by itself on the last frame
     const isPlaying = playing && !atEnd;
+    const still = staticWhenSingle && frames.length === 1;
 
     useEffect(() => {
         if (!isPlaying) return undefined;
@@ -40,10 +43,12 @@ const Player = ({ frames, code, children, title }) => {
             <div>
                 <div className="p-4 sm:p-5">
                     <div className={reduceMotion ? '' : 'transition-all'}>{children(frame)}</div>
-                    <p aria-live="polite" className="mt-4 min-h-12 rounded-xl bg-white/[0.04] px-4 py-3 text-sm leading-relaxed">
-                        <span className="mr-2 font-mono text-xs text-muted">Step {index + 1}/{frames.length}</span>
-                        {frame.message}
-                    </p>
+                    {!(still && !frame.message) && (
+                        <p aria-live="polite" className={`mt-4 ${still ? '' : 'min-h-12 '}rounded-xl bg-white/[0.04] px-4 py-3 text-sm leading-relaxed`}>
+                            {!still && <span className="mr-2 font-mono text-xs text-muted">Step {index + 1}/{frames.length}</span>}
+                            {renderMessage ? renderMessage(frame.message) : frame.message}
+                        </p>
+                    )}
                 </div>
                 {code && (
                     <div className="border-t border-line bg-[#101217]">
@@ -51,7 +56,7 @@ const Player = ({ frames, code, children, title }) => {
                     </div>
                 )}
             </div>
-            <div className="flex flex-wrap items-center gap-2 border-t border-line px-4 py-3">
+            {!still && <div className="flex flex-wrap items-center gap-2 border-t border-line px-4 py-3">
                 <ControlButton label="Back to the start" onClick={() => { setPlaying(false); setIndex(0); }} disabled={index === 0}>
                     <RotateCcw size={16} aria-hidden="true" />
                 </ControlButton>
@@ -88,7 +93,7 @@ const Player = ({ frames, code, children, title }) => {
                         </button>
                     ))}
                 </div>
-            </div>
+            </div>}
         </figure>
     );
 };
