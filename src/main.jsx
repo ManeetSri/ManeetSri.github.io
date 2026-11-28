@@ -13,3 +13,12 @@ createRoot(document.getElementById('root')).render(
     <App />
   </StrictMode>,
 )
+
+if (import.meta.env.PROD && 'serviceWorker' in navigator) {
+  const register = () => {
+    navigator.serviceWorker.register('/sw.js', { updateViaCache: 'none' })
+      .catch((error) => console.warn('Offline support could not start:', error))
+  }
+  if (document.readyState === 'complete') register()
+  else window.addEventListener('load', register, { once: true })
+}

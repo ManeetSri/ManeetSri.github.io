@@ -43,7 +43,7 @@ export const createFirestoreAdapter = (uid) => {
     const store = database();
     const pending = new Map();
     const statusListeners = new Set();
-    let lastStatus = 'synced';
+    let lastStatus = navigator.onLine ? 'synced' : 'offline';
 
     const notify = () => {
         const waiting = [...pending.values()].some(Boolean);

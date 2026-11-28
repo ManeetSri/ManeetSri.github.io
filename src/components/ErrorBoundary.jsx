@@ -18,20 +18,23 @@ class ErrorBoundary extends Component {
 
     render() {
         if (!this.state.hasError) return this.props.children;
+        const offline = !navigator.onLine;
 
         return (
             <main className="flex min-h-svh items-center justify-center px-5 text-center">
                 <div>
-                    <p className="mb-4 font-mono text-sm text-[#FF9D96]">error: unexpected crash</p>
-                    <h1 className="mb-4 font-display text-5xl font-semibold tracking-tight sm:text-6xl">Something went wrong.</h1>
-                    <p className="mb-8 text-lg text-muted">Reloading usually fixes it.</p>
+                    <h1 className="mb-4 font-display text-5xl font-semibold tracking-tight sm:text-6xl">
+                        {offline ? 'This page is unavailable offline.' : 'Something went wrong.'}
+                    </h1>
+                    <p className="mb-8 text-lg text-muted">{offline ? 'Reconnect and reload to open this page.' : 'Reloading usually fixes it.'}</p>
                     <button
                         type="button"
-                        onClick={() => window.location.assign('/')}
+                        onClick={() => window.location.reload()}
                         className="swift-gradient inline-flex h-12 items-center gap-2 rounded-full px-6 font-semibold text-ink"
                     >
-                        <RotateCcw size={18} aria-hidden="true" /> Reload the site
+                        <RotateCcw size={18} aria-hidden="true" /> Reload page
                     </button>
+                    <a href="/" className="mx-auto mt-5 block w-fit text-sm text-muted hover:text-paper">Back to portfolio</a>
                 </div>
             </main>
         );

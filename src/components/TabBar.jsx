@@ -1,6 +1,6 @@
 import { useEffect, useState } from 'react';
 import { motion } from 'framer-motion';
-import { Activity, FileText, GitCommitHorizontal, History, House, LayoutGrid, MessageCircle } from 'lucide-react';
+import { Activity, BookOpen, FileText, GitCommitHorizontal, History, House, LayoutGrid, MessageCircle } from 'lucide-react';
 import { useLocation, useNavigate } from 'react-router-dom';
 
 const TABS = [
@@ -8,6 +8,7 @@ const TABS = [
     { id: 'journey', name: 'Journey', icon: History },
     { id: 'work', name: 'Work', icon: LayoutGrid },
     { id: 'skills', name: 'Skills', icon: Activity },
+    { id: 'learning', name: 'Learning', icon: BookOpen },
     { id: 'notes', name: 'Notes', icon: GitCommitHorizontal },
     { id: 'contact', name: 'Contact', icon: MessageCircle },
 ];
@@ -34,6 +35,7 @@ const TabBar = () => {
     }, [pathname]);
 
     const goTo = (event, id) => {
+        if (event.metaKey || event.ctrlKey || event.shiftKey || event.altKey) return;
         event.preventDefault();
         if (pathname === '/') {
             document.getElementById(id)?.scrollIntoView();
@@ -45,7 +47,7 @@ const TabBar = () => {
     return (
         <nav
             aria-label="Sections"
-            className="phone-ui fixed bottom-3 left-1/2 z-50 flex -translate-x-1/2 items-center gap-0.5 rounded-full border border-line bg-surface/80 p-1 shadow-2xl shadow-black/60 backdrop-blur-xl"
+            className="phone-ui fixed bottom-[calc(0.75rem+env(safe-area-inset-bottom))] left-1/2 z-50 flex -translate-x-1/2 items-center gap-0.5 rounded-full border border-line bg-surface/80 p-1 shadow-2xl shadow-black/60 backdrop-blur-xl"
         >
             {TABS.map(({ id, name, icon: Icon }) => (
                 <a
@@ -53,10 +55,11 @@ const TabBar = () => {
                     href={`/#${id}`}
                     onClick={(event) => goTo(event, id)}
                     aria-label={name}
+                    title={name}
                     data-event="tab_click"
                     data-event-tab={id}
                     aria-current={current === id ? 'location' : undefined}
-                    className={`relative flex h-11 min-w-10 items-center justify-center gap-1.5 rounded-full px-1.5 text-sm transition-colors min-[390px]:min-w-11 min-[390px]:px-2.5 lg:px-3.5 ${current === id ? 'text-ink' : 'text-muted hover:text-paper'}`}
+                    className={`relative flex h-11 min-w-9 items-center justify-center gap-1.5 rounded-full px-1.5 text-sm transition-colors min-[360px]:min-w-10 min-[390px]:min-w-11 min-[390px]:px-2.5 lg:px-3.5 ${current === id ? 'text-ink' : 'text-muted hover:text-paper'}`}
                 >
                     {current === id && (
                         <motion.span
@@ -66,7 +69,7 @@ const TabBar = () => {
                         />
                     )}
                     <Icon size={18} className="relative shrink-0" aria-hidden="true" />
-                    <span className={`relative text-xs font-medium lg:inline lg:text-sm ${current === id ? 'hidden min-[375px]:inline' : 'hidden'}`}>{name}</span>
+                    <span className={`relative text-xs font-medium lg:inline lg:text-sm ${current === id ? 'hidden min-[440px]:inline' : 'hidden'}`}>{name}</span>
                 </a>
             ))}
             <a
@@ -76,7 +79,7 @@ const TabBar = () => {
                 aria-label="Resume (PDF)"
                 data-event="resume_open"
                 data-event-source="tab_bar"
-                className="swift-gradient ml-0.5 flex h-11 min-w-10 items-center justify-center gap-1.5 rounded-full px-1.5 text-sm font-semibold text-ink min-[390px]:min-w-11 min-[390px]:px-2.5 lg:px-3.5"
+                className="swift-gradient ml-0.5 flex h-11 min-w-9 items-center justify-center gap-1.5 rounded-full px-1.5 text-sm font-semibold text-ink min-[360px]:min-w-10 min-[390px]:min-w-11 min-[390px]:px-2.5 lg:px-3.5"
             >
                 <FileText size={18} className="shrink-0" aria-hidden="true" />
                 <span className="hidden lg:inline">Resume</span>

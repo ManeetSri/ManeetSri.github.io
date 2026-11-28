@@ -25,6 +25,9 @@ const renderContent = () => `<div id="seo-content">
     <p><a href="/build">Ship your app: a mobile app building game</a> · <a href="/privacy">Privacy Policy</a> · <a href="/resume.pdf">Resume (PDF)</a> · <a href="mailto:srivastavmaneet@gmail.com">Email</a> · ${PROFILES.map((url) => `<a href="${url}">${new URL(url).hostname.replace('www.', '')}</a>`).join(' · ')}</p>
     <h2>Mobile app development services</h2>
     ${list(services, (service) => `<strong>${escapeHtml(service.title)}</strong>: ${escapeHtml(service.body)}`)}
+    <h2>Learning</h2>
+    <p>Private courses · Passphrase required</p>
+    <ul><li><a href="/dsa">DSA in Swift</a></li><li><a href="/design">System Design</a></li></ul>
     <h2>Apps I've worked on</h2>
     ${list(projects, (project) => `${project.link ? `<a href="${project.link}">${escapeHtml(project.title)}</a>` : escapeHtml(project.title)}: ${escapeHtml(project.category)}. ${escapeHtml(project.description)}`)}
     <h2>Experience</h2>

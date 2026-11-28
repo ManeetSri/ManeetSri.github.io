@@ -72,6 +72,12 @@ To get a local copy up and running, follow these simple steps.
     npm run dev
     ```
 
+### Install and test offline
+
+The portfolio links directly to DSA in Swift and System Design from the Learning section. Both courses use the existing passphrase. Install the site from your browser's install menu or, on iOS, Safari's Share → Add to Home Screen.
+
+To test the service worker locally, run `npm run build` followed by `npm run preview`. Open the preview online first so the service worker can install. After it takes control, open the pages and course material you want to revisit offline. The portfolio shell is saved up front and other files are cached as you use them. Initial course sign-in and external services need a connection. An existing session can use Firestore's offline progress cache.
+
 ## 📬 Contact
 
 **Maneet Srivastav**

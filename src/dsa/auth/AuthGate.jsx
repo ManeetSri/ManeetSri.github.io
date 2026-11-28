@@ -1,5 +1,6 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
-import { KeyRound, Laptop, LoaderCircle } from 'lucide-react';
+import { ArrowLeft, KeyRound, Laptop, LoaderCircle } from 'lucide-react';
+import { Link } from 'react-router-dom';
 import { usePageMeta } from '../../hooks/usePageMeta';
 import { OWNER_EMAIL } from '../services/owner';
 import { createStore, StoreContext } from '../store/store.js';
@@ -10,7 +11,12 @@ const Centered = ({ children }) => {
     usePageMeta({ title: 'Private console', description: 'Private learning console.', path: window.location.pathname, noindex: true });
     return (
         <main className="flex min-h-svh items-center justify-center bg-[radial-gradient(70%_50%_at_50%_0%,rgba(240,81,56,0.14),transparent_70%)] px-5">
-            <div className="w-full max-w-sm">{children}</div>
+            <div className="w-full max-w-sm">
+                {children}
+                <Link to="/#learning" className="mt-6 inline-flex items-center gap-2 text-sm text-muted hover:text-paper">
+                    <ArrowLeft size={16} aria-hidden="true" /> Back to portfolio
+                </Link>
+            </div>
         </main>
     );
 };
@@ -95,8 +101,6 @@ const AuthGate = ({ children }) => {
             .then((module) => {
                 if (cancelled) return;
                 setServices(module);
-                // Fetch the sync code now, while the passphrase is being typed
-                const sync = module.loadSync();
                 let latest = 0;
                 stopWatching = module.watchUser((user) => {
                     if (usingLocalData.current) return;
@@ -105,11 +109,13 @@ const AuthGate = ({ children }) => {
                         setSession({ state: 'signed-out', store: null });
                         return;
                     }
-                    sync.then(({ createFirestoreAdapter }) => {
+                    module.loadSync().then(({ createFirestoreAdapter }) => {
                         // A later sign-in or sign-out wins over this one
                         if (cancelled || attempt !== latest || usingLocalData.current) return;
                         setSession({ state: 'signed-in', store: createStore(createFirestoreAdapter(user.uid)) });
-                    }).catch(() => !cancelled && setLoadError(true));
+                    }).catch(() => {
+                        if (!cancelled && attempt === latest && !usingLocalData.current) setLoadError(true);
+                    });
                 });
             })
             .catch(() => !cancelled && setLoadError(true));
