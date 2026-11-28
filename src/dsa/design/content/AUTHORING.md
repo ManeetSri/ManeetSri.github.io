@@ -384,7 +384,7 @@ Registry: also `swiftTest: '<Type>Tests'`. The statement follows the DSA problem
 - **Foundation and Swift Concurrency only**, so `swift test` runs on a Mac. Anything iOS-only stays in lessons.
 - **Inject the world:** time (`any Clock<Duration>`, `TestClock` in tests), randomness (`some RandomNumberGenerator`, `SeededGenerator`), the network (`HTTPClient`, `StubHTTPClient`), storage (`InMemoryKeyValueStore`). Tests are deterministic and fast.
 - **Stubs fail fast:** they compile, return a placeholder or `throw Unimplemented()`, and never use `fatalError`, `preconditionFailure`, `while true` or sleeps. `design:check` rejects those.
-- **Tests:** Swift Testing, `#if SOLUTIONS import Solutions #else import Exercises #endif`, `@Suite struct <Type>Tests`. Test behaviour, not implementation. Async tests use `TestClock.advance(by:)` and `settle()`; give suites that touch shared state `.serialized`.
+- **Tests:** Swift Testing, `#if SOLUTIONS import Solutions #else import Exercises #endif`, `@Suite struct <Type>Tests`. Test behaviour, not implementation. Async tests use `TestClock.advance(by:)`, then `waitUntil { … }` (bounded, for work that hops through actors) or `settle()`; give suites that touch shared state `.serialized`.
 
 ## Pitfalls other writers hit
 

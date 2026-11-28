@@ -46,12 +46,19 @@ public final class TestClock: Clock, Sendable {
         }
         try await withTaskCancellationHandler {
             try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, any Error>) in
-                let wakeNow = state.withLock { state in
-                    if deadline <= state.now { return true }
+                // Cancellation sets the task's flag before running onCancel, so checking it under the lock closes the
+                // window where onCancel ran before this sleeper was added (and would otherwise never resume it)
+                let outcome = state.withLock { state -> Result<Bool, CancellationError> in
+                    if Task.isCancelled { return .failure(CancellationError()) }
+                    if deadline <= state.now { return .success(true) }
                     state.sleepers.append(Sleeper(id: id, deadline: deadline, continuation: continuation))
-                    return false
+                    return .success(false)
                 }
-                if wakeNow { continuation.resume() }
+                switch outcome {
+                case .failure(let error): continuation.resume(throwing: error)
+                case .success(true): continuation.resume()
+                case .success(false): break
+                }
             }
         } onCancel: {
             let cancelled = state.withLock { state -> Sleeper? in
@@ -80,4 +87,15 @@ public func settle(rounds: Int = 50) async {
     for _ in 0..<rounds {
         await Task.yield()
     }
+}
+
+/// Yields until `condition` holds, at most `rounds` times, and returns whether it did. Prefer this to `settle()` when
+/// work hops through several actors: it waits exactly as long as needed, and a test can still fail instead of hanging.
+@discardableResult
+public func waitUntil(rounds: Int = 10_000, _ condition: @Sendable () async -> Bool) async -> Bool {
+    for _ in 0..<rounds {
+        if await condition() { return true }
+        await Task.yield()
+    }
+    return await condition()
 }
