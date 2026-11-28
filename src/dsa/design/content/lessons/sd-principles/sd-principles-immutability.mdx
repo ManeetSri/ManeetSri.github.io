@@ -1,0 +1,335 @@
+## Why it matters
+
+Two kinds of bug cost iOS teams the most time: state that changed when nobody expected it to, and bad state that lived on long after it was created, until it crashed somewhere unrelated. Two defaults prevent most of both. Make data immutable unless it has a reason to change, and when something is wrong, stop at the first place you can tell. Swift 6 turned the first into a compiler rule, and interviewers expect you to have an error-handling strategy, not a scattering of `try?`.
+
+## Immutability by default
+
+### What it means in Swift
+
+Swift's value types change what "immutable" needs to mean. A `var` struct you own can change, but nobody else can see the change: every copy is independent. So the goal isn't to ban `var`. It's **no shared mutable state**: data is either immutable, or it has exactly one owner who changes it.
+
+Inside a type, choose per property:
+
+- **`let`** for identity and anything that must never change: `id`, `createdAt`, the price a line was sold at.
+- **`private(set) var`** when changes must go through methods that keep the type's rules (its invariants).
+- **`var`** when any new value is valid, such as a free-text delivery note.
+
+```swift check group=order title="let, private(set) and var, chosen per property"
+import Foundation
+import Observation
+
+struct OrderLine: Equatable, Sendable {
+    let productID: String
+    let unitPricePence: Int
+    var quantity: Int
+}
+
+struct Order: Equatable, Sendable {
+    let id: UUID
+    let placedAt: Date
+    private(set) var lines: [OrderLine]
+    var deliveryNote = ""
+
+    init(id: UUID = UUID(), placedAt: Date = .now, lines: [OrderLine]) {
+        self.id = id
+        self.placedAt = placedAt
+        self.lines = lines
+    }
+
+    var totalPence: Int {
+        lines.reduce(0) { $0 + $1.unitPricePence * $1.quantity }
+    }
+
+    // The one way to change lines: a quantity of zero removes the line
+    mutating func setQuantity(_ quantity: Int, of productID: String) {
+        guard let index = lines.firstIndex(where: { $0.productID == productID }) else { return }
+        if quantity > 0 {
+            lines[index].quantity = quantity
+        } else {
+            lines.remove(at: index)
+        }
+    }
+}
+```
+
+Nobody can append a line with a negative quantity, because nobody outside `Order` can touch `lines` directly.
+
+For classes, immutability is **shallow**. A `let` holding a class reference stops you pointing it at another object, but the object itself can still change. A `final class` whose stored properties are all `let` and all `Sendable` is genuinely immutable, and you can declare it `Sendable`.
+
+### Why it pays off
+
+- **Concurrency.** Values can cross threads and actors safely, because nobody can change them underneath you. Swift infers `Sendable` for non-public structs and enums whose stored properties are all `Sendable`; public types declare it.
+- **Reasoning.** A function that receives a value can't be surprised by a change made elsewhere. There's no "action at a distance".
+- **Snapshots for free.** Undo, state restoration and diffing all need "the state as it was". With values, that's a copy. SwiftUI compares view values to decide what to redraw, and `NSDiffableDataSourceSnapshot` is a struct for the same reason.
+- **Safe keys.** An object whose hash changes while it's inside a `Set` or used as a `Dictionary` key corrupts that collection. A value can't change in place there.
+
+Swift 6 makes the concurrency point concrete. Share a mutable class with another task and the compiler stops you:
+
+```swift
+final class Draft {
+    var text = ""
+}
+
+func autosave(_ draft: Draft) {
+    Task.detached {
+        draft.text += " (saved)"
+    }
+}
+```
+
+```text title="What you'll see"
+error: passing closure as a 'sending' parameter risks causing data races between code in the current isolation context and concurrent execution of the closure
+note: closure captures 'draft' which is accessible to code in the current isolation context
+```
+
+Make `Draft` a struct and the detached task captures its own copy, so the code compiles and the race is gone. The compiler is enforcing "immutable or owned".
+
+### Where mutation belongs
+
+Apps are full of state that changes. Give each piece **one owner**: an actor, or a main-actor `@Observable` model. Values flow out as snapshots; changes flow in as method calls.
+
+```swift check group=order title="One owner changes the order; everyone else gets copies"
+@MainActor
+@Observable
+final class CartModel {
+    private(set) var order: Order
+    private let upload: @Sendable (Order) async -> Void
+
+    init(order: Order, upload: @escaping @Sendable (Order) async -> Void) {
+        self.order = order
+        self.upload = upload
+    }
+
+    func setQuantity(_ quantity: Int, of productID: String) {
+        order.setQuantity(quantity, of: productID)
+        let snapshot = order               // a value: safe to hand to another task
+        Task { await upload(snapshot) }
+    }
+}
+```
+
+The view reads `order`; only `CartModel` changes it; the upload gets a copy that can't shift under it. You'll build this shape properly in D07 (functional core, imperative shell) and D19 (state management).
+
+## Failing fast
+
+Jim Shore's IEEE Software column "Fail Fast" (2004) makes the case: when something is wrong, stop **immediately and visibly**, at the point closest to the cause, instead of carrying on with bad state. What makes a bug expensive is usually the distance between where it starts and where it shows. Step through one bug, found late and found early:
+
+```visual timeline
+title: A tester's first session with a misconfigured build
+unit: min
+lanes:
+  - { id: late, label: Fail late }
+  - { id: fast, label: Fail fast }
+spans:
+  - { lane: late, from: 0, to: 1, label: launches, tone: ok }
+  - { lane: late, from: 1, to: 6, label: requests quietly get 401, tone: wait }
+  - { lane: late, from: 6, to: 6.5, label: crash, tone: error }
+  - { lane: fast, from: 0, to: 0.3, label: stops at launch, tone: error }
+markers:
+  - { at: 6, label: checkout }
+steps:
+  - { at: 0, say: "A build goes to testers with `APIBaseURL` missing from `Info.plist`." }
+  - { at: 0.3, say: "**Fail fast:** the configuration type checks at launch and stops with *APIBaseURL is missing*. The message *is* the cause, so the fix takes minutes." }
+  - { at: 3, say: "**Fail late:** the app launches. Requests fail, screens show empty states, and nothing points at the build settings." }
+  - { at: 6.5, say: "Six minutes in, an empty token is force-unwrapped in checkout. The crash report points at checkout, far from the cause." }
+```
+
+### Two kinds of failure
+
+Failing fast doesn't mean crashing more. It means sorting failures into two kinds and treating them differently:
+
+- **Programmer errors** are bugs: a violated precondition, an "impossible" enum case, a resource missing from your own bundle, a misconfigured build. Retrying won't help, because the code is wrong. **Stop**, loudly, so it's found in development and testing.
+- **Expected failures** are the world being the world: no network, a server sending something new, a full disk, invalid input, a permission the user declined. They *will* happen in production. **Never crash**: model them with `throws`, `Result`, optionals and UI states.
+
+The same operation can fall on either side. Decoding JSON that **ships in your app bundle** is a programmer error if it fails: you control that file, and a test should catch it. Decoding a **server response** is an expected failure: the server can change without you.
+
+### Swift's tools, and what Release builds do with them
+
+| Tool | Debug build (`-Onone`) | Release build (`-O`) | Use it for |
+| --- | --- | --- | --- |
+| `assert`, `assertionFailure` | Stops with the message | Not evaluated at all | Checks too costly for production, or "shouldn't happen, but survivable" |
+| `precondition`, `preconditionFailure` | Stops with the message | Stops, without printing the message | Broken contracts that make carrying on unsafe |
+| `fatalError` | Stops with the message | Stops with the message | Truly unreachable code |
+| `!` and `try!` | Stops | Stops | Only where `nil` or an error is impossible by construction; say why in a comment |
+| `throws`, `Result`, `Optional` | Returns the failure | Returns the failure | Every expected failure |
+
+(A third setting, `-Ounchecked`, skips preconditions too. Apps almost never use it.)
+
+### Validate once, where values enter
+
+The cheapest place to fail fast is the **initialiser**. If a type refuses to exist with bad values, nothing downstream ever has to check again. That's the domain-type idea from [From primitive obsession to domain types](/design/learn/sd-modelling-domain-types), used as an error strategy:
+
+```swift run title="Rejecting bad quantities at the door"
+enum QuantityError: Error {
+    case notPositive(Int)
+    case overLimit(Int)
+}
+
+struct Quantity {
+    static let limit = 10
+    let value: Int
+
+    init(_ value: Int) throws(QuantityError) {
+        guard value > 0 else { throw .notPositive(value) }
+        guard value <= Self.limit else { throw .overLimit(value) }
+        self.value = value
+    }
+}
+
+for input in [3, 0, 12] {
+    do {
+        let quantity = try Quantity(input)
+        print("\(input): accepted \(quantity.value)")
+    } catch {
+        print("\(input): rejected, \(error)")
+    }
+}
+```
+
+```output
+3: accepted 3
+0: rejected, notPositive(0)
+12: rejected, overLimit(12)
+```
+
+User input is an expected failure, so `Quantity` **throws** (here with Swift 6's typed throws, which you'll meet in D06). Configuration you control is a programmer error, so it **stops**:
+
+```swift check title="Build configuration is checked at launch"
+import Foundation
+
+struct AppConfiguration {
+    let apiBaseURL: URL
+
+    init(bundle: Bundle = .main) {
+        guard let value = bundle.object(forInfoDictionaryKey: "APIBaseURL") as? String,
+              let url = URL(string: value) else {
+            preconditionFailure("APIBaseURL is missing or invalid in Info.plist")
+        }
+        apiBaseURL = url
+    }
+}
+```
+
+Every user of a build like that would hit the problem, so you want it impossible to miss: in the simulator, in a launch test on CI, and on a tester's first tap.
+
+### When failing fast is the wrong call
+
+Your code, your bundle and your build are yours to fail fast on. Data and services you don't control need the other treatment:
+
+- **A feed item of an unknown type** from the server: skip it, log it, show the rest. Crashing the feed because the server added a card type punishes every user on your current version.
+- **Survivable "impossible" states**: `assertionFailure` plus a recovery path. Developers see it in Debug; users get an error state in Release; your logs and crash reporter record it (D24).
+- **App extensions and widgets** run with tight memory and time limits, and a crash there often shows as a blank widget with no explanation. Prefer a placeholder entry.
+
+## Trade-offs
+
+| When something is wrong, you can | What users see | What developers see | Right when |
+| --- | --- | --- | --- |
+| Stop (`precondition`, `fatalError`) | A crash | The exact place, with a message in Debug | A bug in code, config or bundled resources you control |
+| `assertionFailure` and recover | A degraded screen | A stop in Debug; a log in Release | "Can't happen" states you can survive |
+| Throw or return a `Result` | An error state you designed | A typed error to handle | Expected failures: network, server data, input, disk |
+| Return `nil` | Usually nothing, and that's the risk | Little: the reason is lost | Absence is a normal answer, like a cache miss |
+| Substitute a default silently | Wrong data that looks right | Nothing at all | Almost never: it's how bad state travels far from its cause |
+
+<Callout kind="interview">
+
+**What to say:** describe an error strategy, not individual `catch` blocks. "Programmer errors stop in development and are caught by tests. Expected failures are typed errors at the boundary that become screen states: offline, retrying, failed." And for concurrency: "Models are values; each piece of mutable state has one owner, an actor or the main-actor model."
+
+**What to ask:** "What should the user see when this fails?" It turns error handling into a product decision, which it is.
+
+**Red flags interviewers listen for:** `try!` or force unwraps on network data; `catch { }` that swallows errors; shared mutable singletons accessed from several tasks; and the opposite, a design that crashes on bad server data.
+
+</Callout>
+
+<Callout kind="gotcha" title="Swift gotcha: assert's condition doesn't run in Release">
+
+`assert(cache.removeExpired() > 0)` removes expired entries in Debug, and does nothing at all in Release, because the whole condition is skipped. Never put work with side effects inside `assert`. Do the work first, then assert on its result.
+
+</Callout>
+
+<Callout kind="gotcha" title="iOS gotcha: never fail fast on the user's data at launch">
+
+A `try!` while loading a persisted file or running a data migration crashes at every launch until a new version ships, and the user can't reach their data or even a support screen. That's a crash loop. Persisted data is an expected failure: recover what you can, keep the original file for a later fix, and show the app.
+
+</Callout>
+
+## Practice
+
+In the kata [An upload queue workers can share](/design/practice/sd-kata-principles-upload-queue), workers receive immutable job values while one actor owns every status change, and commands that make no sense, such as finishing a job nobody claimed, change nothing.
+
+```cards
+- id: immutable-swift
+  front: "What does \"immutable by default\" mean in Swift, given value types?"
+  back: "No shared mutable state: data is either immutable or has one owner (an actor or a main-actor model) that changes it, and everyone else gets copies."
+- id: let-privateset-var
+  front: "When do you choose `let`, `private(set) var` and `var` for a property?"
+  back: "`let` for identity and fixed facts; `private(set) var` when changes must go through methods that keep invariants; `var` when any value is valid."
+- id: two-failures
+  front: "Which failures should stop the app, and which never should?"
+  back: "Stop on programmer errors in what you control: code, configuration, bundled resources. Never crash on expected failures: network, server data, input, disk, persisted user data."
+- id: precondition-release
+  front: "What do `assert` and `precondition` do in a Release build?"
+  back: "`assert` isn't evaluated at all. `precondition` still stops the app, but without printing its message."
+```
+
+```quiz
+- id: q1
+  type: sort
+  prompt: "Should each failure stop the app, or be handled as an expected failure?"
+  buckets: ["Stop: it's a bug", "Handle it: it's the world"]
+  items:
+    - ["The onboarding JSON file in the app bundle doesn't decode", 0]
+    - ["The feed endpoint returns a card type this version doesn't know", 1]
+    - ["A `switch` reaches a case your own state machine can never produce", 0]
+    - ["The user denies photo library access", 1]
+    - ["The saved drafts file from the previous version doesn't decode", 1]
+  explain: "Your bundle and your state machine are yours: failure means a bug, so stop and let tests catch it. Server data, user choices and persisted files from old versions will vary in production; handle them, and never crash-loop on the user's own data."
+- id: q2
+  type: mcq
+  prompt: "What happens to `precondition(index < items.count, \"bad index\")` in a Release build when the condition is false?"
+  options:
+    - "Nothing: preconditions are removed in Release"
+    - "The app stops, without printing the message"
+    - "The app stops and prints \"bad index\""
+    - "It throws an error the caller can catch"
+  answer: 1
+  explain: "Preconditions stay in `-O` builds, so a broken contract still stops the app, but the message isn't included. `assert` is the one that disappears. Neither can be caught: they aren't errors."
+- id: q3
+  type: multi
+  prompt: "Which of these can be declared `Sendable` and shared between actors without a data race? Choose all that apply."
+  options:
+    - "A struct whose stored properties are a `String` and an `Int`"
+    - "A `final class` whose stored properties are all `let` constants of `Sendable` types"
+    - "A class with a `var items: [String]` property"
+    - "A struct with a stored property of a non-`Sendable` class type"
+  answer: [0, 1]
+  explain: "Values of `Sendable` types and genuinely immutable final classes are safe to share. A class with a `var` has shared mutable state, and a struct that holds one inherits the problem."
+- id: q4
+  type: truefalse
+  prompt: "Writing `assert(store.flushPendingWrites())` makes sure pending writes are flushed in every build."
+  answer: false
+  explain: "`assert` skips its whole condition in Release, so the flush only happens in Debug. Do the work first, then assert on the result."
+- id: q5
+  type: output
+  prompt: "What does this print?"
+  code: |
+    import Foundation
+
+    struct Tag {
+        let name: String
+        init(_ raw: String) throws {
+            let trimmed = raw.trimmingCharacters(in: .whitespaces)
+            guard !trimmed.isEmpty else { throw CocoaError(.formatting) }
+            name = trimmed.lowercased()
+        }
+    }
+
+    let inputs = ["  Swift ", "   ", "iOS"]
+    let tags = inputs.compactMap { try? Tag($0) }
+    print(tags.map(\.name))
+  answer: "[\"swift\", \"ios\"]"
+  explain: "The blank input fails validation in the initialiser and `try?` turns it into `nil`, which `compactMap` drops. The other two are trimmed and lowercased once, when they enter."
+- id: q6
+  type: recall
+  prompt: "A teammate asks why the app should crash when `Info.plist` is missing a key, but not when the server sends bad JSON. What do you say?"
+  model: "A missing key is a bug in something we control, and every user of that build would hit it, so stopping at launch makes it impossible to miss in testing. Server JSON can change without us shipping anything, so bad data is an expected failure: handle it, show an error state and log it."
+```

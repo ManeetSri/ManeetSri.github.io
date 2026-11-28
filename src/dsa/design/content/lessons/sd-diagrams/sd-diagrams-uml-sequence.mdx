@@ -1,0 +1,298 @@
+## Why it matters
+
+Structure diagrams show what exists; they can't show what happens when the user taps Buy. A sequence diagram shows exactly that: who calls whom, in what order, who waits, and where the flow splits when something fails. It's the diagram you'll draw most often after the container diagram, because the questions that matter in reviews and interviews are about flows: "walk me through a purchase", "what happens when the token expires mid-request".
+
+## The parts of a sequence diagram
+
+Time runs **down** the page. Each participant gets a column:
+
+- A **participant** is a box at the top: an object, a component, a container or a person, whichever level the diagram is about. Keep one level per diagram, as in [What makes a design diagram useful](/design/learn/sd-diagrams-why).
+- Its **lifeline** is the dashed line beneath it. A thin bar on the lifeline (an *activation*) shows when it's busy.
+- **Messages** are arrows between lifelines, and the arrowhead matters:
+  - A **synchronous call** is a solid line with a filled arrowhead: the sender waits for the answer.
+  - An **asynchronous message** is a solid line with an open arrowhead: the sender carries on without waiting.
+  - A **reply** is a dashed line with an open arrowhead, back to the caller.
+  - A **self-call** loops back to the same lifeline.
+- **Notes** explain what an arrow can't.
+- **Combined fragments** are boxes around a run of messages, with an operator in the corner and **guards** in square brackets:
+  - `alt` is if/else: one box split by a dashed line, a guard on each part.
+  - `opt` is an `if` with no else.
+  - `loop` repeats, with a guard such as `[for each page]`.
+  - `par` runs its parts at the same time.
+  - `break` ends the whole interaction early, for example on an error.
+
+## A real flow: buying with StoreKit 2
+
+Here's a one-off purchase in an app that unlocks content on its own server. Step through it; the code under the diagram lights up as each arrow happens:
+
+```visual sequence
+title: Buying a product with StoreKit 2
+participants:
+  - { id: app, label: StoreModel }
+  - { id: storekit, label: StoreKit }
+  - { id: appstore, label: App Store }
+  - { id: server, label: Our server }
+messages:
+  - [app, storekit, "purchase()"]
+  - [storekit, appstore, buy]
+  - { note: "Payment sheet and Face ID: the system's UI, not yours.", over: [storekit, appstore] }
+  - [appstore, storekit, signed transaction, { reply: true }]
+  - [storekit, app, ".success(.verified)", { reply: true }]
+  - [app, server, "POST /purchases (JWS)"]
+  - [server, server, verify signature]
+  - [server, app, entitlement, { reply: true }]
+  - [app, storekit, "finish()"]
+  - [storekit, app, ".userCancelled", { reply: true }]
+  - [storekit, app, ".pending", { reply: true }]
+fragments:
+  - { kind: alt, label: "[purchased]", from: 3, to: 10, else: 9, elseLabel: "[cancelled or pending]" }
+steps:
+  - say: "Before anything happens: four participants, one column each. Time runs down."
+    upTo: -1
+  - say: "The model calls `product.purchase()`. It's a **synchronous** call in UML terms, a filled arrowhead, because `await` waits for the answer."
+    upTo: 0
+    line: 2
+  - say: "StoreKit takes over and talks to the App Store. The payment sheet and Face ID are Apple's code, so the note marks where your responsibility pauses."
+    upTo: 2
+  - say: "The outcome comes back as **replies** (dashed). Inside the `alt` box, the first branch: `.success` wrapping a transaction whose signature StoreKit has checked."
+    upTo: 4
+    line: 5
+  - say: "Your server unlocks the content. It checks the JWS signature itself, so a tampered device can't grant itself the purchase, and returns the entitlement."
+    upTo: 7
+    line: 8
+  - say: "Only now does the app call `finish()`. Finish before delivering, and a crash in between loses a purchase the user paid for."
+    upTo: 8
+    line: 9
+  - say: "Below the dashed divider, the other branch: the user cancelled, or the purchase is `.pending` (Ask to Buy, or a bank check). A pending purchase may complete hours later, and **not through this call**."
+    upTo: 10
+    line: 11
+code: |
+  func buy(_ product: Product) async throws -> Bool {
+      let result = try await product.purchase()
+      switch result {
+      case .success(let verification):
+          guard case .verified(let transaction) = verification else {
+              throw StoreError.failedVerification
+          }
+          try await server.register(signedTransaction: verification.jwsRepresentation)
+          await transaction.finish()
+          return true
+      case .userCancelled, .pending:
+          return false
+      @unknown default:
+          return false
+      }
+  }
+```
+
+The diagram makes two design decisions visible that are easy to miss in code: **delivery happens before `finish()`**, and the `.pending` branch ends without the content being delivered, which means something else must handle it later. Here's the whole type, including that something else:
+
+```swift check ios title="StoreModel.swift"
+import StoreKit
+
+enum StoreError: Error {
+    case failedVerification
+}
+
+/// Our server's side of a purchase: it checks Apple's signature and records the entitlement
+protocol EntitlementServer: Sendable {
+    func register(signedTransaction: String) async throws
+}
+
+@MainActor
+final class StoreModel {
+    private let server: any EntitlementServer
+    private var updates: Task<Void, Never>?
+
+    init(server: any EntitlementServer) {
+        self.server = server
+    }
+
+    func buy(_ product: Product) async throws -> Bool {
+        let result = try await product.purchase()
+        switch result {
+        case .success(let verification):
+            guard case .verified(let transaction) = verification else {
+                throw StoreError.failedVerification
+            }
+            try await server.register(signedTransaction: verification.jwsRepresentation)
+            await transaction.finish()
+            return true
+        case .userCancelled, .pending:
+            return false
+        @unknown default:
+            return false
+        }
+    }
+
+    /// Transactions that complete outside `buy`: Ask to Buy approvals, renewals,
+    /// refunds and purchases made on another device. Start this at launch.
+    func listenForTransactions() {
+        updates = Task { [server] in
+            for await verification in Transaction.updates {
+                guard case .verified(let transaction) = verification else { continue }
+                try? await server.register(signedTransaction: verification.jwsRepresentation)
+                await transaction.finish()
+            }
+        }
+    }
+}
+```
+
+A second sequence diagram, for `listenForTransactions()`, would be a `loop` fragment around three arrows. Drawing it is how teams notice they need it.
+
+## Swift's `async` is not UML's asynchronous
+
+The words clash, so be precise. UML's synchronous and asynchronous are about **whether the sender waits for the answer**. Swift's `await` suspends the caller until the answer comes, so `try await api.user(id)` is a synchronous message with a reply, even though the function is `async`. The caller's *thread* is free, but the caller's *flow* waits.
+
+| Swift | On a sequence diagram |
+| --- | --- |
+| `let user = try await api.user(id)` | Synchronous call (filled arrowhead) and a reply |
+| `Task { await analytics.log(event) }` | Asynchronous message (open arrowhead): the caller doesn't wait |
+| `async let a = …` and `async let b = …` | A `par` fragment with one part each |
+| `for await update in stream` | A `loop` fragment around what each element causes |
+| `if` or `switch` on a result | An `alt` fragment, one part per branch |
+| `guard … else { throw … }` | A `break` fragment: the interaction ends here |
+| A delegate callback | A call from the delegating object to its delegate |
+| A completion handler | A call into the handler, often from another queue: say which in a note |
+
+Here's `async let` as a diagram, written in Mermaid, which renders sequence diagrams from text:
+
+```swift check title="ProfileModel.swift"
+struct User: Sendable { let name: String }
+struct Post: Sendable { let title: String }
+
+protocol ProfileAPI: Sendable {
+    func user(_ id: Int) async throws -> User
+    func posts(of id: Int) async throws -> [Post]
+}
+
+func loadProfile(_ id: Int, from api: some ProfileAPI) async throws -> (User, [Post]) {
+    async let user = api.user(id)
+    async let posts = api.posts(of: id)
+    return try await (user, posts)
+}
+```
+
+```text title="load-profile.mmd"
+sequenceDiagram
+    participant VM as ProfileModel
+    participant API as ProfileAPI client
+    participant S as Profile service
+    par user
+        VM->>API: user(42)
+        API->>S: GET /users/42
+        S-->>API: 200 user
+        API-->>VM: User
+    and posts
+        VM->>API: posts(of: 42)
+        API->>S: GET /users/42/posts
+        S-->>API: 200 posts
+        API-->>VM: [Post]
+    end
+    VM->>VM: show profile
+```
+
+In Mermaid, `->>` is a call, `-->>` a reply and `-)` an asynchronous message; `par … and … end`, `alt … else … end`, `loop … end` and `opt … end` are the fragments.
+
+## Drawing one well
+
+- **One scenario per diagram**, plus at most the one or two failures that matter, in an `alt` or a `break`. A diagram with a fragment around every arrow is a flowchart in disguise; draw the failure as its own diagram instead.
+- **Pick participants at one level.** Objects for a code-level flow (view model, repository, client), containers for an end-to-end flow (app, API, APNs). Mixing them hides where the network is.
+- **Short arrow text, explanations in notes.** The arrow says `POST /purchases`; the note says why the server, not the app, unlocks content.
+- **Show the waits that matter.** A note such as "can take seconds on cellular" over a network arrow tells a reader where the spinner goes.
+- **Say which thread or actor.** A note "on the main actor" or "on URLSession's delegate queue" next to a callback explains half the concurrency bugs before they happen.
+
+## Trade-offs
+
+| Way to show a flow | Shows order | Shows who waits | Shows branches | When it wins |
+| --- | --- | --- | --- | --- |
+| Sequence diagram | Yes, top to bottom | Yes: sync, async and replies | A few, with fragments | Interactions between several participants: purchases, sign-in, sync |
+| Numbered C4 dynamic view | Yes, by number | No | No | A quick tour of which components a flow touches |
+| Activity diagram | Yes | No | Many, with decisions and forks | A process with lots of decisions and parallel steps |
+| Numbered prose steps | Yes | Only if you say so | Awkwardly | Short flows in a PR description |
+
+<Callout kind="interview">
+
+When asked "what happens when…", draw a sequence: participants across the top, then the arrows in order, **saying each one aloud**. Mark where the network is, then volunteer the failure: "if this call times out, we retry once with backoff; the user sees the cached state meanwhile". **Ask** whether to include the server's internals or keep it to app and API. **Red flags:** arrows with no replies, so nobody can tell who waits; no failure branch at all; and participants that mix classes with whole services.
+
+</Callout>
+
+<Callout kind="gotcha" title="iOS gotcha: the purchase that arrives later">
+
+The happy path through `purchase()` is the diagram everyone draws, and it misses the purchases that never come back through it: Ask to Buy approvals, renewals, refunds and purchases made on another device. Those arrive on `Transaction.updates`, so an app that doesn't listen from launch can take a payment and never unlock anything. When you draw a purchase flow, draw the `.pending` branch to its end, and you'll find the second diagram you need.
+
+</Callout>
+
+## Practice
+
+**Component view of a podcast app** asks for a numbered dynamic view of an overnight background download. Once you've written it, redraw it as a sequence diagram with the system's background transfer service as a participant. You'll find that the app's lifeline has a gap in the middle, which is the whole point of a background session.
+
+```cards
+- id: seq-arrowheads
+  front: "How does a sequence diagram tell a synchronous call, an asynchronous message and a reply apart?"
+  back: "Synchronous: solid line, filled arrowhead (the sender waits). Asynchronous: solid line, open arrowhead (it doesn't). Reply: dashed line, open arrowhead."
+- id: seq-await-sync
+  front: "Is `try await api.user(id)` a synchronous or an asynchronous message in UML terms?"
+  back: "Synchronous. UML asks whether the sender waits for the answer, and `await` waits, even though the thread is free meanwhile. `Task { … }` without awaiting is the asynchronous one."
+- id: seq-fragments
+  front: "Which combined fragments do `if/else`, `async let` and `for await` become?"
+  back: "`alt` for if/else (with `opt` for an if without else), `par` for `async let` or a task group, and `loop` for `for await`. `break` ends the flow early, for a thrown error."
+- id: seq-storekit-order
+  front: "In a StoreKit 2 purchase, why does `finish()` come after delivering the content?"
+  back: "Finishing tells StoreKit the purchase is handled. Finish first and a crash before delivery loses a paid purchase; unfinished transactions are offered again through `Transaction.updates`."
+```
+
+```quiz
+- id: q1
+  type: mcq
+  prompt: "How should `Task { await analytics.log(event) }`, called from a view model, be drawn on a sequence diagram?"
+  options:
+    - "A synchronous call with a filled arrowhead, then a dashed reply"
+    - "An asynchronous message with an open arrowhead and no reply to the view model"
+    - "A self-call on the view model's lifeline"
+    - "A `par` fragment containing every analytics call"
+  answer: 1
+  explain: "The view model starts the task and carries on without waiting, which is what UML calls asynchronous. A plain `try await analytics.log(event)` would be the synchronous one."
+- id: q2
+  type: match
+  prompt: "Match each piece of Swift to the fragment it becomes."
+  pairs:
+    - ["`async let a = …; async let b = …`", "par"]
+    - ["`for await message in socket.messages`", "loop"]
+    - ["`if cache.isFresh { … } else { … }`", "alt"]
+    - ["`guard token != nil else { throw AuthError.signedOut }`", "break"]
+  explain: "Concurrent child tasks are `par`, iterating a stream is `loop`, a two-way branch is `alt`, and leaving the whole interaction on an error is `break`."
+- id: q3
+  type: order
+  prompt: "Put the steps of a StoreKit 2 purchase that unlocks content on your server in order."
+  lines:
+    - "The app calls `product.purchase()`"
+    - "The system shows the payment sheet and the App Store processes the payment"
+    - "StoreKit returns `.success` with a verified transaction"
+    - "The app sends the signed transaction to its server, which verifies it and grants the entitlement"
+    - "The app calls `finish()` on the transaction"
+  explain: "Delivery comes before `finish()`, so a crash in between leaves the transaction unfinished, and StoreKit offers it again through `Transaction.updates` instead of losing it."
+- id: q4
+  type: multi
+  prompt: "A teammate's sequence diagram for sign-in has 14 participants and an `alt` around every arrow. Which changes help most? Choose all that apply."
+  options:
+    - "Keep the participants at one level, such as app, auth server and API"
+    - "Draw the happy path, plus the one failure that matters, and give other failures their own diagrams"
+    - "Add more fragments so every possible error is covered in one picture"
+    - "Move long explanations from the arrows into notes"
+  answer: [0, 1, 3]
+  explain: "One level, one scenario with its key failure, and short arrows with notes make it readable. Covering every error in one picture is what made it unreadable."
+- id: q5
+  type: bug
+  prompt: "This Mermaid sequence describes a purchase that unlocks content on a server. Which line shows a step in the wrong place?"
+  code: |
+    sequenceDiagram
+        App->>StoreKit: purchase()
+        StoreKit-->>App: .success(.verified)
+        App->>StoreKit: finish()
+        App->>Server: POST /purchases (JWS)
+        Server-->>App: entitlement
+  answer: 4
+  explain: "`finish()` comes before the server has granted the entitlement. If the app crashes or the request fails after finishing, the user has paid and StoreKit won't offer the transaction again. Finish after delivery."
+```

@@ -1,0 +1,317 @@
+## Why it matters
+
+Cohesion decides what goes in a module; coupling decides how modules depend on each other. A cycle between two modules welds them into one. A widely used module that imports a volatile one passes every change on to everything above it. Three principles and two numbers let you see these problems in the dependency graph before they hurt, and check them automatically in CI. "How do feature modules navigate to each other without depending on each other?" is one of the most common modularisation questions in iOS interviews.
+
+## ADP: no cycles in the dependency graph
+
+> The **acyclic dependencies principle**: allow no cycles in the component dependency graph.
+
+Martin motivates it with the "morning-after syndrome": you go home with working code, and come back to find it broken because someone changed something you depend on. Components fix that, because each one can be built, tested and released on its own, in dependency order: a topological order of the graph, which you can compute with [Topological sort with DFS](/dsa/learn/topo-dfs). That only works if the graph is a **directed acyclic graph**.
+
+A cycle breaks it. Every module in the cycle must be built, tested and released together, so they're effectively one big module. And each drags in everything the others depend on.
+
+SwiftPM doesn't let you declare one:
+
+```text title="What you'll see"
+error: 'Features': cyclic dependency declaration found: Profile -> Settings -> Profile
+```
+
+The most common way an iOS app gets there is navigation. Step through it, and one way out:
+
+```visual flow
+title: Two features that want to open each other
+nodes:
+  - { id: app, label: App target, kind: client, at: [2, 0] }
+  - { id: profile, label: Profile, kind: view, at: [0, 1.6] }
+  - { id: settings, label: Settings, kind: view, at: [4, 1.6] }
+  - { id: routing, label: Routing, at: [2, 3.2] }
+edges:
+  - [profile, settings, imports]
+  - [settings, profile, imports]
+  - [profile, routing]
+  - [settings, routing]
+  - [app, profile]
+  - [app, settings]
+  - [app, routing, implements]
+steps:
+  - say: "The profile screen has a settings button, so the `Profile` module imports `Settings`."
+    show: [profile, settings]
+    send: profile->settings
+  - say: "Settings gains a *View profile* row and imports `Profile`. Now neither can be built, tested or released without the other."
+    send: settings->profile
+    state: { profile: error, settings: error }
+    label: { profile: cycle, settings: cycle }
+  - say: "**Extract what they share**: a small `Routing` module that declares the destinations and a `Router` protocol. Both features depend on it instead of on each other."
+    hide: [profile->settings, settings->profile]
+    show: [routing]
+    send: [profile->routing, settings->routing]
+    state: { profile: null, settings: null }
+    label: { profile: null, settings: null }
+  - say: "The app target, the composition root, depends on everything and **implements** `Router` by building the right screen."
+    show: [app]
+    send: [app->profile, app->settings, app->routing]
+  - say: "The graph is acyclic again: `Routing` builds first, then each feature on its own, then the app."
+    state: { profile: ok, settings: ok, routing: ok }
+```
+
+```swift check title="An interface module both features can depend on"
+// Module: Routing. No screens, no UI framework: only what features need to ask for.
+public enum Route: Hashable, Sendable {
+    case profile(userID: String)
+    case settings
+    case orderDetail(orderID: String)
+}
+
+@MainActor
+public protocol Router: AnyObject {
+    func navigate(to route: Route)
+}
+
+// Module: Profile imports Routing, never Settings
+@MainActor
+public final class ProfileModel {
+    private weak var router: (any Router)?
+
+    public init(router: any Router) {
+        self.router = router
+    }
+
+    public func settingsTapped() {
+        router?.navigate(to: .settings)
+    }
+}
+```
+
+There are three standard ways to break a cycle:
+
+1. **Extract a new component** that both depend on, as with `Routing` above.
+2. **Invert one dependency.** `Profile` declares the protocol it needs, `ProfileNavigation` with `openSettings()`, and the app target implements it with `Settings`. This is [Dependency inversion: the policy owns the abstraction](/design/learn/sd-solid-dip) used on modules.
+3. **Inject closures** at the composition root: `ProfileModel(openSettings: { … })`. It's the lightest form of the second, and enough when there are only a few destinations.
+
+## SDP: depend in the direction of stability
+
+You computed **instability** for types in [Afferent and efferent coupling, and instability](/design/learn/sd-coupling-instability). It was born as a module metric:
+
+- **Ca** (afferent): how many modules import this one.
+- **Ce** (efferent): how many modules this one imports.
+- **I = Ce ÷ (Ca + Ce)**, from 0 (maximally stable: much depends on it, it depends on nothing, so it's hard to change) to 1 (maximally unstable: it depends on others and nothing depends on it, so it's free to change).
+
+> The **stable dependencies principle**: depend in the direction of stability. A module's I should be larger than the I of the modules it imports.
+
+Stability here doesn't mean "has few bugs". It means **hard to change**, because so much would have to change with it. SDP says: never make something hard to change depend on something meant to change often.
+
+A real violation: `DesignSystem` is imported by thirty feature modules, so its I is close to 0. Someone wants an experiment badge on buttons and adds `import Experiments` to it. `Experiments` changes every week, as experiments start and stop. Now every experiment change recompiles the design system and, through it, all thirty features. The fix is to point the arrow the other way: `DesignSystem` offers a `badge` parameter, and the features that run experiments decide what goes in it.
+
+Stability is a **design decision**, not only a measurement. Decide which modules should be stable (foundations, interfaces, the domain) and which should stay flexible (features, the app target), then make every arrow agree.
+
+## SAP: stable modules should be abstract
+
+> The **stable abstractions principle**: a component should be as abstract as it is stable.
+
+A stable module is hard to change. If it's also **concrete**, every new requirement forces a change in exactly the place that's hardest to change. If it's **abstract**, made of protocols and extension points, others can extend it without changing it: [Open–closed: extending with protocols and enums](/design/learn/sd-solid-ocp) at module scale. That's why `Routing` above is almost all protocol and enum.
+
+Martin measures **abstractness** as A = abstract types ÷ all types. In Swift, count protocols as abstract and concrete structs, classes and enums as concrete; it's coarse, but it points the right way. Together, SDP and SAP are dependency inversion for components: dependencies point towards stability, and stability should come with abstraction.
+
+### The main sequence
+
+Plot each module with A against I. The ideal is the line **A + I = 1**, which Martin calls the main sequence: stable modules are abstract, unstable ones are concrete. The **distance** D = |A + I − 1| says how far a module strays:
+
+- **The zone of pain**, near A = 0 and I = 0: concrete and stable. Everything depends on it and it can only be changed by editing it. A concrete `Database` module whose types every feature imports lives here.
+- **The zone of uselessness**, near A = 1 and I = 1: abstract with no dependents. Protocols nobody implements or uses, left over from a design that moved on.
+
+Martin's caveat matters: the zone of pain only hurts for **volatile** modules. Foundation, the standard library, or a tiny `Money` value-type module are concrete and stable, and that's fine, because they rarely change. Try a few modules:
+
+```visual estimator
+title: Where does this module sit?
+inputs:
+  - { id: ca, label: "Modules that import it (Ca)", min: 0, max: 50, value: 30 }
+  - { id: ce, label: "Modules it imports (Ce)", min: 0, max: 20, value: 2 }
+  - { id: protocols, label: "Public protocols", min: 0, max: 40, value: 2 }
+  - { id: types, label: "Public types, protocols included", min: 1, max: 80, value: 40 }
+outputs:
+  - { id: instability, label: "Instability I = Ce ÷ (Ca + Ce)", formula: "ce / max(1, ca + ce)" }
+  - { id: abstractness, label: "Abstractness A = protocols ÷ types", formula: "min(protocols, types) / types" }
+  - { id: distance, label: "Distance from the main sequence, D = |A + I − 1|", formula: "abs(abstractness + instability - 1)" }
+```
+
+The starting values describe a concrete module thirty others import: D is close to 0.9, deep in the zone of pain. Raise the protocols towards 35, as you would by turning it into an interface module, and D falls towards 0. Then set Ca to 0, Ce to 10 and the protocols back to 2 to see a feature module: unstable and concrete, and on the main sequence again. Leave the protocols at 35 instead and you've drawn the zone of uselessness.
+
+## A fitness function for the module graph
+
+These rules are mechanical enough to check on every pull request, as the fitness functions in [Measuring quality: ISO 25010 and fitness functions](/design/learn/sd-quality-measuring) suggest. Here's the core of one, a depth-first search for cycles as in [Cycle detection in undirected and directed graphs](/dsa/learn/gt-cycles), plus an SDP check:
+
+```swift run title="Checking ADP and SDP in a few lines"
+import Foundation
+
+// Each module and the modules it imports, as a fitness function would read them from Package.swift
+let imports: [String: [String]] = [
+    "App": ["Checkout", "Profile", "Settings", "DesignSystem"],
+    "Checkout": ["DesignSystem", "Networking"],
+    "Profile": ["DesignSystem", "Settings"],
+    "Settings": ["DesignSystem", "Profile"],
+    "DesignSystem": ["Experiments"],
+    "Experiments": ["Networking"],
+    "Networking": [],
+]
+let modules = imports.keys.sorted()
+
+func instability(of module: String) -> Double {
+    let efferent = imports[module, default: []].count
+    let afferent = imports.values.filter { $0.contains(module) }.count
+    return afferent + efferent == 0 ? 0 : Double(efferent) / Double(afferent + efferent)
+}
+
+// ADP: a depth-first search that reports an import leading back to a module on the current path
+func firstCycle() -> [String]? {
+    var finished: Set<String> = []
+    var path: [String] = []
+
+    func visit(_ module: String) -> [String]? {
+        if let start = path.firstIndex(of: module) { return Array(path[start...]) + [module] }
+        if finished.contains(module) { return nil }
+        path.append(module)
+        for dependency in imports[module, default: []] {
+            if let cycle = visit(dependency) { return cycle }
+        }
+        path.removeLast()
+        finished.insert(module)
+        return nil
+    }
+
+    for module in modules {
+        if let cycle = visit(module) { return cycle }
+    }
+    return nil
+}
+
+for module in modules {
+    print("\(module.padding(toLength: 13, withPad: " ", startingAt: 0)) I = \(String(format: "%.2f", instability(of: module)))")
+}
+if let cycle = firstCycle() {
+    print("ADP: cycle \(cycle.joined(separator: " → "))")
+}
+// SDP: an import should point at a module at least as stable as the importer
+for module in modules {
+    for dependency in imports[module, default: []] where instability(of: dependency) > instability(of: module) {
+        print("SDP: \(module) (\(String(format: "%.2f", instability(of: module)))) imports less stable \(dependency) (\(String(format: "%.2f", instability(of: dependency))))")
+    }
+}
+```
+
+```output
+App           I = 1.00
+Checkout      I = 0.67
+DesignSystem  I = 0.20
+Experiments   I = 0.50
+Networking    I = 0.00
+Profile       I = 0.50
+Settings      I = 0.50
+ADP: cycle Profile → Settings → Profile
+SDP: DesignSystem (0.20) imports less stable Experiments (0.50)
+```
+
+It finds both problems from this lesson. In a real project, the graph comes from `swift package dump-package` (the manifest as JSON) or from your project generator, and the check runs as a test that fails the build. Add rules your architecture needs, such as "feature modules never import other feature modules", and the graph stays the shape you designed.
+
+## Trade-offs
+
+Ways to break a cycle between two modules:
+
+| Option | Compile-time safety | Coupling afterwards | Ceremony | Wins when |
+| --- | --- | --- | --- | --- |
+| Merge the two modules | Full | One bigger module | None | They really change together: CCP says they're one component |
+| Extract an interface module (`Routing`, `ProfileInterface`) | Full | Both depend on a small, stable, abstract module | One more module | Several features need each other, or teams own them separately |
+| Invert one dependency with a protocol the needing module owns | Full | One-way | A protocol and a conformance in the app target | One direction of the cycle is the odd one out |
+| Inject closures at the composition root | Full | One-way, implicit | Very little | A handful of callbacks, such as "open settings" |
+| Look up the other module at run time (strings, `NSClassFromString`) | None: typos fail at run time | Hidden, still there | Little | Almost never: it hides the cycle instead of removing it |
+
+<Callout kind="interview">
+
+**What to say** when asked how features navigate without depending on each other: features depend only on small interface modules (routes, protocols, models they exchange); the app target is the composition root that depends on everything, implements the router and builds screens. Then mention you'd enforce it: SwiftPM rejects cycles, and a fitness function rejects feature-to-feature imports.
+
+**What to ask:** "Which modules do we want to be stable?" Usually the design system, networking core and interface modules. Then check those are abstract enough and import nothing volatile.
+
+**Red flags interviewers listen for:** routing by string or class-name lookup to dodge the compiler; a design system or networking core that imports feature flags, analytics vendors or features; and interface modules that contain implementations.
+
+</Callout>
+
+<Callout kind="gotcha" title="iOS gotcha: Xcode can hide a cycle that SwiftPM would reject">
+
+Xcode reports "Cycle in dependencies between targets" for cycles it can see, but frameworks found through implicit dependencies, a shared search path or run-time lookups can still end up depending on each other. The result is a build that depends on the order targets happen to build in, and modules that can't be tested alone. SwiftPM's refusal is a feature: declare modules as packages and the cycle has nowhere to hide.
+
+</Callout>
+
+## Practice
+
+The design exercise [Split the Shared module](/design/practice/sd-design-principles-split-shared-module) gives you a module graph with a cycle and a stable module that imports a volatile one. Plan the split so the graph stays acyclic and every arrow points towards stability.
+
+```cards
+- id: adp
+  front: "What does the acyclic dependencies principle say, and why?"
+  back: "Allow no cycles between components. Modules in a cycle can only be built, tested and released together, so they're one big module in disguise."
+- id: break-cycle
+  front: "Name three ways to break a dependency cycle between two feature modules."
+  back: "Extract an interface module both depend on; invert one dependency with a protocol owned by the module that needs it; or inject closures at the composition root."
+- id: sdp
+  front: "What does the stable dependencies principle say?"
+  back: "Depend in the direction of stability: a module's instability, Ce ÷ (Ca + Ce), should be larger than that of the modules it imports."
+- id: sap-zones
+  front: "What are the zone of pain and the zone of uselessness?"
+  back: "Pain: concrete and stable, so hard to change and hard to extend, which hurts if it's volatile. Uselessness: abstract with no dependents, such as unused protocols."
+```
+
+```quiz
+- id: q1
+  type: estimate
+  prompt: "A module is imported by 18 others and imports 2. What is its instability, I = Ce ÷ (Ca + Ce)?"
+  answer: 0.1
+  within: { percent: 10 }
+  explain: "Ce = 2 and Ca = 18, so I = 2 ÷ 20 = 0.1: very stable. By SDP it should import only modules at least that stable, and by SAP it should be mostly abstract."
+- id: q2
+  type: mcq
+  prompt: "`Checkout` and `Cart` import each other: checkout links back to the cart, and the cart shows a checkout button. Two teams own them. What's the best fix?"
+  options:
+    - "Merge them into one `Commerce` module"
+    - "Extract a small interface module with the routes and shared models both need, and let the app target wire them"
+    - "Have `Cart` open checkout with `NSClassFromString(\"CheckoutViewController\")`"
+    - "Move the shared code into the `DesignSystem` module, which both already import"
+  answer: 1
+  explain: "With separate owners, an interface module keeps each feature buildable and testable alone. Merging suits code that changes together; a run-time lookup hides the cycle; and the design system should never learn about checkout."
+- id: q3
+  type: bug
+  prompt: "This is `DesignSystem`'s package manifest. Thirty features import it. Which line breaks the stable dependencies principle?"
+  code: |
+    .target(
+        name: "DesignSystem",
+        dependencies: [
+            "Typography",
+            "Colors",
+            "ExperimentFlags",
+            "Icons",
+        ]
+    )
+  answer: 6
+  explain: "`ExperimentFlags` changes whenever an experiment starts or ends, so it's far less stable than a module thirty others depend on. Every flag change would ripple through the design system into every feature. Let features pass experiment-driven values in."
+- id: q4
+  type: multi
+  prompt: "Which modules are fine sitting in the zone of pain, concrete and very stable? Choose all that apply."
+  options:
+    - "A small `Money` module with a currency value type that hasn't changed in a year"
+    - "A concrete `Database` module whose schema types change every sprint, imported by every feature"
+    - "Foundation"
+    - "A `Networking` module whose concrete client gains a new parameter every week"
+  answer: [0, 2]
+  explain: "The zone of pain hurts only when the module is volatile. Stable, rarely changing concrete code is fine. A frequently changing concrete module that everything imports is the painful case: make it more abstract, or depend on it less."
+- id: q5
+  type: sort
+  prompt: "Which way of breaking a cycle fits each situation best?"
+  buckets: [Merge the modules, Extract an interface module, Inject closures]
+  items:
+    - ["Two small modules that one developer always changes together", 0]
+    - ["Six feature modules, owned by three teams, that all link to each other's screens", 1]
+    - ["A login module that only needs to say \"sign-in finished\" to whoever presented it", 2]
+  explain: "Code that changes together is one component (CCP). Many cross-team links need a stable shared vocabulary. A single callback is lightest as a closure the composition root provides."
+- id: q6
+  type: recall
+  prompt: "Explain to a teammate why a module that thirty features import should be mostly protocols and simple value types."
+  model: "Thirty dependents make it very stable: hard to change without touching all of them. If it's concrete, every new requirement means editing it, and every edit ripples out. If it's abstract, new behaviour can be added by implementing its protocols elsewhere, so it rarely needs to change. That's the stable abstractions principle."
+```

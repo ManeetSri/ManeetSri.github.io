@@ -1,0 +1,331 @@
+<Brief>
+
+**Tern** is a podcast app for iPhone. People subscribe to shows (about 40 each, on average), stream or download episodes (50 to 150 MB each), and listen with Lock Screen controls. New episodes of shows set to auto-download should be **downloaded overnight, on Wi-Fi, ready to play offline** in the morning. Playback position syncs to the user's other devices through Tern's API, so an episode started on the iPhone resumes in the right place on the iPad.
+
+The app has about 250,000 monthly users. Four iOS engineers work on it; the code is split into Swift package modules. There's a Podcast API (shows, episodes, positions), and audio files are served from a CDN. A Home Screen widget shows what's next, and lives outside the app's container.
+
+The team is about to rebuild downloads, and you're writing the **component view of the iOS app container** for the design review, and as the map new engineers will use. It must answer: which component owns downloads, playback and sync; which dependencies are allowed; and how a background download actually flows.
+
+Write, in the sections on the right:
+
+- **Requirements and scope:** the readers, the questions the view answers, its boundary and the platform constraints that shape the components.
+- **Public API:** each component's interface, as Swift signatures, with a short usage example.
+- **Internals:** the components, their responsibilities and allowed dependencies, a **numbered dynamic view** of *a new episode is downloaded overnight and is ready to play offline*, and a **class diagram of the types inside Downloads**, the most intricate component: its protocols, what conforms to them, who owns whom, and any strong references that could form a cycle.
+- **Concurrency and state:** which state exists and who owns it, including the **state diagram of an episode download** (states and transitions).
+- **Failure and edge cases:** the failure paths the views must show.
+- **Testing:** the seams visible on the diagram, and how you'd test through them.
+- **Trade-offs:** what you chose, what you rejected, and why.
+
+Spend about 35 minutes.
+
+</Brief>
+
+```workspace
+template: component
+minutes: 35
+```
+
+<ModelAnswer section="requirements">
+
+**Readers:** the four engineers reviewing the downloads rebuild, and new joiners. **Questions the view answers:** who owns downloads, playback and position sync; what may depend on what; how an overnight download flows through the app, including when the app isn't running.
+
+**Boundary:** the iOS app container. The Podcast API, the audio CDN, APNs, the system's background transfer service and the widget extension appear **outside** the boundary.
+
+**Constraints that shape the components:**
+
+- A **background `URLSession`** hands transfers to the system, which runs them while the app is suspended or after the system has terminated it, then relaunches the app in the background to deliver the results. Only delegate callbacks work with it, not async/await or completion handlers.
+- **Background time is rationed.** `BGAppRefreshTask` gives short, unscheduled windows to check feeds; a silent push can also wake the app, but the system throttles them, so neither is guaranteed.
+- **Files are big.** Episodes need a disk budget, eviction of played episodes, and a location the system won't purge (Application Support, excluded from backup), not Caches.
+- **Playback** uses `AVPlayer`, the audio session, Now Playing info and remote commands, all driven from the main actor.
+
+**Out of scope:** search, CarPlay, the watch app and the Up Next queue's rules.
+
+</ModelAnswer>
+
+<ModelAnswer section="api">
+
+The interfaces are small on purpose: each box on the diagram is one of these protocols.
+
+```swift check title="Tern components"
+import Foundation
+
+struct Episode: Identifiable, Sendable {
+    let id: UUID
+    let showID: UUID
+    var title: String
+    let audioURL: URL
+}
+
+enum DownloadPolicy: Sendable {
+    case userRequested   // may use cellular
+    case automatic       // Wi-Fi only, never in Low Data Mode
+}
+
+enum DownloadFailure: Error, Equatable, Sendable {
+    case diskFull, network, notFound
+}
+
+enum DownloadState: Equatable, Sendable {
+    case notDownloaded
+    case queued
+    case downloading(fraction: Double)
+    case paused
+    case downloaded(URL)
+    case failed(DownloadFailure, attempts: Int)
+}
+
+/// Shows, episodes and what's been played: the source of truth on the device
+protocol Library: Sendable {
+    func episodes(ofShow show: UUID) async throws -> [Episode]
+    func add(_ episodes: [Episode]) async throws
+    func markPlayed(_ episode: Episode.ID) async throws
+}
+
+/// Owns the background URLSession and every episode's download state
+protocol Downloads: Sendable {
+    func enqueue(_ episode: Episode, policy: DownloadPolicy) async
+    func cancel(_ episode: Episode.ID) async
+    func state(of episode: Episode.ID) async -> DownloadState
+    var updates: AsyncStream<(Episode.ID, DownloadState)> { get }
+    /// Called when the system relaunches the app because background transfers finished
+    func handleBackgroundEvents(completion: @escaping @Sendable () -> Void)
+}
+
+/// AVPlayer, the audio session, Now Playing and remote commands
+@MainActor
+protocol Playback: AnyObject {
+    var nowPlaying: Episode.ID? { get }
+    var position: Duration { get }
+    func play(_ episode: Episode, from position: Duration) async throws
+    func pause()
+}
+
+/// Uses whatever background time the system gives to find new episodes and queue downloads
+protocol FeedRefresher: Sendable {
+    func refresh() async -> Int
+}
+
+/// Playback positions across devices
+protocol PositionSync: Sendable {
+    func record(_ position: Duration, for episode: Episode.ID) async
+    func pullLatest() async throws -> [Episode.ID: Duration]
+}
+
+/// Where episode files live, and the disk budget. Synchronous on purpose: see Concurrency.
+protocol EpisodeFiles: Sendable {
+    func store(_ temporaryFile: URL, for episode: Episode.ID) throws -> URL
+    func remove(_ episode: Episode.ID) throws
+    func makeRoom(forBytes bytes: Int64) throws
+}
+
+/// The Podcast API
+protocol PodcastAPI: Sendable {
+    func newEpisodes(since date: Date) async throws -> [Episode]
+    func upload(positions: [Episode.ID: Duration]) async throws
+}
+
+// Usage: the episode screen's Download button
+func downloadTapped(_ episode: Episode, downloads: some Downloads) async {
+    await downloads.enqueue(episode, policy: .userRequested)
+}
+```
+
+No component's interface mentions `URLSession`, SwiftData or `AVPlayer`, except Playback's implementation; that's what lets each be replaced in tests.
+
+</ModelAnswer>
+
+<ModelAnswer section="internals">
+
+**Components** (each a Swift package target):
+
+- **Features** (SwiftUI views and their `@Observable` models): Library feature, Player feature, Downloads feature. They depend only on the domain components below.
+- **Library**: shows and episodes in SwiftData; the source of truth on the device.
+- **Downloads**: an actor owning the background session, its delegate, the download states and the retry policy. Depends on EpisodeFiles and Library.
+- **Playback**: the main-actor engine around `AVPlayer`, the audio session, `MPNowPlayingInfoCenter` and `MPRemoteCommandCenter`. Depends on Library, EpisodeFiles (for the local file) and PositionSync.
+- **FeedRefresher**: runs the app refresh task and handles silent pushes. Depends on PodcastAPI, Library and Downloads.
+- **PositionSync**: batches position updates and pulls others'. Depends on PodcastAPI and Library.
+- **EpisodeFiles**: file locations, the disk budget, eviction of played episodes.
+- **PodcastAPI client** and **Session** (tokens in the Keychain).
+
+**Allowed dependencies:** features → domain; domain → infrastructure; never feature → feature or feature → infrastructure. The package manifest enforces it.
+
+**Dynamic view: a new episode, downloaded overnight**
+
+1. The system launches Tern in the background for its app refresh task (or a silent push arrives).
+2. **FeedRefresher** asks the **PodcastAPI client** for episodes since the last check.
+3. FeedRefresher adds them to the **Library**.
+4. For shows set to auto-download, FeedRefresher calls **Downloads**.`enqueue(_:policy: .automatic)`.
+5. Downloads asks **EpisodeFiles** to make room, evicting played episodes if needed.
+6. Downloads creates background download tasks (no cellular, no Low Data Mode, discretionary). The refresh task completes; the system transfers the file from the **audio CDN** while Tern is suspended.
+7. When the transfer finishes, the system relaunches Tern in the background. The app delegate passes the completion handler to Downloads, which recreates the session with **the same identifier** so the events can be delivered.
+8. In `urlSession(_:downloadTask:didFinishDownloadingTo:)`, Downloads moves the file through **EpisodeFiles** before returning, then marks the episode downloaded; the Library feature shows it as available offline.
+9. When `urlSessionDidFinishEvents(forBackgroundURLSession:)` arrives, Downloads calls the stored completion handler on the main actor, telling the system it may suspend Tern again.
+
+**Inside Downloads** (the C4 code level, drawn only for this component because it's the intricate one):
+
+```text title="downloads.mmd"
+classDiagram
+    class Downloads {
+        <<protocol>>
+    }
+    class DownloadTransport {
+        <<protocol>>
+        +start(url: URL, resumeData: Data?) TaskID
+        +cancel(task: TaskID)
+        +events: AsyncStream~TransportEvent~
+    }
+    class DownloadManager {
+        <<actor>>
+        -states: [Episode.ID: DownloadState]
+        -retry: RetryPolicy
+    }
+    class URLSessionTransport {
+        -session: URLSession
+    }
+    class RetryPolicy {
+        <<struct>>
+        +maxAttempts: Int
+    }
+    class DownloadMachine {
+        <<enum>>
+        +next(state, event) DownloadState
+    }
+    Downloads <|.. DownloadManager
+    DownloadTransport <|.. URLSessionTransport
+    DownloadManager *-- RetryPolicy
+    DownloadManager --> "1" DownloadTransport : transport
+    DownloadManager --> "1" EpisodeFiles : files
+    DownloadManager ..> DownloadMachine : uses
+    URLSessionTransport --> URLSession : owns
+    URLSession --> URLSessionTransport : strong delegate
+```
+
+- `DownloadManager` conforms to `Downloads`; the features only ever see the protocol.
+- The session sits behind `DownloadTransport`, so tests replace it with a fake that emits `TransportEvent`s (progress, finished with the moved file, failed with resume data).
+- The transition rules are a pure `DownloadMachine`, used by the manager: a dependency, not a stored reference.
+- The last two arrows are a **cycle on purpose**: a `URLSession` keeps a strong reference to its delegate until it's invalidated. That's fine for a transport that lives as long as the app; anything shorter-lived must call `invalidateAndCancel()` or `finishTasksAndInvalidate()`, or it leaks.
+
+</ModelAnswer>
+
+<ModelAnswer section="concurrency">
+
+**Who owns what:**
+
+- **Download state** per episode: the Downloads actor, persisted with the Library so it survives relaunches. Features read it through `updates`.
+- **Playback state** (current episode, position, rate): Playback, on the main actor, because `AVPlayer`'s observers and Now Playing must be updated there.
+- **Library data:** SwiftData. The UI reads with the main context; background writes (FeedRefresher, Downloads) go through a `@ModelActor`, because a model context isn't `Sendable`.
+- **Positions:** PositionSync, an actor that batches what Playback reports every few seconds and uploads at most once a minute or on backgrounding. Conflicts: the most recent update wins.
+
+**The episode download state machine:**
+
+- notDownloaded → queued on `enqueue`
+- queued → downloading on `start`
+- downloading → downloading on `progress`
+- downloading → paused on `pause`, or when an automatic download loses Wi-Fi
+- paused → queued on `resume`
+- downloading → downloaded on `finish`
+- downloading → failed on `error`
+- failed → queued on `retry [attempts < 3]`, keeping resume data
+- failed → notDownloaded on `retry [attempts = 3]`, telling the user
+- downloaded → notDownloaded on `delete` or `evict`
+- queued, downloading, paused or failed → notDownloaded on `cancel`
+
+**One subtle rule:** the delegate's `didFinishDownloadingTo` must move the file **before it returns**, because the system deletes the temporary file afterwards. So that delegate method is nonisolated and calls the synchronous `EpisodeFiles.store` directly, then sends the result into the Downloads actor. An `await` before the move would lose the file.
+
+</ModelAnswer>
+
+<ModelAnswer section="failure">
+
+- **The user force-quits Tern:** the system cancels its background transfers. On the next launch, Downloads compares its states with the session's tasks and puts orphaned downloads back to queued.
+- **The system terminates Tern:** transfers continue, and step 7 of the dynamic view handles the relaunch.
+- **Disk full:** the download fails as `diskFull`. Don't retry until space is freed; show it in the Downloads feature.
+- **Network drops mid-file:** the error carries resume data (`URLError.downloadTaskResumeData`), so the retry continues from where it stopped instead of re-downloading 100 MB.
+- **Cellular and Low Data Mode:** automatic downloads set `allowsExpensiveNetworkAccess` and `allowsConstrainedNetworkAccess` to false; user-requested ones may use cellular.
+- **Background time never comes:** refresh tasks and silent pushes aren't guaranteed, so FeedRefresher also runs when the app comes to the foreground.
+- **Truncated files:** check the size against the response's expected length before marking an episode downloaded.
+- **Episode removed from the feed:** a `notFound` failure goes straight to notDownloaded with no retries.
+
+On the diagram, these are notes on the arrows to the background transfer service and the CDN, plus the failure transitions in the state diagram.
+
+</ModelAnswer>
+
+<ModelAnswer section="testing">
+
+**The seams are the arrows to infrastructure:** PodcastAPI, EpisodeFiles, the Library store and the URLSession itself. Downloads talks to the session through a small `DownloadTransport` protocol, so a fake transport can deliver progress, completion and failure events in any order.
+
+- **The state machine** as a pure transition function, with a test for every arrow, including `retry` at the attempt limit and `cancel` from each active state.
+- **Downloads** with a fake transport and temporary-directory EpisodeFiles: finish, fail with resume data and retry, disk full, an orphaned task after relaunch.
+- **FeedRefresher** with a stub API and an in-memory SwiftData container: new episodes are added once, and only auto-download shows are queued.
+- **The dynamic view as a test:** steps 2 to 8 with fakes, asserting the episode ends up downloaded and the completion handler is called.
+- **On a device:** background relaunch can't be unit-tested; trigger the refresh task from the debugger (`BGTaskScheduler` has a documented launch command for development) and check the relaunch path by hand before each release.
+
+</ModelAnswer>
+
+<ModelAnswer section="tradeoffs">
+
+- **Downloads as its own component**, not part of Library: it owns a system resource with its own lifecycle and relaunch path, and it's the part being rebuilt.
+- **A background session for all episode downloads**, a foreground one only for streaming: background transfers survive suspension, at the cost of delegate-only APIs and harder testing.
+- **Download state persisted alongside Library data**, so screens can query "downloaded episodes" in one place; only Downloads writes it.
+- **Feature modules over one app target:** more manifest work, but the dependency rules on the diagram become build errors.
+- **One class diagram, for Downloads only.** The other components' types change too often to be worth drawing; Downloads is where ownership mistakes (the session's strong delegate) would hurt. Also not drawn: the widget extension's internals and the Up Next queue. A static component diagram, one dynamic view, one state diagram and one class diagram are what the review needs.
+
+</ModelAnswer>
+
+```rubric
+- id: components
+  label: Chose components at the right size and level
+  skill: client
+  look_for:
+    - Six to twelve components, not classes; features separate from domain and infrastructure
+    - Downloads, Playback, Library, feed refresh, position sync, file storage and the API client named
+    - Other containers (API, CDN, system transfer service, widget) outside the boundary
+- id: interfaces
+  label: Gave each component a small, testable interface
+  skill: api
+  look_for:
+    - Protocol signatures with async/await or async sequences
+    - No URLSession, SwiftData or AVPlayer types leaking through domain interfaces
+- id: dynamic
+  label: Traced the background download correctly
+  skill: architecture
+  look_for:
+    - A refresh task or silent push as the trigger, not a timer
+    - A background session; relaunch with the same session identifier
+    - The file moved before the delegate method returns, and the completion handler called at the end
+- id: state
+  label: Owned state explicitly
+  skill: client
+  look_for:
+    - A download state machine with failure, retry limit, pause and cancel
+    - Owners named per state (an actor for downloads, the main actor for playback) and SwiftData context isolation handled
+- id: failure
+  label: Covered the failure paths
+  skill: offline
+  look_for:
+    - Force quit cancels background transfers, and the app reconciles on launch
+    - Resume data on network failure; disk full; Wi-Fi only and Low Data Mode for automatic downloads
+    - Background time not guaranteed, with a foreground fallback
+- id: classes
+  label: Drew the intricate component's classes with honest ownership
+  skill: client
+  look_for:
+    - The Downloads protocol and its conformer, with the session behind its own transport protocol
+    - Composition, association and dependency used for what they mean, with multiplicities
+    - That a URLSession holds its delegate strongly until it's invalidated
+- id: testing
+  label: Made the seams testable
+  skill: testing
+  look_for:
+    - Protocols at every infrastructure arrow, including a transport wrapper around URLSession
+    - Tests for the state machine and a fake-driven test of the dynamic view
+```
+
+<Pitfalls>
+
+- Drawing classes (`EpisodeCell`, `DownloadManager+Delegate`) instead of components.
+- Using async/await `URLSession` APIs with a background session; it only works through the delegate.
+- Awaiting before moving the downloaded file, so the system deletes it first.
+- Storing episodes in Caches, where the system can purge them before the morning commute.
+- A dynamic view that assumes the app stays running all night.
+
+</Pitfalls>

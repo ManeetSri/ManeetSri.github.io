@@ -1,0 +1,301 @@
+## Why it matters
+
+SOLID helps you shape a type once you know what it's for. It doesn't answer the question every new feature starts with: **which type should do this?** Who computes the cart total, who creates the line item, who handles the tap on "Add to cart"? GRASP is a vocabulary for exactly those decisions. "Design the cart" or "design checkout" in an interview is mostly a test of where you put responsibilities and why.
+
+## What GRASP is
+
+Craig Larman collected the **General Responsibility Assignment Software Patterns** in *Applying UML and Patterns* (first edition 1997, third 2004). They aren't code templates like the Gang of Four patterns. They're nine reasons for giving a responsibility to one type rather than another.
+
+A **responsibility** is one of two kinds:
+
+- **Knowing:** data a type holds, or something it can work out from that data. A cart knows its lines and can work out its total.
+- **Doing:** an action. Creating an object, changing state, or coordinating other objects.
+
+This lesson covers the three patterns that answer the everyday questions: **information expert** (who knows?), **creator** (who makes it?) and **controller** (who handles the user's action?). The next two lessons cover the other six, which decide between candidates when these three disagree.
+
+## Information expert: give it to the type that has the information
+
+> Assign a responsibility to the type that has the information needed to fulfil it.
+
+Who should compute a cart's total? The total needs every line's subtotal. Each line has its product's price and its quantity, so the **line** is the expert on its subtotal. The **cart** has all the lines, so it's the expert on the total.
+
+The alternative is what many iOS codebases have: a view model that reaches in and does the sum itself.
+
+```swift
+// In CartViewModel, MiniCartView and CheckoutViewModel: three copies
+let total = cart.lines.reduce(0) { $0 + $1.product.pricePence * $1.quantity }
+```
+
+That duplicates a rule in every screen that shows a total (the DRY problem from [DRY vs the wrong abstraction (AHA)](/design/learn/sd-principles-dry)), and reaches through the cart into lines and into products, which is exactly what [The Law of Demeter and tell, don't ask](/design/learn/sd-coupling-demeter) warns against. Expert pushes behaviour to where the data lives, so callers ask one question and get one answer.
+
+The rule spreads logic across many small types, each doing the part it knows about. That's the point: no type knows everything, and none needs to.
+
+## Creator: who should make a new object?
+
+> Give type B the responsibility to create instances of A when B **contains** or aggregates A, **records** A, **closely uses** A, or **has the data** to initialise A. The more of these hold, the stronger the case.
+
+A cart contains its line items, so the cart creates them. That puts the creation rules in one place: adding a product that's already in the cart increases its quantity instead of adding a second line, and no line can exceed the maximum quantity.
+
+```swift run title="Experts compute; the container creates"
+import Foundation
+
+struct Product {
+    let id: String
+    let name: String
+    let pricePence: Int
+}
+
+struct LineItem {
+    let product: Product
+    fileprivate(set) var quantity: Int
+
+    // Expert: a line has the price and the quantity
+    var subtotalPence: Int { product.pricePence * quantity }
+}
+
+struct Cart {
+    static let maxQuantity = 10
+    private(set) var lines: [LineItem] = []
+
+    // Expert: the cart has the lines
+    var totalPence: Int { lines.reduce(0) { $0 + $1.subtotalPence } }
+    var itemCount: Int { lines.reduce(0) { $0 + $1.quantity } }
+
+    // Creator: the cart contains line items, so it makes them, and merges repeats
+    mutating func add(_ product: Product, quantity: Int = 1) {
+        if let index = lines.firstIndex(where: { $0.product.id == product.id }) {
+            lines[index].quantity = min(Self.maxQuantity, lines[index].quantity + quantity)
+        } else {
+            lines.append(LineItem(product: product, quantity: min(Self.maxQuantity, quantity)))
+        }
+    }
+}
+
+func pounds(_ pence: Int) -> String {
+    String(format: "£%d.%02d", pence / 100, pence % 100)
+}
+
+let oatMilk = Product(id: "p1", name: "Oat milk", pricePence: 150)
+let coffee = Product(id: "p2", name: "Coffee beans", pricePence: 640)
+
+var cart = Cart()
+cart.add(oatMilk)
+cart.add(coffee)
+cart.add(oatMilk, quantity: 12)
+
+for line in cart.lines {
+    print("\(line.product.name) × \(line.quantity) = \(pounds(line.subtotalPence))")
+}
+print("\(cart.itemCount) items, total \(pounds(cart.totalPence))")
+```
+
+```output
+Oat milk × 10 = £15.00
+Coffee beans × 1 = £6.40
+11 items, total £21.40
+```
+
+The third `add` merged into the existing line and stopped at the limit. No caller can create a `LineItem` with 13 oat milks, because only code in this file can set `quantity`. That's the aggregate idea from [Aggregates and consistency boundaries](/design/learn/sd-modelling-aggregates): the root creates its parts, so it can keep their rules.
+
+More examples of creator on iOS:
+
+- A `Conversation` creates its `Message`s. It has the conversation ID and the next local sequence number, the initialising data.
+- An `UploadQueue` creates `UploadJob`s. It records them and closely uses them.
+- **Screens and view models** are created by whatever has their dependencies: a coordinator or the composition root (D21), not the previous screen reaching for singletons.
+
+When creation gets complicated, such as many dependencies or a choice between subtypes, creator hands over to a factory. You'll meet those in D10.
+
+## Controller: who handles the user's action?
+
+A **system event** is something from outside that the app must respond to: "add to cart", "check out", "mark as read". GRASP says:
+
+> Give the responsibility for handling a system event to an object that **isn't part of the UI** and represents either the whole system or subsystem (a *facade controller*), or one use case (a *use case controller*).
+
+The UI's job is to turn a tap into a call. The controller's job is to **coordinate**: ask the experts, tell the creators, call the services, record the outcome. It does little work itself.
+
+```swift check ios title="The controller behind the product screen"
+import SwiftUI
+
+struct Product: Sendable {
+    let id: String
+    let name: String
+}
+
+struct Cart {
+    private(set) var productIDs: [String] = []
+    mutating func add(_ product: Product) { productIDs.append(product.id) }
+    mutating func remove(_ product: Product) { productIDs.removeAll { $0 == product.id } }
+}
+
+protocol CartAPI: Sendable {
+    func addItem(productID: String, quantity: Int) async throws
+}
+
+@MainActor
+@Observable
+final class ProductDetailModel {
+    private(set) var cart = Cart()
+    private(set) var errorMessage: String?
+    private let api: any CartAPI
+
+    init(api: any CartAPI) {
+        self.api = api
+    }
+
+    // The system event. The model coordinates; the cart and the API do the work.
+    func addToCartTapped(_ product: Product) async {
+        cart.add(product)
+        do {
+            try await api.addItem(productID: product.id, quantity: 1)
+        } catch {
+            cart.remove(product)
+            errorMessage = "Couldn't add \(product.name). Try again."
+        }
+    }
+}
+
+struct AddToCartButton: View {
+    let product: Product
+    let model: ProductDetailModel
+
+    var body: some View {
+        Button("Add to cart") {
+            Task { await model.addToCartTapped(product) }
+        }
+    }
+}
+```
+
+Step through the same event, and notice who does what:
+
+```visual sequence
+title: "Add to cart: who is responsible for what"
+participants:
+  - { id: view, label: Product screen }
+  - { id: model, label: Detail model }
+  - { id: cart, label: Cart }
+  - { id: api, label: Cart API }
+messages:
+  - [view, model, "addToCartTapped(oatMilk)", { say: "The button sends a **system event** to the controller, the first object behind the UI. The view decides nothing." }]
+  - [model, cart, "add(oatMilk)", { say: "The controller delegates. The cart **creates** the line item, or merges it, because it contains its lines." }]
+  - [cart, cart, merge or append line]
+  - [model, api, "addItem(p1, 1)", { say: "The controller coordinates the side effect: telling the server." }]
+  - [api, model, ok, { reply: true }]
+  - [view, model, cart total?, { say: "The screen asks for the total, a query." }]
+  - [model, cart, totalPence, { say: "The cart is the **expert**: it has the lines, and each line knows its own subtotal." }]
+  - [cart, model, "£1.50", { reply: true }]
+  - { note: "A widget button, Siri or a deep link can send the same event to the same controller.", over: [view, model] }
+```
+
+Because the controller isn't UI, the same operation can come from a SwiftUI button, an App Intent behind a widget button or Siri, a deep link, or a unit test, and all of them get identical behaviour.
+
+### The naming trap: UIViewController isn't a GRASP controller
+
+`UIViewController` sounds like the controller, but it's a UI object: it owns views and responds to their lifecycle. GRASP's controller is the first object *behind* the UI. Classic iOS MVC folds the two together, and Massive View Controller (D15, D26) is what happens: system events, coordination, formatting and networking all land in the one object UIKit makes you subclass. View models, interactors, use cases and reducer-based stores are all, among other things, ways to give the GRASP controller role its own home.
+
+### A controller that does too much
+
+Controllers bloat in two ways: one controller handles every event in a large feature, or it starts doing the work instead of delegating it. The fix for the first is a controller per use case (`CheckoutModel`, `AddressBookModel`). For the second, push the work back to the experts: if a view model computes a delivery fee, the fee rule belongs on the cart or a pricing policy.
+
+## Trade-offs
+
+Where should "work out the cart total" go?
+
+| Option | Duplication risk | Testability | Coupling | Wins when |
+| --- | --- | --- | --- | --- |
+| In each view or view model | High: one copy per screen | Needs UI-layer tests | Views reach through cart, lines and products | Never, past a prototype |
+| A `CartService` that reads the cart's data | Low | Good | The service knows the cart's insides; the cart is a bag of data | The calculation needs data the cart doesn't have |
+| On `Cart` and `LineItem` (expert) | Low | Excellent: plain values | Low: callers ask one question | The data is all inside the cart, the common case |
+| A pricing policy the cart asks | Low | Excellent | Low, plus one interface | Rules vary: promotions, tax regions, experiments |
+
+<Callout kind="interview">
+
+**What to say:** narrate ownership. "The cart owns its line items, so it creates them and computes totals. The screen's model handles the user's actions and delegates. The API client talks to the server." You rarely need the word GRASP; you need the reasoning.
+
+**What to ask:** "Is the server the authority on prices and promotions?" Usually yes: the client total is a preview, and checkout uses the server's figure. That changes how much pricing logic the app should hold at all.
+
+**Red flags interviewers listen for:** a `CartManager` holding all the logic while `Cart` is a bag of properties; view controllers doing arithmetic; and every object created by whoever happens to need it, through singletons.
+
+</Callout>
+
+<Callout kind="gotcha" title="iOS gotcha: SwiftData models as experts">
+
+A SwiftData `@Model` class is a fine expert for values derived from its own properties, such as `var isOverdue: Bool`. Keep networking, formatting for display and cross-aggregate rules out of it: the model is also your persistence schema, so every responsibility you add couples that logic to the database and to the model context's actor.
+
+</Callout>
+
+## Practice
+
+In the kata [An upload queue workers can share](/design/practice/sd-kata-principles-upload-queue), the queue is both the expert on every job's status and the creator of the job values it hands out, which is what lets it keep its books right.
+
+```cards
+- id: expert
+  front: "What does the information expert pattern say?"
+  back: "Give a responsibility to the type that has the information to fulfil it. A cart computes its total because it has the lines; each line computes its subtotal."
+- id: creator
+  front: "When should type B create instances of A?"
+  back: "When B contains or aggregates A, records A, closely uses A, or has the data to initialise A. A cart creates its line items."
+- id: controller
+  front: "What is a GRASP controller?"
+  back: "The first non-UI object that receives a system event, such as \"add to cart\", and coordinates the work: a view model, interactor, use case or store."
+- id: uivc-not-controller
+  front: "Is `UIViewController` a GRASP controller?"
+  back: "No. It's a UI object. Putting the controller role in it too is how Massive View Controller happens."
+```
+
+```quiz
+- id: q1
+  type: sort
+  prompt: "Which GRASP pattern best justifies each decision?"
+  buckets: [Information expert, Creator, Controller]
+  items:
+    - ["`Conversation` makes new `Message` values with the next sequence number", 1]
+    - ["`Order.isEligibleForReturn` is computed from the order's own dates and status", 0]
+    - ["`CheckoutModel.placeOrderTapped()` receives the tap and calls the payment and order services", 2]
+    - ["`Playlist.totalDuration` sums its tracks' durations", 0]
+    - ["`UploadQueue.enqueue(_:)` makes the `UploadJob` it will track", 1]
+  explain: "Computing from your own data is expert. Making objects you contain, record or have the data for is creator. Receiving a system event and coordinating others is controller."
+- id: q2
+  type: bug
+  prompt: "Which line puts a responsibility in the wrong type?"
+  code: |
+    struct WishlistRowModel {
+        let item: WishlistItem
+        var title: String { item.product.name }
+        var isOnSale: Bool {
+            item.product.pricePence < item.product.regularPricePence
+        }
+        var accessibilityLabel: String { "\(title), in your wishlist" }
+    }
+  answer: 5
+  explain: "Whether a product is on sale depends only on the product's own prices, so `Product` is the expert: `product.isOnSale`. Otherwise every screen that shows a sale badge re-implements the rule. The title and accessibility label are presentation, which a row model may own."
+- id: q3
+  type: truefalse
+  prompt: "In UIKit MVC, the UIViewController plays the role of GRASP's controller, so it should handle system events itself."
+  answer: false
+  explain: "`UIViewController` is part of the UI. GRASP's controller is the first object behind the UI, so the same event can come from a widget, Siri, a deep link or a test."
+- id: q4
+  type: mcq
+  prompt: "A messaging app needs a new `Message` with the conversation's ID, the sender and the next local sequence number. Which type should create it?"
+  options:
+    - "The chat view controller, because the user typed the text there"
+    - "The `Conversation`, because it contains its messages and has the ID and the next sequence number"
+    - "A global `MessageFactory` singleton used everywhere"
+    - "The network client, because messages are eventually sent to the server"
+  answer: 1
+  explain: "Several creator criteria point at `Conversation`: it contains messages and holds the initialising data, so it can guarantee sequence numbers never collide. The view controller only has the text."
+- id: q5
+  type: multi
+  prompt: "Signs that a GRASP controller has grown too big? Choose all that apply."
+  options:
+    - "It handles events from five unrelated screens"
+    - "It computes discounts and delivery fees itself"
+    - "It calls the cart, then the API, then records an error state"
+    - "It formats prices, builds URLRequests and decodes JSON"
+  answer: [0, 1, 3]
+  explain: "Coordinating calls to the cart and the API is a controller's job. Handling many unrelated events, doing the experts' calculations, and doing the services' work are signs to split it by use case and push work back to the types that own it."
+- id: q6
+  type: recall
+  prompt: "Explain why the same \"add to cart\" behaviour is easier to reuse from a widget and Siri when a non-UI controller handles it."
+  model: "The UI only turns a tap into a call on the controller, and the controller coordinates the cart and the API. A widget's App Intent, Siri or a deep link can call the same method, so they all get the same rules and error handling instead of copying logic out of a view controller."
+```

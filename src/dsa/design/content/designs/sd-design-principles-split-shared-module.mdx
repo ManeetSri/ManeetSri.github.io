@@ -1,0 +1,143 @@
+<Brief>
+
+You've joined the platform team of a personal-finance app. Twelve iOS engineers in three teams (Accounts, Budgets and Platform) ship it weekly. Two features already live in their own framework targets, `Budgets` and `Payments`. Everything else that's shared sits in one framework called `Shared`.
+
+**What's in `Shared`:** about 38,000 lines in 160 files. Account and transaction models; the networking client; a Keychain wrapper; currency and date formatting; the design system's components; a wrapper around a third-party charting library; a wrapper around the analytics vendor's SDK; the feature-flag and experiments client; a `DeepLinkRouter`; and some feature code that drifted in, such as `BudgetsSummaryViewModel`, which the watch app also uses.
+
+**Who uses it:** the app, a home-screen widget, a watch app, a notification service extension, and the `Budgets` and `Payments` frameworks.
+
+**What hurts:**
+
+- About **60% of pull requests** touch `Shared`, roughly 45 a week, and after any change to it an incremental build of the app takes about **6 minutes**, against **50 seconds** for a change inside `Budgets`.
+- The widget links `Shared`, and with it the charting library and the analytics SDK. Its binary is **11 MB**, and crash reports show the system killing it for memory on about **0.8%** of timeline reloads.
+- `DeepLinkRouter` in `Shared` imports `Budgets` to build its screens, while `Budgets` imports `Shared`. The build only works because of the order Xcode happens to build the targets in.
+- The design system's buttons read experiment flags to decide whether to show a "New" badge, so every experiment change rebuilds everything.
+- Rough metrics for `Shared`: imported by 6 targets, imports 3 (the two SDKs and `Budgets`), and 6 of its 160 public types are protocols.
+
+**Constraints:** weekly releases continue throughout; no long-lived branch. Platform can give one engineer full-time. Next quarter a second app, a small-business version, starts; it needs networking, the models, money formatting, the design system and analytics, but not charts or the Budgets feature.
+
+Plan the migration. Spend about 35 minutes, and write in the sections on the right as you'd write a proposal for the three teams.
+
+</Brief>
+
+```workspace
+template: migration
+minutes: 35
+```
+
+<ModelAnswer section="current">
+
+`Shared` breaks all six package principles, and the numbers show what each costs:
+
+- **CRP:** every client depends on all of it. The widget needs models, money formatting and a few design tokens, but links two SDKs; that's most of its 11 MB and the likely cause of the memory kills.
+- **CCP:** feature code such as `BudgetsSummaryViewModel` changes with the Budgets team's work, so `Shared` changes in 60% of PRs and each one costs about 6 minutes of rebuild for everyone.
+- **REP:** no theme. Its "release notes" would mix Keychain fixes, chart styling and JSON changes, and everything is `public` because it had to be visible to someone.
+- **ADP:** `Shared ⇄ Budgets` is a cycle, held together by build order. Neither can be built or tested alone.
+- **SDP:** the design system, which should be among the most stable code, depends on experiments, which change weekly.
+- **SAP:** `Shared` has I = 3 ÷ (6 + 3) ≈ 0.33 and A = 6 ÷ 160 ≈ 0.04, so D ≈ 0.63: concrete, depended on, and changing weekly. Deep in the zone of pain.
+
+</ModelAnswer>
+
+<ModelAnswer section="target">
+
+Small modules with one theme each, in a local Swift package (`Platform`) with a product per module, and a few rules the graph must obey:
+
+- **Foundations** (stable, small, mostly value types): `Money`, `Models`, `KeychainStore`, `NetworkingCore` (an `HTTPClient` protocol, its URLSession implementation and request building).
+- **Interfaces** (stable and abstract): `Routing` (a `Route` enum and a `Router` protocol) and `AnalyticsInterface` (the app's event enum and a tracker protocol).
+- **Adapters**, linked only by the app: `AnalyticsVendor` implements the tracker with the SDK. `ChartsUI` wraps the charting library and is linked by the app and the watch app only.
+- **UI:** `DesignSystem`, which imports no experiments: components take a `badge: String?` and features decide what goes in it.
+- **Features:** `Accounts`, `Budgets`, `Payments`, each owning its own view models (`BudgetsSummaryViewModel` moves to `Budgets`) and reading experiments through `Experiments`, a module only features and the app import.
+
+**Rules:** features never import features; foundations and interfaces import nothing volatile; only the app target, the composition root, imports adapters and implements `Router`.
+
+**Per target:** the widget links `Models`, `Money` and `DesignSystem`. The notification extension links `Models`, `Money` and `NetworkingCore`. The watch app adds `ChartsUI`. The business app links the foundations, `DesignSystem` and `AnalyticsInterface` with its own adapter, and no charts or Budgets.
+
+</ModelAnswer>
+
+<ModelAnswer section="steps">
+
+Each step is a handful of small PRs that ship in the normal weekly release.
+
+1. **Measure and guard.** Record the baseline: PRs touching `Shared`, incremental build times, widget size and memory kills. Add a CI script that prints the module graph and checks the rules, as warnings at first.
+2. **Break the cycle.** Create `Routing`. `DeepLinkRouter` turns URLs into `Route` values; the app target implements `Router` and builds `Budgets` screens. Remove `import Budgets` from `Shared`. Doing this first means no extracted module inherits the cycle.
+3. **Point the design system the right way.** Replace the experiment reads in buttons with a `badge` parameter, set by the features running experiments.
+4. **Extract the leaves:** `Money`, `Models`, `KeychainStore`, which depend on nothing. To avoid touching hundreds of call sites in one PR, `Shared` temporarily re-exports them; a tracked ticket removes the re-export once call sites import the new modules directly.
+5. **Split analytics** into `AnalyticsInterface` and `AnalyticsVendor`; the app wires the vendor adapter. The widget and extensions stop linking the SDK. Measure the widget now: this is the step users feel.
+6. **Move `ChartsUI` out**, linked only by the app and the watch app.
+7. **Send feature code home:** `BudgetsSummaryViewModel` and friends move to their feature modules, reviewed by the owning team.
+8. **Extract `NetworkingCore`**, then delete what's left of `Shared` or rename the remainder honestly. Turn the graph rules into CI errors.
+
+</ModelAnswer>
+
+<ModelAnswer section="risks">
+
+- **Merge conflicts with feature work.** Moves are mechanical but touch many files. Keep PRs small, use `git mv` so history follows, announce each move a day ahead, and land moves early in the release week.
+- **Everything becomes `public`.** Moving code into modules exposes `internal` uses. Use the `package` access level for code shared between `Platform` targets, and review each module's public API as a contract: that's REP.
+- **Re-exports that never go away.** The temporary re-exports keep call sites compiling but hide real dependencies. Track their removal, and make the graph check flag them.
+- **Linking and launch time.** Library products link statically by default, so a module used by the app and three extensions is copied into each binary, which is usually fine for small foundations. Changing to or from dynamic frameworks affects launch time, so measure cold launch before and after each step.
+- **Behaviour changes.** Deep links (step 2) get UI tests for every route first. For analytics (step 5), compare per-event counts on the dashboard for the release before and after.
+- **Rollback:** every step is an ordinary release, so rolling back is reverting its PRs. No step depends on a later one to work.
+
+</ModelAnswer>
+
+<ModelAnswer section="measure">
+
+- **Change locality:** PRs touching foundation modules fall from 60% to under 15%; most PRs touch one feature module.
+- **Build time:** a typical feature change rebuilds in about a minute, not six; CI time for a feature-only PR drops accordingly.
+- **The widget:** binary from 11 MB to a few MB, and memory kills from 0.8% of reloads to near zero.
+- **The graph:** no cycles, no imports that point at a less stable module, and the foundation and interface modules sit near the main sequence (D under about 0.3). All enforced in CI.
+- **The business app** builds on day one with the foundations, `DesignSystem` and `AnalyticsInterface`, and links neither charts nor `Budgets`.
+
+</ModelAnswer>
+
+```rubric
+- id: diagnosis
+  label: Diagnosed the module with the right principles and the numbers
+  skill: architecture
+  look_for:
+    - "CRP: the widget links SDKs it never uses, tied to its size and memory kills"
+    - "CCP: feature code in Shared, so most PRs touch it and pay the rebuild cost"
+    - "ADP: the Shared and Budgets cycle, held together by build order"
+    - "SDP: the design system depending on volatile experiments"
+- id: target
+  label: Proposed a target graph with clear rules
+  skill: architecture
+  look_for:
+    - Small foundation modules, each with one theme
+    - "Interface modules (routing, analytics) so extensions never link vendor SDKs"
+    - Features never import features; the app target composes and owns adapters
+    - What each target, including the business app, links
+- id: sequencing
+  label: Ordered the steps so the app keeps shipping
+  skill: client
+  look_for:
+    - The cycle broken first or very early
+    - Leaves with no dependencies extracted before the tangled middle
+    - Each step releasable on its own, with no long-lived branch
+    - Temporary re-exports or similar scaffolding, with a plan to remove it
+- id: safety
+  label: Named the risks and the safety nets
+  skill: testing
+  look_for:
+    - Tests before risky moves, such as deep-link UI tests and analytics parity checks
+    - "Access control: `package` instead of making everything `public`"
+    - Launch time and linking measured
+    - Small PRs and a plan for conflicts with feature teams
+- id: measure
+  label: Defined success with before-and-after numbers
+  skill: performance
+  look_for:
+    - Share of PRs touching shared modules, and incremental build time
+    - Widget size and memory kills
+    - Graph rules enforced in CI as a fitness function
+```
+
+<Pitfalls>
+
+- Splitting by layer (`Models`, `Networking`, `Views`): every feature change still crosses several modules.
+- Moving the SDKs into a new `Core` module that everyone imports: the same grab-bag with a new name.
+- A rewrite on a long-lived branch that diverges from weekly releases for months.
+- Making everything `public` to get the first split compiling, so no module has a real API.
+- Extracting modules before breaking the cycle, so each new module inherits it.
+
+</Pitfalls>

@@ -386,6 +386,14 @@ Registry: also `swiftTest: '<Type>Tests'`. The statement follows the DSA problem
 - **Stubs fail fast:** they compile, return a placeholder or `throw Unimplemented()`, and never use `fatalError`, `preconditionFailure`, `while true` or sleeps. `design:check` rejects those.
 - **Tests:** Swift Testing, `#if SOLUTIONS import Solutions #else import Exercises #endif`, `@Suite struct <Type>Tests`. Test behaviour, not implementation. Async tests use `TestClock.advance(by:)` and `settle()`; give suites that touch shared state `.serialized`.
 
+## Pitfalls other writers hit
+
+- **`@State` is a macro in the current SDK.** In the Xcode 27 SDK on this machine (iOS 27.1), `@State` is a macro and its initial value is created once per view identity. Up to Xcode 16 it was evaluated every time the view struct was built, while only the first value was kept. Don't present the old "your initial value is recreated on every init" warning as current fact: say which toolchain it applies to, as [View lifetime vs state lifetime](/design/learn/sd-swiftui-lifetimes) does. `_x = State(initialValue:)` in an initialiser still builds a new value each time.
+- **Commas split YAML items.** In `sort` and `match` items and in flow edge labels, an unquoted comma silently makes two items. Quote any item containing a comma.
+- **Short layer names.** A one-row `layers` band truncates its label at about 11 characters, and node labels with no spaces break mid-word past about 14. Keep both short, and step through the diagram in the browser.
+- **`#expect` can't call mutating methods.** Call the method first, then assert on its result.
+- **Test code is checkable.** `check` blocks may import XCTest or Testing; don't leave test examples unchecked.
+
 ## Checking your work
 
 ```bash

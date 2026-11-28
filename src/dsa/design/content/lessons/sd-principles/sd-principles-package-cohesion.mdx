@@ -1,0 +1,233 @@
+## Why it matters
+
+Once an app has more than a handful of modules, the question changes from "which type should do this?" to "which **module** should this live in?" Get the boundaries wrong and every feature touches five modules, or a widget extension links half the app. Robert C. Martin's three component cohesion principles are the vocabulary for deciding what goes together. Staff-level interviews ask how you'd modularise a large app, and these are the reasons behind a good answer.
+
+## From types to components
+
+Martin introduced the component principles in the 1990s and collected them in *Agile Software Development: Principles, Patterns, and Practices* (2002); *Clean Architecture* (2017) revisits them. A **component** is a unit you build, version and depend on as a whole. On iOS that's a Swift package target or product, a framework, or an XCFramework.
+
+There are six principles. Three are about **cohesion**, what belongs inside a component, and they're this lesson. Three are about **coupling** between components, and they're the next.
+
+It helps to remember what a module actually changes in Swift:
+
+- **An access boundary.** `internal` code is invisible outside the module, so a module is the strongest information hiding the language offers.
+- **A build unit.** When a module's interface changes, modules that import it are recompiled; when it doesn't, build systems can reuse cached results.
+- **An explicit dependency graph.** A SwiftPM target lists exactly what it depends on, and nothing else can be imported.
+- **A unit of reuse** across the app, its widgets, a watch app, an App Clip, or several apps.
+
+## REP: the granule of reuse is the granule of release
+
+> The **reuse/release equivalence principle**: what you reuse together, you release together, with version numbers and release notes.
+
+If other code reuses a component, its users need to know when it changes and whether a change can break them. That means a release process: semantic versions (a breaking change bumps the major version), notes, and a public API kept stable on purpose. And a release only means something if the component's contents share a **theme**.
+
+- A SwiftPM package in its own repository, tagged `2.4.0` and depended on with `from: "2.0.0"`, is REP made literal.
+- In a monorepo of local packages, everything releases together with the app. REP still applies wherever a module serves several clients, such as the app, its widget and its watch app: treat its public API as a contract.
+
+**A quick test:** could you write one sentence of release notes for a typical change? "Changed the date formatter, the Keychain wrapper and the image resizer" describes three components that happen to share a name.
+
+## CCP: what changes together, lives together
+
+> The **common closure principle**: gather into a component the types that change for the same reasons and at the same times. Separate those that change at different times for different reasons.
+
+This is [Single responsibility: reasons to change](/design/learn/sd-solid-srp), one level up. Its most important consequence on iOS is the choice between **layer** modules and **feature** modules.
+
+Layer modules group code by kind: `Models`, `Networking`, `ViewModels`, `Views`. Feature modules group it by what it's for: `Checkout`, `Search`, `Profile`. Count the modules a typical change touches:
+
+| Change request | Layer modules touched | Feature modules touched |
+| --- | --- | --- |
+| Add a promo-code field to checkout | 4: model, endpoint, view model, view | 1: `Checkout` |
+| Show delivery slots in checkout | 4 | 1: `Checkout` |
+| Change how all requests decode dates | 1: `Networking` | 1: `NetworkingCore` |
+| Restyle the primary button everywhere | 1: `Views` | 1: `DesignSystem` |
+
+Most changes are feature changes, so CCP favours **feature modules** for feature code, plus a few shared foundation modules for what's genuinely cross-cutting and stable: a networking core, a design system, an analytics interface. You'll see how teams organise this at scale in D61.
+
+## CRP: don't make clients depend on what they don't use
+
+> The **common reuse principle**: types that are used together belong together. Don't force a component's users to depend on things they don't need.
+
+This is [Interface segregation with role protocols](/design/learn/sd-solid-isp), one level up. It matters more than it sounds, because you can't import a third of a module. Depend on a module and you get:
+
+- **All of its dependencies**, linked into your target, including any third-party SDKs it imports.
+- **All of its changes.** When its interface changes, you're recompiled; your tests rerun even if the change was in a part you never call.
+- **Its size and start-up work**, for anything that registers or initialises itself when loaded.
+
+Here's the classic failure, and the fix:
+
+```visual flow
+title: One shared module, three targets
+groups:
+  - { id: targets, label: Targets, nodes: [app, widget, watch] }
+  - { id: split, label: Split by use, nodes: [analytics, formatting, charts] }
+nodes:
+  - { id: app, label: App, kind: client, at: [0, 0] }
+  - { id: widget, label: Widget, kind: client, at: [0, 1.5] }
+  - { id: watch, label: Watch app, kind: client, at: [0, 3] }
+  - { id: analytics, label: AnalyticsKit, at: [4, 0] }
+  - { id: formatting, label: Formatting, at: [4, 1.5] }
+  - { id: charts, label: ChartsUI, at: [4, 3] }
+  - { id: shared, label: SharedKit, at: [2, 4.4] }
+edges:
+  - [app, shared]
+  - [widget, shared]
+  - [watch, shared]
+  - [app, analytics]
+  - [app, formatting]
+  - [app, charts]
+  - [widget, formatting]
+  - [watch, formatting]
+  - [watch, charts]
+steps:
+  - say: "Three targets share `SharedKit`: date and price formatting, a charting wrapper and the analytics SDK wrapper."
+    show: [targets, shared]
+    send: [app->shared, widget->shared, watch->shared]
+  - say: "The widget needs only formatting, but it links everything, including two third-party SDKs. **CRP** is broken."
+    state: { widget: error }
+    label: { widget: "+ 2 SDKs" }
+  - say: "Worse, every change to the analytics wrapper recompiles and retests all three targets, though only the app sends events."
+    state: { shared: active, app: wait, watch: wait }
+    label: { shared: "1 change, 3 rebuilds" }
+  - say: "Split by **who uses what together**. Each target depends only on the modules it needs."
+    hide: [shared]
+    show: [split]
+    send: [app->analytics, app->formatting, app->charts, widget->formatting, watch->formatting, watch->charts]
+    state: { widget: null, app: null, watch: null }
+    label: { widget: null }
+  - say: "The widget links only `Formatting`: small and rarely changed. An analytics change now rebuilds only the app."
+    state: { widget: ok, formatting: ok }
+```
+
+In SwiftPM the split costs little. One package can offer several products, and the `package` access level (Swift 5.9) lets its targets share code with each other without making it public API:
+
+```swift title="Package.swift: one package, three products"
+// swift-tools-version: 6.0
+import PackageDescription
+
+let package = Package(
+    name: "AppFoundations",
+    platforms: [.iOS(.v18), .watchOS(.v11)],
+    products: [
+        .library(name: "Formatting", targets: ["Formatting"]),
+        .library(name: "ChartsUI", targets: ["ChartsUI"]),
+        .library(name: "AnalyticsKit", targets: ["AnalyticsKit"]),
+    ],
+    dependencies: [
+        .package(url: "https://github.com/example/plotting", from: "4.0.0"),
+        .package(url: "https://github.com/example/analytics-sdk", from: "11.0.0"),
+    ],
+    targets: [
+        .target(name: "Formatting"),
+        .target(name: "ChartsUI", dependencies: ["Formatting", .product(name: "Plotting", package: "plotting")]),
+        .target(name: "AnalyticsKit", dependencies: [.product(name: "AnalyticsSDK", package: "analytics-sdk")]),
+    ]
+)
+```
+
+The widget target lists only `Formatting`, and neither SDK can reach it.
+
+## The tension: you can't max out all three
+
+The principles pull in different directions. REP and CCP are **inclusive**: they make components bigger, gathering what's released or changed together. CRP is **exclusive**: it makes them smaller, splitting what isn't used together. *Clean Architecture* draws this as a triangle, and each edge describes what you give up:
+
+| You favour | You neglect | Symptom |
+| --- | --- | --- |
+| REP and CCP | CRP | Too many needless rebuilds and releases: clients get changes they don't use |
+| REP and CRP | CCP | Too many components change for each feature |
+| CCP and CRP | REP | Hard to reuse: no coherent, versioned units others can depend on |
+
+Martin's useful observation is that a project **moves around the triangle over time**. Early on, when the team's main problem is shipping features, favour CCP: fewer, feature-shaped modules that are easy to change. As other targets, teams or apps start reusing code, shift towards REP and CRP: smaller, stable, well-named components with deliberate public APIs.
+
+## Trade-offs
+
+| Module structure | Build times | Change locality (CCP) | Reuse (REP, CRP) | Overhead | Wins when |
+| --- | --- | --- | --- | --- | --- |
+| One app target | Every change can rebuild everything | Fine while small | None | None | A small app or a small team |
+| Layer modules (`Models`, `Networking`, `Views`) | Moderate | Poor: features cut across every layer | Poor: each layer is a grab-bag | Low | Rarely; it's the most common first attempt |
+| Feature modules plus a few small foundations | Good: changes stay local | Good | Good for the foundations | Moderate | Most growing apps and teams |
+| A module per type or two | Many small builds, lots of graph overhead | Poor: one change spans many modules | High, but mostly unused | High | Almost never; there's nothing to gain from splitting cohesive code |
+
+<Callout kind="interview">
+
+**What to say** when asked how you'd modularise a large app: feature modules owned by teams, so a feature change stays in one module (CCP); a small set of foundation modules such as networking, design system and analytics interfaces, each with a clear theme and a stable API (REP); and no `Common` or `Utilities` grab-bags, so targets like widgets depend only on what they use (CRP).
+
+**What to ask:** "Which targets ship this code: widgets, a watch app, an App Clip, other apps?" Every extra client raises the value of small, focused components.
+
+**Red flags interviewers listen for:** modularising by layer only; a `Core` module everyone depends on; and splitting a codebase into modules before anyone knows where the boundaries are.
+
+</Callout>
+
+<Callout kind="gotcha" title="iOS gotcha: extensions pay for everything they link">
+
+App extensions such as widgets run under much tighter memory limits than the app, and an App Clip has a strict size limit. A dependency added "for one helper" brings its whole module, its SDKs and their start-up work into the extension. Check what each extension target actually links, and keep the modules extensions use small and boring.
+
+</Callout>
+
+## Practice
+
+The design exercise [Split the Shared module](/design/practice/sd-design-principles-split-shared-module) gives you a real-sized grab-bag module, the targets that use it and its build numbers. Plan the split in shippable steps, using all six package principles.
+
+```cards
+- id: rep
+  front: "What does the reuse/release equivalence principle say?"
+  back: "The granule of reuse is the granule of release: what you share, you version and release as a unit, so its contents need a single theme."
+- id: ccp
+  front: "What does the common closure principle say, and what does it favour on iOS?"
+  back: "Types that change together for the same reasons belong in one component. It favours feature modules over layer modules for feature code."
+- id: crp
+  front: "What does the common reuse principle say?"
+  back: "Don't make a component's users depend on things they don't use. Depending on a module means linking, rebuilding and retesting all of it."
+- id: tension
+  front: "How do REP, CCP and CRP pull against each other?"
+  back: "REP and CCP make components bigger; CRP makes them smaller. Early projects favour CCP, then shift towards REP and CRP as code is reused."
+```
+
+```quiz
+- id: q1
+  type: sort
+  prompt: "Which principle does each problem violate most directly?"
+  buckets: [REP, CCP, CRP]
+  items:
+    - ["Adding a field to the checkout form means editing `Models`, `Networking`, `ViewModels` and `Views`", 1]
+    - ["The watch app imports `Utilities` for one date formatter and links an ads SDK with it", 2]
+    - ["A shared package's release notes list a Keychain fix, a new chart style and a JSON change", 0]
+    - ["Every change to the payment wrapper rebuilds the widget, which never takes payments", 2]
+    - ["Two teams' features live in one module, so each team's changes keep breaking the other's builds", 1]
+  explain: "Changes that spread across modules, or modules that change for two teams' reasons, are CCP. Depending on code you don't use is CRP. A release with no single theme is REP."
+- id: q2
+  type: estimate
+  prompt: "40 modules import `Utilities`, which changes about 15 times a week. If each change makes every importer rebuild and retest in CI, at about 2 minutes per module, roughly how many CI minutes a week does that cost?"
+  answer: 1200
+  unit: minutes a week
+  within: { factor: 1.5 }
+  explain: "40 × 15 × 2 = 1,200 minutes, about 20 hours a week, mostly for modules that never use the part that changed. Splitting `Utilities` by use is how CRP saves it."
+- id: q3
+  type: mcq
+  prompt: "A team is starting to modularise a mid-sized app. Which first structure best follows the principles?"
+  options:
+    - "Four layer modules: `Models`, `Networking`, `ViewModels`, `Views`"
+    - "Feature modules (`Checkout`, `Search`, `Profile`) plus small foundations for networking and the design system"
+    - "One module per screen, plus one per model type"
+    - "Keep one target, and add a `Common` module for anything two screens share"
+  answer: 1
+  explain: "Feature modules keep changes local (CCP), and small, themed foundations are reusable without dragging in unrelated code (REP, CRP). Layers spread every feature across modules; tiny modules and a `Common` grab-bag break CCP and CRP respectively."
+- id: q4
+  type: multi
+  prompt: "Your widget extension imports a module for one formatter. What does it pay for? Choose all that apply."
+  options:
+    - "Linking the module's other dependencies, including any SDKs"
+    - "Recompiling when the module's interface changes, even in parts it doesn't use"
+    - "Only the code of the formatter it calls, nothing else"
+    - "Any work the module or its dependencies do when they're loaded"
+  answer: [0, 1, 3]
+  explain: "You depend on a whole module. Dead-code stripping can remove some unused code from the final binary, but dependencies, rebuilds and load-time work still come with it."
+- id: q5
+  type: truefalse
+  prompt: "The common closure principle is the single responsibility principle applied to components."
+  answer: true
+  explain: "SRP groups code by reason to change within a type; CCP does the same for modules. Likewise, CRP is interface segregation for modules."
+- id: q6
+  type: recall
+  prompt: "Your startup's app has one target. A year later, a widget, a watch app and a second team arrive. How should your priorities among REP, CCP and CRP shift, and why?"
+  model: "Early on, favour CCP: a few feature-shaped modules that are easy to change, because shipping features is the main problem. With new targets and a second team, code is reused, so shift towards CRP (split shared code by who uses it, so the widget doesn't link everything) and REP (stable, themed foundation modules with deliberate public APIs)."
+```
