@@ -10,6 +10,7 @@ import { fileURLToPath } from 'node:url';
 // Each course's Swift package, by the name the console sends
 const PACKAGES = {
     dsa: fileURLToPath(new URL('../dsa-swift/Sources/Exercises', import.meta.url)),
+    design: fileURLToPath(new URL('../design-swift/Sources/Exercises', import.meta.url)),
 };
 const FILE = /^[a-z0-9-]+\/[A-Za-z0-9]+\.swift$/;
 const MAX_BYTES = 256 * 1024;

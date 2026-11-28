@@ -1,19 +1,21 @@
 // Shared by the MDX build plugin and the content scripts, so they agree on how blocks are read and
 // where runnable examples live.
 import { basename, dirname, sep } from 'node:path';
+import { COURSES, courseOfPath } from './courses.js';
 
 // title="Reverse in place" highlight=2,4-6 run   (a bare word is a flag set to true)
 export const parseMeta = (meta) => Object.fromEntries(
     [...(meta ?? '').matchAll(/(\w+)(?:=(?:"([^"]*)"|(\S+)))?/g)].map(([, key, quoted, bare]) => [key, quoted ?? bare ?? true]),
 );
 
-// A lesson lives at src/dsa/content/lessons/<module>/<lesson>.mdx
+// A lesson lives at <course content>/lessons/<module>/<lesson>.mdx
 export const lessonLocation = (path) => {
     if (!path || !path.split(sep).join('/').includes('/content/lessons/')) return null;
-    return { module: basename(dirname(path)), lesson: basename(path, '.mdx') };
+    const course = courseOfPath(path);
+    return { course, packageDir: COURSES[course].packageDir, module: basename(dirname(path)), lesson: basename(path, '.mdx') };
 };
 
-// The nth runnable Swift block of a lesson, relative to dsa-swift/. Run it with `swift <path>`.
+// The nth runnable Swift block of a lesson, relative to its course's package. Run it with `swift <path>`.
 export const exampleFile = (module, lesson, number) => `Examples/${module}/${lesson}-${number}.swift`;
 
 // Fenced blocks in document order: { lang, meta, body, line }. Lessons never nest fences.

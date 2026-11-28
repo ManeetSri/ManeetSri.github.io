@@ -8,8 +8,9 @@
 //   ```visual <name>   → <Visual data="…">      optional YAML props for the visualiser
 //   ```swift title="…" → <CodeBlock data="…">   any other fence, with an ```output block after it attached
 //
-// A lesson's ```swift block marked `run` is a complete program. `npm run dsa:examples` copies it to
-// dsa-swift/Examples/<module>/<lesson>-<n>.swift and can check that it prints exactly its ```output block.
+// A lesson's ```swift block marked `run` is a complete program. `npm run dsa:examples` (or design:examples)
+// copies it to <package>/Examples/<module>/<lesson>-<n>.swift and can check that it prints exactly its
+// ```output block. A block marked `check` (or `check ios`) is a fragment that's type-checked instead.
 //
 // Each file also exports `dsa`, a JSON string of its quiz questions, cards and section headings, which
 // the review queue and the table of contents read without rendering the lesson.
@@ -48,6 +49,20 @@ const QUESTION_RULES = {
     match: (q) => (Array.isArray(q.pairs) && q.pairs.length >= 2 && q.pairs.every((pair) => isStringList(pair, 2) && pair.length === 2))
         || 'needs 2+ pairs, each [left, right]',
     recall: (q) => isString(q.model) || 'needs a model answer',
+    estimate: (q) => {
+        if (typeof q.answer !== 'number' || !(q.answer > 0)) return 'answer must be a positive number';
+        if (q.unit !== undefined && !isString(q.unit)) return 'unit must be text';
+        const within = q.within ?? {};
+        if (within.factor !== undefined && !(within.factor > 1)) return 'within.factor must be more than 1';
+        if (within.percent !== undefined && !(within.percent > 0 && within.percent < 100)) return 'within.percent must be between 0 and 100';
+        return true;
+    },
+    sort: (q) => {
+        if (!isStringList(q.buckets, 2) || q.buckets.length > 5) return 'needs 2 to 5 buckets';
+        const valid = Array.isArray(q.items) && q.items.length >= 3
+            && q.items.every((item) => Array.isArray(item) && item.length === 2 && isString(item[0]) && isIndex(item[1], q.buckets));
+        return valid || 'needs 3+ items, each [text, bucket index]';
+    },
 };
 
 const checkQuestion = (question, seen) => {
@@ -185,11 +200,16 @@ export default function remarkDsaBlocks() {
 
             const meta = parseMeta(node.meta);
             if (meta.run && (node.lang !== 'swift' || !location)) file.fail('Only ```swift blocks in lessons can be marked `run`', node);
+            if (meta.check && node.lang !== 'swift') file.fail('Only ```swift blocks can be marked `check`', node);
+            if (meta.run && meta.check) file.fail('A block is either `run` (a whole program) or `check` (a fragment), not both', node);
+            if (meta.ios && !meta.check) file.fail('`ios` goes with `check`: write ```swift check ios', node);
             const codeBlock = element('CodeBlock', {
                 lang: node.lang ?? 'text',
                 code: node.value,
                 title: meta.title,
                 run: meta.run ? exampleFile(location.module, location.lesson, runnable.length + 1) : undefined,
+                pkg: meta.run ? location.packageDir : undefined,
+                verify: meta.run ? 'run' : meta.check ? (meta.ios ? 'ios' : 'macos') : undefined,
                 highlight: parseLines(meta.highlight),
             });
             if (meta.run) runnable.push({ codeBlock, node });

@@ -3,7 +3,7 @@ import { ArrowDown, ArrowUp, Check, CircleCheck, CircleX, Eye, RotateCcw } from 
 import { HighlightedCode } from '../CodeBlock.jsx';
 import { Inline } from '../inline.jsx';
 import { Button } from '../../ui/primitives.jsx';
-import { BIG_O_OPTIONS, correctAnswerText, emptyAnswer, isAnswered, isCorrect, shuffledIndexes, TYPE_LABELS } from './grading.js';
+import { BIG_O_OPTIONS, correctAnswerText, emptyAnswer, estimateRange, isAnswered, isCorrect, shuffledIndexes, TYPE_LABELS } from './grading.js';
 
 const optionTone = (checked, isRight, chosen) => {
     if (!checked) return chosen ? 'border-amber bg-amber/10' : 'border-line hover:border-white/30';
@@ -141,6 +141,58 @@ const MatchPairs = ({ question, answer, onChange, checked }) => {
     );
 };
 
+// A number, written however you like (2.5k, 3M, 1,200), with how close it has to be
+const Estimate = ({ question, answer, onChange, checked }) => {
+    const { within = {} } = question;
+    const tolerance = within.percent !== undefined ? `within ${within.percent}%` : `within a factor of ${within.factor ?? 2}`;
+    return (
+        <div>
+            <label className="flex flex-wrap items-center gap-3">
+                <input
+                    value={answer}
+                    onChange={(event) => onChange(event.target.value)}
+                    disabled={checked}
+                    inputMode="decimal"
+                    autoComplete="off"
+                    aria-label={`Your estimate${question.unit ? ` in ${question.unit}` : ''}`}
+                    placeholder="e.g. 2.5k"
+                    className="h-11 w-48 rounded-xl border border-line bg-[#101217] px-3 font-mono text-[15px] outline-none focus:border-amber"
+                />
+                {question.unit && <span className="text-muted">{question.unit}</span>}
+            </label>
+            <p className="mt-2 text-xs text-muted">Counts if it’s {tolerance} of the answer{checked ? ` (${estimateRange(question).map((value) => Number(value.toPrecision(3)).toLocaleString('en-GB')).join(' to ')})` : ''}.</p>
+        </div>
+    );
+};
+
+// Each item goes in one bucket. Items appear in a fixed shuffled order.
+const SortItems = ({ question, answer, onChange, checked }) => {
+    const order = useMemo(() => shuffledIndexes(question.items.length, `${question.id}-sort`), [question]);
+    return (
+        <div className="space-y-2">
+            {order.map((index) => {
+                const [text, bucket] = question.items[index];
+                const right = answer[index] === bucket;
+                return (
+                    <div key={text} className={`grid items-center gap-2 rounded-xl border p-2 pl-4 sm:grid-cols-2 ${checked ? (right ? 'border-[#30D158]' : 'border-[#FF9D96]') : 'border-line'}`}>
+                        <span><Inline text={text} /></span>
+                        <select
+                            value={answer[index]}
+                            disabled={checked}
+                            onChange={(event) => onChange(answer.map((value, at) => (at === index ? Number(event.target.value) : value)))}
+                            aria-label={`Group for ${text}`}
+                            className="h-10 w-full rounded-lg border border-line bg-raised px-3 text-sm outline-none focus:border-amber"
+                        >
+                            <option value={-1}>Choose…</option>
+                            {question.buckets.map((name, at) => <option key={name} value={at}>{name}</option>)}
+                        </select>
+                    </div>
+                );
+            })}
+        </div>
+    );
+};
+
 const Recall = ({ question, answer, onChange, checked }) => {
     const [draft, setDraft] = useState('');
     const [revealed, setRevealed] = useState(false);
@@ -237,6 +289,8 @@ const Question = ({ question, number, previous, onResult, allowRetry = true }) =
                 {question.type === 'order' && <OrderLines lines={question.lines} answer={answer} onChange={setAnswer} checked={checked} />}
                 {question.type === 'bug' && <BugLines name={name} code={question.code} value={answer} onChange={setAnswer} checked={checked} answerLine={question.answer} />}
                 {question.type === 'match' && <MatchPairs question={question} answer={answer} onChange={setAnswer} checked={checked} />}
+                {question.type === 'estimate' && <Estimate question={question} answer={answer} onChange={setAnswer} checked={checked} />}
+                {question.type === 'sort' && <SortItems question={question} answer={answer} onChange={setAnswer} checked={checked} />}
                 {isRecall && <Recall question={question} answer={answer} onChange={setAnswer} checked={checked} />}
             </div>
 

@@ -59,7 +59,7 @@ export const HighlightedCode = ({ code, lang = 'swift', highlight = [], activeLi
 // A fenced block from a lesson: ```swift title="…" highlight=2,4-5 run, optionally followed by an
 // ```output block, which the build attaches as `output`. `run` is the example's file in dsa-swift.
 const CodeBlock = ({ data, ...direct }) => {
-    const { lang = 'swift', code, title, run, highlight = [], output } = data ? JSON.parse(data) : direct;
+    const { lang = 'swift', code, title, run, pkg, verify, highlight = [], output } = data ? JSON.parse(data) : direct;
     const isTerminal = lang === 'bash' || lang === 'sh';
     return (
         <figure className="my-6 overflow-hidden rounded-2xl border border-line bg-[#101217]">
@@ -67,7 +67,9 @@ const CodeBlock = ({ data, ...direct }) => {
                 {isTerminal && <TerminalSquare size={14} aria-hidden="true" className="text-muted" />}
                 <span className="min-w-0 flex-1 truncate font-mono text-xs text-muted">{title ?? LANGUAGE_LABELS[lang] ?? lang}</span>
                 {/* Run from the dsa-swift folder: every runnable example is also a file there */}
-                {run && <CopyButton text={`swift ${run}`} label="Run command" />}
+                {/* Fragments are type-checked by the content scripts, on macOS or against the iOS SDK */}
+                {(verify === 'macos' || verify === 'ios') && <span className="font-mono text-[11px] text-[#9FE6B0]" title="Checked by the Swift compiler when the content is built">{verify === 'ios' ? 'Type-checked · iOS' : 'Type-checked'}</span>}
+                {run && <CopyButton text={`swift ${run}`} label={pkg && pkg !== 'dsa-swift' ? `Run in ${pkg}` : 'Run command'} />}
                 <CopyButton text={code} />
             </figcaption>
             <HighlightedCode code={code} lang={lang} highlight={highlight} showNumbers={!isTerminal && code.split('\n').length > 3} />
