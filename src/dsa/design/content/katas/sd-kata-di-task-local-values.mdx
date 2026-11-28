@@ -1,0 +1,106 @@
+Build the core of a swift-dependencies-style system: a `DependencyValues` struct that gives every dependency a live, preview and test default, overrides that apply to one scope and the tasks it starts, and a property wrapper that remembers the values in force when its owner was created.
+
+`DITaskLocalValues.DependencyValues` (its `subscript(key:)`), `DITaskLocalValues.withDependencies(_:operation:)` (sync and async) and `DITaskLocalValues.Dependency`
+
+- A dependency is a `DependencyKey` with a `Value`, a `liveValue`, a `testValue` and a `previewValue` (which defaults to `liveValue`). Code reads it through a computed property on `DependencyValues`, such as `values.server`, written in an extension as `self[ServerKey.self]`.
+- `values[Key.self]` returns the value that was set for that key, if any; otherwise the default for `values.context`. Setting it overrides that key only. `DependencyValues` is a value type: changing a copy never changes the original.
+- `DependencyValues.current` is a `@TaskLocal`: what the current task sees. Outside any scope it's the live context with nothing overridden (this part is written for you).
+- `withDependencies({ $0.server = "staging" }, operation:)` takes a copy of `current`, lets `update` change it, and runs `operation` with that copy as `current`. Nested scopes start from the outer one. Child tasks (`async let`, `Task { }`, task groups) see the scope's values; `Task.detached` doesn't.
+- `@Dependency(\.server) var server` captures `current` when its owner is initialised, and always reads from that snapshot. A model created inside `withDependencies` keeps the scope's values after the scope ends; a model created outside it keeps the defaults even if it's used inside a later scope.
+
+## Examples
+
+| Code | Result |
+| --- | --- |
+| `DependencyValues(context: .test).server` | `"localhost"` (the key's `testValue`) |
+| `DependencyValues(context: .preview).server` with no `previewValue` | the live value |
+| `withDependencies({ $0.server = "staging" }) { DependencyValues.current.server }` | `"staging"`; afterwards `current.server` is live again |
+| `withDependencies({ $0.context = .test })` around code that reads `server` and `newShelf` | both keys' test values |
+| Inside a scope: `Task { current.server }` and `Task.detached { current.server }` | `"staging"` and the live value |
+| `let model = withDependencies({ $0.server = "staging" }) { ShelfModel() }`, then `model.server` later | `"staging"` |
+
+## Constraints
+
+- `DependencyValues` stays `Sendable`, and so does `Dependency`, so a value type holding one can cross tasks.
+- Use the task local for scoping, not a global variable: the tests run twenty overlapping scopes at once and each must see only its own value.
+- Overrides are stored per key, so an override survives a change of context: set `server`, then switch to `.preview`, and `server` keeps the override while other keys take preview defaults.
+
+<Hints>
+<Hint>
+Store overrides as `[ObjectIdentifier: any Sendable]`, keyed by `ObjectIdentifier(Key.self)`. In the getter, `overrides[id] as? Key.Value` gives you the override or `nil`; then `switch context` for the default.
+</Hint>
+<Hint>
+`DependencyValues.$current.withValue(newValues) { … }` binds a task-local value for the length of a closure. It has a synchronous overload and an asynchronous one, so both versions of `withDependencies` are three lines.
+</Hint>
+<Hint>
+The property wrapper needs two stored properties: the key path, and a copy of `DependencyValues.current` taken in `init`. `wrappedValue` reads the key path from the copy.
+</Hint>
+</Hints>
+
+## Solutions
+
+<Approach title="Overrides in a value type, scoped by a task local" time="O(1) per read and override" space="O(k) for k overridden keys per scope">
+
+```swift
+public struct DependencyValues: Sendable {
+    @TaskLocal public static var current = DependencyValues(context: .live)
+
+    public var context: Context
+    private var overrides: [ObjectIdentifier: any Sendable] = [:]
+
+    public init(context: Context) {
+        self.context = context
+    }
+
+    public subscript<Key: DependencyKey>(key: Key.Type) -> Key.Value {
+        get {
+            if let value = overrides[ObjectIdentifier(key)] as? Key.Value {
+                return value
+            }
+            switch context {
+            case .live: return Key.liveValue
+            case .preview: return Key.previewValue
+            case .test: return Key.testValue
+            }
+        }
+        set {
+            overrides[ObjectIdentifier(key)] = newValue
+        }
+    }
+}
+
+public static func withDependencies<R>(_ update: (inout DependencyValues) throws -> Void, operation: () throws -> R) rethrows -> R {
+    var values = DependencyValues.current
+    try update(&values)
+    return try DependencyValues.$current.withValue(values, operation: operation)
+}
+
+nonisolated(nonsending) public static func withDependencies<R>(
+    _ update: (inout DependencyValues) throws -> Void,
+    operation: nonisolated(nonsending) () async throws -> R
+) async rethrows -> R {
+    var values = DependencyValues.current
+    try update(&values)
+    return try await DependencyValues.$current.withValue(values, operation: operation)
+}
+
+@propertyWrapper public struct Dependency<Value: Sendable>: Sendable {
+    private let keyPath: KeyPath<DependencyValues, Value> & Sendable
+    private let captured: DependencyValues
+
+    public init(_ keyPath: KeyPath<DependencyValues, Value> & Sendable) {
+        self.keyPath = keyPath
+        self.captured = DependencyValues.current
+    }
+
+    public var wrappedValue: Value {
+        captured[keyPath: keyPath]
+    }
+}
+```
+
+Everything rests on two Swift features. **Value semantics** make each scope's changes private: `withDependencies` edits a copy, so nested and concurrent scopes can't disturb each other. **Task locals** give the copy a lifetime: it's bound for exactly the length of `operation`, inherited by child tasks, and gone afterwards, which is what makes parallel tests safe without any locking.
+
+The capture in the property wrapper is the subtle part, and it's how swift-dependencies behaves too: dependencies are fixed when the owner is created, not when they're read. That's why you create a model *inside* `withDependencies` in a test, and why a child model needs `withDependencies(from: parent)` in the real library to inherit its parent's overrides. The real library also detects the test and preview contexts for you, records a test failure when a test touches a dependency with no test value, and offers `withEscapedDependencies` for callbacks that leave the task tree, such as a `DispatchQueue` closure.
+
+</Approach>

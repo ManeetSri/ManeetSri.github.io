@@ -1,0 +1,373 @@
+## Why it matters
+
+Every object you inject lives for some length of time, and someone decides how long. Leave it to accident and you get the classic mobile bugs: the last user's basket on a shared iPad, a checkout draft that survives into the next order, an upload loop that keeps running after sign-out, a widget that runs out of memory. Name the lifetime and give it an owner, and sign-out becomes "drop one reference". Interviewers probe this with "what happens to this state when the user logs out?", and the answer they want is a scope, not a list of `reset()` calls.
+
+## The vocabulary of lifetimes
+
+DI containers use slightly different words, but they all describe the same handful of lifetimes:
+
+| Lifetime | What it means | Typical iOS uses |
+| --- | --- | --- |
+| **Transient** (Swinject `.transient`, Factory's default `unique`) | A new instance every time one is asked for | Screen models, request builders, formatters with per-use settings |
+| **Singleton** (Swinject `.container`, Factory `.singleton`) | One per container or root, living as long as it does | `URLSession`, the image cache, the API client, analytics, the database |
+| **Scoped** (Factory `.scope(.session)`, child containers) | One per *instance of a scope*, gone when the scope ends | The signed-in user's basket and inbox, a window's selection, a checkout flow's draft order |
+| **Weak** (Swinject `.weak`, Factory `.shared`) | Shared while anyone holds it, rebuilt after everyone lets go | A media player shared by whatever screens show it, a heavy model used by several open screens |
+| **Graph** (Swinject's default `.graph`) | Shared within one resolution of an object graph | One unit of work shared by a screen's model and its helpers |
+
+You don't need a container to have these. In a hand-written composition root, a stored property is a singleton for that root's scope, a factory method is a transient, and an object created at sign-in and dropped at sign-out is a scope.
+
+## The scopes an iOS app actually has
+
+Scopes nest, and on iOS they follow the app's real structure:
+
+- **Process.** Lives from launch until iOS terminates the app. App-wide services belong here. Remember that every extension is a separate process with its own copy of this scope.
+- **Signed-in session.** From sign-in to sign-out. Anything that belongs to one person: their profile, basket, inbox, drafts, caches of their data, and API clients carrying their token.
+- **Scene (window).** On iPad and Mac each window has its own navigation, selection and scroll position, but shares the app's and the session's services.
+- **Flow.** A multi-step task such as checkout or onboarding: the draft order, the chosen delivery slot, the payment sheet's state. It ends when the flow completes or is cancelled.
+- **Screen.** A view model and whatever only that screen uses.
+
+Watch them come and go across one afternoon on a family iPad:
+
+```visual timeline
+title: Scopes on a shared iPad
+unit: min
+lanes:
+  - { id: app, label: App process }
+  - { id: ana, label: "Session: Ana" }
+  - { id: ben, label: "Session: Ben" }
+  - { id: window, label: Window }
+  - { id: checkout, label: Checkout flow }
+spans:
+  - { lane: app, from: 0, to: 60, label: URLSession · image cache · analytics, tone: neutral }
+  - { lane: window, from: 1, to: 60, label: navigation · selection, tone: neutral }
+  - { lane: ana, from: 5, to: 28, label: Ana's basket · inbox · token, tone: active }
+  - { lane: checkout, from: 12, to: 20, label: draft order, tone: wait }
+  - { lane: ben, from: 34, to: 60, label: Ben's basket · inbox · token, tone: ok }
+  - { lane: checkout, from: 40, to: 46, label: new draft, tone: wait }
+markers:
+  - { at: 5, label: Ana signs in }
+  - { at: 28, label: Ana signs out }
+  - { at: 34, label: Ben signs in }
+steps:
+  - { at: 0, say: "Launch creates the **process scope**: one URL session, one image cache, one analytics pipeline. They'll outlive everything else." }
+  - { at: 5, say: "Ana signs in. A **session scope** is created holding everything that is hers: her token, basket and inbox." }
+  - { at: 12, say: "She starts checking out. The **flow scope** holds a draft order. It uses her session's basket; the basket knows nothing about it." }
+  - { at: 20, say: "The order is placed and the flow ends. Its draft is released; the session carries on." }
+  - { at: 28, say: "Ana signs out. Dropping her session scope releases **everything** inside it at once. There's no list of things to reset." }
+  - { at: 34, say: "Ben signs in and gets a **new** session scope. Nothing of Ana's can leak, because nothing of hers is still alive." }
+  - { at: 46, say: "The app-wide services served both of them throughout. They never held anything belonging to either user." }
+```
+
+## Dependencies point towards longer lifetimes
+
+One rule keeps scopes working: **an object may depend on objects that live at least as long as it does, never on shorter-lived ones.** The checkout flow can use the session's basket and the app's API client. The app's analytics must not hold the session.
+
+Break the rule and you get a **captive dependency** (Mark Seemann's term): a long-lived object captures a short-lived one and keeps it alive past the end of its scope. The usual iOS version is an app-wide service that was created lazily, on first use, while someone happened to be signed in:
+
+```swift run title="A captive session, and the fix"
+@MainActor final class UserSession {
+    let userID: String
+    init(userID: String) { self.userID = userID }
+}
+
+final class Basket {}
+
+/// App scope: one pipeline for the whole process. It knows nothing about users.
+@MainActor final class AnalyticsPipeline {
+    private(set) var sent: [String] = []
+    func send(_ line: String) { sent.append(line) }
+}
+
+/// The bug: an app-wide wrapper that captured whichever session existed when it was first built
+@MainActor final class CapturingAnalytics {
+    private let pipeline: AnalyticsPipeline
+    private let session: UserSession
+
+    init(pipeline: AnalyticsPipeline, session: UserSession) {
+        self.pipeline = pipeline
+        self.session = session
+    }
+
+    func track(_ event: String) {
+        pipeline.send("captured: \(event) user=\(session.userID)")
+    }
+}
+
+/// The fix: a wrapper in the session scope, depending on the longer-lived pipeline
+@MainActor final class SessionAnalytics {
+    private let pipeline: AnalyticsPipeline
+    private let session: UserSession
+
+    init(pipeline: AnalyticsPipeline, session: UserSession) {
+        self.pipeline = pipeline
+        self.session = session
+    }
+
+    func track(_ event: String) {
+        pipeline.send("scoped: \(event) user=\(session.userID)")
+    }
+}
+
+/// Everything that belongs to one signed-in person
+@MainActor final class SessionScope {
+    let session: UserSession
+    let basket = Basket()
+    let analytics: SessionAnalytics
+
+    init(userID: String, pipeline: AnalyticsPipeline) {
+        session = UserSession(userID: userID)
+        analytics = SessionAnalytics(pipeline: pipeline, session: session)
+    }
+}
+
+@MainActor final class AppRoot {
+    let pipeline = AnalyticsPipeline()
+    private(set) var signedIn: SessionScope?
+    private var capturing: CapturingAnalytics?
+
+    func signIn(_ userID: String) { signedIn = SessionScope(userID: userID, pipeline: pipeline) }
+    func signOut() { signedIn = nil }
+
+    // Built once, lazily: the shape of a container singleton whose factory resolves the session
+    func capturingAnalytics() -> CapturingAnalytics {
+        if let capturing { return capturing }
+        let analytics = CapturingAnalytics(pipeline: pipeline, session: signedIn!.session)
+        capturing = analytics
+        return analytics
+    }
+}
+
+let root = AppRoot()
+root.signIn("ana")
+root.capturingAnalytics().track("checkout_started")
+root.signedIn?.analytics.track("checkout_started")
+
+weak var anasBasket = root.signedIn?.basket
+weak var anasSession = root.signedIn?.session
+root.signOut()
+print("Ana's basket released:", anasBasket == nil)
+print("Ana's session released:", anasSession == nil)
+
+root.signIn("ben")
+root.capturingAnalytics().track("checkout_started")
+root.signedIn?.analytics.track("checkout_started")
+root.pipeline.sent.forEach { print($0) }
+```
+
+```output
+Ana's basket released: true
+Ana's session released: false
+captured: checkout_started user=ana
+scoped: checkout_started user=ana
+captured: checkout_started user=ana
+scoped: checkout_started user=ben
+```
+
+Ana's basket went with her scope, but her session is still alive, held by an app-wide object, and Ben's checkout is now attributed to Ana. In a real app that same mistake shows one person's name in another's push notifications, or sends requests with an expired token. There are three ways out, and the right one depends on what the long-lived object needs:
+
+- **Move the dependent object into the shorter scope**, as `SessionAnalytics` does. It's the usual answer.
+- **Pass the short-lived value per call** (method injection): `track(event, userID:)`. Good when the long-lived object only needs a value now and then.
+- **Depend on something long-lived that tracks the current value**, such as an app-scoped `@Observable` model whose `currentUserID` changes at sign-in. It's the right choice for genuinely app-wide behaviour that varies by user, like attaching the user ID to every crash report.
+
+A container can enforce the rule for you. In this module's container kata, an app singleton's factory resolves from the container that registered it, so asking for a session's service from there fails immediately instead of leaking quietly.
+
+## Building a session scope
+
+A session scope is an ordinary object: created by the app's composition root at sign-in, holding the services that belong to that person, and dropped at sign-out. SwiftUI makes the "drop" part easy, because a view tree built from the scope disappears with it:
+
+```swift check ios title="A session scope that the signed-in UI is built from"
+import SwiftUI
+
+protocol APIClient: Sendable {
+    func basketItems(token: String) async throws -> [String]
+}
+
+/// One person's basket: lives exactly as long as their session
+@MainActor @Observable final class BasketModel {
+    private let api: any APIClient
+    private let token: String
+    private(set) var items: [String] = []
+
+    init(api: any APIClient, token: String) {
+        self.api = api
+        self.token = token
+    }
+
+    func refresh() async {
+        items = (try? await api.basketItems(token: token)) ?? []
+    }
+}
+
+/// Everything that belongs to the signed-in person, built from the app's longer-lived services
+@MainActor final class SessionScope {
+    let userID: String
+    let basket: BasketModel
+
+    init(userID: String, token: String, api: any APIClient) {
+        self.userID = userID
+        basket = BasketModel(api: api, token: token)
+    }
+}
+
+@MainActor @Observable final class AppModel {
+    private let api: any APIClient
+    private(set) var session: SessionScope?
+
+    init(api: any APIClient) {
+        self.api = api
+    }
+
+    func signedIn(userID: String, token: String) {
+        session = SessionScope(userID: userID, token: token, api: api)
+    }
+
+    func signOut() {
+        session = nil
+    }
+}
+
+struct RootView: View {
+    let app: AppModel
+
+    var body: some View {
+        if let session = app.session {
+            SignedInView()
+                .environment(session.basket)
+                .id(session.userID)          // a different person gets a whole new tree of view state
+        } else {
+            Button("Sign in as Ana") { app.signedIn(userID: "ana", token: "t-1") }
+        }
+    }
+}
+
+struct SignedInView: View {
+    @Environment(BasketModel.self) private var basket
+
+    var body: some View {
+        List(basket.items, id: \.self) { Text($0) }
+            .task { await basket.refresh() }
+    }
+}
+```
+
+Three details make it robust:
+
+- **Signing out sets one property to `nil`.** Every object in the scope, and every view built from it, is released together. There's no `reset()` to forget.
+- **`.id(session.userID)` gives a new person a new identity**, so no `@State` in the signed-in tree, such as a scroll position or a half-typed search, survives from the previous user.
+- **The scope is built from the app's services**, never the other way round. The API client is shared; the token and the basket aren't.
+
+A test can check the release directly: keep a `weak` reference to something inside the scope, sign out, and expect it to be `nil`. That one assertion catches retain cycles, captive dependencies and stray tasks.
+
+## What ARC won't clean up for you
+
+Dropping a scope releases its *objects*. Several things outlive objects, and each needs an explicit end:
+
+- **Unstructured tasks.** A `Task { while !Task.isCancelled { … } }` started by a session object keeps running, and keeps `self` alive if it captures it. Store the task and cancel it when the scope ends, or start the work from a SwiftUI `.task`, which is cancelled when its view goes away.
+- **Registrations with longer-lived objects.** A session object that adds itself as an observer of an app-wide service, a `NotificationCenter` block observer, or a Combine subscription stored somewhere app-wide, stays reachable from there.
+- **Data on disk.** Files, caches, a per-user SQLite store, `URLCache` responses, Keychain items. ARC never deletes them. Put each user's files in a per-user directory and delete it at sign-out, and remove their Keychain items.
+- **Background URL sessions.** A background `URLSession` is identified by a string and outlives your process. Include the user in the identifier, or cancel its tasks at sign-out, or the next person's app can receive the previous person's downloads.
+
+## Lifetimes and thread safety
+
+The longer an object lives, the more places can reach it, and the more carefully it must handle concurrent use. A transient screen model touched only by its screen can be a plain `@MainActor` class. An app-wide cache used by every screen, background refreshes and the widget's timeline code must be an actor, or main-actor isolated with every caller hopping to it, or internally locked with a `Mutex`. Swift 6 checks this: a singleton-scoped service has to be `Sendable` to be shared across isolation domains, which is a useful nudge towards deciding its isolation on purpose. You'll design those services in depth in D22.
+
+## Trade-offs
+
+| Lifetime | State shared between | Memory | Must be safe for concurrent use | Ending it | Watch out for |
+| --- | --- | --- | --- | --- | --- |
+| Transient | No one | Freed with its user | Rarely | Automatic | Accidental copies of something meant to be shared |
+| Scoped (session, flow, window) | Everything in the scope | Freed when the scope ends | Often | Drop the scope | Captive dependencies, tasks and files that outlive it |
+| Singleton (process) | The whole app | Held until termination | Yes | Only by the process ending | Per-user data stored in it; launch cost if built eagerly |
+| Weak | Whoever holds it now | Freed when unused | Usually | Automatic | Rebuilding an expensive object over and over |
+
+<Callout kind="interview">
+
+**What to say:** "I name a lifetime for every service: process-wide for the URL session and caches, a session scope created at sign-in for anything per-user, flows and screens below that. Dependencies only point at longer-lived scopes, so sign-out is dropping the session scope, plus deleting the user's files and Keychain items." Then mention one captive-dependency example you'd look for.
+
+**What to ask:** "Can more than one person use this device? Does any state belong to a flow rather than a screen? Which background work must stop at sign-out?"
+
+**Red flags:** per-user state in singletons with a growing list of `reset()` calls; an app-wide object holding the current user; and believing that releasing objects also removes the user's data from disk.
+
+</Callout>
+
+<Callout kind="gotcha" title="iOS gotcha: a shared iPad is a real case">
+
+Family iPads, shop-floor devices and Shared iPad in schools all switch people on one install. Treat "sign out, sign in as someone else, open every tab" as a release test. It finds captive dependencies, per-user caches on disk and `@State` that survived because the signed-in tree kept its identity.
+
+</Callout>
+
+<Callout kind="gotcha" title="Swift gotcha: a stored Task keeps its scope alive">
+
+`pollTask = Task { while true { await self.refresh(); try await Task.sleep(for: .seconds(30)) } }` holds `self` strongly for as long as the loop runs, so the session object is never released and the loop never stops. Capture `self` weakly inside the loop, and cancel the task in an explicit `end()` that the scope's owner calls at sign-out.
+
+</Callout>
+
+## Practice
+
+**A scoped container with cycle detection** builds singletons, transients and child containers for a session, and makes a parent's singleton unable to capture a session's services. **Review: the locator inside the models** has a stale-session bug caused by mixed lifetimes, and **Plan: move a 200-screen app from singletons to injection** asks you to introduce a session scope into a large app.
+
+```cards
+- id: scopes-vocabulary
+  front: "What do transient, singleton, scoped and weak lifetimes mean?"
+  back: "Transient: new on every request. Singleton: one per container or root, for its whole life. Scoped: one per instance of a scope (a session, a flow) and released with it. Weak: shared while someone holds it, rebuilt afterwards."
+- id: scopes-direction
+  front: "Which way may dependencies point between scopes?"
+  back: "From shorter-lived to longer-lived only. A session object may use the app's API client; an app-wide object must not hold the session."
+- id: scopes-captive
+  front: "What's a captive dependency, and how do you fix one?"
+  back: "A long-lived object holding a short-lived one, keeping it alive past its scope. Move the dependent object into the shorter scope, pass the short-lived value per call, or depend on a long-lived holder of the current value."
+- id: scopes-signout
+  front: "What does a session scope release at sign-out, and what must you clean up yourself?"
+  back: "It releases every object in the scope. Tasks, observers registered with longer-lived objects, files, caches, Keychain items and background URL session transfers need explicit cleanup."
+```
+
+```quiz
+- id: q1
+  type: sort
+  prompt: "Which scope should own each of these?"
+  buckets: [App process, Signed-in session, Flow, Screen]
+  items:
+    - [The shared `URLSession` and image cache, 0]
+    - [The user's basket, 1]
+    - [The delivery slot chosen during checkout, 2]
+    - [A product page's view model, 3]
+    - [An API client that carries the user's access token, 1]
+    - [The analytics upload pipeline, 0]
+  explain: "Process-wide services know nothing about users. Anything carrying one person's data or credentials belongs to their session. Checkout's choices last as long as checkout. A screen's model lasts as long as the screen."
+- id: q2
+  type: mcq
+  prompt: "After someone signs out and a partner signs in, push notifications still greet the first person by name. The `PushService` is an app-wide singleton. What's the most likely design flaw?"
+  options:
+    - "Push tokens change on every sign-in"
+    - "The app-wide `PushService` captured the first user's session when it was created, so it outlives that session: a captive dependency"
+    - "The session scope was released too early"
+    - "Notifications are cached by iOS"
+  answer: 1
+  explain: "A longer-lived object holding a shorter-lived one keeps it alive and keeps using it. Either move the user-specific part into the session scope, or have `PushService` receive the user per registration."
+- id: q3
+  type: multi
+  prompt: "A `SessionScope` object is set to `nil` at sign-out. Which of these still need explicit cleanup? Choose all that apply."
+  options:
+    - "The user's cached images in a per-user folder in Caches"
+    - "The basket model held only by the scope"
+    - "The user's refresh token in the Keychain"
+    - "A `Task` with a polling loop that captures the inbox model strongly"
+    - "A view model created by a screen in the signed-in tree"
+  answer: [0, 2, 3]
+  explain: "ARC releases objects nobody references: the basket and the signed-in tree's view models go with the scope. Files and Keychain items aren't objects, and a running task holds what it captures until it's cancelled."
+- id: q4
+  type: truefalse
+  prompt: "A checkout flow object may hold a reference to the session's basket, but the basket must not hold a reference to the checkout flow."
+  answer: true
+  explain: "The flow is shorter-lived than the session, so it may depend on the basket. If the basket held the flow, the flow would stay alive as long as the session, a captive dependency."
+- id: q5
+  type: mcq
+  prompt: "Your signed-in tab view keeps its scroll position and search text after a different person signs in. The session scope is replaced correctly. What's missing?"
+  options:
+    - "The search text should be stored in a singleton"
+    - "The signed-in tree keeps the same SwiftUI identity, so its `@State` survives; give it `.id(session.userID)`"
+    - "SwiftUI caches view state across launches"
+    - "The new session should copy the old session's state"
+  answer: 1
+  explain: "`@State` lives as long as a view's identity. A new user should mean a new identity for the whole signed-in tree, so all its view state starts fresh."
+```

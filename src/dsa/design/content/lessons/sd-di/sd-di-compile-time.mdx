@@ -1,0 +1,295 @@
+## Why it matters
+
+At a few hundred engineers and a few hundred modules, both common approaches to DI start to hurt. A runtime container fails when a screen opens, and in an app that size some screens are opened rarely. A hand-written composition root is safe, but it becomes thousands of lines of wiring in the app target, edited by every team, conflicting in every merge. **Compile-time DI** keeps the safety and removes the hand-wiring: you declare what each part needs, a tool checks that the graph can be built and generates the code that builds it, and a missing dependency stops the build. Uber's Needle and the newer SafeDI do this for Swift; Dagger does it on Android. Large-company interviews ask "how would you scale dependency injection to a hundred teams?", and this is the vocabulary of the answer.
+
+## What "compile-time safe" means
+
+A DI approach is compile-time safe when **the build fails if any object in the graph can't get something it needs**, and nothing is looked up at run time, so nothing can be missing at run time. By that definition you already know one compile-time-safe approach: the hand-written composition root. Every initialiser call is checked by the compiler.
+
+So the question at scale isn't "how do we get safety?" but "how do we keep safety without one enormous, hand-maintained root?" There are two answers that stay in plain Swift, and one that adds a code generator.
+
+## Protocol composition: narrow, checked plumbing
+
+The first answer cuts the plumbing without any tool. Each dependency gets a tiny `Has…` protocol; one object at each scope conforms to all of them; and each type declares the exact combination it needs:
+
+```swift check title="Has-protocols: each type asks for exactly what it uses"
+import Foundation
+
+protocol TripsAPI: Sendable {
+    func upcoming() async throws -> [String]
+}
+
+protocol Analytics: Sendable {
+    func track(_ event: String) async
+}
+
+protocol HasTripsAPI { var tripsAPI: any TripsAPI { get } }
+protocol HasAnalytics { var analytics: any Analytics { get } }
+protocol HasClock { var now: @Sendable () -> Date { get } }
+
+/// The app scope: one value that satisfies every Has-protocol
+struct AppDependencies: HasTripsAPI, HasAnalytics, HasClock, Sendable {
+    var tripsAPI: any TripsAPI
+    var analytics: any Analytics
+    var now: @Sendable () -> Date
+}
+
+@MainActor final class UpcomingTripsModel {
+    // The model's dependencies, stated in its type: nothing more is reachable
+    typealias Dependencies = HasTripsAPI & HasAnalytics
+    private let dependencies: any Dependencies
+    private(set) var trips: [String] = []
+
+    init(dependencies: any Dependencies) {
+        self.dependencies = dependencies
+    }
+
+    func load() async throws {
+        trips = try await dependencies.tripsAPI.upcoming()
+        await dependencies.analytics.track("upcoming_viewed")
+    }
+}
+
+@MainActor final class CountdownModel {
+    typealias Dependencies = HasClock
+    private let dependencies: any Dependencies
+
+    init(dependencies: any Dependencies) {
+        self.dependencies = dependencies
+    }
+
+    func secondsUntil(_ departure: Date) -> TimeInterval {
+        departure.timeIntervalSince(dependencies.now())
+    }
+}
+
+// The root passes the same value to both; each model sees only its own slice
+@MainActor func makeModels(_ app: AppDependencies) -> (UpcomingTripsModel, CountdownModel) {
+    (UpcomingTripsModel(dependencies: app), CountdownModel(dependencies: app))
+}
+```
+
+Hand a model a scope object that lacks one of its protocols, say a `WidgetDependencies` that conforms only to `HasTripsAPI` and `HasClock`, and it doesn't compile:
+
+```text title="What you'll see"
+error: argument type 'WidgetDependencies' does not conform to expected type 'HasAnalytics'
+    UpcomingTripsModel(dependencies: widget)
+                                     `- error: argument type 'WidgetDependencies' does not conform to expected type 'HasAnalytics'
+```
+
+The pattern scales well: a new dependency is one protocol and one property on the scope objects that provide it, and intermediate layers pass `dependencies` along without knowing what's inside. Its costs are one protocol per dependency, existential access (`any Dependencies`) on each use, and a scope object that grows wide. It also checks *presence* but not *which* implementation: the scope object still has to be filled in by hand at the root.
+
+## Generated wiring: the component tree
+
+The second answer is to generate the root. Every tool in this family shares one model:
+
+- The app is a **tree of components**, one per scope: the app root, the signed-in session, each feature or flow. It mirrors the scope tree from [Scopes and lifetimes](/design/learn/sd-di-scopes).
+- Each component **declares what it needs from its ancestors**, and **provides** things to its descendants.
+- A generator reads the source, builds the tree, and for every need finds the **nearest ancestor that provides it**. If none does, the build fails, naming the missing dependency and the component that wanted it. Otherwise it writes ordinary Swift that passes each value down.
+
+```visual flow
+title: A generator resolving a checkout component's needs
+nodes:
+  - { id: root, label: RootComponent, kind: client, at: [0, 0] }
+  - { id: loggedIn, label: LoggedInComponent, at: [0, 2] }
+  - { id: checkout, label: CheckoutComponent, kind: view, at: [0, 4] }
+  - { id: payments, label: paymentsClient, kind: service, at: [3, 0] }
+  - { id: basket, label: basket, kind: store, at: [3, 2] }
+  - { id: needs, label: needs basket · payments · loyalty, kind: external, at: [3, 4] }
+edges:
+  - [root, loggedIn, parent of]
+  - [loggedIn, checkout, parent of]
+  - [root, payments, provides, { style: data }]
+  - [loggedIn, basket, provides, { style: data }]
+  - [checkout, needs, declares, { style: data }]
+steps:
+  - say: "The components form a tree that mirrors the app's scopes: the app, the signed-in session, then checkout."
+    show: [root, loggedIn, checkout, root->loggedIn, loggedIn->checkout]
+  - say: "Each component provides some things: the root an app-wide payments client, the session the user's basket."
+    show: [payments, basket]
+    send: [root->payments, loggedIn->basket]
+  - say: "`CheckoutComponent` declares what it needs from its ancestors as a protocol: `basket`, `paymentsClient` and `loyaltyClient`."
+    show: [needs]
+    send: checkout->needs
+    state: { checkout: active }
+  - say: "The generator walks up the tree for each need. `basket` is found one level up, in the session; `paymentsClient` two levels up, at the root."
+    send: [checkout->loggedIn, loggedIn->root]
+    state: { basket: ok, payments: ok }
+  - say: "Nothing provides `loyaltyClient`, so the **build fails** with the name of the missing dependency and the component that needs it, long before anyone opens checkout."
+    state: { checkout: error, needs: error }
+    label: { needs: "loyaltyClient: not found" }
+```
+
+### Needle
+
+Uber's Needle, built for its RIBs architecture (D29), expresses the tree with classes. A component subclasses `Component<SomeDependency>`, where the dependency protocol lists what it needs from ancestors; its own computed properties are what it provides; `shared { }` makes a property a singleton for that component instance; and a parent creates its children with `ChildComponent(parent: self)`. (A third-party library, so not compiled here.)
+
+```swift
+import NeedleFoundation
+
+/// What checkout needs from its ancestors. The generator finds a provider for each property.
+protocol CheckoutDependency: Dependency {
+    var basket: Basket { get }
+    var paymentsClient: any PaymentsClient { get }
+}
+
+final class CheckoutComponent: Component<CheckoutDependency> {
+    // Provided by this component: one draft per checkout, built from the ancestors' services
+    var draftOrder: DraftOrder {
+        shared { DraftOrder(basket: dependency.basket) }
+    }
+
+    var checkoutModel: CheckoutModel {
+        CheckoutModel(draft: draftOrder, payments: dependency.paymentsClient)
+    }
+}
+
+final class LoggedInComponent: Component<LoggedInDependency> {
+    var basket: Basket {
+        shared { Basket(userID: dependency.userID) }
+    }
+
+    var checkoutComponent: CheckoutComponent {
+        CheckoutComponent(parent: self)
+    }
+}
+
+final class RootComponent: BootstrapComponent {
+    var paymentsClient: any PaymentsClient {
+        shared { LivePaymentsClient() }
+    }
+}
+```
+
+The generator runs as a build step over the whole source tree, writes a file of provider classes that conform to each `Dependency` protocol by forwarding to the right ancestor, and the app calls the generated `registerProviderFactories()` once at launch. At run time, resolving a dependency is a property access: there's no lookup to fail.
+
+### SafeDI
+
+SafeDI is a newer tool that puts the annotations on the types themselves, using Swift macros and a build plugin, so there are no separate component classes:
+
+```swift
+import SafeDI
+
+@Instantiable
+public final class CheckoutModel: Instantiable {
+    public init(user: User, basket: Basket, payments: any PaymentsClient, draft: DraftOrder) { /* … */ }
+
+    @Forwarded private let user: User                    // a run-time value passed in when checkout starts
+    @Received private let basket: Basket                 // provided by an ancestor in the tree
+    @Received private let payments: any PaymentsClient
+    @Instantiated private let draft: DraftOrder          // created by and owned by this type
+}
+```
+
+`@Instantiated` marks what a type creates and owns (a child in the tree), `@Received` what an ancestor must supply, and `@Forwarded` a value only known at run time, such as the signed-in user. An `Instantiator<T>` property builds a subtree later, on demand, which covers screens created during navigation. Unsatisfiable graphs are reported as compiler diagnostics at the relevant declaration.
+
+## What generation costs
+
+Compile-time tools move work, they don't remove it:
+
+- **A build step.** The generator parses source on every build that changes it. On very large projects that's measurable, and it has to be integrated with Xcode, SwiftPM, Bazel or Tuist, and kept working through Xcode upgrades.
+- **A new model to learn.** Components, providers and annotations are concepts on top of Swift. New joiners have to learn where a dependency "comes from" in the tree.
+- **Lock-in.** Annotations spread through every type. Leaving the tool later is a project of its own, so the tool's maintenance and Swift 6 readiness matter at the moment you adopt it.
+- **Generated code to debug.** When the wiring surprises you, the answer is in generated files. They're plain Swift, which helps, but they're long.
+
+In return you get the safety of a hand-written root, wiring that's distributed (each team owns its components; nobody edits a giant root), and a dependency graph that a tool can draw and audit.
+
+## Choosing
+
+| Approach | Missing dependency | Hand-written wiring | Extra tooling | Scales to many teams | Wins when |
+| --- | --- | --- | --- | --- | --- |
+| Hand-written root | Compile error | All of it, in one place | None | Up to a point: the root becomes a conflict hotspot | Small and medium apps |
+| Has-protocol composition | Compile error | Scope objects only | None | Well, for presence checks | Medium and large apps that want safety without a generator |
+| Runtime container | Run-time failure | Registrations | A library | With smoke tests and discipline | Teams already invested in one |
+| Generated (Needle, SafeDI) | Build error from the generator | Annotations or components | A code generator in every build | Very well: each team owns its part of the tree | Hundreds of engineers and modules, deep scope trees |
+
+The progression most large apps follow is telling: a hand-written root first, Has-protocols or per-feature dependency structs as it grows, and generation only when the root's size and merge conflicts become a real cost. Because every one of these keeps types taking their dependencies through initialisers, moving from one to the next doesn't change the feature code, only how the root is produced.
+
+<Callout kind="interview">
+
+**What to say:** "Compile-time safety means the build fails if the graph can't be built. A hand-written root already has it; the problem at scale is that the root becomes thousands of lines edited by every team. I'd start with per-feature dependency structs or Has-protocols, and move to a generator such as Needle or SafeDI when the root is the bottleneck. The component tree mirrors the scopes, each component declares what it needs, and the generator resolves each need to the nearest ancestor or fails the build."
+
+**What to ask:** "How many engineers and modules? How often does the root conflict in merges? Have we had wiring crashes in production?"
+
+**Red flags:** adopting a code generator for a ten-person app; describing a runtime container as compile-time safe because its types are generic; not knowing that hand-written injection is already checked by the compiler.
+
+</Callout>
+
+<Callout kind="gotcha" title="Swift gotcha: Has-protocols check presence, not choice">
+
+`UpcomingTripsModel(dependencies: app)` compiles as long as `app` has a `tripsAPI` property, even if the root filled it with the staging client in a production build. Compile-time DI proves the graph is *complete*; it can't prove the root chose the right implementation. Keep a smoke test that builds the production graph and checks a few key choices, such as the API host.
+
+</Callout>
+
+<Callout kind="gotcha" title="iOS gotcha: generators and extensions">
+
+A widget or share extension is its own target with its own root, so it needs its own component tree (or its own `isRoot` type in SafeDI) that includes only what the extension links. Sharing the app's root component drags the app's whole graph, and its memory, into an extension with a far smaller memory limit.
+
+</Callout>
+
+## Practice
+
+**Plan: move a 200-screen app from singletons to injection** asks you to choose a DI approach for six squads and 28 engineers. Decide whether a hand-written root, Has-protocols or a generator fits, and say what would make you change your mind.
+
+```cards
+- id: ctdi-definition
+  front: "What makes a DI approach compile-time safe?"
+  back: "The build fails if any object in the graph can't get a dependency, and nothing is looked up at run time. A hand-written composition root already meets this; generators keep it while removing the hand-wiring."
+- id: ctdi-has-protocols
+  front: "How do Has-protocols make dependency plumbing compile-time checked?"
+  back: "Each dependency gets a tiny `Has…` protocol; scope objects conform to the ones they provide; each type asks for a composition like `HasTripsAPI & HasAnalytics`. A scope object missing one fails to compile at the call site."
+- id: ctdi-component-tree
+  front: "How does a Needle-style generator resolve dependencies?"
+  back: "Components form a tree mirroring the scopes. Each declares what it needs in a dependency protocol; the generator finds the nearest ancestor providing each item and writes forwarding code, or fails the build naming what's missing."
+- id: ctdi-costs
+  front: "What does generated DI cost?"
+  back: "A code-generation step in every build, a new model to learn, annotations spread through the codebase (lock-in), and generated code to read when wiring surprises you."
+```
+
+```quiz
+- id: q1
+  type: truefalse
+  prompt: "Passing every dependency through initialisers from a hand-written composition root is compile-time-safe dependency injection."
+  answer: true
+  explain: "Every initialiser call is checked by the compiler, and nothing is resolved at run time. What generators add is not safety but freedom from writing and maintaining the wiring by hand."
+- id: q2
+  type: mcq
+  prompt: "`CheckoutComponent` declares `loyaltyClient` in its dependency protocol, but no ancestor provides one. With Needle, when do you find out?"
+  options:
+    - "When a user opens checkout"
+    - "When the generator runs during the build: it can't find a provider, so the build fails"
+    - "Never: Needle supplies a default"
+    - "In a unit test, if one resolves checkout"
+  answer: 1
+  explain: "The generator resolves every declared need to an ancestor while building the project. A need with no provider is a build error, which is the whole point of the approach."
+- id: q3
+  type: order
+  prompt: "Put the typical evolution of DI in a growing app in order."
+  lines:
+    - "Objects create or find their dependencies"
+    - "A hand-written composition root passes dependencies through initialisers"
+    - "Per-feature dependency structs or Has-protocols keep the root readable"
+    - "A generator produces the wiring from declarations once the root becomes a bottleneck"
+  explain: "Each step keeps types taking dependencies through initialisers, so moving to the next changes how the graph is assembled, not the feature code."
+- id: q4
+  type: multi
+  prompt: "Which are real costs of adopting a compile-time DI generator? Choose all that apply."
+  options:
+    - "A code-generation step that runs as part of the build"
+    - "Missing dependencies crash at run time"
+    - "Annotations or components throughout the codebase, which make leaving the tool expensive"
+    - "Generated code to read when the wiring surprises you"
+    - "No way to create screens after launch"
+  answer: [0, 2, 3]
+  explain: "Generators catch missing dependencies at build time, and they support creating subtrees later (Needle's child components, SafeDI's `Instantiator`). The build step, lock-in and generated code are the real price."
+- id: q5
+  type: mcq
+  prompt: "A ten-engineer team with 40 screens and a 300-line composition root asks whether to adopt Needle. What's the best advice?"
+  options:
+    - "Yes: compile-time safety is always worth it"
+    - "Not yet: the hand-written root is already compile-time safe and small; revisit if it becomes a merge-conflict hotspot or grows into thousands of lines"
+    - "Switch to Swinject instead, because it's simpler"
+    - "Remove the root and let screens create their dependencies"
+  answer: 1
+  explain: "A generator solves the problems of very large roots maintained by many teams. At this size it would add a build step and a new model for no safety they don't already have."
+```

@@ -1,0 +1,382 @@
+## Why it matters
+
+Once you've decided to hand an object its dependencies, you still have to choose *how*: through its initialiser, by setting a property after it exists, or by passing the dependency to the one method that needs it. Each form makes different promises about when the dependency is there and whether it can change, and UIKit's storyboards, SwiftUI's `@State` and the system's own entry points each push you towards particular ones. Interviewers ask "constructor or property injection?" to see whether you know what each one guarantees, and what breaks when you pick the wrong one.
+
+## Constructor injection: the default
+
+The object declares everything it needs as initialiser parameters and keeps them in `let` properties:
+
+```swift check title="Constructor injection"
+import Foundation
+
+struct Trip: Sendable, Identifiable {
+    let id: String
+    let destination: String
+}
+
+protocol TripLoading: Sendable {
+    func trip(id: String) async throws -> Trip
+}
+
+protocol Analytics: Sendable {
+    func track(_ event: String) async
+}
+
+@MainActor final class TripDetailModel {
+    private let tripID: String
+    private let loader: any TripLoading
+    private let analytics: any Analytics
+    private(set) var trip: Trip?
+
+    init(tripID: String, loader: any TripLoading, analytics: any Analytics) {
+        self.tripID = tripID
+        self.loader = loader
+        self.analytics = analytics
+    }
+
+    func load() async throws {
+        trip = try await loader.trip(id: tripID)
+        await analytics.track("trip_viewed")
+    }
+}
+```
+
+What it guarantees is the reason it's the default:
+
+- **The object is complete as soon as it exists.** There's no moment when `loader` is missing, so no method needs to check.
+- **The compiler checks the wiring.** Forget the analytics and the code doesn't build. Add a dependency later and the compiler lists every call site that must supply it.
+- **Dependencies can't change underneath you.** `let` means the analytics a model started with is the one it ends with, which also makes the type easier to reason about under Swift 6's isolation rules.
+- **The signature documents the type.** Reading `init` tells you everything the model can touch.
+
+Structs get this almost for free: the memberwise initialiser *is* constructor injection.
+
+### Storyboards can do it too
+
+UIKit creates storyboard view controllers through `init(coder:)`, which seems to rule constructor injection out. Since iOS 13 it doesn't. `instantiateViewController(identifier:creator:)` lets you call your own initialiser, and `@IBSegueAction` does the same for segues:
+
+```swift check ios title="Constructor injection for storyboard screens"
+import UIKit
+
+protocol TripLoading: Sendable {
+    func tripTitle(id: String) async throws -> String
+}
+
+final class TripDetailViewController: UIViewController {
+    private let tripID: String
+    private let loader: any TripLoading
+
+    init?(coder: NSCoder, tripID: String, loader: any TripLoading) {
+        self.tripID = tripID
+        self.loader = loader
+        super.init(coder: coder)
+    }
+
+    @available(*, unavailable, message: "Use init(coder:tripID:loader:)")
+    required init?(coder: NSCoder) {
+        fatalError("TripDetailViewController needs its dependencies")
+    }
+}
+
+final class TripListViewController: UITableViewController {
+    private let loader: any TripLoading
+    private var tripIDs: [String] = []
+
+    init?(coder: NSCoder, loader: any TripLoading) {
+        self.loader = loader
+        super.init(coder: coder)
+    }
+
+    @available(*, unavailable, message: "Use init(coder:loader:)")
+    required init?(coder: NSCoder) {
+        fatalError("TripListViewController needs its dependencies")
+    }
+
+    // Connected to the segue in Interface Builder: UIKit calls it instead of init(coder:)
+    @IBSegueAction func showTrip(_ coder: NSCoder, sender: Any?) -> TripDetailViewController? {
+        guard let row = tableView.indexPathForSelectedRow?.row else { return nil }
+        return TripDetailViewController(coder: coder, tripID: tripIDs[row], loader: loader)
+    }
+}
+
+// Whoever builds the first screen passes its dependencies in
+@MainActor func makeTripList(loader: any TripLoading) -> TripListViewController {
+    UIStoryboard(name: "Trips", bundle: nil).instantiateViewController(identifier: "TripList") { coder in
+        TripListViewController(coder: coder, loader: loader)
+    }
+}
+```
+
+Marking `init(coder:)` unavailable turns "someone instantiated this screen the old way" from a runtime surprise into a compile error everywhere except the storyboard itself. If the storyboard still has a plain segue or an initial view controller pointing at the screen, UIKit calls `init(coder:)` and you hit the `fatalError` the first time you run that path, which is a loud failure in development rather than a blank screen in production.
+
+### SwiftUI views and `@State` models
+
+A SwiftUI view takes its dependencies as stored properties, which is constructor injection with the memberwise initialiser. The subtle case is a view that owns its model in `@State`:
+
+```swift check ios title="A view that owns an injected model"
+import SwiftUI
+
+struct Trip: Sendable {
+    let id: String
+    let destination: String
+}
+
+protocol TripLoading: Sendable {
+    func trip(id: String) async throws -> Trip
+}
+
+@MainActor @Observable final class TripModel {
+    let tripID: String
+    private let loader: any TripLoading
+    private(set) var trip: Trip?
+
+    // Cheap: no work here, because this may run many times
+    init(tripID: String, loader: any TripLoading) {
+        self.tripID = tripID
+        self.loader = loader
+    }
+
+    func load() async {
+        trip = try? await loader.trip(id: tripID)
+    }
+}
+
+struct TripScreen: View {
+    @State private var model: TripModel
+
+    init(tripID: String, loader: any TripLoading) {
+        _model = State(initialValue: TripModel(tripID: tripID, loader: loader))
+    }
+
+    var body: some View {
+        Text(model.trip?.destination ?? "Loading…")
+            .task { await model.load() }
+    }
+}
+
+struct TripsTab: View {
+    let loader: any TripLoading
+    @State private var selectedID = "LIS-42"
+
+    var body: some View {
+        // .id gives the screen a new identity, and so a new model, when the trip changes
+        TripScreen(tripID: selectedID, loader: loader)
+            .id(selectedID)
+    }
+}
+```
+
+Two facts about `@State` shape this code. SwiftUI keeps the **first** value for as long as the view keeps its identity, so if the parent later passes a different `tripID` or `loader`, the screen silently keeps the old model; `.id(selectedID)` makes a new identity, and with it a new model. And the parent re-creates the `TripScreen` struct every time its own body runs, which evaluates `TripModel(...)` each time only for SwiftUI to throw the extra models away. Keep model initialisers cheap and do the work in `.task`, or have the parent own the model and pass it in.
+
+## Property injection: when the object already exists
+
+With **property injection** (also called setter injection) the object is created first and its dependencies are assigned afterwards. Sometimes you have no choice: the frameworks create the object, and the first moment you can touch it is after `init`. A storyboard segue without a segue action is the classic case, and its timing is a trap:
+
+```visual sequence
+title: Property injection through a storyboard segue
+participants:
+  - { id: list, label: TripListVC }
+  - { id: uikit, label: UIKit }
+  - { id: detail, label: TripDetailVC }
+messages:
+  - [list, uikit, performSegue]
+  - [uikit, detail, "init(coder:)", { say: "UIKit creates the destination with `init(coder:)`. It can't pass your dependencies, so `loader` starts as `nil`." }]
+  - { note: "From here until it's set, the screen has no loader.", over: detail }
+  - [uikit, list, "prepare(for:sender:)", { say: "UIKit gives the source a chance to configure the destination before it appears." }]
+  - [list, detail, "loader = …", { say: "The source assigns the dependency. Nothing has touched the destination's view yet, because views load lazily." }]
+  - [uikit, detail, "viewDidLoad()", { say: "The view loads when it's about to appear, so `viewDidLoad` finds the loader in place." }]
+  - [list, detail, "reads .view", { say: "But suppose `prepare` reads `destination.view` first, perhaps to set a label. That loads the view **now**." }]
+  - [detail, detail, "viewDidLoad(): loader is nil", { say: "`viewDidLoad` runs before the assignment below it, finds no loader, and the screen stays blank or crashes on an implicitly unwrapped optional." }]
+  - [list, detail, "loader = … (too late)"]
+fragments:
+  - { kind: alt, label: assigns first, from: 4, to: 8, else: 6, elseLabel: touches the view first }
+```
+
+That window between creation and assignment is **temporal coupling**: the object works only if things happen in the right order, and nothing in the types says so. If you must use property injection, make the missing case loud and the type honest:
+
+```swift check ios title="Property injection that fails loudly"
+import UIKit
+
+protocol TripLoading: Sendable {
+    func tripTitle(id: String) async throws -> String
+}
+
+final class LegacyTripViewController: UIViewController {
+    // Optional, not `TripLoading!`: the type admits that it can be missing
+    var loader: (any TripLoading)?
+    var tripID: String?
+
+    override func viewDidLoad() {
+        super.viewDidLoad()
+        guard let loader, let tripID else {
+            assertionFailure("Set loader and tripID before the view loads")
+            return
+        }
+        Task {
+            title = try? await loader.tripTitle(id: tripID)
+        }
+    }
+}
+```
+
+Property injection is also the right tool, not only a workaround, in two cases:
+
+- **Optional collaborators with a sensible default.** A `weak var delegate`, or a `var logger: Logger = Logger(.disabled)` that a host app may replace. The object works without them.
+- **Breaking a construction cycle.** If a coordinator and its child each need a reference to the other, one of them has to exist first. The child is constructed with what it needs, and the parent is set afterwards as a weak property.
+
+Avoid it for anything the object can't work without, and avoid making injected properties publicly settable "so tests can swap them halfway through": that's a dependency the object can't rely on.
+
+## Method injection: when it changes per call
+
+Some collaborators belong to one call rather than to the object. Pass them as parameters:
+
+```swift check ios title="Stable dependencies in init, per-call context in the method"
+import UIKit
+
+struct Trip: Sendable {
+    let id: String
+    let destination: String
+}
+
+protocol TripLinkMaking: Sendable {
+    func shareLink(for trip: Trip) async throws -> URL
+}
+
+@MainActor struct TripSharer {
+    private let links: any TripLinkMaking
+
+    init(links: any TripLinkMaking) {
+        self.links = links
+    }
+
+    /// The presenter differs on every call: whichever screen the user is looking at
+    func share(_ trip: Trip, from presenter: UIViewController) async throws {
+        let url = try await links.shareLink(for: trip)
+        let activity = UIActivityViewController(activityItems: [url], applicationActivities: nil)
+        presenter.present(activity, animated: true)
+    }
+}
+```
+
+The link maker is a service, the same for every call, so it's injected once. The presenting view controller changes from call to call, and storing it would also risk keeping a dismissed screen alive. You've used method injection many times without the name: `UIViewRepresentable.makeUIView(context:)`, `draw(_:)` receiving a rect, `Canvas` handing you a `GraphicsContext`, a `URLSession` delegate method receiving the session.
+
+Method injection suits context objects, values that vary per call and things you shouldn't keep a reference to. Its cost is that every caller must have the dependency to hand, and passing it through five layers of calls only to reach the sixth is a sign it belongs in an initialiser further down.
+
+## Ambient context: the fourth form
+
+There's one more form, where the dependency isn't passed at all but sits in the **surrounding context**: a SwiftUI environment value, or a task-local value that a scope sets and everything inside it reads. It removes the plumbing at the cost of visibility, and it gets two lessons of its own later in this module. Treat it as a deliberate exception for cross-cutting values (the clock, a logger, a theme), not as a way to avoid writing initialisers.
+
+## When the initialiser gets long
+
+Constructor injection makes every dependency visible, which means it also makes too many dependencies visible. When an initialiser passes five or six parameters, the options are:
+
+- **Split the type.** Look for parameters used together by different methods: those clusters are separate responsibilities. This is usually the right answer.
+- **Introduce a facade** when several services genuinely form one concept: `CheckoutServices` wrapping pricing, payment and order placement behind three methods the screen needs.
+- **Use a dependencies struct at feature boundaries.** A feature's entry point taking `TripsDependencies(api:analytics:images:clock:)` keeps the composition root readable. Inside the feature, pass each type only what it uses, or every type ends up depending on everything in the struct.
+
+What doesn't help is hiding the count: grabbing the dependencies from a container or a locator inside the type shortens the initialiser and hides exactly the information the long list was giving you.
+
+## Trade-offs
+
+| Form | Dependency guaranteed present | Can change after creation | Compiler checks the wiring | Watch out for | Best for |
+| --- | --- | --- | --- | --- | --- |
+| Constructor | Yes, from the start | No (`let`) | Yes | Long parameter lists; the frameworks' own initialisers | Anything the object can't work without: the default |
+| Property | Only after assignment | Yes | No | Temporal coupling, `!` crashes, a window where it's `nil` | Framework-created objects, optional collaborators, breaking a cycle |
+| Method | For that call | Per call | Yes | Threading it through many layers | Per-call context: presenters, graphics contexts, destinations |
+| Ambient (environment, task-local) | A default always exists | Per scope | No | Hidden dependencies; a missing override silently uses the default | Cross-cutting values many layers read |
+
+<Callout kind="interview">
+
+**What to say:** "Constructor injection by default: the object is complete when it exists and the compiler checks the wiring. Property injection only where a framework creates the object, made safe with an optional and an assertion. Method injection for things that change per call, like the presenting view controller." If UIKit comes up, mention `instantiateViewController(identifier:creator:)` and `@IBSegueAction`: many candidates don't know storyboards can do constructor injection.
+
+**What to ask:** "Is this screen created by a storyboard, by code, or by SwiftUI? Can the dependency change during the object's life?"
+
+**Red flags:** implicitly unwrapped `var service: Service!` properties as the house style; public settable dependencies so tests can swap them mid-test; a five-layer chain of method parameters that exists only to reach one leaf.
+
+</Callout>
+
+<Callout kind="gotcha" title="Swift gotcha: @State ignores later initial values">
+
+`_model = State(initialValue: Model(service: service))` only matters the first time SwiftUI sees the view. If the parent passes a different service or ID later, the view keeps its first model, and the new one is built and thrown away. Change the view's identity with `.id(…)` when the input should reset the model, or let the parent own the model and pass it in.
+
+</Callout>
+
+<Callout kind="gotcha" title="iOS gotcha: reading a destination's view loads it">
+
+In `prepare(for:sender:)`, anything that reads `destination.view`, including setting a subview's text through an outlet, triggers `viewDidLoad` immediately. Assign every dependency first, or better, replace the segue with an `@IBSegueAction` so the dependencies arrive in the initialiser.
+
+</Callout>
+
+## Practice
+
+**A composition root for a reading app** uses constructor injection throughout: every service and screen model takes its collaborators in its initialiser, and the root's factory methods supply them.
+
+```cards
+- id: forms-constructor-default
+  front: "Why is constructor injection the default form?"
+  back: "The object is complete as soon as it exists, its dependencies can be `let`, the compiler checks every call site, and the initialiser documents everything the type can touch."
+- id: forms-storyboards
+  front: "How do you use constructor injection with storyboard view controllers?"
+  back: "Add an `init?(coder:…)` that takes the dependencies, then create the screen with `instantiateViewController(identifier:creator:)` or from a segue with an `@IBSegueAction` method (both iOS 13 and later). Mark plain `init(coder:)` unavailable."
+- id: forms-property-risk
+  front: "What's the main risk of property injection?"
+  back: "Temporal coupling: between creation and assignment the dependency is missing, and code that runs in that window (such as a `viewDidLoad` triggered early) finds `nil`."
+- id: forms-method
+  front: "When is method injection the right choice?"
+  back: "When the collaborator varies per call or shouldn't be stored, like the presenting view controller, a graphics context or an export destination."
+```
+
+```quiz
+- id: q1
+  type: sort
+  prompt: "Which form of injection fits each dependency best?"
+  buckets: [Constructor, Property, Method]
+  items:
+    - [The API client a checkout model always needs, 0]
+    - [The view controller to present a share sheet from, 2]
+    - ["A `weak var delegate` that may or may not be set", 1]
+    - [A repository a SwiftUI view model can't work without, 0]
+    - [The file URL to export this trip's itinerary to, 2]
+    - ["A storyboard screen's loader, with no segue action or creator available", 1]
+  explain: "Required, stable collaborators go in the initialiser. Things that change per call are parameters. Property injection is for optional collaborators and for objects the framework creates before you can reach them."
+- id: q2
+  type: mcq
+  prompt: "In `prepare(for:sender:)` a developer writes `destination.titleLabel.text = trip.name` and then `destination.loader = loader`. The detail screen's `viewDidLoad` starts loading with `loader!`. What happens?"
+  options:
+    - "Nothing unusual: `viewDidLoad` always runs after `prepare` finishes"
+    - "Reading the outlet loads the view, so `viewDidLoad` runs before `loader` is set and the force unwrap crashes"
+    - "UIKit queues `viewDidLoad` until the segue completes"
+    - "The outlet is nil, so the line is skipped"
+  answer: 1
+  explain: "Outlets are only connected once the view loads, and touching the view loads it on the spot. That runs `viewDidLoad` before the next line assigns the loader. Assign dependencies first, or use an `@IBSegueAction` so they arrive in `init`."
+- id: q3
+  type: mcq
+  prompt: "`TripScreen.init(tripID:loader:)` creates its model with `_model = State(initialValue: TripModel(tripID: tripID, loader: loader))`. The parent changes the selected trip, and the screen keeps showing the old one. Which fix is best?"
+  options:
+    - "Make `model` a plain `let` instead of `@State`"
+    - "Give the screen `.id(selectedTripID)` in the parent, so a new trip means a new view identity and a new model"
+    - "Call `load()` again from `body`"
+    - "Store the loader in a singleton so it can't change"
+  answer: 1
+  explain: "`@State` keeps its first value for the life of the view's identity. Changing the identity is how you tell SwiftUI the old state no longer applies. A plain `let` would lose the model's state on every re-render instead."
+- id: q4
+  type: truefalse
+  prompt: "Moving a type's eight dependencies into a container that the type resolves from inside its initialiser fixes the problem that the initialiser was too long."
+  answer: false
+  explain: "It hides the problem. The type still depends on eight things, but now nobody can see which, the compiler can't check them, and tests must configure the container. Split the type, or group related services behind a facade."
+- id: q5
+  type: bug
+  prompt: "Which line makes this property injection unsafe?"
+  code: |
+    final class ReceiptViewController: UIViewController {
+        var printer: ReceiptPrinting!
+        var receipt: Receipt?
+
+        override func viewDidLoad() {
+            super.viewDidLoad()
+            guard let receipt else { return }
+            printer.preview(receipt, in: view)
+        }
+    }
+  answer: 2
+  explain: "The implicitly unwrapped optional hides the temporal coupling: if `viewDidLoad` runs before `printer` is assigned, line 8 crashes with no hint of why. Declare it as an optional and check it with an assertion, as `receipt` is handled, or move both into an initialiser."
+```

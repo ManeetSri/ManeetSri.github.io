@@ -1,0 +1,266 @@
+## Why it matters
+
+"What's the difference between a service locator and dependency injection?" is one of the most common DI questions in interviews, and many codebases that say they use DI are really using a locator. Both decouple a type from the concrete classes it uses; both let tests substitute fakes. The difference is **who asks for the dependency, and when**, and it decides whether dependencies are visible, whether mistakes are caught by the compiler, and how long objects really live. [Singleton abuse, global state and service locators](/design/learn/sd-refactoring-global-state) introduced the locator as a smell. This lesson takes it apart properly: what it costs, the few places it's the honest choice on iOS, and how to move from one to the other.
+
+## The same registry, used two ways
+
+Martin Fowler's 2004 article compared the two patterns side by side, and the comparison still holds:
+
+- **Service locator:** an object **pulls** its dependencies. It holds (or reaches) a registry and calls `resolve` when it needs something: in its initialiser, lazily, or on every call.
+- **Dependency injection:** an object is **pushed** its dependencies. Someone else (the composition root) obtains them and passes them in.
+
+The registry itself doesn't decide which you have. A Swinject container, a Factory `Container`, or a dictionary keyed by type is a locator when objects call it and part of a DI setup when only the root does:
+
+```visual flow
+title: One registry, two patterns
+nodes:
+  - { id: root, label: Composition root, kind: client, at: [0, 0] }
+  - { id: registry, label: Registry, kind: store, at: [2, 0] }
+  - { id: model, label: CheckoutModel, kind: view, at: [0, 2] }
+  - { id: payments, label: PaymentsClient, at: [2, 2] }
+edges:
+  - [model, registry, "resolve()"]
+  - [registry, payments, builds]
+  - [root, registry, "resolve()"]
+  - [root, model, "init(payments:)"]
+  - [model, payments, uses, { style: data }]
+steps:
+  - say: "**Service locator.** `CheckoutModel()` takes nothing. Inside, it asks the registry for a payments client whenever it likes."
+    show: [model, registry, payments, model->registry, registry->payments]
+    send: model->registry
+    state: { model: error }
+    label: { model: "pulls" }
+  - say: "The dependency exists, but nothing outside the model's body shows it. A test has to put a fake *into the registry* and hope nothing else is using it."
+    active: [model->payments]
+  - say: "**Dependency injection.** Same registry, same client. Now only the root resolves, and it passes the client to `init(payments:)`."
+    reset: true
+    show: [root, registry, payments, model, registry->payments, root->registry, root->model, model->payments]
+    send: [root->registry, root->model]
+    state: { root: active }
+  - say: "The model's signature tells the truth, a test passes a fake directly, and the model has no idea a registry exists."
+    state: { root: null, model: ok }
+    label: { model: "is given" }
+```
+
+## What pulling costs
+
+The costs follow from one fact: a locator turns a dependency from part of a type's **interface** into part of its **implementation**.
+
+- **The API lies by omission.** `CheckoutModel()` compiles anywhere, but works only where the right things happen to be registered. Mark Seemann's argument against the pattern rests on this: a consumer can't tell from the type what it must provide, so every use is a guess checked at run time.
+- **Mistakes move to run time.** A missing registration, a typo in a type, or registering the concrete type while resolving the protocol all compile. They fail when the code path runs, which for a rarely used screen means in production.
+- **Order becomes a rule nobody wrote down.** Everything must be registered before anything resolves. A widget, a preview, an App Intent or a test that skips the app's start-up code breaks.
+- **Lifetimes are chosen by call sites.** Resolve in `init` and the object keeps whatever was registered then; resolve lazily and it gets whatever is registered on first use; resolve per call and it can change underneath you. The same service ends up with different lifetimes in different files.
+- **Tests share state.** The registry is global, so fakes registered by one test are visible to the next, and Swift Testing's parallel runs make that a race.
+- **Everything depends on the locator.** Every module that resolves must import the module that defines the registry, which quietly couples all of them to it.
+
+The lifetime point is the least obvious and the most damaging, so here it is running. A shopping app lets people switch store between the UK and Ireland, and re-registers the price formatter when they do:
+
+```swift run title="Where you call resolve decides what you get"
+protocol PriceFormatting {
+    func format(pence: Int) -> String
+}
+
+struct PoundFormatter: PriceFormatting {
+    func format(pence: Int) -> String { "£\(pence / 100)" }
+}
+
+struct EuroFormatter: PriceFormatting {
+    func format(pence: Int) -> String { "€\(pence / 100)" }
+}
+
+@MainActor final class Locator {
+    static let shared = Locator()
+    private var services: [ObjectIdentifier: Any] = [:]
+
+    func register<T>(_ service: T, as type: T.Type) {
+        services[ObjectIdentifier(type)] = service
+    }
+
+    func resolve<T>(_ type: T.Type) -> T? {
+        services[ObjectIdentifier(type)] as? T
+    }
+}
+
+/// Resolves once, when it's created
+@MainActor final class BasketRow {
+    private let formatter = Locator.shared.resolve((any PriceFormatting).self)
+    func label(pence: Int) -> String { formatter?.format(pence: pence) ?? "?" }
+}
+
+/// Resolves on every call
+@MainActor final class TotalBar {
+    func label(pence: Int) -> String { Locator.shared.resolve((any PriceFormatting).self)?.format(pence: pence) ?? "?" }
+}
+
+/// Injected: the root decides, and rebuilds the screen when the store changes
+@MainActor final class CheckoutSummary {
+    private let formatter: any PriceFormatting
+    init(formatter: any PriceFormatting) { self.formatter = formatter }
+    func label(pence: Int) -> String { formatter.format(pence: pence) }
+}
+
+Locator.shared.register(PoundFormatter(), as: (any PriceFormatting).self)
+let row = BasketRow()
+let total = TotalBar()
+var summary = CheckoutSummary(formatter: PoundFormatter())
+print("row:", row.label(pence: 1200), "· total:", total.label(pence: 1200), "· summary:", summary.label(pence: 1200))
+
+// The user switches to the Irish store
+Locator.shared.register(EuroFormatter(), as: (any PriceFormatting).self)
+summary = CheckoutSummary(formatter: EuroFormatter())
+print("row:", row.label(pence: 1200), "· total:", total.label(pence: 1200), "· summary:", summary.label(pence: 1200))
+```
+
+```output
+row: £12 · total: £12 · summary: £12
+row: £12 · total: €12 · summary: €12
+```
+
+One screen now shows a basket in pounds and a total in euros. Neither the row nor the bar is wrong on its own terms; the bug is that each one's lifetime was decided by *where it happened to call* `resolve`. With injection the decision is made once, by the root, which builds the new screen with the new formatter.
+
+## When a locator is the honest choice
+
+Some objects are created by the system, so nothing can pass them anything: the app and scene delegates, App Intents, widget timeline providers, notification service extensions, objects decoded by `NSCoder`, storyboard view controllers without a creator. At those points a lookup is unavoidable, and Apple ships one. App Intents use a small, typed locator: the app registers dependencies at launch, and intents read them with `@Dependency`:
+
+```swift check ios title="Apple's locator for App Intents"
+import AppIntents
+
+protocol TripsService: Sendable {
+    func nextTripName() async throws -> String
+}
+
+struct NextTripIntent: AppIntent {
+    static let title: LocalizedStringResource = "Show my next trip"
+
+    // Looked up in AppDependencyManager when the system runs the intent
+    @Dependency private var trips: any TripsService
+
+    func perform() async throws -> some IntentResult & ReturnsValue<String> {
+        .result(value: try await trips.nextTripName())
+    }
+}
+
+// In the composition root, before any intent can run
+@MainActor func registerIntentDependencies(trips: any TripsService) {
+    AppDependencyManager.shared.add(dependency: trips)
+}
+```
+
+The pattern that keeps this healthy is **locator at the edge**: resolve once, in the framework-created object, and inject everything below it. The intent above looks up one service and calls it; the service itself was built by the composition root with ordinary initialisers. That's the same shape as the scene delegate reaching the app delegate's root in [The composition root](/design/learn/sd-di-composition-root): one lookup per entry point, never one per class.
+
+A registry is also fine when it holds **strategies chosen at run time** and is itself injected: a router given a dictionary of route handlers, a payment screen given a table of payment-method renderers. Nothing pulls from a global; the registry is an ordinary dependency.
+
+## Getting out of a locator
+
+The move from pulling to pushing goes one layer at a time, and every step compiles and ships:
+
+1. **Surface the dependency.** Move each `resolve` call out of the body into an initialiser parameter whose default value resolves: `init(payments: any PaymentsClient = Locator.shared.resolve(...)!)`. Behaviour is unchanged; tests can now pass a fake.
+2. **Push resolution to the caller.** Change the callers to pass the dependency explicitly, resolving it themselves if they must. The `resolve` call has moved one layer up.
+3. **Repeat until it reaches the root.** When the outermost caller is the composition root or a framework entry point, the lookup is where it belongs. Delete the default arguments; the compiler lists anything still relying on them.
+4. **Make the remaining lookups safe.** Have `resolve` throw or return an optional rather than crash, key it by `ObjectIdentifier` rather than strings, and log a fault when something is missing.
+5. **Fence it.** A lint rule that allows the locator only in entry-point files, plus a count that can only go down, keeps new pulls from appearing while the old ones are removed.
+
+Each step makes one more type honest. You don't need to finish all of them before the benefits start: the first step alone makes a type testable without the global.
+
+## Ambient context: the middle ground
+
+Between the two sits the **ambient context**: a scoped default that code reads without being passed it, such as SwiftUI's environment or a task-local `DependencyValues`. It pulls, like a locator, but the value always exists (there's a default), overrides are scoped rather than global, and a test's override can't leak into another test. That's why [Dependencies as values](/design/learn/sd-di-dependency-values) is a defensible design and a global registry usually isn't. It's still worth reserving for cross-cutting things (the clock, a logger, analytics) rather than every dependency in the app.
+
+## Trade-offs
+
+| Approach | Dependencies visible | Missing dependency | Lifetime decided by | Parallel tests | Wins when |
+| --- | --- | --- | --- | --- | --- |
+| Service locator throughout | No | Run-time failure | Each call site | Unsafe: a global registry | Rarely; as a stage in a migration |
+| Locator at the edge only | At every type below the edge | Run-time failure, at a few known places | The root | Safe below the edge | Framework-created objects: App Intents, extensions, delegates |
+| Dependency injection | Yes | Compile error | The root | Safe | The default |
+| Ambient context (environment, task local) | Declared, not passed | A default runs | The scope that set it | Safe | Cross-cutting values many layers read |
+
+<Callout kind="interview">
+
+**What to say:** "Both decouple a type from concrete implementations. The difference is who asks: with a locator the type pulls from a registry, so its dependencies are hidden, failures happen at run time and lifetimes depend on where it calls `resolve`. With injection the root pushes them in, so the signature is honest and the compiler checks it. The same container can be either; what matters is that only the composition root, and unavoidable entry points like App Intents, ever resolve."
+
+**What to ask:** "Where is `resolve` called from today? How do tests replace a dependency? Has a missing registration ever crashed in production?"
+
+**Red flags:** "we use DI: everything calls `Container.shared.resolve`"; injecting the container into objects; claiming locators are always wrong while the app's App Intents necessarily use one.
+
+</Callout>
+
+<Callout kind="gotcha" title="iOS gotcha: intents can run before your UI exists">
+
+The system can launch your app in the background only to run an App Intent, from Shortcuts, Siri or a widget button, without creating a scene. Register App Intent dependencies in the `App` struct's initialiser (or `application(_:didFinishLaunchingWithOptions:)`), not in a view's `onAppear`, or the intent's `@Dependency` lookup fails on exactly the launches you didn't test.
+
+</Callout>
+
+<Callout kind="gotcha" title="Swift gotcha: resolve() with an inferred type">
+
+A generic `func resolve<T>() -> T` lets you write `let api: any APIClient = locator.resolve()`, with the key inferred from the annotation. Change the annotation to `(any APIClient)?` or to a concrete type and the code still compiles, but looks up a different key that nobody registered. Pass the type explicitly, `resolve((any APIClient).self)`, so the key is visible where it's used.
+
+</Callout>
+
+## Practice
+
+**Review: the locator inside the models** is a home-grown locator resolved from view models and from a `Decodable` model type. Find why one person's orders appear for another, why the preview and widget crash, and why the tests pass only one at a time; then plan the move to injection in small steps.
+
+```cards
+- id: locator-vs-di
+  front: "What's the essential difference between a service locator and dependency injection?"
+  back: "Who asks. With a locator the object pulls its dependencies from a registry; with injection someone else (the root) pushes them in. The same registry can serve either."
+- id: locator-costs
+  front: "Name four costs of a service locator."
+  back: "Hidden dependencies (the API lies), failures at run time instead of compile time, an unwritten registration-order rule, lifetimes decided by where each call site resolves, and shared state between tests."
+- id: locator-edge
+  front: "Where is a locator the honest choice on iOS?"
+  back: "At framework-created entry points that can't receive injection, such as App Intents (`@Dependency` with `AppDependencyManager`), extensions and delegates. Resolve once there and inject everything below: a locator at the edge."
+- id: locator-exit
+  front: "How do you migrate a type off a locator?"
+  back: "Move each resolve into an initialiser default, make callers pass the dependency, repeat until resolution reaches the root or an entry point, then delete the defaults and fence the locator with a lint rule."
+```
+
+```quiz
+- id: q1
+  type: mcq
+  prompt: "Which of these is dependency injection rather than a service locator?"
+  options:
+    - "`CheckoutModel` calls `Container.shared.resolve(PaymentsClient.self)` in its initialiser"
+    - "The scene delegate resolves a `PaymentsClient` from a container and passes it to `CheckoutModel(payments:)`"
+    - "`CheckoutModel` holds a `Resolver` and resolves the payments client when checkout starts"
+    - "`CheckoutModel` uses `@Injected(\\.payments)` backed by `Container.shared`"
+  answer: 1
+  explain: "Only the second has the model *given* its dependency. The others pull from a registry inside the model, whatever the registry is called."
+- id: q2
+  type: multi
+  prompt: "Which are consequences of objects resolving from a global registry? Choose all that apply."
+  options:
+    - "A missing registration is found when the code runs, not when it builds"
+    - "Two classes that resolve the same service at different times can see different instances"
+    - "The compiler lists every type that needs a given service"
+    - "Fakes registered in one test can affect another test"
+    - "A preview that skips the app's start-up code can crash"
+  answer: [0, 1, 3, 4]
+  explain: "The compiler can't see dependencies that live in method bodies; that's precisely what injection gives back."
+- id: q3
+  type: mcq
+  prompt: "An App Intent needs the app's `TripsService`. What's the right design?"
+  options:
+    - "Make `TripsService` a singleton so the intent can call `TripsService.shared`"
+    - "Register the service with `AppDependencyManager` in the composition root at launch, and read it once in the intent with `@Dependency`"
+    - "Create a new `TripsService` inside `perform()` with its own URL session and token store"
+    - "App Intents can't use services; move the logic into the intent"
+  answer: 1
+  explain: "The system creates intents, so they can't receive initialiser injection. Apple's typed locator is the bridge: one lookup at the edge, with the service itself built by the root."
+- id: q4
+  type: order
+  prompt: "Put the steps for moving `ProfileModel` off `Locator.shared` in order."
+  lines:
+    - "Move the `resolve` calls into initialiser parameters with default values that resolve"
+    - "Change callers to pass the dependencies explicitly"
+    - "Repeat until resolution happens only in the composition root"
+    - "Delete the default arguments and let the compiler find any remaining callers"
+    - "Add a lint rule that allows the locator only in entry-point files"
+  explain: "Each step compiles and ships, and each makes one more layer honest. The fence at the end keeps new pulls from appearing."
+- id: q5
+  type: truefalse
+  prompt: "A task-local `DependencyValues` read through a property wrapper has the same test-isolation problem as a global service locator."
+  answer: false
+  explain: "Overrides are scoped copies bound to a task, so a test's override can't leak into another test, even in parallel. It shares the locator's visibility cost, but not its global mutable state."
+```

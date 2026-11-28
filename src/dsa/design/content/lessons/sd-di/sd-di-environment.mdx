@@ -1,0 +1,337 @@
+## Why it matters
+
+SwiftUI ships with a dependency injection system built in: the environment. Every value you put there is available to a whole subtree, can be overridden for part of it, and falls back to a default when nobody set it. That makes it the natural home for capabilities that many views need (loading images, tracking events, opening links), and a dangerous home for everything else, because none of it shows up in a signature. [Environment values and preferences](/design/learn/sd-swiftui-environment) covered how the environment works. This lesson is about using it as a DI mechanism: what to put there, how to choose defaults, how to get environment dependencies into view models, and how a subtree becomes a scope.
+
+## Ambient injection, with a scope built in
+
+Compared with the forms in [Constructor, property and method injection](/design/learn/sd-di-injection-forms), the environment is **ambient**: the dependency isn't passed to the view, it's in the view's surroundings. That brings three properties a DI designer cares about:
+
+- **Scoping comes free.** A value set on a subtree applies to that subtree only. Put a basket in the environment at the root of the signed-in UI and it's session-scoped without any extra code: when that subtree goes, so does access to the basket.
+- **Overrides are local.** A preview, a test host, or one feature's subtree can replace a value for itself without touching anything else.
+- **Something always answers.** An `@Entry` value has a default, so a view never fails to find it. That's convenient, and it's also the environment's biggest risk: a forgotten override doesn't fail, it silently uses the default.
+
+Its limits are as important. The environment is readable only by views (and view modifiers), only once they're in the hierarchy, and it's invisible at the call site: `TripRow(trip:)` doesn't tell you the row also loads images and tracks taps.
+
+## What belongs in the environment
+
+A practical test: **would you be happy for every view in the subtree to call this?** If yes, and it has a sensible default, the environment fits. If only one screen's model needs it, use an initialiser.
+
+| Put it in the environment | Pass it through initialisers |
+| --- | --- |
+| Capabilities many views call at many depths: image loading, `track`, open a URL, haptics, show a toast | What one screen's model needs: its repository, its use cases |
+| Values with a natural default: theme, density, feature-flag snapshot | Per-item data: the trip a row shows |
+| Shared observable models for a scope: the session, the basket, the audio player | Anything a non-view type needs: services, view models, background work |
+| Things a container passes to children it doesn't know about | Anything with no safe default, where a missing value must be a compile error |
+
+## Capabilities, not service objects
+
+When you do put a dependency in the environment, prefer a small **capability**, a value with one job, over a whole service:
+
+```swift check ios group=env title="A capability with a deliberate default"
+import SwiftUI
+import os
+
+/// The one thing views need from analytics: a way to record an event
+struct TrackAction: Sendable {
+    private let handler: @Sendable (String, [String: String]) -> Void
+
+    init(_ handler: @escaping @Sendable (String, [String: String]) -> Void) {
+        self.handler = handler
+    }
+
+    func callAsFunction(_ event: String, _ properties: [String: String] = [:]) {
+        handler(event, properties)
+    }
+
+    /// The default does nothing, but says so in the console, so a missing install is easy to spot
+    static let notInstalled = TrackAction { event, _ in
+        Logger(subsystem: "com.example.travel", category: "di")
+            .fault("track(\(event, privacy: .public)) was called, but no analytics is installed")
+    }
+}
+
+extension EnvironmentValues {
+    @Entry var track: TrackAction = .notInstalled
+}
+
+struct SaveTripButton: View {
+    @Environment(\.track) private var track
+    let tripID: String
+
+    var body: some View {
+        Button("Save trip") {
+            track("trip_saved", ["trip": tripID])
+        }
+    }
+}
+```
+
+A capability is easy to fake (one closure), easy to decorate, and doesn't drag the analytics SDK's API into every view. It also makes the dependency honest about what views may do: track events, not reconfigure the analytics pipeline.
+
+### Choosing the default is the design decision
+
+Every `@Entry` needs a default, and which one you pick decides how the app fails when someone forgets to install the real thing:
+
+| Default | Production with a forgotten install | Previews and tests with no setup | Use it for |
+| --- | --- | --- | --- |
+| The live implementation | Works | Silently hits real services: previews log analytics to production, tests touch the network | Pure, local behaviour only (a formatter, a theme) |
+| A no-op | Silently does nothing: the feature "works" but nothing is recorded | Safe and quiet | Purely visual capabilities, like haptics |
+| A no-op that reports (as `notInstalled` above) | Does nothing, but logs a fault you'll see in Console and in crash-reporting breadcrumbs | Safe, and visible when it matters | Side effects: analytics, saving, network calls |
+
+A live default is the dangerous one, because it hides the mistake everywhere: production works, so nobody notices that previews and tests are calling real services. If production depends on it, install it explicitly at the root and make the default harmless.
+
+## Installing, overriding and decorating
+
+The composition root installs the real capabilities once, near the top of the tree. Any subtree can then override or **decorate** what it inherited, which is the decorator pattern applied through the environment:
+
+```swift check ios group=env title="Installed at the root, decorated by one flow"
+protocol AnalyticsClient: Sendable {
+    func log(_ event: String, properties: [String: String]) async
+}
+
+struct CheckoutFlow: View {
+    var body: some View {
+        SaveTripButton(tripID: "LIS-42")
+            // Every event tracked inside checkout is tagged, without any view knowing
+            .transformEnvironment(\.track) { track in
+                let parent = track
+                track = TrackAction { event, properties in
+                    parent(event, properties.merging(["flow": "checkout"]) { current, _ in current })
+                }
+            }
+    }
+}
+
+struct AppRootView: View {
+    let analytics: any AnalyticsClient
+
+    var body: some View {
+        CheckoutFlow()
+            .environment(\.track, TrackAction { event, properties in
+                Task { await analytics.log(event, properties: properties) }
+            })
+    }
+}
+```
+
+Step through who sees what, including a preview that never installs the live analytics:
+
+```visual flow
+title: One capability, three scopes and a preview
+layers:
+  - { label: App root, rows: [0, 0] }
+  - { label: Features, rows: [1, 2] }
+nodes:
+  - { id: root, label: AppRootView, kind: client, at: [1, 0] }
+  - { id: trips, label: Trips tab, kind: view, at: [0, 1] }
+  - { id: checkout, label: CheckoutFlow, kind: view, at: [2, 1] }
+  - { id: row, label: TripRow, kind: view, at: [0, 2] }
+  - { id: button, label: SaveTripButton, kind: view, at: [2, 2] }
+  - { id: preview, label: "#Preview", kind: actor, at: [4, 2] }
+edges:
+  - [root, trips]
+  - [root, checkout]
+  - [trips, row]
+  - [checkout, button]
+  - [preview, button, fakes]
+steps:
+  - say: "The root installs the live `track` action once. It's the only view that knows an analytics client exists."
+    show: [root]
+    state: { root: active }
+    label: { root: "live track" }
+  - say: "Both features inherit it. `TripRow` calls `track(\"trip_opened\")` without taking a parameter for it."
+    show: [trips, row, checkout]
+    send: [root->trips, trips->row, root->checkout]
+    label: { row: live }
+  - say: "Checkout **decorates** what it inherited with `transformEnvironment`: every event inside it gains `flow: checkout`. The Trips tab is unaffected."
+    state: { checkout: active }
+    label: { checkout: "+ flow tag" }
+  - say: "So the save button inside checkout tracks through the decorated action, and the live client underneath."
+    show: [button]
+    send: checkout->button
+    state: { checkout: null, button: ok }
+    label: { button: tagged }
+  - say: "A preview of the button installs a fake that collects events, or gets the reporting default if it installs nothing. Either way, no event reaches production."
+    show: [preview]
+    send: preview->button
+    state: { button: null, root: null }
+    label: { button: fake }
+```
+
+## Getting environment dependencies into a view model
+
+Here's the problem every SwiftUI-plus-MVVM codebase hits. A view model is a plain class and can't read the environment. The view can, but **only once it's installed in the hierarchy**: reading an `@Environment` property in the view's `init` gives you the default value, and SwiftUI logs `Accessing Environment<Value>'s value outside of being installed on a View. This will always read the default value and will not update.` So `_model = State(initialValue: TripModel(trips: trips))` in `init` silently wires the model to the default.
+
+There are three good ways round it:
+
+1. **Create the model once the environment exists**, in `.task`. The view holds an optional model and builds it with the environment's values:
+
+```swift check ios group=env title="Building a view model from environment dependencies"
+struct Trip: Sendable {
+    let id: String
+    let destination: String
+}
+
+struct TripsClient: Sendable {
+    var trip: @Sendable (String) async throws -> Trip
+
+    static let notInstalled = TripsClient { _ in throw URLError(.unsupportedURL) }
+}
+
+extension EnvironmentValues {
+    @Entry var tripsClient: TripsClient = .notInstalled
+}
+
+@MainActor @Observable final class TripModel {
+    private let tripID: String
+    private let trips: TripsClient
+    private let track: TrackAction
+    private(set) var trip: Trip?
+
+    init(tripID: String, trips: TripsClient, track: TrackAction) {
+        self.tripID = tripID
+        self.trips = trips
+        self.track = track
+    }
+
+    func load() async {
+        trip = try? await trips.trip(tripID)
+        track("trip_viewed", ["trip": tripID])
+    }
+}
+
+struct TripScreen: View {
+    let tripID: String
+    @Environment(\.tripsClient) private var trips
+    @Environment(\.track) private var track
+    @State private var model: TripModel?
+
+    var body: some View {
+        Group {
+            if let trip = model?.trip {
+                Text(trip.destination)
+            } else {
+                ProgressView()
+            }
+        }
+        // Runs once the view is in the hierarchy, so the environment is real; a new tripID builds a new model
+        .task(id: tripID) {
+            let model = TripModel(tripID: tripID, trips: trips, track: track)
+            self.model = model
+            await model.load()
+        }
+    }
+}
+```
+
+2. **Pass the capability per call**: the view reads `track` from the environment and calls `model.save(using: track)`. It's method injection, fed from the environment, and it suits capabilities only one or two actions need.
+3. **Don't read the environment for models at all.** The parent (ultimately the composition root) builds the model with initialiser injection, and the environment is reserved for leaf views. This is the most explicit option and the easiest to test; it costs a little plumbing.
+
+Mixing the three is normal. What doesn't work is a view model reaching for a global because the environment was awkward.
+
+## Environment objects as scoped services
+
+`.environment(basket)` with an `@Observable` object, read with `@Environment(BasketModel.self)`, is the environment's version of a scoped service. Installed at the root of the signed-in tree, as in [Scopes and lifetimes](/design/learn/sd-di-scopes), it's available to every view in the session and to nothing outside it.
+
+Unlike an `@Entry` value, an object has **no default**: a view that reads one nobody installed crashes. For a required dependency that's arguably better than silently using a fake, but it's still a run-time failure, not a compile-time one, and every preview of such a view must install it. A `PreviewModifier` trait (from [Previews as a design tool](/design/learn/sd-swiftui-previews)) installs it in one line. If a view genuinely works without the object, declare it optional, `@Environment(BasketModel.self) private var basket: BasketModel?`, and handle `nil`.
+
+## Where the environment stops
+
+The environment flows down one SwiftUI hierarchy, and some boundaries start a new one:
+
+- A **`UIHostingController`** you create in UIKit starts with a fresh environment: install your capabilities on its root view, ideally from one helper every hosting controller uses.
+- A **widget** or **App Intent snippet** is rendered in another process with its own hierarchy, so the app's root never installs anything there.
+- **UIKit code** inside SwiftUI reads the environment through the representable's `context.environment`, and can't see it at all once it's been handed to some other object.
+
+Each of those boundaries needs its own small installation step, which is the composition root again, at a smaller scale.
+
+## Trade-offs
+
+| Mechanism | Visible in the signature | If nothing provides it | Readable from view models | Scope | Wins when |
+| --- | --- | --- | --- | --- | --- |
+| Initialiser parameter | Yes | Compile error | Yes | Whatever the creator decides | The default for models and per-screen services |
+| `@Entry` capability | No | The default runs | No: pass it in or build the model in `.task` | The subtree that set it | Cross-cutting actions many views call |
+| Environment object | No | Crash (or `nil` if optional) | No | The subtree that set it | Session- or flow-scoped observable models |
+| Global or singleton | No | Always "works" | Yes | The process | Almost never in SwiftUI |
+
+<Callout kind="interview">
+
+**What to say:** "Initialisers for view models and services; the environment for capabilities that many views call, like image loading and analytics, each with a default that's safe but visible when it's missing; environment objects for session-scoped models, installed at the root of the signed-in tree. View models get environment dependencies through the view, in `.task` or per call, never by reading globals."
+
+**What to ask:** "How many views need this, and how deep are they? What should happen if it isn't installed: crash, do nothing, or warn?"
+
+**Red flags:** every service in the environment so nothing has initialisers; live defaults that make previews hit production; building view models in `init` from `@Environment` properties.
+
+</Callout>
+
+<Callout kind="gotcha" title="iOS gotcha: previews run your defaults">
+
+Xcode previews execute real code. A preview of a view whose `@Entry` default is the live analytics client sends events from your Mac to the production pipeline every time the canvas refreshes, and a live network default makes previews depend on the server being up. Make side-effecting defaults harmless, and give previews explicit fakes.
+
+</Callout>
+
+<Callout kind="gotcha" title="Swift gotcha: environment reads in init are always the default">
+
+Inside a view's `init`, `@Environment` properties aren't connected yet, so they return the default value, and SwiftUI warns in the console at run time rather than at build time. Anything built in `init` from them is wired to the default for good. Build environment-dependent models in `.task`, or receive the dependency as a parameter instead.
+
+</Callout>
+
+## Practice
+
+**Plan: move a 200-screen app from singletons to injection** has 80 SwiftUI screens: decide which of the app's services become environment capabilities, which become environment objects in the session scope, and which stay initialiser parameters.
+
+```cards
+- id: env-di-fit
+  front: "Which dependencies belong in the SwiftUI environment, and which in initialisers?"
+  back: "The environment: capabilities many views call at many depths, values with a natural default, and scoped observable models. Initialisers: what one screen's model needs, per-item data, anything a non-view type uses, and anything with no safe default."
+- id: env-di-defaults
+  front: "Why is a live default for an @Entry capability risky?"
+  back: "A forgotten install still 'works' in production, so nobody notices that previews and tests silently call real services. Install the live value at the root and make the default harmless but visible."
+- id: env-di-view-models
+  front: "How does a view model get a dependency that lives in the environment?"
+  back: "Through its view: build the model in `.task` once the environment is available, or pass the capability per call. Reading `@Environment` in the view's `init` always returns the default."
+```
+
+```quiz
+- id: q1
+  type: sort
+  prompt: "Environment or initialiser?"
+  buckets: [SwiftUI environment, Initialiser]
+  items:
+    - [An image-loading capability used by rows on every tab, 0]
+    - [The repository a trip detail model needs, 1]
+    - [A `track` action that buttons and rows call, 0]
+    - [The trip a row displays, 1]
+    - [The signed-in session's basket model, 0]
+    - [The API client a background sync engine uses, 1]
+  explain: "Capabilities and scoped models that many views read fit the environment. A model's repository, per-row data and anything outside the view tree go through initialisers."
+- id: q2
+  type: mcq
+  prompt: "`TripScreen.init` does `_model = State(initialValue: TripModel(trips: trips))`, where `trips` is an `@Environment` property. The root installs the live client, but the screen always shows the not-installed error. Why?"
+  options:
+    - "The root installed the client on the wrong view"
+    - "Environment properties aren't connected during `init`, so `trips` was the default when the model was built"
+    - "`@State` can't hold a model that uses the environment"
+    - "Environment values are copied lazily after the first frame"
+  answer: 1
+  explain: "SwiftUI connects environment properties when the view is installed, after `init`. Build the model in `.task`, where the environment is real, or pass the client in as a parameter."
+- id: q3
+  type: mcq
+  prompt: "Which default is best for an `@Entry var saveDraft: SaveDraftAction`?"
+  options:
+    - "The live implementation that writes to disk, so production works even if nobody installs it"
+    - "A no-op that also logs a fault, so previews are safe and a missing install is visible"
+    - "`fatalError()`, so a missing install is impossible to miss"
+    - "Whatever the last preview installed"
+  answer: 1
+  explain: "Saving is a side effect. A live default makes previews and tests write real files without anyone noticing; a crashing default breaks every preview. A reporting no-op is safe everywhere and still tells you when the root forgot."
+- id: q4
+  type: truefalse
+  prompt: "Installing an `@Observable` basket with `.environment(basket)` at the root of the signed-in tree makes it session-scoped: views outside that tree can't reach it."
+  answer: true
+  explain: "Environment values and objects apply to the subtree they're set on. When the signed-in tree is replaced at sign-out, nothing can read the old basket any more."
+- id: q5
+  type: recall
+  prompt: "Every event tracked inside the checkout flow should carry `flow: checkout`. How would you do it without changing any view inside checkout?"
+  model: "Decorate the inherited capability on the checkout flow's root view: `.transformEnvironment(\\.track) { track in let parent = track; track = TrackAction { event, properties in parent(event, properties + flow tag) } }`. Every view inside reads the decorated action; views elsewhere keep the original."
+```

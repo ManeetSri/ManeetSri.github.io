@@ -1,0 +1,303 @@
+## Why it matters
+
+Every object in your app needs other objects to do its job: a view model needs an API client, a repository needs a database, a scheduler needs the clock. *How* it gets them decides whether the object can be tested, previewed, reused in a widget, or safely thrown away when someone signs out. Dependency injection is the habit of handing objects what they need instead of letting them fetch it. It's in every mobile architecture interview, usually as "how would you test this?", and the answer reveals whether you design for change or bolt testability on afterwards.
+
+## Three ways to get a collaborator
+
+An object can get something it needs in only three ways:
+
+1. **Create it**: `let api = TripsAPI(session: URLSession.shared)` inside the view model.
+2. **Find it**: `TripsAPI.shared`, a global, or a lookup in a registry (a *service locator*).
+3. **Be given it**: the object declares the dependency, usually as an initialiser parameter, and someone else supplies it.
+
+Only the third is **dependency injection**. Martin Fowler named it in 2004, and James Shore summed it up as "a 25-dollar term for a 5-cent concept". The concept really is that small: *parameters instead of reaching out*. The rest of this module is about doing it well across a whole app.
+
+<Callout kind="analogy">
+
+A chef who grows their own vegetables, or drives to the market whenever an ingredient runs out, can only cook in one kitchen. A chef who is handed ingredients can cook anywhere: in the restaurant, at a tasting with sample portions, or in a cookery-school demo with plastic food. The recipe doesn't change; only who supplies the ingredients does.
+
+</Callout>
+
+## Before: an object that reaches out
+
+Here's a boarding-pass screen's model for a travel app. It refreshes the pass and, if departure is far enough away, schedules a check-in reminder three hours before:
+
+```swift check ios title="BoardingPassModel.swift (before)"
+import Foundation
+import UserNotifications
+
+struct BoardingPass: Codable, Sendable {
+    let tripID: String
+    let departure: Date
+}
+
+@MainActor final class BoardingPassModel {
+    private(set) var pass: BoardingPass?
+
+    func refresh(tripID: String) async throws {
+        let url = URL(string: "https://api.example.com/trips/\(tripID)/boarding-pass")!
+        let (data, _) = try await URLSession.shared.data(from: url)
+        let pass = try JSONDecoder().decode(BoardingPass.self, from: data)
+        self.pass = pass
+
+        let reminderTime = pass.departure.addingTimeInterval(-3 * 3600)
+        guard reminderTime > Date() else { return }
+        let content = UNMutableNotificationContent()
+        content.title = "Check in for \(tripID)"
+        let trigger = UNTimeIntervalNotificationTrigger(timeInterval: reminderTime.timeIntervalSinceNow, repeats: false)
+        try await UNUserNotificationCenter.current().add(UNNotificationRequest(identifier: tripID, content: content, trigger: trigger))
+    }
+}
+```
+
+It's tidy, and it works. Now try to check its one rule ("remind three hours before, unless that's already passed"):
+
+- A test needs the real network, a real server with a real trip, and notification permission on the simulator.
+- Testing "departure in one hour schedules nothing" means waiting for a real flight to be an hour away, because `Date()` is the real clock.
+- A SwiftUI preview of the screen calls the production API.
+- The widget can't reuse the model to show the pass, because the widget extension has no business scheduling notifications.
+- Staging is a different host, so testing against staging means editing this file.
+
+None of these is a bug in the code. They're all consequences of one choice: the model decides for itself where its data, its notifications and its time come from.
+
+## After: an object that's given what it needs
+
+Make the model *declare* its needs, in its own words, and accept them from outside:
+
+```swift run title="The same rule, tested in a world the test controls"
+import Foundation
+
+struct BoardingPass: Sendable {
+    let tripID: String
+    let departure: Date
+}
+
+protocol BoardingPassLoading: Sendable {
+    func boardingPass(for tripID: String) async throws -> BoardingPass
+}
+
+protocol ReminderScheduling: Sendable {
+    func remind(_ message: String, at date: Date) async
+}
+
+@MainActor final class BoardingPassModel {
+    private let passes: any BoardingPassLoading
+    private let reminders: any ReminderScheduling
+    private let now: @Sendable () -> Date
+    private(set) var pass: BoardingPass?
+
+    // Everything the model touches arrives here, so its signature tells the whole story
+    init(passes: any BoardingPassLoading, reminders: any ReminderScheduling, now: @escaping @Sendable () -> Date) {
+        self.passes = passes
+        self.reminders = reminders
+        self.now = now
+    }
+
+    func refresh(tripID: String) async throws {
+        let pass = try await passes.boardingPass(for: tripID)
+        self.pass = pass
+        let reminderTime = pass.departure.addingTimeInterval(-3 * 3600)
+        if reminderTime > now() {
+            await reminders.remind("Check in for \(tripID)", at: reminderTime)
+        }
+    }
+}
+
+// A test's world: a canned pass, reminders that are recorded, and a clock stopped at 09:00
+struct CannedPasses: BoardingPassLoading {
+    let departure: Date
+    func boardingPass(for tripID: String) async throws -> BoardingPass {
+        BoardingPass(tripID: tripID, departure: departure)
+    }
+}
+
+actor RecordedReminders: ReminderScheduling {
+    private(set) var scheduled: [String] = []
+    func remind(_ message: String, at date: Date) {
+        scheduled.append("\(message) at \(date.formatted(.iso8601))")
+    }
+}
+
+let nineAM = Date(timeIntervalSince1970: 1_767_258_000)   // 1 January 2026, 09:00 UTC
+let reminders = RecordedReminders()
+
+let earlyFlight = BoardingPassModel(passes: CannedPasses(departure: nineAM.addingTimeInterval(5 * 3600)), reminders: reminders, now: { nineAM })
+try await earlyFlight.refresh(tripID: "LIS-42")
+print(await reminders.scheduled)
+
+let soonFlight = BoardingPassModel(passes: CannedPasses(departure: nineAM.addingTimeInterval(3600)), reminders: reminders, now: { nineAM })
+try await soonFlight.refresh(tripID: "OPO-7")
+print("reminders after a flight in one hour:", await reminders.scheduled.count)
+```
+
+```output
+["Check in for LIS-42 at 2026-01-01T11:00:00Z"]
+reminders after a flight in one hour: 1
+```
+
+The rule hasn't changed, but now it runs in milliseconds, on a Mac, at any time of day you choose. In the app, the live implementations wrap `URLSession` and `UNUserNotificationCenter`, and `now` is `{ Date() }`. The model can't tell which world it's in, and that's the point.
+
+Notice what *didn't* change: there's still exactly one API client and one notification centre in the app. Injection doesn't multiply objects. It moves the decision about which object to use out of the code that uses it.
+
+## Three decisions, moved to one place
+
+Every dependency involves three decisions:
+
+| Decision | Before | With injection |
+| --- | --- | --- |
+| **Construction:** how is it built, with which settings? | Inside every user | Once, where the app starts |
+| **Choice:** which implementation, live, staging, fake or preview? | Hard-coded in every user | Whoever builds the graph |
+| **Lifetime:** how long does it live, and who shares it? | Accidental: forever for `.shared`, one call for a local | Deliberate: app, session, screen |
+
+Without injection, those decisions are scattered across hundreds of files, and changing one (say, a new staging host, or a cart that must be thrown away at sign-out) means finding them all. With injection they gather in one place, the **composition root**, which is a lesson of its own in this module.
+
+## An app is a graph of objects
+
+At runtime your app is a graph: each object points at the objects it uses. With injection, each initialiser parameter is an edge of that graph, written in the code where anyone can read it. Building the app means building the graph from the leaves up, because an object can only be created once everything it needs exists. That's a topological order of a directed acyclic graph, exactly as in [DAGs and topological order](/dsa/learn/topo-dags), and a dependency cycle is as much a bug here as it is there.
+
+```visual flow
+title: Who builds the boarding-pass graph?
+nodes:
+  - { id: model, label: BoardingPassModel, kind: view, at: [0, 1] }
+  - { id: api, label: Passes API, kind: service, at: [2, 0] }
+  - { id: reminders, label: Reminders, kind: service, at: [2, 2] }
+  - { id: session, label: URLSession, kind: external, at: [4, 0] }
+  - { id: center, label: Notification centre, kind: external, at: [4, 2] }
+  - { id: root, label: Composition root, kind: client, at: [4, 1] }
+edges:
+  - [model, session, .shared]
+  - [model, center, .current()]
+  - [api, session, uses]
+  - [reminders, center, uses]
+  - [root, api, builds]
+  - [root, reminders, builds]
+  - [root, model, injects]
+steps:
+  - say: "**Before:** the model reaches straight for `URLSession.shared` and the notification centre. The graph exists, but it's hidden inside method bodies."
+    show: [model, session, center]
+    send: [model->session, model->center]
+    state: { model: error }
+  - say: "**After:** the composition root builds the leaves first: an API client over `URLSession`, a reminders service over the notification centre."
+    reset: true
+    show: [root, api, reminders, session, center, api->session, reminders->center]
+    send: [root->api, root->reminders]
+    state: { root: active }
+  - say: "Then it builds the model, handing it the two services and a clock. Every edge of the graph is now an initialiser parameter."
+    show: [model]
+    send: root->model
+    state: { root: null, model: ok }
+  - say: "A test or a preview is a different root: it builds the same model from fakes. The model's code never changes."
+    active: [model]
+```
+
+## Services are injected; values are created
+
+Not everything should be injected. Miško Hevery's distinction between **injectables** and **newables** draws the line:
+
+- **Injectables** are services: objects with behaviour that touch the outside world or hold shared state. API clients, repositories, stores, analytics, the clock, view models. They arrive through initialisers, and their implementations vary between the app, tests and previews.
+- **Newables** are values and entities: `BoardingPass`, `Trip`, `Money`, `URLRequest`, a view-state enum. Any code may create them with an ordinary initialiser, from data. They never hold services.
+
+The rule that falls out is short and catches a lot of design mistakes: **a newable must not need an injectable.** If `Trip` has a `cancel()` method that calls the API, a `Trip` can no longer be decoded in a widget, built in a test or compared for equality without the networking stack. Move `cancel` to a service that takes a `Trip`. You'll see this smell in this module's review, where a `Decodable` model reaches into a service locator.
+
+Some things need neither: stable, pure helpers like `JSONDecoder`, `Calendar` arithmetic with an explicit time zone, or your own pricing function can be used directly. [Dependency inversion](/design/learn/sd-solid-dip) drew that line: inject what's volatile, slow, side-effecting or non-deterministic.
+
+## What it costs
+
+Injection isn't free, and it's worth being honest about the bill:
+
+- **More parameters.** An initialiser that takes eight dependencies is noisy. It's also telling you the type does too much: injection didn't create the problem, it made it visible.
+- **Wiring code.** Someone has to build the graph. In a large app that's real code, and the rest of this module is about keeping it manageable.
+- **Indirection.** "Which `BoardingPassLoading` is this?" means a jump to the composition root instead of reading one line. Clear names and one obvious root keep the jump short.
+- **Over-abstraction.** A protocol in front of every type, each with exactly one conformer, adds files without adding options. Put protocols where you need a second implementation (a fake, a preview, a different platform); concrete types are fine elsewhere.
+
+DI is also not a framework. Everything above is plain Swift, and hand-wiring an app without any library (sometimes called **pure DI**) is a perfectly good way to work. Containers are a tool you may add later, with trade-offs of their own.
+
+## Trade-offs
+
+| How the object gets it | Dependencies visible | Tests and previews | Lifetime control | Fails when | Wins when |
+| --- | --- | --- | --- | --- | --- |
+| Creates it | No | Can't substitute | One per user, accidentally | A second copy breaks shared state | Values, and pure helpers |
+| Finds it (singleton, global, locator) | No | Only by mutating a global | Process lifetime | Tests interfere; data outlives the user | Truly global, stateless facilities |
+| Is given it (injection) | Yes, in the signature | Pass a fake | Whoever builds it decides | Someone forgets to wire it (a compile error) | Services: anything volatile, stateful or slow |
+
+<Callout kind="interview">
+
+**What to say:** "I inject anything volatile, slow or stateful, through the initialiser, as a protocol the consumer owns. One place, the composition root, builds the real graph; tests and previews build their own." Then name a concrete payoff: the clock injected so "expires in 30 days" is testable, or a session-scoped object thrown away at sign-out.
+
+**What to ask:** "How is this tested today? Does anything need to differ between the app, the widget and previews? Does any of this state belong to one signed-in user?"
+
+**Red flags:** saying "we use a DI framework" as if that were the design; injecting `JSONDecoder` and value types while the network stays a singleton; and a model type that performs its own network calls.
+
+</Callout>
+
+<Callout kind="gotcha" title="iOS gotcha: the frameworks create some of your objects">
+
+You can't add initialiser parameters to objects that iOS creates for you: the app and scene delegates, view controllers instantiated from a storyboard through `init(coder:)`, a widget's timeline provider, an App Intent, an extension's principal class. Injection starts at the **first object you create yourself**, and each of those entry points needs a small bridge. The next lesson shows the bridges UIKit gives you, and the composition root lesson shows where the graph begins.
+
+</Callout>
+
+## Practice
+
+**A composition root for a reading app** is the after picture at app scale: every building block is written, and you wire them, choosing implementations from a config and letting tests swap a single dependency. **Review: the locator inside the models** shows what happens when objects *find* their dependencies instead of being given them.
+
+```cards
+- id: di-three-ways
+  front: "What are the three ways an object can get a collaborator, and which one is dependency injection?"
+  back: "Create it, find it (a singleton, global or locator), or be given it. Only being given it, usually through the initialiser, is injection."
+- id: di-three-decisions
+  front: "Which three decisions does injection move out of the objects that use a dependency?"
+  back: "How it's constructed, which implementation is used (live, staging, fake, preview), and how long it lives and who shares it."
+- id: di-newables
+  front: "What's the difference between an injectable and a newable?"
+  back: "Injectables are services (API clients, stores, view models) and arrive through initialisers. Newables are values and entities that any code creates from data. A newable must never need an injectable."
+```
+
+```quiz
+- id: q1
+  type: sort
+  prompt: "How should a `TripDetailModel` get each of these?"
+  buckets: [Inject it, Create it where needed]
+  items:
+    - [The API client that loads the trip, 0]
+    - ["The current time, used to show \"departs in 3 hours\"", 0]
+    - [A `URLRequest` for one call, 1]
+    - [The `Trip` value it displays, 1]
+    - [The analytics service, 0]
+    - [A `Money` value for the fare, 1]
+  explain: "Services that touch the network, the clock or shared state are injected so tests and previews can replace them. Values like requests, trips and money are newables: built from data wherever they're needed."
+- id: q2
+  type: mcq
+  prompt: "A teammate says: \"We don't need DI. We already have one `APIClient.shared`, so there's only one instance anyway.\" What's the best reply?"
+  options:
+    - "They're right: DI is about having one instance"
+    - "One instance is fine; the problem is that every caller *finds* it, so nothing can substitute it and its lifetime is the whole process"
+    - "Singletons are always wrong and must be deleted"
+    - "DI requires a container, so they'd need to add one first"
+  answer: 1
+  explain: "Injection keeps the single instance, created once at the root, and removes global access: callers declare the dependency, tests pass a fake, and the root decides how long it lives."
+- id: q3
+  type: multi
+  prompt: "Which of these does injecting `BoardingPassModel`'s dependencies make possible? Choose all that apply."
+  options:
+    - "Testing the three-hour rule without waiting for a real flight"
+    - "A SwiftUI preview that never calls the production API"
+    - "Pointing the model at staging without editing it"
+    - "Making the network faster"
+    - "Reusing the model's loading in a widget with a reminders service that does nothing"
+  answer: [0, 1, 2, 4]
+  explain: "Each of those is a different set of dependencies for the same model: a fixed clock, a fake API, a staging client, a no-op reminders service. Injection changes where decisions are made, not how fast anything runs."
+- id: q4
+  type: mcq
+  prompt: "`struct Trip: Codable` gains a method `func cancel() async throws`, which calls `TripsAPI.shared`. What's the main design problem?"
+  options:
+    - "Structs can't have async methods"
+    - "A value type now depends on a service, so a `Trip` can't be used in a widget, a test or a preview without the networking stack"
+    - "It should use `URLSession.shared` directly instead"
+    - "`Codable` types can't call APIs"
+  answer: 1
+  explain: "`Trip` is a newable: data that any layer should be able to create and pass around. Cancelling is a service's job, such as a `TripsService.cancel(_:)` that takes the trip, and that service is what gets injected."
+- id: q5
+  type: recall
+  prompt: "An initialiser now takes nine dependencies. Is that a problem with dependency injection? What would you do?"
+  model: "Not with injection: injection made an existing problem visible. A type that needs nine collaborators probably has several responsibilities. Look for clusters of parameters used together and split the type along them, or group closely related services behind one role (a facade) if they really form one concept. Don't hide them in a container or a locator to make the list shorter."
+```

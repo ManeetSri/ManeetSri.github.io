@@ -1,0 +1,139 @@
+<Brief>
+
+A food delivery app replaced its singletons with a home-grown `Services` locator two years ago, "so everything is testable". The order history tab below is typical of its 120 screens. Support reports that after someone signs out and a partner signs in on the same phone, the tab can show the first person's orders. The order-status widget crashes on launch, nobody can open this screen's preview, and the tests pass alone but fail together. Review it as you would a pull request: what's wrong, what matters most, and how you'd fix it.
+
+```swift check ios title="OrderHistory.swift"
+import SwiftUI
+
+protocol OrdersAPI: Sendable {
+    func orders(for userID: String) async throws -> [Order]
+    func reorder(_ orderID: String) async throws
+}
+
+protocol Analytics: Sendable { func track(_ event: String) }
+
+struct Session: Sendable { let userID: String }
+
+/// Filled at launch, and again whenever someone signs in; resolved wherever a service is needed
+@MainActor final class Services {
+    static let shared = Services()
+    private var factories: [String: () -> Any] = [:]
+
+    func register<T>(_ type: T.Type, factory: @escaping () -> T) {
+        factories[String(describing: type)] = factory
+    }
+
+    func resolve<T>(_ type: T.Type = T.self) -> T {
+        factories[String(describing: type)]!() as! T
+    }
+
+    func registerLive(session: Session, api: any OrdersAPI, analytics: any Analytics) {
+        register(Session.self) { session }
+        register((any OrdersAPI).self) { api }
+        register((any Analytics).self) { analytics }
+    }
+}
+
+struct Order: Identifiable, Decodable, Sendable {
+    let id: String
+    let totalPence: Int
+
+    @MainActor func reorder() async throws {
+        let api: any OrdersAPI = Services.shared.resolve()
+        try await api.reorder(id)
+        Services.shared.resolve((any Analytics).self).track("reorder:\(id)")
+    }
+}
+
+@MainActor @Observable final class OrderHistoryModel {
+    private(set) var orders: [Order] = []
+    private let api: any OrdersAPI = Services.shared.resolve()
+    private let session: Session = Services.shared.resolve()
+    @ObservationIgnored private lazy var analytics: any Analytics = Services.shared.resolve()
+
+    func load() async {
+        orders = (try? await api.orders(for: session.userID)) ?? []
+        analytics.track("order_history_viewed")
+    }
+}
+
+struct OrderHistoryView: View {
+    @State private var model = OrderHistoryModel()
+
+    var body: some View {
+        List(model.orders) { order in
+            Button("Order \(order.id)") {
+                Task { try? await order.reorder() }
+            }
+        }
+        .task { await model.load() }
+    }
+}
+
+#Preview {
+    OrderHistoryView()
+}
+```
+
+</Brief>
+
+```workspace
+template: critique
+minutes: 25
+```
+
+```findings
+- id: stale-session
+  title: View models keep whichever session was registered when they were created
+  severity: high
+  lines: "25-29, 45-51, 56"
+  detail: "`api` and `session` are resolved once, when the model is created, and the tab's `@State` model lives as long as the tab. Signing in as someone else calls `registerLive` again, but the existing model still holds the first `Session` and loads the first person's orders: the privacy bug support sees. `analytics` is `lazy`, so it comes from whatever was registered at the first `load()`, and one object can mix two people's services. The registry has no idea what a session's lifetime is, so nothing is thrown away at sign-out."
+- id: crash-on-missing
+  title: Any entry point that didn't register first crashes on its first resolve
+  severity: high
+  lines: "21-23, 68-70"
+  detail: "`resolve` force-unwraps the factory and force-casts the result. The preview, the widget extension, an App Intent, a unit test, or a screen that appears before `registerLive` has run all crash at run time, on whichever line happens to resolve first. The compiler can't help, because no signature says what must be registered."
+- id: hidden-dependencies
+  title: The view model's needs are invisible, so tests must mutate a global
+  severity: high
+  lines: "43-47, 56"
+  detail: "`OrderHistoryModel()` takes nothing, so its API client, session and analytics can only be found by reading its body. A test has to register fakes into `Services.shared`, which every test shares. Swift Testing runs tests in parallel, so one test's fake session is another test's real one, which is why the tests pass alone and fail together. And because `@State`'s initial value is evaluated every time the view struct is created, every re-creation builds and discards another model, resolving everything again."
+- id: entity-locator
+  title: A Decodable value type reaches into the locator to perform side effects
+  severity: medium
+  lines: "32-40"
+  detail: "`Order` should be plain data that any layer can create and use. Instead it resolves an API client and analytics to reorder itself, so a widget or a background task can't touch orders without the registry, `reorder()` is pinned to the main actor, and a test of anything that holds orders needs the whole app wired. Reordering belongs in the view model, or a small use case, with the API and analytics injected."
+- id: string-keys
+  title: Keys built from type names collide, and break on small type changes
+  severity: medium
+  lines: "17-23, 37, 45"
+  detail: "`String(describing:)` drops the module, so a `Checkout.Analytics` protocol and this `Analytics` share the key \"Analytics\", and whichever registered last wins. Lookups that infer the type from an annotation are fragile too: change `let api: any OrdersAPI` to `(any OrdersAPI)?` and the key becomes \"Optional<OrdersAPI>\", which nobody registered, so it crashes."
+- id: main-actor-registry
+  title: A main-actor registry drags everything that resolves onto the main actor
+  severity: medium
+  lines: "13, 36"
+  detail: "Because `Services` is `@MainActor`, `Order.reorder()` had to become `@MainActor` too, and any background work (a sync engine, a notification service extension) that needs a service must hop to the main thread to get one. An injected dependency carries its own isolation; a global registry imposes its isolation on every caller."
+- id: swallowed-errors
+  title: Failures look like an empty history, and failed reorders vanish
+  severity: low
+  lines: "50, 61"
+  detail: "`try?` turns an offline or expired-token error into \"you have no orders\", and a failed reorder into nothing at all. Once the API is injected, these paths are easy to test with a failing fake, so model them as an error state."
+```
+
+<ReferenceReview>
+
+**Most important first.** The stale-session bug is a privacy problem, not a style issue: the screen can show one person's order history to another. It comes from mixing lifetimes in a global registry. The tab's model is created once and resolves the session at that moment, while the registry is quietly re-filled at every sign-in. The crashes come from the same design: nothing in any signature says what must be registered, so every entry point that forgets crashes at run time.
+
+**The underlying problem** is that the locator is a service locator, not dependency injection. Objects *pull* their dependencies from a global whenever they like, so dependencies are invisible, lifetimes are accidental and tests share state. Moving the same calls into a container wouldn't fix it; moving the *pulling* into one place would.
+
+**How I'd fix it, in small steps:**
+
+1. **Make the model honest.** Give `OrderHistoryModel` an initialiser that takes `api`, `session` (or only the user ID) and `analytics`. Keep a temporary convenience `init()` that resolves from `Services` and calls it, so the 120 screens still compile; new code and tests use the real initialiser.
+2. **Strip services out of `Order`.** Move `reorder` into the view model (or a small `ReorderUseCase`) with the injected API and analytics. `Order` goes back to being plain data that a widget can decode and show.
+3. **Give the session a real scope.** Build a `SignedInDependencies` value at sign-in that holds the session, the API client for that user and the analytics, and root the signed-in UI in it: `.id(session.userID)` on the signed-in root, or a fresh scene of views, so every model is rebuilt when the user changes. Sign-out drops the whole value.
+4. **Wire at the composition root.** The `App` builds the app-wide services; the sign-in flow builds the session scope; screens receive what they need through initialisers or the SwiftUI environment. The preview and the widget get their own small roots with fakes or read-only services.
+5. **Shrink the locator to the edges, then delete it.** While it exists, make `resolve` throw (or return an optional) instead of crashing, key it by `ObjectIdentifier`, and allow it only in files at framework-created entry points. Add a lint rule against `Services.shared` elsewhere and burn the count down screen by screen.
+
+**Tests to add:** the view model with a fake API for loaded, empty and failed states; a sign-out then sign-in test asserting that the new session's model loads only the new user's orders; and a smoke test that builds the live composition root and the widget's root without crashing.
+
+</ReferenceReview>

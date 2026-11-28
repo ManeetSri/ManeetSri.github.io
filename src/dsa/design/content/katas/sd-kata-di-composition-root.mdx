@@ -1,0 +1,80 @@
+Shelf is a reading app with two screens so far: the library and a book's page. Every building block is written: an API client for the shelf, an in-memory cache, batched analytics, a no-op analytics, and the two screen models. What's missing is the **composition root**: the one class that reads the launch configuration, picks an implementation for every role, decides which instances are shared, and hands each screen a fresh model. Tests must be able to swap one dependency and keep the rest live.
+
+`DIShelfCompositionRoot.AppRoot`, with `init(config:overrides:)`, `baseURL`, `makeLibraryModel()` and `makeBookDetailModel(for:)`
+
+- `baseURL` is `https://api.shelf.example` in production and `https://staging.api.shelf.example` on staging.
+- The network is `overrides.http` if a test gave one, otherwise `URLSession.shared` (DesignKit makes it an `HTTPClient`).
+- The shelf comes from **one** `BookAPI` (with the config's token) behind **one** `CachedBooks`, shared by every library screen, so the shelf is fetched once per launch.
+- Analytics is `overrides.analytics` if given. Otherwise it's **one** `BatchedAnalytics`, on the same network and base URL, shared by every screen; or `NoAnalytics` when `config.analyticsEnabled` is false.
+- `makeLibraryModel()` and `makeBookDetailModel(for:)` return a new model on every call, wired to the shared services.
+
+## Examples
+
+| Config and overrides | What happens |
+| --- | --- |
+| staging, `http` stubbed | the library loads from `https://staging.api.shelf.example/books` |
+| token `"t-42"` | `GET /books` carries `Authorization: Bearer t-42`; with no token, no header |
+| two library screens load | one `GET /books` |
+| library loads, then two book screens open | one `POST /events` with `library_viewed`, `book_opened:1` and `book_opened:2` |
+| `analyticsEnabled: false` | no `POST /events`, however many screens open |
+| `analytics` overridden with a recorder | the recorder gets every event; nothing is posted |
+
+## Constraints
+
+- The root is `@MainActor`, like the screen models it makes.
+- Build the shared services once, in `init`; the tests check sharing by behaviour (one fetch, one batch), not by identity.
+- Don't change the building blocks or the models. All the wiring belongs in `AppRoot`.
+
+<Hints>
+<Hint>
+Three stored properties cover everything that's shared: the base URL, the shelf loader (`any BookLoading`) and the analytics (`any AnalyticsLogging`).
+</Hint>
+<Hint>
+`overrides.http ?? URLSession.shared` gives you the network for both the shelf and the analytics, so a test that swaps only the network still exercises the live analytics.
+</Hint>
+<Hint>
+If `make…` builds a new `CachedBooks` or `BatchedAnalytics`, every screen gets its own cache and its own half-empty batch. Build them in `init` and pass the same instances to every model.
+</Hint>
+</Hints>
+
+## Solutions
+
+<Approach title="Decide once in init, share through stored properties" time="O(1) per screen" space="O(1) beyond the shared services">
+
+```swift
+@MainActor public final class AppRoot {
+    public let baseURL: URL
+    private let books: any BookLoading
+    private let analytics: any AnalyticsLogging
+
+    public init(config: Config, overrides: Overrides = Overrides()) {
+        baseURL = switch config.environment {
+        case .production: URL(string: "https://api.shelf.example")!
+        case .staging: URL(string: "https://staging.api.shelf.example")!
+        }
+        let http = overrides.http ?? URLSession.shared
+        books = CachedBooks(source: BookAPI(http: http, baseURL: baseURL, token: config.authToken))
+        if let analytics = overrides.analytics {
+            self.analytics = analytics
+        } else if config.analyticsEnabled {
+            analytics = BatchedAnalytics(http: http, baseURL: baseURL)
+        } else {
+            analytics = NoAnalytics()
+        }
+    }
+
+    public func makeLibraryModel() -> LibraryModel {
+        LibraryModel(loader: books, analytics: analytics)
+    }
+
+    public func makeBookDetailModel(for book: Book) -> BookDetailModel {
+        BookDetailModel(book: book, analytics: analytics)
+    }
+}
+```
+
+The root is short, and that's the point: it's the one place that knows `BookAPI`, `CachedBooks`, `BatchedAnalytics` and `URLSession` exist. Everything below it depends on two protocols. Two kinds of lifetime appear without any container: **stored properties** are app-lifetime singletons, and **factory methods** make a transient per screen. Overrides replace the **leaves** of the graph (the network, analytics), never the middle, so a test that swaps the network still runs the real cache, the real batching and the real request building.
+
+In an app, `AppRoot` is created by the `App` struct (or the scene delegate) and handed to the navigation layer, which calls `make…` as screens appear. A signed-in session would be a second, shorter-lived root that the app root creates at sign-in, holding the token and anything per-user. If services were expensive to build, `lazy var`s would defer them to first use without changing the shape.
+
+</Approach>

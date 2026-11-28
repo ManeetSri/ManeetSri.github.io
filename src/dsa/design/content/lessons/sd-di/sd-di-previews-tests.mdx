@@ -1,0 +1,365 @@
+## Why it matters
+
+Dependency injection pays for itself in tests and previews: they're where you swap the real world for a controlled one. But "we use protocols, so it's testable" is only the start. Fakes drift away from the real implementations, tests that share one graph interfere when Swift Testing runs them in parallel, UI tests can't inject objects at all, and hosted unit tests quietly launch your production app first. This lesson treats every test, preview and UI test as a **composition root of its own**, and shows how to make each one fast, isolated and honest. Interviewers ask "how do you test this?" about almost every design, and an answer that covers doubles, isolation and UI-test wiring stands out.
+
+## One feature, many roots
+
+The app has one composition root per process. Everything that runs your code outside the app has one too, and each wants different leaves:
+
+| Root | Built by | Needs | Must never |
+| --- | --- | --- | --- |
+| The app | `App` struct or delegates | Live services, chosen by configuration | Know about fakes |
+| A unit test | Each test, or each suite instance | Fast doubles that fail on unexpected calls | Touch the network, disk or shared state |
+| A preview | The `#Preview` body or a `PreviewModifier` | Realistic sample data, one preview per state | Call real servers or send analytics |
+| A UI test | The app, reading launch arguments | The real app with stubbed network responses | Depend on a live backend's data |
+| A snapshot test | The test | Fixed clock, locale, Dynamic Type and fixtures | Vary between runs |
+
+```visual flow
+title: One feature, four composition roots
+nodes:
+  - { id: feature, label: CheckoutModel, kind: view, at: [2, 1] }
+  - { id: app, label: App root, kind: client, at: [0, 0] }
+  - { id: test, label: Unit test, kind: actor, at: [4, 0] }
+  - { id: preview, label: "#Preview", kind: actor, at: [0, 2] }
+  - { id: uitest, label: UI test, kind: actor, at: [4, 2] }
+edges:
+  - [app, feature, live client]
+  - [test, feature, spy + stub]
+  - [preview, feature, sample data]
+  - [uitest, feature, stubbed network]
+steps:
+  - say: "The feature declares what it needs and nothing more. It's the same code in every case below."
+    show: [feature]
+  - say: "The **app root** gives it the live payments client, chosen by configuration."
+    show: [app]
+    send: app->feature
+  - say: "A **unit test** builds its own tiny graph: a stub that returns a declined card and a spy that records what was tracked. Every test gets a fresh one."
+    show: [test]
+    send: test->feature
+  - say: "A **preview** passes sample data for one state: declined, slow, succeeded. Nothing leaves the Mac."
+    show: [preview]
+    send: preview->feature
+  - say: "A **UI test** can't pass objects into another process, so it passes **configuration**: a launch argument that makes the app's own root wire a stubbed network."
+    show: [uitest]
+    send: uitest->feature
+    state: { feature: ok }
+```
+
+## Choosing a test double
+
+Gerard Meszaros's names for test doubles are worth using precisely, because each answers a different question:
+
+| Double | What it does | Use it for | Swift shape |
+| --- | --- | --- | --- |
+| **Dummy** | Fills a parameter; never used | A dependency the test doesn't touch | `NoAnalytics()`, or a closure that does nothing |
+| **Stub** | Returns canned answers | Queries: "given the API returns X, the screen shows Y" | A struct whose closure returns a fixture |
+| **Spy** | Records how it was called | Commands: "tapping Pay sends exactly one charge" | An actor or `@MainActor` class with a `calls` array |
+| **Fake** | A working, simplified implementation | Stateful collaborators: an in-memory store, a fake clock | `InMemoryTripStore`, `TestClock` |
+| **Mock** | Pre-programmed with expectations it verifies | Rarely needed in Swift | Usually a spy plus `#expect` reads better |
+
+Two rules of thumb follow. **Stub queries, spy on commands**: assert on what the code returned for reads, and on what it sent for writes. And reach for a **fake** when operations share state and must agree, since a stubbed `save` with an unrelated stubbed `load` describes no real store.
+
+Swift has no runtime proxy objects, so there's no mainstream mocking framework; hand-written doubles are normal, and with closure-based clients they're one line each.
+
+## Doubles that fail loudly
+
+A test that doesn't expect a dependency to be used should **fail** if it is, rather than quietly pass. Give each client a "failing" value whose every endpoint records a test issue, and override only what the test expects:
+
+```swift check title="A client whose test value fails on any unexpected call"
+import Foundation
+import Testing
+
+struct Trip: Equatable, Sendable {
+    let id: String
+    let departure: Date
+}
+
+struct TripsClient: Sendable {
+    var upcoming: @Sendable () async throws -> [Trip]
+    var cancel: @Sendable (String) async throws -> Void
+}
+
+extension TripsClient {
+    /// Every endpoint records an issue: a test overrides exactly the ones it expects
+    static let failing = TripsClient(
+        upcoming: {
+            Issue.record("TripsClient.upcoming wasn't expected")
+            return []
+        },
+        cancel: { _ in Issue.record("TripsClient.cancel wasn't expected") }
+    )
+}
+
+@MainActor final class UpcomingTripsModel {
+    private let client: TripsClient
+    private let now: @Sendable () -> Date
+    private(set) var trips: [Trip] = []
+
+    init(client: TripsClient, now: @escaping @Sendable () -> Date) {
+        self.client = client
+        self.now = now
+    }
+
+    func load() async throws {
+        let all = try await client.upcoming()
+        trips = all.filter { $0.departure > now() }.sorted { $0.departure < $1.departure }
+    }
+}
+
+@MainActor @Suite struct UpcomingTripsModelTests {
+    let nine = Date(timeIntervalSince1970: 1_767_258_000)
+
+    @Test func hidesTripsThatHaveLeftAndSortsTheRest() async throws {
+        let later = Trip(id: "OPO", departure: nine.addingTimeInterval(7200))
+        let sooner = Trip(id: "LIS", departure: nine.addingTimeInterval(3600))
+        let gone = Trip(id: "MAD", departure: nine.addingTimeInterval(-3600))
+        var client = TripsClient.failing
+        client.upcoming = { [later, gone, sooner] }
+
+        let model = UpcomingTripsModel(client: client, now: { [nine] in nine })
+        try await model.load()
+
+        #expect(model.trips == [sooner, later])
+        // Loading never cancels anything: if it ever did, `cancel` would record an issue
+    }
+}
+```
+
+The test now states the feature's whole contract with the outside world: it reads upcoming trips and does nothing else. If a later change starts cancelling stale trips during load, this test fails and says why.
+
+## Every test builds its own world
+
+Swift Testing runs tests **in parallel** by default and creates **a new instance of the suite for every test**. That suits injection perfectly: put each test's dependencies in the suite's stored properties (or build them in the test), and every test gets a fresh graph with nothing to reset. The things that break isolation are the things that aren't injected: a `static` property, a singleton, `UserDefaults.standard`, a file at a fixed path, `Container.shared`. If a suite needs `.serialized` to pass, that's a sign some dependency is still global.
+
+A small **test composition root** keeps tests short as features grow: a function that builds the feature with harmless defaults and lets each test override the one or two things it cares about. You built one in this module's composition-root kata, where tests swap the network or the analytics and keep everything else live.
+
+## Fakes must agree with reality
+
+A fake is only useful while it behaves like the real thing, and fakes drift: the real store starts sorting by departure, the fake doesn't, and every test that uses the fake now checks behaviour that doesn't exist. The fix is a **contract test**: one set of checks, run against the fake *and* the real implementation:
+
+```swift run title="One contract, run against the fake and the real store"
+import Foundation
+
+struct Trip: Codable, Equatable, Sendable {
+    let id: String
+    let departure: Int
+}
+
+protocol TripStore {
+    func save(_ trip: Trip) throws
+    func all() throws -> [Trip]
+}
+
+/// The fake: quick, in memory, and quietly out of date
+final class InMemoryTripStore: TripStore {
+    private var trips: [Trip] = []
+    func save(_ trip: Trip) { trips.append(trip) }
+    func all() -> [Trip] { trips }
+}
+
+/// The real store: a JSON file, sorted by departure, as the app relies on
+final class FileTripStore: TripStore {
+    private let url: URL
+
+    init(directory: URL) {
+        url = directory.appending(path: "trips.json")
+    }
+
+    func save(_ trip: Trip) throws {
+        let trips = (try all()) + [trip]
+        try JSONEncoder().encode(trips.sorted { $0.departure < $1.departure }).write(to: url, options: .atomic)
+    }
+
+    func all() throws -> [Trip] {
+        guard let data = try? Data(contentsOf: url) else { return [] }
+        return try JSONDecoder().decode([Trip].self, from: data)
+    }
+}
+
+/// The contract every TripStore must meet
+func checkContract(_ name: String, _ makeStore: () throws -> any TripStore) throws {
+    let store = try makeStore()
+    try store.save(Trip(id: "OPO", departure: 20))
+    try store.save(Trip(id: "LIS", departure: 10))
+    let ids = try store.all().map(\.id)
+    let keepsEverything = Set(ids) == ["OPO", "LIS"]
+    let sortedByDeparture = ids == ["LIS", "OPO"]
+    print("\(name): keeps every trip \(keepsEverything ? "ok" : "FAILED"); sorted by departure \(sortedByDeparture ? "ok" : "FAILED")")
+}
+
+let folder = FileManager.default.temporaryDirectory.appending(path: UUID().uuidString)
+try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+defer { try? FileManager.default.removeItem(at: folder) }
+
+try checkContract("InMemoryTripStore") { InMemoryTripStore() }
+try checkContract("FileTripStore") { FileTripStore(directory: folder) }
+```
+
+```output
+InMemoryTripStore: keeps every trip ok; sorted by departure FAILED
+FileTripStore: keeps every trip ok; sorted by departure ok
+```
+
+In a real suite the contract is a parameterised Swift Testing test, `@Test(arguments:)` over the store factories, and it runs on every pull request. The real store's half can run against a temporary directory or an in-memory SQLite database, so it stays fast.
+
+## Previews are roots too
+
+A preview is a composition root that renders instead of asserting. Everything from [Previews as a design tool](/design/learn/sd-swiftui-previews) applies, and injection is what makes it work: one preview per state through a configurable fake, a `PreviewModifier` that installs shared environment objects once, sample data kept out of the release build. Three habits keep previews honest:
+
+- **Preview values are explicit.** If a dependency has a preview implementation (swift-dependencies' `previewValue`, Factory's `.onPreview`, or your own `.preview` static), every preview uses it, and the default is never the live service.
+- **Previews show states, tests check rules.** A preview of a declined card shows what the user sees; a unit test proves the decline happened for the right reason.
+- **Production views carry no preview code.** If a view needs `#if DEBUG` branches to be previewable, its dependencies aren't injected yet.
+
+## UI tests: inject configuration, not objects
+
+A UI test drives your app in **another process**, so it can't hand the app a fake. What it can pass is configuration, through launch arguments and the launch environment, and the app's own composition root turns that configuration into a wiring:
+
+```swift check ios title="The UI test chooses a scenario; the app's root wires it"
+import UIKit
+import XCTest
+
+/// Answers every request with the response for the scenario the UI test chose
+final class ScenarioURLProtocol: URLProtocol {
+    override class func canInit(with request: URLRequest) -> Bool { true }
+    override class func canonicalRequest(for request: URLRequest) -> URLRequest { request }
+
+    override func startLoading() {
+        let declined = ProcessInfo.processInfo.environment["STUB_SCENARIO"] == "card-declined"
+        let response = HTTPURLResponse(url: request.url!, statusCode: declined ? 402 : 200, httpVersion: nil, headerFields: nil)!
+        let body = declined ? #"{"error":"card_declined"}"# : #"{"status":"paid"}"#
+        client?.urlProtocol(self, didReceive: response, cacheStoragePolicy: .notAllowed)
+        client?.urlProtocol(self, didLoad: Data(body.utf8))
+        client?.urlProtocolDidFinishLoading(self)
+    }
+
+    override func stopLoading() {}
+}
+
+/// In the app's composition root: the one place that reacts to UI-test configuration
+func makeURLSession(arguments: [String] = ProcessInfo.processInfo.arguments) -> URLSession {
+    let configuration = URLSessionConfiguration.default
+    if arguments.contains("-ui-testing") {
+        configuration.protocolClasses = [ScenarioURLProtocol.self]
+    }
+    return URLSession(configuration: configuration)
+}
+
+/// In the UI test target
+final class CheckoutUITests: XCTestCase {
+    @MainActor func testDeclinedCardShowsAnError() {
+        let app = XCUIApplication()
+        app.launchArguments = ["-ui-testing"]
+        app.launchEnvironment["STUB_SCENARIO"] = "card-declined"
+        app.launch()
+
+        app.buttons["Pay"].tap()
+        XCTAssertTrue(app.staticTexts["Your card was declined"].waitForExistence(timeout: 2))
+    }
+}
+```
+
+Stubbing at the `URLProtocol` level means the UI test exercises the app's real networking code, decoding and error mapping, and only the server is replaced. Because the switch lives in the composition root, no feature contains UI-test code, and nothing about it can ship to users by accident: without the launch argument the stub is never installed.
+
+## Testing the wiring itself
+
+Unit tests with fakes check each type; they can't check that the production root wired the right implementations. Keep one or two **smoke tests** that build the real composition root and make every top-level screen's model, without making requests. They catch a configuration value that's missing, a staging host in a release configuration, or (with a runtime container) a missing registration.
+
+## Trade-offs
+
+| Technique | Speed | Catches | Misses | Wins when |
+| --- | --- | --- | --- | --- |
+| Unit tests with stubs and spies | Milliseconds | Rules, state changes, what was sent | Whether the fakes match reality | Every view model, use case and service |
+| Contract tests over fake and real | Fast with temp storage | Fakes drifting from the real implementation | UI and wiring | Any fake that many tests rely on |
+| Previews per state | Instant, visual | Layout and copy in every state | Logic: previews don't assert | Every screen with more than one state |
+| UI tests with stubbed network | Seconds per test | End-to-end flows through real code | Real server behaviour | A few critical journeys: sign-in, checkout |
+| Smoke test of the production root | Fast | Wrong or missing wiring and configuration | Behaviour | Every app, once |
+
+<Callout kind="interview">
+
+**What to say:** "Every test builds its own small graph, so tests are isolated and run in parallel. I stub queries and spy on commands, and default every dependency to a value that fails if it's called unexpectedly, so each test states its contract. Fakes that many tests rely on get contract tests against the real implementation. Previews get explicit sample data per state. UI tests pass a launch argument that makes the app's own root stub the network with a `URLProtocol`."
+
+**What to ask:** "How long does the suite take, and does it run in parallel? Which fakes are shared, and are they tested against the real thing?"
+
+**Red flags:** tests that need `.serialized` because of shared singletons; a mocking approach built on method swizzling; UI tests that depend on a staging server's data; `#if DEBUG` branches in production views for previews.
+
+</Callout>
+
+<Callout kind="gotcha" title="iOS gotcha: hosted unit tests launch your app first">
+
+Unit tests in an app's test target usually run inside the app (the target's host application), so the app launches before the first test: your `App` struct's initialiser or `application(_:didFinishLaunchingWithOptions:)` runs, building the production root, and possibly starting network calls, analytics and push registration. Put logic in Swift packages whose tests need no host, or detect the test run in the root (Xcode sets the `XCTestConfigurationFilePath` environment variable) and build a minimal graph instead.
+
+</Callout>
+
+<Callout kind="gotcha" title="Swift gotcha: suite instances are fresh, static state is not">
+
+Swift Testing creates a new suite instance per test, so stored properties are per-test dependencies with nothing to reset. A `static` property on the suite, or any global, is shared by every test running in parallel. Keep doubles in instance properties or local variables.
+
+</Callout>
+
+## Practice
+
+**Dependency values with task-local overrides** is test isolation from the other side: overrides bound per task, so twenty concurrent scopes each see only their own values, and a model created inside an override keeps it.
+
+```cards
+- id: tests-roots
+  front: "Why treat tests, previews and UI tests as composition roots?"
+  back: "Each runs the same feature code with different leaves: fakes for unit tests, sample data for previews, stubbed network for UI tests. Building each graph explicitly keeps them isolated and keeps test code out of features."
+- id: tests-doubles
+  front: "When do you use a stub, a spy and a fake?"
+  back: "Stubs return canned answers for queries; spies record calls for commands; fakes are simplified working implementations for stateful collaborators whose operations must agree."
+- id: tests-contract
+  front: "How do you stop a fake from drifting away from the real implementation?"
+  back: "Run one contract test suite against both the fake and the real implementation (with temporary storage), so any behaviour the fake lacks fails a test."
+- id: tests-ui
+  front: "How do UI tests inject dependencies into an app running in another process?"
+  back: "They pass configuration through `launchArguments` and `launchEnvironment`; the app's composition root reads it and wires stubs, for example a `URLProtocol` that returns the scenario's responses."
+```
+
+```quiz
+- id: q1
+  type: sort
+  prompt: "Which test double fits each need?"
+  buckets: [Stub, Spy, Fake, Dummy]
+  items:
+    - [The API returns a declined-card error so the test can check the message, 0]
+    - [Check that tapping Pay sends exactly one charge request, 1]
+    - [An in-memory trip store that saves and loads consistently, 2]
+    - [An analytics dependency the test never looks at, 3]
+    - [Check which events were tracked and in what order, 1]
+  explain: "Stubs answer queries, spies record commands for assertions, fakes are working simplified implementations, and dummies only fill a parameter."
+- id: q2
+  type: mcq
+  prompt: "A suite passes alone but fails randomly when the whole target runs. Each test sets `CheckoutTests.paymentsStub = …` before running. What's the fix?"
+  options:
+    - "Add `.serialized` to every suite in the target"
+    - "Move the stub into an instance property or a local, so each test, which gets its own suite instance, builds its own"
+    - "Run the tests in a fixed order"
+    - "Reset the static property in `deinit`"
+  answer: 1
+  explain: "Static state is shared by tests running in parallel. Swift Testing gives every test a fresh suite instance, so per-test dependencies belong in instance properties."
+- id: q3
+  type: mcq
+  prompt: "Every view-model test uses `InMemoryOrderStore`. Production moved to a database that rejects duplicate order IDs; the fake still accepts them, and a duplicate-order bug ships with all tests green. What practice would have caught it?"
+  options:
+    - "More unit tests using the fake"
+    - "A contract test suite run against both the fake and the real store"
+    - "A UI test of the order list"
+    - "Making the fake a mock with expectations"
+  answer: 1
+  explain: "Tests against a fake only prove behaviour the fake has. Running the same contract against both implementations is what keeps them in agreement."
+- id: q4
+  type: multi
+  prompt: "Which are good ways to make a checkout UI test independent of the live backend? Choose all that apply."
+  options:
+    - "Pass `-ui-testing` and a scenario name; the app's root installs a `URLProtocol` that returns that scenario's responses"
+    - "Point the UI test at the staging server and hope its test card still works"
+    - "Use `#if DEBUG` inside `CheckoutView` to show the declined state"
+    - "Have the app's root read `launchEnvironment` once and choose a stubbed network layer"
+  answer: [0, 3]
+  explain: "The UI test can only pass configuration; the composition root turns it into a wiring, so the real networking code runs against controlled responses. A shared staging server and debug branches in views make tests flaky and leak test code into the app."
+- id: q5
+  type: truefalse
+  prompt: "Unit tests in an app's hosted test target can trigger the production app's network calls before the first test runs."
+  answer: true
+  explain: "Hosted tests run inside the app, so its launch code (and composition root) runs first. Keep logic in packages with host-less tests, or have the root detect the test run and build a minimal graph."
+```

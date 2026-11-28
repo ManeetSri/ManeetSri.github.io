@@ -15,7 +15,7 @@ import { execFile, execFileSync } from 'node:child_process';
 import { existsSync, mkdirSync, readdirSync, readFileSync, rmSync, writeFileSync, mkdtempSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join, relative } from 'node:path';
-import { fileURLToPath } from 'node:url';
+import { fileURLToPath, pathToFileURL } from 'node:url';
 import { parse } from 'yaml';
 import { COURSES, IOS_TARGET } from './courses.js';
 import { fencedBlocks, parseMeta, runnableExamples } from './dsa-content-lib.js';
@@ -104,12 +104,25 @@ for (const { module, lesson, path } of selected) {
     }
 }
 
-// Fragments are type-checked rather than run: in lessons, and (for a full run) cheat sheets and practice
+// Fragments are type-checked rather than run: in lessons, and (for a full run) cheat sheets and practice.
+// A --module run also checks the practice statements registered in those modules' registry files.
 selected.forEach(({ path }) => collectChecks(path));
 if (!onlyModules.length && !onlyLessons.length) {
     [sheetsDir, ...Object.values(course.practiceDirs).map((dir) => join(root, dir))].filter((dir) => existsSync(dir)).forEach((dir) => {
         readdirSync(dir).filter((name) => name.endsWith('.mdx')).forEach((name) => collectChecks(join(dir, name)));
     });
+} else if (onlyModules.length) {
+    for (const module of onlyModules) {
+        for (const dir of course.registryDirs) {
+            const registry = join(root, dir, `${module}.js`);
+            if (!existsSync(registry)) continue;
+            const items = (await import(pathToFileURL(registry).href)).default ?? [];
+            items.forEach((item) => {
+                const statement = join(root, course.practiceDirs[item.kind] ?? course.practiceDirs.problem, `${item.id}.mdx`);
+                if (existsSync(statement)) collectChecks(statement);
+            });
+        }
+    }
 }
 
 // Generated files for lessons that no longer have them are removed
