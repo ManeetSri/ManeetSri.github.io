@@ -23,6 +23,22 @@ export const TEMPLATES = {
             section('tradeoffs', 'Trade-offs and evolution', 'What you chose over what, why, and how the design changes as it grows.', 5),
         ],
     },
+    // The backend a mobile app depends on: a notification service, a feed backend, an upload service
+    system: {
+        label: 'Backend system design',
+        minutes: 45,
+        sections: [
+            section('requirements', 'Requirements and scope', 'Clarifying questions, functional and non-functional requirements, what’s out of scope.', 5),
+            section('estimates', 'Estimates', 'Users, QPS at peak, storage and bandwidth: the numbers that shape the design.', 4),
+            section('architecture', 'High-level design', 'Services, stores, queues, caches and CDNs, and how a request flows through them.', 7),
+            section('api', 'API', 'Endpoints or messages, request and response shapes, pagination, errors, versioning.', 6),
+            section('data', 'Data model and storage', 'Entities, which store holds each, keys, indexes, partitioning and replication.', 6),
+            section('scale', 'Scaling and performance', 'Caching, sharding, hot spots, fan-out, and what breaks first at 10×.', 7),
+            section('failure', 'Reliability and failure', 'Retries, idempotency, degradation, monitoring, and what happens when each part is down.', 6),
+            section('client', 'What the app needs', 'How the mobile client uses it: payload budgets, offline, push, old app versions in the wild.', 5),
+            section('tradeoffs', 'Trade-offs and evolution', 'What you chose over what, why, and how the design changes as it grows.', 5),
+        ],
+    },
     // One component or SDK: an image loader, a networking layer, a feature-flag client
     component: {
         label: 'Component design',

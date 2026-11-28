@@ -355,7 +355,7 @@ Each lesson has practice where it makes sense: a design exercise, an architectur
 
 ### Design exercises (`kind: 'design'`)
 
-Registry: also `template` (`feature`, `component`, `migration`; see `src/dsa/design/data/templates.js`), `mock` (true if it makes a good timed mock interview) and a one-sentence `summary`.
+Registry: also `template` (`feature` for an app or feature, `system` for a backend service, `component`, `migration`; see `src/dsa/design/data/templates.js`), `mock` (true if it makes a good timed mock interview) and a one-sentence `summary`.
 
 The MDX, in this order:
 

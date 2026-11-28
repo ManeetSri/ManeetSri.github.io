@@ -1,0 +1,1334 @@
+Skeletons you can adapt in a few minutes. Each one compiles as it stands under Swift 6, names the rule that keeps it correct, and links to the lesson that explains it. Learn the idea from the lesson first: a template you don't understand is a template you'll misuse.
+
+## Networking
+
+### Endpoint and request builder
+
+One value describes a request; one function turns it into a `URLRequest`. See [Endpoint modelling](/design/learn/sd-netlayer-endpoints).
+
+**Rule:** endpoints are data; only the builder knows the base URL and the encoding.
+
+```swift check
+import Foundation
+
+struct Endpoint<Response: Decodable & Sendable>: Sendable {
+    enum Method: String, Sendable { case get = "GET", post = "POST", put = "PUT", delete = "DELETE" }
+    var method: Method = .get
+    var path: String
+    var query: [URLQueryItem] = []
+    var body: Data? = nil
+}
+
+struct RequestBuilder: Sendable {
+    let baseURL: URL
+    let defaultHeaders: [String: String]
+
+    func request<Response>(for endpoint: Endpoint<Response>) throws -> URLRequest {
+        guard var components = URLComponents(url: baseURL.appending(path: endpoint.path), resolvingAgainstBaseURL: false) else {
+            throw URLError(.badURL)
+        }
+        if !endpoint.query.isEmpty { components.queryItems = endpoint.query }
+        guard let url = components.url else { throw URLError(.badURL) }
+        var request = URLRequest(url: url, timeoutInterval: 30)
+        request.httpMethod = endpoint.method.rawValue
+        request.httpBody = endpoint.body
+        defaultHeaders.forEach { request.setValue($1, forHTTPHeaderField: $0) }
+        if endpoint.body != nil { request.setValue("application/json", forHTTPHeaderField: "Content-Type") }
+        return request
+    }
+}
+
+struct Article: Decodable, Sendable { let id: String; let title: String }
+
+extension Endpoint where Response == [Article] {
+    static func articles(page cursor: String?) -> Self {
+        Endpoint(path: "articles", query: cursor.map { [URLQueryItem(name: "cursor", value: $0)] } ?? [])
+    }
+}
+```
+
+### Async API client with error mapping
+
+The transport sits behind a protocol, so tests use a stub. See [A generic async API client](/design/learn/sd-netlayer-api-client).
+
+**Rule:** map transport, HTTP and decoding failures to one error type the app understands.
+
+```swift check
+import Foundation
+
+protocol HTTPTransport: Sendable {
+    func send(_ request: URLRequest) async throws -> (Data, HTTPURLResponse)
+}
+
+struct URLSessionTransport: HTTPTransport {
+    let session: URLSession
+    func send(_ request: URLRequest) async throws -> (Data, HTTPURLResponse) {
+        let (data, response) = try await session.data(for: request)
+        guard let http = response as? HTTPURLResponse else { throw URLError(.badServerResponse) }
+        return (data, http)
+    }
+}
+
+enum APIError: Error, Equatable {
+    case offline
+    case unauthorized
+    case notFound
+    case rateLimited(retryAfter: TimeInterval?)
+    case server(status: Int)
+    case client(status: Int)
+    case decoding(String)
+    case transport(URLError.Code)
+}
+
+struct APIClient: Sendable {
+    let transport: any HTTPTransport
+    let decoder: JSONDecoder
+
+    func send<Response: Decodable>(_ request: URLRequest, as type: Response.Type = Response.self) async throws(APIError) -> Response {
+        let data: Data
+        let response: HTTPURLResponse
+        do {
+            (data, response) = try await transport.send(request)
+        } catch let error as URLError {
+            throw error.code == .notConnectedToInternet ? .offline : .transport(error.code)
+        } catch {
+            throw .transport(.unknown)
+        }
+        switch response.statusCode {
+        case 200..<300: break
+        case 401: throw .unauthorized
+        case 404: throw .notFound
+        case 429: throw .rateLimited(retryAfter: response.value(forHTTPHeaderField: "Retry-After").flatMap(TimeInterval.init))
+        case 400..<500: throw .client(status: response.statusCode)
+        default: throw .server(status: response.statusCode)
+        }
+        do {
+            return try decoder.decode(Response.self, from: data)
+        } catch {
+            throw .decoding(String(describing: error))
+        }
+    }
+}
+```
+
+### Interceptor chain
+
+Each interceptor can change the request, handle the response, or call the next one. See [Interceptor chains](/design/learn/sd-netlayer-interceptors).
+
+**Rule:** order matters: auth inside retry, so a retried request gets a fresh token; logging outermost.
+
+```swift check
+import Foundation
+
+protocol Interceptor: Sendable {
+    func intercept(_ request: URLRequest, next: @Sendable (URLRequest) async throws -> (Data, HTTPURLResponse)) async throws -> (Data, HTTPURLResponse)
+}
+
+struct InterceptorChain: Sendable {
+    let interceptors: [any Interceptor]       // outermost first
+    let send: @Sendable (URLRequest) async throws -> (Data, HTTPURLResponse)
+
+    func run(_ request: URLRequest) async throws -> (Data, HTTPURLResponse) {
+        let terminal = send
+        let chain = interceptors.reversed().reduce(terminal) { next, interceptor in
+            { @Sendable request in try await interceptor.intercept(request, next: next) }
+        }
+        return try await chain(request)
+    }
+}
+
+struct HeaderInterceptor: Interceptor {
+    let name: String
+    let value: @Sendable () async -> String
+    func intercept(_ request: URLRequest, next: @Sendable (URLRequest) async throws -> (Data, HTTPURLResponse)) async throws -> (Data, HTTPURLResponse) {
+        var request = request
+        request.setValue(await value(), forHTTPHeaderField: name)
+        return try await next(request)
+    }
+}
+```
+
+### Token refresher
+
+Many requests can fail with 401 at once; only one refresh should run. See [Token refresh with request queueing](/design/learn/sd-netlayer-token-refresh).
+
+**Rule:** store the refresh task, so every caller awaits the same one.
+
+```swift check
+import Foundation
+
+struct Tokens: Sendable, Equatable { let access: String; let refresh: String }
+
+actor TokenStore {
+    private var tokens: Tokens?
+    private var refreshing: Task<Tokens, any Error>?
+    private let refreshCall: @Sendable (String) async throws -> Tokens
+
+    init(tokens: Tokens?, refresh: @escaping @Sendable (String) async throws -> Tokens) {
+        self.tokens = tokens
+        self.refreshCall = refresh
+    }
+
+    func accessToken() throws -> String {
+        guard let tokens else { throw URLError(.userAuthenticationRequired) }
+        return tokens.access
+    }
+
+    /// Call after a 401. `rejected` is the token that failed, so a refresh that already happened isn't repeated.
+    func refresh(rejected: String) async throws -> String {
+        if let tokens, tokens.access != rejected { return tokens.access }
+        if let refreshing { return try await refreshing.value.access }
+        guard let refreshToken = tokens?.refresh else { throw URLError(.userAuthenticationRequired) }
+        let task = Task { try await refreshCall(refreshToken) }
+        refreshing = task
+        defer { refreshing = nil }
+        do {
+            let fresh = try await task.value
+            tokens = fresh
+            return fresh.access
+        } catch {
+            tokens = nil              // the refresh token is dead: sign out
+            throw error
+        }
+    }
+}
+```
+
+### Retry with exponential backoff and full jitter
+
+See [Retry with exponential backoff and jitter](/design/learn/sd-resilience-retry-backoff).
+
+**Rule:** retry only idempotent work, cap attempts and delay, and randomise the delay.
+
+```swift check
+import Foundation
+
+struct RetryPolicy: Sendable {
+    var maxAttempts = 4
+    var base: Duration = .milliseconds(200)
+    var cap: Duration = .seconds(10)
+
+    func delay(afterAttempt attempt: Int, using generator: inout some RandomNumberGenerator) -> Duration {
+        let exponential = base * (1 << min(attempt, 20))
+        let ceiling = min(exponential, cap)
+        let millis = Int(ceiling.components.seconds * 1000) + Int(ceiling.components.attoseconds / 1_000_000_000_000_000)
+        return .milliseconds(Int.random(in: 0...max(millis, 0), using: &generator))
+    }
+}
+
+func withRetry<T: Sendable>(
+    _ policy: RetryPolicy,
+    clock: some Clock<Duration>,
+    shouldRetry: (any Error) -> Bool,
+    _ operation: () async throws -> T
+) async throws -> T {
+    var generator = SystemRandomNumberGenerator()
+    var attempt = 0
+    while true {
+        do {
+            return try await operation()
+        } catch {
+            attempt += 1
+            guard attempt < policy.maxAttempts, shouldRetry(error) else { throw error }
+            try await clock.sleep(for: policy.delay(afterAttempt: attempt - 1, using: &generator))
+        }
+    }
+}
+```
+
+### Circuit breaker
+
+See [Circuit breakers and bulkheads](/design/learn/sd-resilience-circuit-breaker).
+
+**Rule:** after enough failures, fail fast for a cool-down, then let one trial call through.
+
+```swift check
+actor CircuitBreaker<C: Clock> where C.Duration == Duration {
+    enum State: Equatable { case closed(failures: Int), open(until: C.Instant), halfOpen }
+    struct OpenError: Error {}
+
+    private(set) var state: State = .closed(failures: 0)
+    private let threshold: Int
+    private let coolDown: Duration
+    private let clock: C
+
+    init(threshold: Int = 5, coolDown: Duration = .seconds(30), clock: C) {
+        self.threshold = threshold
+        self.coolDown = coolDown
+        self.clock = clock
+    }
+
+    func run<T: Sendable>(_ operation: @Sendable () async throws -> T) async throws -> T {
+        if case .open(let until) = state {
+            guard clock.now >= until else { throw OpenError() }
+            state = .halfOpen
+        }
+        do {
+            let value = try await operation()
+            state = .closed(failures: 0)
+            return value
+        } catch {
+            switch state {
+            case .halfOpen: state = .open(until: clock.now.advanced(by: coolDown))
+            case .closed(let failures) where failures + 1 >= threshold: state = .open(until: clock.now.advanced(by: coolDown))
+            case .closed(let failures): state = .closed(failures: failures + 1)
+            case .open: break
+            }
+            throw error
+        }
+    }
+}
+```
+
+### Cursor pagination loader
+
+See [Pagination: offset, cursor and keyset](/design/learn/sd-api-pagination).
+
+**Rule:** one load at a time, de-duplicate by id, and stop when the server returns no next cursor.
+
+```swift check
+struct Page<Item: Sendable>: Sendable { let items: [Item]; let next: String? }
+
+@MainActor
+final class PagedList<Item: Identifiable & Sendable> where Item.ID: Sendable {
+    private(set) var items: [Item] = []
+    private(set) var isLoading = false
+    private(set) var reachedEnd = false
+    private var cursor: String?
+    private var seen: Set<Item.ID> = []
+    private let fetch: @Sendable (String?) async throws -> Page<Item>
+
+    init(fetch: @escaping @Sendable (String?) async throws -> Page<Item>) { self.fetch = fetch }
+
+    func loadMore() async throws {
+        guard !isLoading, !reachedEnd else { return }
+        isLoading = true
+        defer { isLoading = false }
+        let page = try await fetch(cursor)
+        for item in page.items where seen.insert(item.id).inserted { items.append(item) }
+        cursor = page.next
+        reachedEnd = page.next == nil
+    }
+
+    func refresh() async throws {
+        items = []; seen = []; cursor = nil; reachedEnd = false
+        try await loadMore()
+    }
+}
+```
+
+## Caching
+
+### LRU cache with TTL
+
+See [Eviction: LRU, LFU, TTL and size budgets](/design/learn/sd-cache-eviction).
+
+**Rule:** a hit refreshes recency; an expired entry is a miss and is removed.
+
+```swift check
+import Foundation
+
+struct LRUCache<Key: Hashable, Value> {
+    private struct Entry { var value: Value; var expires: Date }
+    private var entries: [Key: Entry] = [:]
+    private var order: [Key] = []              // least recent first; fine for small caches
+    let capacity: Int
+    let ttl: TimeInterval
+
+    init(capacity: Int, ttl: TimeInterval) { self.capacity = capacity; self.ttl = ttl }
+
+    mutating func value(for key: Key, now: Date) -> Value? {
+        guard let entry = entries[key] else { return nil }
+        guard entry.expires > now else { remove(key); return nil }
+        touch(key)
+        return entry.value
+    }
+
+    mutating func insert(_ value: Value, for key: Key, now: Date) {
+        entries[key] = Entry(value: value, expires: now.addingTimeInterval(ttl))
+        touch(key)
+        while order.count > capacity { remove(order[0]) }
+    }
+
+    mutating func remove(_ key: Key) {
+        entries[key] = nil
+        order.removeAll { $0 == key }
+    }
+
+    private mutating func touch(_ key: Key) {
+        order.removeAll { $0 == key }
+        order.append(key)
+    }
+}
+```
+
+For large caches, replace the array with a dictionary of nodes in a doubly linked list so every operation is O(1).
+
+### Memory + disk read-through cache
+
+See [Memory, disk, HTTP and CDN layers](/design/learn/sd-cache-layers).
+
+**Rule:** check the fastest layer first, fill the faster layers on the way back, and coalesce concurrent misses.
+
+```swift check
+import Foundation
+
+protocol DiskStore: Sendable {
+    func data(for key: String) async -> Data?
+    func save(_ data: Data, for key: String) async
+}
+
+actor TieredCache {
+    private var memory: [String: Data] = [:]
+    private var inFlight: [String: Task<Data, any Error>] = [:]
+    private let disk: any DiskStore
+    private let network: @Sendable (String) async throws -> Data
+
+    init(disk: any DiskStore, network: @escaping @Sendable (String) async throws -> Data) {
+        self.disk = disk
+        self.network = network
+    }
+
+    func data(for key: String) async throws -> Data {
+        if let hit = memory[key] { return hit }
+        if let running = inFlight[key] { return try await running.value }
+        let disk = self.disk, network = self.network
+        let task = Task<Data, any Error> {
+            if let stored = await disk.data(for: key) { return stored }
+            let fetched = try await network(key)
+            await disk.save(fetched, for: key)
+            return fetched
+        }
+        inFlight[key] = task
+        defer { inFlight[key] = nil }
+        let value = try await task.value
+        memory[key] = value
+        return value
+    }
+}
+```
+
+## Persistence
+
+### Repository with an in-memory fake
+
+See [Repository and DAO](/design/learn/sd-persist-repository).
+
+**Rule:** the protocol speaks the domain's language; storage types never escape it.
+
+```swift check
+import Foundation
+
+struct Note: Identifiable, Equatable, Sendable {
+    let id: UUID
+    var title: String
+    var body: String
+    var updatedAt: Date
+}
+
+protocol NotesRepository: Sendable {
+    func all() async throws -> [Note]
+    func note(id: UUID) async throws -> Note?
+    func save(_ note: Note) async throws
+    func delete(id: UUID) async throws
+    func changes() -> AsyncStream<[Note]>
+}
+
+actor InMemoryNotesRepository: NotesRepository {
+    private var notes: [UUID: Note] = [:]
+    private var observers: [UUID: AsyncStream<[Note]>.Continuation] = [:]
+
+    func all() -> [Note] { notes.values.sorted { $0.updatedAt > $1.updatedAt } }
+    func note(id: UUID) -> Note? { notes[id] }
+    func save(_ note: Note) { notes[note.id] = note; publish() }
+    func delete(id: UUID) { notes[id] = nil; publish() }
+
+    nonisolated func changes() -> AsyncStream<[Note]> {
+        AsyncStream { continuation in
+            let token = UUID()
+            Task { await self.add(continuation, token: token) }
+            continuation.onTermination = { _ in Task { await self.remove(token) } }
+        }
+    }
+
+    private func add(_ continuation: AsyncStream<[Note]>.Continuation, token: UUID) {
+        observers[token] = continuation
+        continuation.yield(all())
+    }
+    private func remove(_ token: UUID) { observers[token] = nil }
+    private func publish() { let snapshot = all(); observers.values.forEach { $0.yield(snapshot) } }
+}
+```
+
+### Ordered migrations
+
+See [Migrations](/design/learn/sd-persist-migrations).
+
+**Rule:** migrations run in order, each exactly once, and the version is recorded only after a migration succeeds.
+
+```swift check
+struct Migration: Sendable {
+    let version: Int
+    let name: String
+    let apply: @Sendable () throws -> Void
+}
+
+struct Migrator {
+    let migrations: [Migration]
+
+    /// Returns the new schema version.
+    func migrate(from current: Int, record: (Int) throws -> Void) throws -> Int {
+        var version = current
+        for migration in migrations.sorted(by: { $0.version < $1.version }) where migration.version > version {
+            try migration.apply()
+            try record(migration.version)
+            version = migration.version
+        }
+        return version
+    }
+}
+```
+
+### Keychain wrapper
+
+See [The keychain](/design/learn/sd-store-keychain).
+
+**Rule:** choose the accessibility class on purpose, and update rather than add when an item exists.
+
+```swift check ios
+import Foundation
+import Security
+
+struct KeychainError: Error { let status: OSStatus }
+
+struct Keychain: Sendable {
+    let service: String
+    var accessibility = kSecAttrAccessibleWhenUnlockedThisDeviceOnly as String
+
+    private func query(_ account: String) -> [String: Any] {
+        [kSecClass as String: kSecClassGenericPassword,
+         kSecAttrService as String: service,
+         kSecAttrAccount as String: account]
+    }
+
+    func set(_ data: Data, for account: String) throws {
+        let attributes: [String: Any] = [kSecValueData as String: data, kSecAttrAccessible as String: accessibility]
+        var status = SecItemUpdate(query(account) as CFDictionary, attributes as CFDictionary)
+        if status == errSecItemNotFound {
+            status = SecItemAdd(query(account).merging(attributes) { $1 } as CFDictionary, nil)
+        }
+        guard status == errSecSuccess else { throw KeychainError(status: status) }
+    }
+
+    func data(for account: String) throws -> Data? {
+        var search = query(account)
+        search[kSecReturnData as String] = true
+        search[kSecMatchLimit as String] = kSecMatchLimitOne
+        var result: CFTypeRef?
+        let status = SecItemCopyMatching(search as CFDictionary, &result)
+        if status == errSecItemNotFound { return nil }
+        guard status == errSecSuccess else { throw KeychainError(status: status) }
+        return result as? Data
+    }
+
+    func remove(_ account: String) throws {
+        let status = SecItemDelete(query(account) as CFDictionary)
+        guard status == errSecSuccess || status == errSecItemNotFound else { throw KeychainError(status: status) }
+    }
+}
+```
+
+## Sync
+
+### Outbox
+
+See [The outbox](/design/learn/sd-sync-outbox).
+
+**Rule:** write locally and enqueue in one step; send in order with an idempotency key; remove only after the server confirms.
+
+```swift check
+import Foundation
+
+struct PendingChange: Codable, Sendable, Identifiable {
+    let id: UUID                 // doubles as the idempotency key
+    let entityID: String
+    let payload: Data
+    var attempts = 0
+}
+
+protocol OutboxStorage: Sendable {
+    func load() async -> [PendingChange]
+    func store(_ changes: [PendingChange]) async
+}
+
+actor Outbox {
+    enum SendResult: Sendable { case accepted, retryLater, rejected }
+
+    private let storage: any OutboxStorage
+    private let send: @Sendable (PendingChange) async -> SendResult
+    private var isFlushing = false
+
+    init(storage: any OutboxStorage, send: @escaping @Sendable (PendingChange) async -> SendResult) {
+        self.storage = storage
+        self.send = send
+    }
+
+    func enqueue(_ change: PendingChange) async {
+        await storage.store(await storage.load() + [change])
+    }
+
+    /// Sends changes in order; stops at the first one that should be retried later.
+    func flush(maxAttempts: Int = 10) async {
+        guard !isFlushing else { return }
+        isFlushing = true
+        defer { isFlushing = false }
+        var queue = await storage.load()
+        while var change = queue.first {
+            switch await send(change) {
+            case .accepted, .rejected:
+                queue.removeFirst()              // a rejection should also surface to the user
+            case .retryLater:
+                change.attempts += 1
+                if change.attempts >= maxAttempts { queue.removeFirst() } else { queue[0] = change }
+                await storage.store(queue)
+                return
+            }
+            await storage.store(queue)
+        }
+    }
+}
+```
+
+### Last-writer-wins register and G-counter
+
+See [CRDTs](/design/learn/sd-sync-crdts).
+
+**Rule:** merge must be commutative, associative and idempotent, so replicas converge whatever order changes arrive in.
+
+```swift check
+struct LWWRegister<Value: Equatable & Sendable>: Equatable, Sendable {
+    var value: Value
+    var timestamp: UInt64            // a hybrid logical clock, not the device's wall clock
+    var replica: String              // breaks ties deterministically
+
+    func merged(with other: Self) -> Self {
+        (other.timestamp, other.replica) > (timestamp, replica) ? other : self
+    }
+}
+
+struct GCounter: Equatable, Sendable {
+    private(set) var counts: [String: Int] = [:]
+    var value: Int { counts.values.reduce(0, +) }
+
+    mutating func increment(by amount: Int = 1, at replica: String) {
+        counts[replica, default: 0] += amount
+    }
+
+    func merged(with other: GCounter) -> GCounter {
+        var result = self
+        result.counts.merge(other.counts) { max($0, $1) }
+        return result
+    }
+}
+```
+
+## Navigation
+
+### Route enum and deep-link parser
+
+See [Routers and route enums](/design/learn/sd-nav-routers) and [Deep links](/design/learn/sd-nav-deep-links).
+
+**Rule:** every way into the app becomes the same typed route; bad input becomes `nil`, never a crash.
+
+```swift check
+import Foundation
+
+enum Route: Equatable, Sendable {
+    case home
+    case article(id: String)
+    case profile(username: String)
+    case settings(section: String?)
+
+    init?(url: URL) {
+        let parts = url.pathComponents.filter { $0 != "/" }
+        let isOurs = url.scheme == "myapp" || url.host() == "example.com"
+        guard isOurs else { return nil }
+        let path = url.scheme == "myapp" ? [url.host() ?? ""] + parts : parts
+        switch (path.first ?? "", path.count > 1 ? path[1] : nil, path.count) {
+        case ("", _, ...1): self = .home
+        case ("articles", let id?, 2) where id.allSatisfy({ $0.isLetter || $0.isNumber || $0 == "-" }): self = .article(id: id)
+        case ("u", let name?, 2) where (1...30).contains(name.count): self = .profile(username: name)
+        case ("settings", nil, 1): self = .settings(section: nil)
+        case ("settings", let section?, 2): self = .settings(section: section)
+        default: return nil
+        }
+    }
+}
+```
+
+### State-driven navigation in SwiftUI
+
+See [State-driven navigation](/design/learn/sd-nav-state-driven).
+
+**Rule:** the path is state; pushing, popping and deep links are changes to that state.
+
+```swift check ios
+import SwiftUI
+
+enum Screen: Hashable { case article(String), profile(String) }
+
+@MainActor @Observable
+final class AppRouter {
+    var path: [Screen] = []
+    var presentedSheet: String?
+
+    func open(_ screen: Screen) { path.append(screen) }
+    func popToRoot() { path.removeAll() }
+    func handle(deepLink screens: [Screen]) { path = screens }
+}
+
+struct RootView: View {
+    @State private var router = AppRouter()
+
+    var body: some View {
+        NavigationStack(path: $router.path) {
+            List {
+                Button("Open article") { router.open(.article("42")) }
+            }
+            .navigationDestination(for: Screen.self) { screen in
+                switch screen {
+                case .article(let id): Text("Article \(id)")
+                case .profile(let name): Text("Profile \(name)")
+                }
+            }
+        }
+        .environment(router)
+    }
+}
+```
+
+### UIKit coordinator
+
+See [Coordinators in UIKit](/design/learn/sd-nav-coordinators-uikit).
+
+**Rule:** the coordinator owns its children and releases each one when its flow finishes.
+
+```swift check ios
+import UIKit
+
+@MainActor
+protocol Coordinator: AnyObject {
+    var children: [any Coordinator] { get set }
+    func start()
+}
+
+@MainActor
+final class CheckoutCoordinator: Coordinator {
+    var children: [any Coordinator] = []
+    var onFinish: ((_ orderID: String?) -> Void)?
+    private let navigation: UINavigationController
+
+    init(navigation: UINavigationController) { self.navigation = navigation }
+
+    func start() {
+        let cart = UIViewController()
+        cart.title = "Cart"
+        navigation.pushViewController(cart, animated: true)
+    }
+
+    func didPlaceOrder(_ id: String) { onFinish?(id) }
+}
+
+@MainActor
+final class AppCoordinator: Coordinator {
+    var children: [any Coordinator] = []
+    private let navigation: UINavigationController
+
+    init(navigation: UINavigationController) { self.navigation = navigation }
+
+    func start() { navigation.setViewControllers([UIViewController()], animated: false) }
+
+    func startCheckout() {
+        let checkout = CheckoutCoordinator(navigation: navigation)
+        checkout.onFinish = { [weak self, weak checkout] _ in
+            guard let self, let checkout else { return }
+            self.children.removeAll { $0 === checkout }
+            self.navigation.popToRootViewController(animated: true)
+        }
+        children.append(checkout)
+        checkout.start()
+    }
+}
+```
+
+## Dependencies
+
+### Dependencies as a struct of closures
+
+See [Dependencies as closures and structs](/design/learn/sd-functional-environment).
+
+**Rule:** the world (clock, ids, network) comes in from outside, with a live value and a test value.
+
+```swift check
+import Foundation
+
+struct AppEnvironment: Sendable {
+    var now: @Sendable () -> Date
+    var uuid: @Sendable () -> UUID
+    var fetchProfile: @Sendable (String) async throws -> String
+
+    static let live = AppEnvironment(
+        now: { Date() },
+        uuid: { UUID() },
+        fetchProfile: { id in "Profile \(id)" }
+    )
+
+    static func test(now: Date = Date(timeIntervalSince1970: 0)) -> AppEnvironment {
+        AppEnvironment(
+            now: { now },
+            uuid: { UUID(uuidString: "00000000-0000-0000-0000-000000000001")! },
+            fetchProfile: { _ in "Test profile" }
+        )
+    }
+}
+```
+
+### A small DI container with lifetimes
+
+See [DI containers](/design/learn/sd-di-containers) and [Scopes and lifetimes](/design/learn/sd-di-scopes).
+
+**Rule:** register at the composition root, resolve there; features receive dependencies through initialisers, never by calling the container.
+
+```swift check
+import Synchronization
+
+final class Container: Sendable {
+    enum Lifetime: Sendable { case transient, singleton }
+    private struct Registration: @unchecked Sendable {       // factories are only called under the lock
+        let lifetime: Lifetime
+        let make: (Container) -> Any
+    }
+    private struct State: @unchecked Sendable {
+        var registrations: [ObjectIdentifier: Registration] = [:]
+        var singletons: [ObjectIdentifier: Any] = [:]
+        var resolving: Set<ObjectIdentifier> = []
+    }
+    struct CycleError: Error { let type: String }
+    struct NotRegistered: Error { let type: String }
+
+    private let state = Mutex(State())
+    private let parent: Container?
+
+    init(parent: Container? = nil) { self.parent = parent }
+
+    func register<T>(_ type: T.Type, _ lifetime: Lifetime = .transient, make: @escaping (Container) -> T) {
+        state.withLock { $0.registrations[ObjectIdentifier(type)] = Registration(lifetime: lifetime, make: make) }
+    }
+
+    func resolve<T>(_ type: T.Type = T.self) throws -> T {
+        let key = ObjectIdentifier(type)
+        let found: (Registration?, Any?) = state.withLock { ($0.registrations[key], $0.singletons[key]) }
+        guard let registration = found.0 else {
+            guard let parent else { throw NotRegistered(type: "\(T.self)") }
+            return try parent.resolve(type)
+        }
+        if let existing = found.1 as? T { return existing }
+        let started = state.withLock { $0.resolving.insert(key).inserted }
+        guard started else { throw CycleError(type: "\(T.self)") }
+        defer { state.withLock { _ = $0.resolving.remove(key) } }
+        let value = registration.make(self) as! T
+        if registration.lifetime == .singleton { state.withLock { $0.singletons[key] = value } }
+        return value
+    }
+}
+```
+
+## State
+
+### View-state enum with an observable model
+
+See [View-state enums](/design/learn/sd-state-view-state).
+
+**Rule:** one enum makes impossible combinations (loading *and* error) unrepresentable.
+
+```swift check
+import Observation
+
+enum ViewState<Value: Sendable>: Sendable {
+    case idle
+    case loading
+    case loaded(Value)
+    case empty
+    case failed(message: String)
+}
+
+@MainActor @Observable
+final class OrdersModel {
+    private(set) var state: ViewState<[String]> = .idle
+    private let load: @Sendable () async throws -> [String]
+
+    init(load: @escaping @Sendable () async throws -> [String]) { self.load = load }
+
+    func appear() async {
+        guard case .idle = state else { return }
+        await reload()
+    }
+
+    func reload() async {
+        state = .loading
+        do {
+            let orders = try await load()
+            state = orders.isEmpty ? .empty : .loaded(orders)
+        } catch {
+            state = .failed(message: "Couldn't load your orders. Check your connection and try again.")
+        }
+    }
+}
+```
+
+### Reducer store
+
+See [Reducers](/design/learn/sd-functional-reducers) and [Flux and Redux](/design/learn/sd-udf-flux-redux).
+
+**Rule:** state changes only in the reducer, which is pure; effects run outside it and feed actions back.
+
+```swift check
+import Observation
+
+struct Effect<Action: Sendable>: Sendable {
+    let run: @Sendable () async -> Action?
+    static var none: Effect? { nil }
+}
+
+@MainActor @Observable
+final class Store<State, Action: Sendable> {
+    private(set) var state: State
+    private let reducer: (inout State, Action) -> Effect<Action>?
+
+    init(initial: State, reducer: @escaping (inout State, Action) -> Effect<Action>?) {
+        self.state = initial
+        self.reducer = reducer
+    }
+
+    func send(_ action: Action) {
+        guard let effect = reducer(&state, action) else { return }
+        Task {
+            if let next = await effect.run() { send(next) }
+        }
+    }
+}
+
+struct CounterState: Equatable { var count = 0; var fact: String? }
+enum CounterAction: Sendable { case increment, factTapped, factLoaded(String) }
+
+@MainActor
+func counterReducer(state: inout CounterState, action: CounterAction) -> Effect<CounterAction>? {
+    switch action {
+    case .increment:
+        state.count += 1
+        return .none
+    case .factTapped:
+        let count = state.count
+        return Effect { .factLoaded("\(count) is a number") }
+    case .factLoaded(let fact):
+        state.fact = fact
+        return .none
+    }
+}
+```
+
+### Enum state machine
+
+See [Enum state machines](/design/learn/sd-functional-state-machines).
+
+**Rule:** a transition function lists every valid (state, event) pair; anything else is rejected explicitly.
+
+```swift check
+enum UploadState: Equatable, Sendable {
+    case idle, uploading(progress: Double), paused(progress: Double), done(url: String), failed(reason: String)
+}
+
+enum UploadEvent: Sendable {
+    case start, progress(Double), pause, resume, finished(String), failed(String), reset
+}
+
+func transition(_ state: UploadState, _ event: UploadEvent) -> UploadState? {
+    switch (state, event) {
+    case (.idle, .start): .uploading(progress: 0)
+    case (.uploading, .progress(let value)): .uploading(progress: min(max(value, 0), 1))
+    case (.uploading(let progress), .pause): .paused(progress: progress)
+    case (.paused(let progress), .resume): .uploading(progress: progress)
+    case (.uploading, .finished(let url)): .done(url: url)
+    case (.uploading, .failed(let reason)), (.paused, .failed(let reason)): .failed(reason: reason)
+    case (.failed, .start): .uploading(progress: 0)
+    case (_, .reset): .idle
+    default: nil                     // not allowed from this state
+    }
+}
+```
+
+### Undo and redo stacks
+
+See [Undo and redo](/design/learn/sd-state-undo-redo).
+
+**Rule:** a new change clears the redo stack.
+
+```swift check
+struct History<State> {
+    private(set) var current: State
+    private var past: [State] = []
+    private var future: [State] = []
+    let limit: Int
+
+    init(_ initial: State, limit: Int = 100) { current = initial; self.limit = limit }
+
+    var canUndo: Bool { !past.isEmpty }
+    var canRedo: Bool { !future.isEmpty }
+
+    mutating func apply(_ change: (inout State) -> Void) {
+        past.append(current)
+        if past.count > limit { past.removeFirst() }
+        change(&current)
+        future.removeAll()
+    }
+
+    mutating func undo() {
+        guard let previous = past.popLast() else { return }
+        future.append(current)
+        current = previous
+    }
+
+    mutating func redo() {
+        guard let next = future.popLast() else { return }
+        past.append(current)
+        current = next
+    }
+}
+```
+
+## Concurrency and timing
+
+### Debounced search on an injected clock
+
+See [Debounce, throttle and coalesce](/design/learn/sd-resilience-debounce-throttle).
+
+**Rule:** every keystroke cancels the previous pending search; only the latest query's results are shown.
+
+```swift check
+import Foundation
+
+@MainActor
+final class SearchModel<C: Clock> where C.Duration == Duration {
+    private(set) var results: [String] = []
+    private var pending: Task<Void, Never>?
+    private let clock: C
+    private let delay: Duration
+    private let search: @Sendable (String) async throws -> [String]
+
+    init(clock: C, delay: Duration = .milliseconds(300), search: @escaping @Sendable (String) async throws -> [String]) {
+        self.clock = clock
+        self.delay = delay
+        self.search = search
+    }
+
+    func queryChanged(_ query: String) {
+        pending?.cancel()
+        let trimmed = query.trimmingCharacters(in: .whitespaces)
+        guard !trimmed.isEmpty else { results = []; return }
+        pending = Task { [clock, delay, search] in
+            do {
+                try await clock.sleep(for: delay)
+                let found = try await search(trimmed)
+                try Task.checkCancellation()       // a newer query has started
+                self.results = found
+            } catch {}
+        }
+    }
+}
+```
+
+### Token-bucket rate limiter
+
+See [Client-side rate limiting](/design/learn/sd-resilience-rate-limiting).
+
+**Rule:** tokens refill continuously up to the capacity; a request spends one or waits.
+
+```swift check
+struct TokenBucket {
+    let capacity: Double
+    let refillPerSecond: Double
+    private var tokens: Double
+    private var last: Double            // seconds, from an injected clock
+
+    init(capacity: Double, refillPerSecond: Double, now: Double) {
+        self.capacity = capacity
+        self.refillPerSecond = refillPerSecond
+        tokens = capacity
+        last = now
+    }
+
+    /// Spends a token if one is available. Otherwise returns how long to wait, in seconds.
+    mutating func take(now: Double) -> Double? {
+        tokens = min(capacity, tokens + (now - last) * refillPerSecond)
+        last = now
+        if tokens >= 1 {
+            tokens -= 1
+            return nil
+        }
+        return (1 - tokens) / refillPerSecond
+    }
+}
+```
+
+### Broadcasting events with AsyncStream
+
+See [AsyncSequence and AsyncStream](/design/learn/sd-concurrency-async-sequence).
+
+**Rule:** each subscriber gets its own stream; remove it when the stream terminates.
+
+```swift check
+import Foundation
+
+actor EventBus<Event: Sendable> {
+    private var subscribers: [UUID: AsyncStream<Event>.Continuation] = [:]
+
+    func subscribe(bufferingNewest limit: Int = 50) -> AsyncStream<Event> {
+        let (stream, continuation) = AsyncStream.makeStream(of: Event.self, bufferingPolicy: .bufferingNewest(limit))
+        let id = UUID()
+        subscribers[id] = continuation
+        continuation.onTermination = { [weak self] _ in
+            Task { await self?.unsubscribe(id) }
+        }
+        return stream
+    }
+
+    func publish(_ event: Event) {
+        subscribers.values.forEach { $0.yield(event) }
+    }
+
+    func finish() {
+        subscribers.values.forEach { $0.finish() }
+        subscribers.removeAll()
+    }
+
+    private func unsubscribe(_ id: UUID) { subscribers[id] = nil }
+}
+```
+
+## Product infrastructure
+
+### Feature flags with safe defaults
+
+See [Flag architecture](/design/learn/sd-flags-architecture).
+
+**Rule:** every flag has a compiled-in default; remote values are cached and never block launch.
+
+```swift check
+import Foundation
+
+struct FlagKey<Value: Sendable & Codable>: Sendable {
+    let name: String
+    let defaultValue: Value
+}
+
+extension FlagKey where Value == Bool {
+    static let newCheckout = FlagKey(name: "new_checkout", defaultValue: false)
+}
+
+actor FeatureFlags {
+    private var remote: [String: Data] = [:]
+    private var overrides: [String: Data] = [:]        // debug menu and tests
+    private let decoder = JSONDecoder()
+
+    init(cached: [String: Data]) { remote = cached }
+
+    func value<Value>(_ key: FlagKey<Value>) -> Value {
+        for source in [overrides, remote] {
+            if let data = source[key.name], let value = try? decoder.decode(Value.self, from: data) { return value }
+        }
+        return key.defaultValue
+    }
+
+    func update(remote fresh: [String: Data]) { remote = fresh }
+
+    func override<Value>(_ key: FlagKey<Value>, with value: Value?) throws {
+        overrides[key.name] = try value.map { try JSONEncoder().encode($0) }
+    }
+}
+
+/// Stable 0–99 bucket for percentage rollouts: the same user always gets the same answer.
+func rolloutBucket(userID: String, flag: String) -> Int {
+    var hash: UInt64 = 0xcbf29ce484222325                // FNV-1a
+    for byte in "\(flag):\(userID)".utf8 {
+        hash ^= UInt64(byte)
+        hash = hash &* 0x100000001b3
+    }
+    return Int(hash % 100)
+}
+```
+
+### Analytics queue with batching
+
+See [Analytics SDK design](/design/learn/sd-analytics-sdk) and [Delivery](/design/learn/sd-analytics-delivery).
+
+**Rule:** record is cheap and never throws; sending happens in batches, and failed batches go back in the queue.
+
+```swift check
+import Foundation
+
+struct AnalyticsEvent: Codable, Sendable {
+    let name: String
+    let properties: [String: String]
+    let timestamp: Date
+}
+
+actor AnalyticsQueue {
+    private var pending: [AnalyticsEvent] = []
+    private let batchSize: Int
+    private let maxQueued: Int
+    private let upload: @Sendable ([AnalyticsEvent]) async -> Bool
+    private var isSending = false
+
+    init(batchSize: Int = 50, maxQueued: Int = 5_000, upload: @escaping @Sendable ([AnalyticsEvent]) async -> Bool) {
+        self.batchSize = batchSize
+        self.maxQueued = maxQueued
+        self.upload = upload
+    }
+
+    func record(_ event: AnalyticsEvent) async {
+        pending.append(event)
+        if pending.count > maxQueued { pending.removeFirst(pending.count - maxQueued) }   // drop the oldest
+        if pending.count >= batchSize { await flush() }
+    }
+
+    func flush() async {
+        guard !isSending, !pending.isEmpty else { return }
+        isSending = true
+        defer { isSending = false }
+        while !pending.isEmpty {
+            let batch = Array(pending.prefix(batchSize))
+            pending.removeFirst(batch.count)
+            guard await upload(batch) else {
+                pending.insert(contentsOf: batch, at: 0)   // try again on the next flush
+                return
+            }
+        }
+    }
+}
+```
+
+### Logging with Logger
+
+See [Logger and OSLog](/design/learn/sd-diag-logger).
+
+**Rule:** one subsystem, a category per area, and privacy on anything personal.
+
+```swift check
+import OSLog
+
+extension Logger {
+    private static let subsystem = "com.example.app"
+    static let network = Logger(subsystem: subsystem, category: "network")
+    static let sync = Logger(subsystem: subsystem, category: "sync")
+}
+
+func logRequest(path: String, status: Int, email: String, milliseconds: Int) {
+    Logger.network.info("GET \(path, privacy: .public) → \(status) in \(milliseconds) ms for \(email, privacy: .private(mask: .hash))")
+}
+
+let signposter = OSSignposter(logger: .sync)
+
+func measured<T>(_ name: StaticString, _ work: () async throws -> T) async rethrows -> T {
+    let state = signposter.beginInterval(name)
+    defer { signposter.endInterval(name, state) }
+    return try await work()
+}
+```
+
+### Downsampling an image for display
+
+See [The image pipeline](/design/learn/sd-media-image-pipeline).
+
+**Rule:** decode at the size you'll show, off the main thread; never decode the full image to make a thumbnail.
+
+```swift check
+import Foundation
+import ImageIO
+
+func downsampledImage(at url: URL, maxPixelSize: Int) -> CGImage? {
+    let sourceOptions = [kCGImageSourceShouldCache: false] as CFDictionary
+    guard let source = CGImageSourceCreateWithURL(url as CFURL, sourceOptions) else { return nil }
+    let options = [
+        kCGImageSourceCreateThumbnailFromImageAlways: true,
+        kCGImageSourceShouldCacheImmediately: true,          // decode now, on this background thread
+        kCGImageSourceCreateThumbnailWithTransform: true,    // respect EXIF orientation
+        kCGImageSourceThumbnailMaxPixelSize: maxPixelSize,   // points × screen scale
+    ] as CFDictionary
+    return CGImageSourceCreateThumbnailAtIndex(source, 0, options)
+}
+```
+
+### Background refresh
+
+See [Background execution](/design/learn/sd-bg-execution).
+
+**Rule:** register before launch finishes, always reschedule, and stop cleanly when the system says time's up.
+
+```swift check ios
+import BackgroundTasks
+
+enum BackgroundRefresh {
+    static let identifier = "com.example.app.refresh"       // also listed in Info.plist
+
+    static func register(refresh: @escaping @Sendable () async -> Bool) {
+        BGTaskScheduler.shared.register(forTaskWithIdentifier: identifier, using: nil) { task in
+            schedule()                                       // the next one, before doing the work
+            let work = Task {
+                let succeeded = await refresh()
+                task.setTaskCompleted(success: succeeded && !Task.isCancelled)
+            }
+            task.expirationHandler = { work.cancel() }
+        }
+    }
+
+    static func schedule() {
+        let request = BGAppRefreshTaskRequest(identifier: identifier)
+        request.earliestBeginDate = Date(timeIntervalSinceNow: 15 * 60)
+        try? BGTaskScheduler.shared.submit(request)
+    }
+}
+```
+
+### Testable clock, ids and dates in tests
+
+See [Controlling time](/design/learn/sd-testability-controlling-time).
+
+**Rule:** code under test asks for the time; tests decide what it is.
+
+```swift check
+import Foundation
+
+struct ReceiptNumberer: Sendable {
+    let now: @Sendable () -> Date
+    let uuid: @Sendable () -> UUID
+    let calendar: Calendar
+
+    func next() -> String {
+        let parts = calendar.dateComponents([.year, .month, .day], from: now())
+        let suffix = uuid().uuidString.prefix(6)
+        return String(format: "R-%04d%02d%02d-", parts.year ?? 0, parts.month ?? 0, parts.day ?? 0) + suffix
+    }
+}
+
+// In a test:
+let fixed = ReceiptNumberer(
+    now: { Date(timeIntervalSince1970: 1_700_000_000) },
+    uuid: { UUID(uuidString: "ABCDEF00-0000-0000-0000-000000000000")! },
+    calendar: {
+        var calendar = Calendar(identifier: .gregorian)
+        calendar.timeZone = TimeZone(identifier: "UTC")!
+        return calendar
+    }()
+)
+// fixed.next() == "R-20231114-ABCDEF"
+```

@@ -1,0 +1,147 @@
+GCD, OperationQueue and Swift concurrency side by side, with the Swift 6 rules that matter for architecture. The lessons are in [Concurrency architecture](/design/learn/sd-concurrency-async-await), starting from [GCD and QoS](/design/learn/sd-concurrency-gcd).
+
+## The same job, three ways
+
+| Job | GCD | OperationQueue | Swift concurrency |
+| --- | --- | --- | --- |
+| Run work in the background | `DispatchQueue.global(qos: .utility).async { … }` | `queue.addOperation { … }` | `Task { … }` from a non-isolated context, or a `nonisolated async` function |
+| Get back to the UI | `DispatchQueue.main.async { … }` | `OperationQueue.main.addOperation { … }` | Call a `@MainActor` function with `await` |
+| Wait for a result | completion handler | completion block, dependencies | `let value = try await load()` |
+| Several in parallel, wait for all | `DispatchGroup` | operations + a final dependent operation | `async let` (fixed count) or `withTaskGroup` (dynamic) |
+| Limit concurrency | `DispatchSemaphore` (blocks a thread) | `maxConcurrentOperationCount` | Start at most n child tasks; add the next as one finishes |
+| Protect shared state | serial queue, or a concurrent queue + barrier | serial queue | `actor`, or `Mutex` for tiny synchronous sections |
+| Cancel | `DispatchWorkItem.cancel()` (only before it starts) | `operation.cancel()` (cooperative) | `task.cancel()`; check `Task.isCancelled` or `try Task.checkCancellation()` |
+| Priority | QoS classes | `qualityOfService`, `queuePriority` | `Task(priority:)`; priority escalation when awaited |
+| Delay | `asyncAfter` | none built in | `try await Task.sleep(for: .seconds(1))` or an injected `Clock` |
+| Stream of values | repeated callbacks | none | `AsyncStream`, `AsyncSequence` |
+
+## Task kinds
+
+| Kind | Inherits actor and priority | Cancelled with its parent | Use for |
+| --- | --- | --- | --- |
+| `async let` | yes | yes | A fixed number of concurrent child operations |
+| Task group child | yes | yes | A dynamic number of child operations |
+| `Task { }` | inherits the current actor, priority and task-locals | no: keep the handle to cancel it | Starting async work from sync code (a button tap) |
+| `Task.detached { }` | no | no | Rare: work that must not inherit the actor or task-locals |
+| SwiftUI `.task { }` | runs on the main actor | yes, when the view disappears | Loading data for a view |
+
+Prefer structured concurrency (`async let`, groups): cancellation and errors flow automatically, and no work outlives its scope.
+
+## Isolation in Swift 6
+
+| Declaration | Runs on | Callers from elsewhere need |
+| --- | --- | --- |
+| `@MainActor class ViewModel` | the main actor | `await` (unless already on the main actor) |
+| `actor ImageCache` | the actor's own executor, one task at a time | `await` |
+| `nonisolated func` | sync: the caller's context. async: the generic executor, or the caller's actor with Swift 6.2's `NonisolatedNonsendingByDefault` | nothing extra |
+| `@concurrent func` | always the generic executor (Swift 6.2+) | `await` |
+| `struct` with only `Sendable` stored properties | wherever it's used | nothing; it's `Sendable` implicitly if non-public |
+
+**Sendable rules:**
+- Value types are `Sendable` when all their stored properties are.
+- `final` classes with only immutable `Sendable` properties can be `Sendable`.
+- Classes with mutable state must be actors, be `@MainActor`, or guard their state with a `Mutex` and be marked `@unchecked Sendable`, justified in a comment.
+
+## Actor reentrancy
+
+An actor runs one task at a time, but every `await` inside it is a suspension point where another call can run. State checked before an `await` may have changed after it. Store the in-flight task, not just the result:
+
+```swift check
+import Foundation
+
+actor ThumbnailCache {
+    private var cached: [URL: Data] = [:]
+    private var inFlight: [URL: Task<Data, any Error>] = [:]
+    private let fetch: @Sendable (URL) async throws -> Data
+
+    init(fetch: @escaping @Sendable (URL) async throws -> Data) {
+        self.fetch = fetch
+    }
+
+    func data(for url: URL) async throws -> Data {
+        if let data = cached[url] { return data }
+        if let task = inFlight[url] { return try await task.value }   // join the request already running
+        let task = Task { try await fetch(url) }
+        inFlight[url] = task                                          // recorded before the first await
+        defer { inFlight[url] = nil }
+        let data = try await task.value
+        cached[url] = data
+        return data
+    }
+}
+```
+
+## Bridging callbacks to async
+
+Resume a continuation exactly once: never zero times (the caller hangs) and never twice (a crash).
+
+```swift check
+import Foundation
+
+enum LegacyLocationService {
+    static func requestOnce(completion: @escaping @Sendable (Result<Double, any Error>) -> Void) {
+        completion(.success(51.5))
+    }
+}
+
+func currentLatitude() async throws -> Double {
+    try await withCheckedThrowingContinuation { continuation in
+        LegacyLocationService.requestOnce { result in
+            continuation.resume(with: result)
+        }
+    }
+}
+```
+
+## Bounded parallel work that keeps order
+
+```swift check
+func mapConcurrently<Input: Sendable, Output: Sendable>(
+    _ inputs: [Input],
+    limit: Int,
+    _ transform: @escaping @Sendable (Input) async throws -> Output
+) async throws -> [Output] {
+    try await withThrowingTaskGroup(of: (Int, Output).self) { group in
+        var results = [Output?](repeating: nil, count: inputs.count)
+        var next = 0
+        for _ in 0..<min(limit, inputs.count) {
+            let index = next
+            group.addTask { (index, try await transform(inputs[index])) }
+            next += 1
+        }
+        while let (index, output) = try await group.next() {     // the first error cancels the rest
+            results[index] = output
+            if next < inputs.count {
+                let index = next
+                group.addTask { (index, try await transform(inputs[index])) }
+                next += 1
+            }
+        }
+        return results.compactMap { $0 }
+    }
+}
+```
+
+## Hazards and their fixes
+
+| Hazard | Symptom | Fix |
+| --- | --- | --- |
+| Data race | Random crashes, corrupted collections | Actors or a `Mutex`; Swift 6 language mode catches most at compile time |
+| Deadlock | Frozen app | Never `sync` onto the queue you're on; never block the main thread waiting for it |
+| Priority inversion | UI stutters while waiting on low-QoS work | Don't block a high-priority thread on low-priority work; tasks escalate priority when awaited |
+| Thread explosion | Hundreds of GCD threads, memory spikes | Bounded concurrency; the Swift concurrency pool has one thread per core |
+| Blocking the cooperative pool | Async code stalls | No semaphores, `sleep` or synchronous I/O inside tasks |
+| Reentrancy bug | Duplicate work, lost updates in an actor | Record intent before `await`; re-check state after it |
+| Leaked task | Work continues after the screen closes | Structured tasks, `.task` in SwiftUI, cancel stored handles in `deinit` or on disappear |
+| Main-thread hang | Watchdog kill at launch, hitches | Move I/O and decoding off the main actor |
+
+## Combine and async
+
+| Need | Combine | async |
+| --- | --- | --- |
+| One value | `Future` | `async` function |
+| Many values | `Publisher` | `AsyncSequence` |
+| Publisher to async | `for await value in publisher.values` | |
+| Async to publisher | `Future { promise in Task { … } }` or a subject fed by a task | |
+| Debounce | `.debounce(for:scheduler:)` | `AsyncAlgorithms` `debounce`, or a task restarted on each input |
+| Cancellation | `AnyCancellable` released | `Task.cancel()`, or leaving the scope |
