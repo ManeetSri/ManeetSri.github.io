@@ -47,7 +47,7 @@ export const rankFor = (xp) => {
 export const minutesOn = (record) => Object.values(record?.minutes ?? {}).reduce((sum, value) => sum + value, 0);
 
 // Every day with any recorded learning
-export const activeDays = ({ lessons = {}, problems = {}, cards = {}, activity = {}, checkpoints = {}, mocks = {} }) => {
+export const activeDays = ({ lessons = {}, problems = {}, designs = {}, cards = {}, activity = {}, checkpoints = {}, mocks = {} }) => {
     const days = new Set();
     const add = (ms) => ms && days.add(dayKey(ms));
     Object.values(lessons).forEach((record) => {
@@ -56,6 +56,7 @@ export const activeDays = ({ lessons = {}, problems = {}, cards = {}, activity =
     });
     // Attempts are keyed by time, so two devices' attempts merge instead of replacing each other
     Object.values(problems).forEach((record) => Object.values(record.attempts ?? {}).forEach((attempt) => add(attempt.at)));
+    Object.values(designs).forEach((record) => Object.values(record.attempts ?? {}).forEach((attempt) => add(attempt.at)));
     Object.values(cards).forEach((card) => add(card.last));
     Object.values(checkpoints).forEach((record) => Object.values(record.attempts ?? {}).forEach((attempt) => add(attempt.at)));
     Object.values(mocks).forEach((record) => add(record.at));

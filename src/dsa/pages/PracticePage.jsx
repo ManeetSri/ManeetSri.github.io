@@ -3,7 +3,7 @@ import { Link, useNavigate } from 'react-router-dom';
 import { ArrowRight, CheckCircle2, Circle, CircleDot, Code2, Search, Shuffle } from 'lucide-react';
 import { useCourse } from '../course/context.js';
 import { isDue } from '../engine/srs.js';
-import { cardId, useStore } from '../store/store.js';
+import { cardId, useCourseStore } from '../store/store.js';
 import { useConsoleMeta, useNow } from '../ui/hooks.js';
 import { Button, Chip, EmptyState, PageHeader, ProgressBar } from '../ui/primitives.jsx';
 
@@ -28,7 +28,7 @@ const PracticePage = () => {
     const { lessonById, lessons: allLessons, moduleById, DIFFICULTIES, LISTS, PATTERNS, practice: problems, links, practiceIntro } = useCourse();
     useConsoleMeta('Practice', links.practice);
     const navigate = useNavigate();
-    const { problems: records, cards, lessons } = useStore();
+    const { problems: records, cards, lessons } = useCourseStore();
     const [query, setQuery] = useState('');
     const [difficulty, setDifficulty] = useState('');
     const [pattern, setPattern] = useState('');

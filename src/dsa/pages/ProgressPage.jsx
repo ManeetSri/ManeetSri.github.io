@@ -5,7 +5,7 @@ import { completion } from '../engine/path.js';
 import { minutesOn, RANKS } from '../engine/stats.js';
 import { badgesFor, longestStreak, masteryByPart } from '../engine/badges.js';
 import MasteryRadar from '../ui/MasteryRadar.jsx';
-import { useProfile, useStore } from '../store/store.js';
+import { useCourseStore, useProfile } from '../store/store.js';
 import { formatDate, formatMinutes } from '../ui/format.js';
 import { useConsoleMeta, useNow, usePath, useStats } from '../ui/hooks.js';
 import { Card, PageHeader, ProgressBar } from '../ui/primitives.jsx';
@@ -52,7 +52,7 @@ const ProgressPage = () => {
     const course = useCourse();
     const { lessons: allLessons, parts, DIFFICULTIES, practice: problems, links } = course;
     useConsoleMeta('Progress', links.progress);
-    const state = useStore();
+    const state = useCourseStore();
     const path = usePath();
     const { xp, rank, streak, days } = useStats();
     const now = useNow();

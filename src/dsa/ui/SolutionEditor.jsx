@@ -3,7 +3,7 @@ import { Download, FolderInput, LoaderCircle, RotateCcw } from 'lucide-react';
 import { loadStarter } from '../content/index.js';
 import { useCourse } from '../course/context.js';
 import { CopyButton } from '../mdx/CodeBlock.jsx';
-import { useActions, useStore } from '../store/store.js';
+import { useActions, useCourseStore } from '../store/store.js';
 import { CodeEditor } from './CodeEditor.jsx';
 import { Button } from './primitives.jsx';
 
@@ -30,7 +30,7 @@ const writeToPackage = async (pkg, file, code) => {
 // your progress, so it follows you between devices. Only code that differs from the stub is stored.
 export const SolutionEditor = ({ problem, compact = false }) => {
     const course = useCourse();
-    const { problems, ready } = useStore();
+    const { problems, ready } = useCourseStore();
     const actions = useActions();
     const stored = problems[problem.id]?.solution ?? '';
     const [starter, setStarter] = useState({ status: 'loading' });

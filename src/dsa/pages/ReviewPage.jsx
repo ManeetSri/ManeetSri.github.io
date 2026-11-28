@@ -6,7 +6,7 @@ import { useCourse } from '../course/context.js';
 import { isDue, RATINGS, reviewCard } from '../engine/srs.js';
 import { Inline } from '../mdx/inline.jsx';
 import Question from '../mdx/quiz/Question.jsx';
-import { useActions, useStore } from '../store/store.js';
+import { useActions, useCourseStore } from '../store/store.js';
 import { formatDate, relativeDays } from '../ui/format.js';
 import { useConsoleMeta, useNow } from '../ui/hooks.js';
 import { Button, ButtonLink, Card, Chip, EmptyState, PageHeader } from '../ui/primitives.jsx';
@@ -103,7 +103,7 @@ const ProblemCard = ({ card, onRate, now }) => {
 const ReviewPage = () => {
     const { links } = useCourse();
     useConsoleMeta('Review', links.review);
-    const { cards } = useStore();
+    const { cards } = useCourseStore();
     const { review } = useActions();
     const now = useNow(30_000);
     const all = Object.entries(cards).map(([id, card]) => ({ id, ...card }));

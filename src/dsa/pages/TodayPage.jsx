@@ -3,7 +3,7 @@ import { Link } from 'react-router-dom';
 import { useCourse } from '../course/context.js';
 import { completion, isDone, isOnPath, projection } from '../engine/path.js';
 import { planToday } from '../engine/today.js';
-import { useProfile, useStore } from '../store/store.js';
+import { useCourseStore, useProfile } from '../store/store.js';
 import { formatDate, formatMinutes, greeting } from '../ui/format.js';
 import { useConsoleMeta, useNow, usePath, useStats } from '../ui/hooks.js';
 import { ButtonLink, Card, Chip, ProgressBar, ProgressRing } from '../ui/primitives.jsx';
@@ -38,7 +38,7 @@ const TodayPage = () => {
     const course = useCourse();
     const { GOALS, moduleById, modules, partByNumber, DIFFICULTIES, links, onboarding } = course;
     useConsoleMeta('Today');
-    const state = useStore();
+    const state = useCourseStore();
     const profile = useProfile();
     const path = usePath();
     const { xp, rank, streak } = useStats();

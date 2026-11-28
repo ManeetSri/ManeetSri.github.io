@@ -6,7 +6,7 @@ import { useContent } from '../content/index.js';
 import { reviewCard, RATINGS } from '../engine/srs.js';
 import { CopyButton } from '../mdx/CodeBlock.jsx';
 import { mdxComponents } from '../mdx/components.js';
-import { cardId, useActions, useStore } from '../store/store.js';
+import { cardId, useActions, useCourseStore } from '../store/store.js';
 import { AutosaveTextarea } from '../ui/AutosaveTextarea.jsx';
 import { SolutionEditor } from '../ui/SolutionEditor.jsx';
 import { formatDate, formatDuration, relativeDays } from '../ui/format.js';
@@ -36,7 +36,7 @@ const Stopwatch = ({ seconds, running, onToggle, onReset }) => (
 
 const Workspace = ({ problem }) => {
     const { swift } = useCourse();
-    const { problems, cards } = useStore();
+    const { problems, cards } = useCourseStore();
     const actions = useActions();
     const record = problems[problem.id];
     const card = cards[cardId.problem(problem.id)];

@@ -6,7 +6,7 @@ import { useCourse } from '../course/context.js';
 import { isDone } from '../engine/path.js';
 import { XP } from '../engine/stats.js';
 import Question from '../mdx/quiz/Question.jsx';
-import { useActions, useStore } from '../store/store.js';
+import { useActions, useCourseStore } from '../store/store.js';
 import { formatDate } from '../ui/format.js';
 import { useConsoleMeta } from '../ui/hooks.js';
 import { Button, ButtonLink, Card, EmptyState, PageHeader, ProgressBar } from '../ui/primitives.jsx';
@@ -33,7 +33,7 @@ const loadQuestions = async (course, module) => {
 
 const Results = ({ module, questions, answers, onRetake }) => {
     const { links } = useCourse();
-    const { lessons } = useStore();
+    const { lessons } = useCourseStore();
     const { testOut } = useActions();
     const [testedOut, setTestedOut] = useState(false);
     const score = questions.filter((question) => answers[question.key]).length;
@@ -85,7 +85,7 @@ const Results = ({ module, questions, answers, onRetake }) => {
 const CheckpointView = ({ module }) => {
     const course = useCourse();
     useConsoleMeta(`${module.code} checkpoint`, course.links.checkpoint(module.id));
-    const { checkpoints } = useStore();
+    const { checkpoints } = useCourseStore();
     const { recordCheckpoint } = useActions();
     const record = checkpoints[module.id];
     const attempts = Object.values(record?.attempts ?? {}).sort((a, b) => b.at - a.at);

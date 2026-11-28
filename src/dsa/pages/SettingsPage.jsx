@@ -34,7 +34,8 @@ const Segmented = ({ label, options, value, onChange }) => (
 );
 
 const SettingsPage = () => {
-    const { GOALS, links, placementName } = useCourse();
+    const course = useCourse();
+    const { GOALS, links, placementName } = course;
     useConsoleMeta('Settings', links.settings);
     const state = useStore();
     const profile = useProfile();
@@ -43,6 +44,7 @@ const SettingsPage = () => {
     const fileInput = useRef(null);
     const [message, setMessage] = useState('');
     const [confirmReset, setConfirmReset] = useState('');
+    const [confirmCourseReset, setConfirmCourseReset] = useState('');
 
     const importFile = async (file) => {
         if (!file) return;
@@ -56,6 +58,12 @@ const SettingsPage = () => {
         } finally {
             fileInput.current.value = '';
         }
+    };
+
+    const resetCourse = async () => {
+        await actions.resetCourse(course);
+        setConfirmCourseReset('');
+        setMessage(`${course.title} progress deleted.`);
     };
 
     const reset = async () => {
@@ -80,7 +88,7 @@ const SettingsPage = () => {
                             type="button"
                             role="radio"
                             aria-checked={profile.goal === key}
-                            onClick={() => actions.saveProfile({ goal: key })}
+                            onClick={() => actions.saveCourseProfile(course, { goal: key })}
                             className={`rounded-xl border p-4 text-left ${profile.goal === key ? 'border-amber bg-amber/10' : 'border-line hover:border-white/25'}`}
                         >
                             <span className="block font-medium">{goal.label}</span>
@@ -92,15 +100,15 @@ const SettingsPage = () => {
 
             <Section title="Your pace" detail="Today’s plan fits into your daily minutes, and your finish date follows from both.">
                 <p className="mb-2 text-sm">Minutes a day</p>
-                <Segmented label="Minutes a day" value={profile.minutesPerDay} onChange={(value) => actions.saveProfile({ minutesPerDay: value })} options={MINUTE_OPTIONS.map((value) => ({ value, label: `${value}` }))} />
+                <Segmented label="Minutes a day" value={profile.minutesPerDay} onChange={(value) => actions.saveCourseProfile(course, { minutesPerDay: value })} options={MINUTE_OPTIONS.map((value) => ({ value, label: `${value}` }))} />
                 <p className="mb-2 mt-5 text-sm">Days a week</p>
-                <Segmented label="Days a week" value={profile.daysPerWeek} onChange={(value) => actions.saveProfile({ daysPerWeek: value })} options={[3, 4, 5, 6, 7].map((value) => ({ value, label: `${value}` }))} />
+                <Segmented label="Days a week" value={profile.daysPerWeek} onChange={(value) => actions.saveCourseProfile(course, { daysPerWeek: value })} options={[3, 4, 5, 6, 7].map((value) => ({ value, label: `${value}` }))} />
                 <label className="mt-5 block text-sm">
                     Target date <span className="text-muted">(optional)</span>
                     <input
                         type="date"
                         value={profile.targetDate ?? ''}
-                        onChange={(event) => actions.saveProfile({ targetDate: event.target.value || null })}
+                        onChange={(event) => actions.saveCourseProfile(course, { targetDate: event.target.value || null })}
                         className="mt-2 block h-10 rounded-xl border border-line bg-surface px-3 text-paper outline-none [color-scheme:dark] focus:border-amber"
                     />
                 </label>
@@ -120,12 +128,20 @@ const SettingsPage = () => {
                 <p aria-live="polite" className="mt-3 text-sm text-muted">{message}</p>
             </Section>
 
-            <Section title="Danger zone" detail="Deleting progress removes every lesson, answer, attempt, card and note from all your devices. Export a backup first.">
+            <Section title={`Start ${course.title} over`} detail={`Deletes this course’s lessons, answers, attempts, cards, notes and settings from all your devices. Other courses, your streak and your study minutes stay. Export a backup first.`}>
+                <label className="block text-sm">
+                    Type <span className="font-mono text-swift">delete</span> to confirm
+                    <input value={confirmCourseReset} onChange={(event) => setConfirmCourseReset(event.target.value)} className="mt-2 block h-10 w-full max-w-xs rounded-xl border border-line bg-surface px-3 outline-none focus:border-swift" />
+                </label>
+                <Button className="mt-3" onClick={resetCourse} disabled={confirmCourseReset !== 'delete'}><Trash2 size={17} aria-hidden="true" /> Delete {course.shortTitle} progress</Button>
+            </Section>
+
+            <Section title="Danger zone" detail="Deleting everything removes every course’s lessons, answers, attempts, cards and notes from all your devices. Export a backup first.">
                 <label className="block text-sm">
                     Type <span className="font-mono text-swift">delete</span> to confirm
                     <input value={confirmReset} onChange={(event) => setConfirmReset(event.target.value)} className="mt-2 block h-10 w-full max-w-xs rounded-xl border border-line bg-surface px-3 outline-none focus:border-swift" />
                 </label>
-                <Button className="mt-3" onClick={reset} disabled={confirmReset !== 'delete'}><Trash2 size={17} aria-hidden="true" /> Delete all progress</Button>
+                <Button className="mt-3" onClick={reset} disabled={confirmReset !== 'delete'}><Trash2 size={17} aria-hidden="true" /> Delete everything</Button>
             </Section>
 
             <Section title="This device" detail="Locking signs out here and clears the offline copy. Your progress stays safe in your account.">

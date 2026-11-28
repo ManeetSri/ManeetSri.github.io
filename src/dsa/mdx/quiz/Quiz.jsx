@@ -1,5 +1,5 @@
 import { ListChecks } from 'lucide-react';
-import { useActions, useStore } from '../../store/store.js';
+import { useActions, useCourseStore } from '../../store/store.js';
 import { useLessonContext } from '../lessonContext.js';
 import Question from './Question.jsx';
 
@@ -8,7 +8,7 @@ import Question from './Question.jsx';
 const Quiz = ({ data }) => {
     const { questions } = JSON.parse(data);
     const lesson = useLessonContext();
-    const { lessons } = useStore();
+    const { lessons } = useCourseStore();
     const { recordAnswer } = useActions();
     const saved = lesson ? lessons[lesson.lessonId]?.quiz ?? {} : {};
     const correct = questions.filter((question) => saved[question.id]?.correct).length;

@@ -3,7 +3,7 @@ import { Link } from 'react-router-dom';
 import { Award, CheckCircle2, ChevronDown, Circle, CircleDot, Clock3, SkipForward } from 'lucide-react';
 import { useCourse } from '../course/context.js';
 import { completion, isOnPath, lessonState, moduleCompletion, nextOnPath } from '../engine/path.js';
-import { useProfile, useStore } from '../store/store.js';
+import { useCourseStore, useProfile } from '../store/store.js';
 import { formatMinutes } from '../ui/format.js';
 import { useConsoleMeta, usePath } from '../ui/hooks.js';
 import { Chip, PageHeader, ProgressBar, ProgressRing } from '../ui/primitives.jsx';
@@ -76,7 +76,7 @@ const ModuleRow = ({ module, progress, goal, showAll, open, onToggle, nextId, ma
 const PathPage = () => {
     const { GOALS, parts, modulesInPart, links } = useCourse();
     useConsoleMeta('Path', links.path);
-    const { lessons: progress, checkpoints } = useStore();
+    const { lessons: progress, checkpoints } = useCourseStore();
     const { goal } = useProfile();
     const path = usePath();
     const next = nextOnPath(path, progress);

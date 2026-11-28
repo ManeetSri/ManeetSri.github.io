@@ -6,7 +6,7 @@ import {
 } from 'lucide-react';
 import { useCourse } from '../course/context.js';
 import { moduleCompletion } from '../engine/path.js';
-import { useProfile, useStore } from '../store/store.js';
+import { useCourseStore, useProfile, useStore } from '../store/store.js';
 import { useStats, useStudyTimer } from './hooks.js';
 import { Kbd, ProgressRing } from './primitives.jsx';
 
@@ -43,7 +43,7 @@ const currentLessonId = (pathname, base) => (pathname.startsWith(`${base}/learn/
 const ModuleTree = ({ onNavigate }) => {
     const { lessons, parts, modulesInPart, GOALS, links, base } = useCourse();
     const { pathname } = useLocation();
-    const { lessons: progress } = useStore();
+    const { lessons: progress } = useCourseStore();
     const { goal } = useProfile();
     const activeLesson = lessons.find((lesson) => lesson.id === currentLessonId(pathname, base));
     const [openParts, setOpenParts] = useState(() => new Set([activeLesson?.part ?? 0]));

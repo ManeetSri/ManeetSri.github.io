@@ -5,7 +5,7 @@ import { useCourse } from '../course/context.js';
 import { useContent } from '../content/index.js';
 import { mdxComponents } from '../mdx/components.js';
 import { LessonContext } from '../mdx/lessonContext.js';
-import { useActions, useProfile, useStore } from '../store/store.js';
+import { useActions, useCourseStore, useProfile } from '../store/store.js';
 import { formatMinutes } from '../ui/format.js';
 import { lessonContext, useConsoleMeta, usePath } from '../ui/hooks.js';
 import { Button, ButtonLink, Card, Chip, EmptyState } from '../ui/primitives.jsx';
@@ -43,7 +43,7 @@ const OnThisPage = ({ headings }) => {
 
 const Practice = ({ lesson }) => {
     const { practiceById, DIFFICULTIES, links } = useCourse();
-    const { problems } = useStore();
+    const { problems } = useCourseStore();
     const list = lesson.problems.map((id) => practiceById[id]).filter(Boolean);
     if (!list.length) return null;
     return (
@@ -93,7 +93,7 @@ const LessonView = ({ lesson }) => {
     const { lessons: allLessons, LEVELS, TRACKS, links } = course;
     useConsoleMeta(lesson.title, links.lesson(lesson.id));
     const content = useContent('lesson', lesson.id);
-    const { lessons: progress, notes } = useStore();
+    const { lessons: progress, notes } = useCourseStore();
     const actions = useActions();
     const { textSize } = useProfile();
     const path = usePath();

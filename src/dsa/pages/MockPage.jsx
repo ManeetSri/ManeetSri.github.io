@@ -5,7 +5,7 @@ import { useCourse } from '../course/context.js';
 import { useContent } from '../content/index.js';
 import { isDone } from '../engine/path.js';
 import { mdxComponents } from '../mdx/components.js';
-import { useActions, useStore } from '../store/store.js';
+import { useActions, useCourseStore } from '../store/store.js';
 import { formatDate, formatDuration } from '../ui/format.js';
 import { useConsoleMeta } from '../ui/hooks.js';
 import { Button, Card, Chip, EmptyState, PageHeader } from '../ui/primitives.jsx';
@@ -98,7 +98,7 @@ const Rubric = ({ problem, seconds, onSaved }) => {
 const MockPage = () => {
     const { DIFFICULTIES, problemById, problems, links } = useCourse();
     useConsoleMeta('Mock interview', links.mock);
-    const { lessons, problems: records, mocks } = useStore();
+    const { lessons, problems: records, mocks } = useCourseStore();
     const [duration, setDuration] = useState(45);
     const [difficulty, setDifficulty] = useState('any');
     const [stage, setStage] = useState('setup');

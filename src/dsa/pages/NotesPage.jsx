@@ -2,7 +2,7 @@ import { Link } from 'react-router-dom';
 import { Bookmark, CircleAlert, Flag, NotebookPen } from 'lucide-react';
 import { useCourse } from '../course/context.js';
 import { mockMistakes, problemMistakes, quizMistakes } from '../engine/mistakes.js';
-import { useStore } from '../store/store.js';
+import { useCourseStore } from '../store/store.js';
 import { formatDate } from '../ui/format.js';
 import { useConsoleMeta } from '../ui/hooks.js';
 import { Card, EmptyState, PageHeader } from '../ui/primitives.jsx';
@@ -23,7 +23,7 @@ const LinkList = ({ items }) => (
 const NotesPage = () => {
     const { lessonById, moduleById, practiceById: problemById, links } = useCourse();
     useConsoleMeta('Notes', links.notes);
-    const { notes, lessons, problems, mocks } = useStore();
+    const { notes, lessons, problems, mocks } = useCourseStore();
 
     const lessonNotes = Object.entries(notes)
         .filter(([id, note]) => lessonById[id] && note.text?.trim())

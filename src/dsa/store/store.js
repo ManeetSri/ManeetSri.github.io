@@ -1,18 +1,15 @@
 // The console's progress store. It mirrors every collection from the adapter (Firestore in production,
 // localStorage in development) and exposes small actions that only ever record facts.
-import { createContext, useContext, useSyncExternalStore } from 'react';
+import { createContext, useContext, useMemo, useSyncExternalStore } from 'react';
+import { useCourse } from '../course/context.js';
+import { filterState, ownerOf, OWNED } from '../course/ownership.js';
+import { COURSE_FIELDS, courseProfile, profilePatch } from '../course/profile.js';
 import { addDays, dayKey, startOfDay } from '../engine/dates.js';
+import { ratingFromRubric } from '../engine/exercises.js';
 import { newCard, reviewCard } from '../engine/srs.js';
 
-export const COLLECTIONS = ['meta', 'lessons', 'problems', 'cards', 'notes', 'activity', 'checkpoints', 'mocks'];
-
-export const DEFAULT_PROFILE = {
-    goal: 'foundations',
-    minutesPerDay: 45,
-    daysPerWeek: 5,
-    targetDate: null,
-    textSize: 'normal',
-};
+// `designs` holds design exercises and architecture reviews (answers, reveals, attempts)
+export const COLLECTIONS = ['meta', 'lessons', 'problems', 'designs', 'cards', 'notes', 'activity', 'checkpoints', 'mocks'];
 
 const STATUS_RANK = { attempted: 1, helped: 2, solved: 3 };
 const DEVICE_KEY = 'maneet-dsa-device';
@@ -39,6 +36,7 @@ export const cardId = {
     takeaway: (lessonId, id) => `${lessonId}~card~${id}`,
     question: (lessonId, id) => `${lessonId}~q~${id}`,
     problem: (problemId) => `problem~${problemId}`,
+    design: (designId) => `design~${designId}`,
 };
 
 export const createStore = (adapter) => {
@@ -65,7 +63,11 @@ export const createStore = (adapter) => {
     const now = () => Date.now();
 
     const actions = {
+        // Console-wide settings, such as text size
         saveProfile: (patch) => put('meta', 'profile', patch),
+
+        // A course's own settings: goal, pace, target date, setup
+        saveCourseProfile: (course, patch) => put('meta', 'profile', profilePatch(course, patch)),
 
         openLesson: (lessonId) => {
             if (!state.lessons[lessonId]?.openedAt) put('lessons', lessonId, { openedAt: now() });
@@ -140,13 +142,44 @@ export const createStore = (adapter) => {
             });
         },
 
-        // A mock interview keeps its rubric, and also counts as an attempt at the problem
-        recordMock: ({ problemId, seconds, status, scores, notes }) => {
+        // A design exercise or architecture review: section drafts autosave as they're written
+        saveDesignDraft: (designId, kind, sectionId, text) => put('designs', designId, { kind, draft: { [sectionId]: text }, updatedAt: now() }),
+
+        saveDesignNotes: (designId, kind, text) => put('designs', designId, { kind, notes: text, updatedAt: now() }),
+
+        // Revealing the model answer is remembered, so a reload doesn't hide it again
+        setRevealed: (designId, kind, revealed) => put('designs', designId, { kind, revealedAt: revealed ? now() : null }),
+
+        // Scored attempts are kept, keyed by time, and schedule the next recall of the design
+        logDesignAttempt: (designId, { kind, seconds, rating, status, scores, skills, marks, words, source = 'practice', answer }) => {
             const time = now();
-            const average = Object.values(scores).reduce((sum, value) => sum + value, 0) / Math.max(1, Object.values(scores).length);
-            const rating = status === 'attempted' || average < 2 ? 'again' : average < 2.75 ? 'hard' : average < 3.5 ? 'good' : 'easy';
-            put('mocks', String(time), { at: time, problemId, seconds, status, scores, notes });
-            actions.logAttempt(problemId, { status, seconds, rating });
+            const record = state.designs[designId];
+            const best = STATUS_RANK[status] > (STATUS_RANK[record?.status] ?? 0) ? status : record.status;
+            const attempt = { at: time, status, seconds, rating, words, source, ...(scores ? { scores } : {}), ...(skills ? { skills } : {}), ...(marks ? { marks } : {}) };
+            put('designs', designId, { kind, status: best, attempts: { [time]: attempt }, ...(answer ? { lastAnswer: answer, lastAnsweredAt: time } : {}) });
+            const id = cardId.design(designId);
+            const card = state.cards[id] ?? newCard({ kind, ref: designId }, time);
+            put('cards', id, reviewCard(card, rating, time));
+        },
+
+        // Keep the last answer for comparison, and start again with an empty sheet
+        startDesignOver: (designId, kind) => {
+            const record = state.designs[designId];
+            put('designs', designId, { kind, ...(record?.draft ? { lastAnswer: record.draft, lastAnsweredAt: now() } : {}), draft: null, revealedAt: null });
+        },
+
+        // A mock interview keeps its rubric, and also counts as an attempt at what was practised.
+        // DSA mocks are coding problems; other courses say which course and kind the mock belongs to.
+        recordMock: ({ course, kind = 'problem', problemId, itemId = problemId, seconds, status, scores, notes, answer }) => {
+            const time = now();
+            const rating = ratingFromRubric(scores, status);
+            put('mocks', String(time), {
+                at: time, seconds, status, scores, notes,
+                ...(kind === 'problem' ? { problemId: itemId } : { itemId, kind }),
+                ...(course ? { course } : {}),
+            });
+            if (kind === 'problem') actions.logAttempt(itemId, { status, seconds, rating });
+            else actions.logDesignAttempt(itemId, { kind, seconds, rating, status, scores, source: 'mock', answer });
         },
 
         addMinutes: (minutes) => {
@@ -159,6 +192,15 @@ export const createStore = (adapter) => {
         importAll: async (data) => {
             const writes = COLLECTIONS.flatMap((name) => Object.entries(data[name] ?? {}).map(([id, value]) => adapter.put(name, id, value)));
             await Promise.all(writes);
+        },
+
+        // Deletes one course's progress and settings, keeping every other course and the shared daily minutes
+        resetCourse: async (course) => {
+            const removals = OWNED.flatMap((name) => Object.entries(state[name])
+                .filter(([id, doc]) => ownerOf(name, id, doc) === course.id)
+                .map(([id]) => adapter.remove(name, id)));
+            removals.push(put('meta', 'profile', profilePatch(course, Object.fromEntries(COURSE_FIELDS.map((field) => [field, null])))));
+            await Promise.all(removals);
         },
 
         resetAll: async () => {
@@ -191,7 +233,17 @@ export const useStore = () => {
 
 export const useActions = () => useContext(StoreContext).actions;
 
+// The current course's settings, with console-wide ones such as text size
 export const useProfile = () => {
+    const course = useCourse();
     const { meta } = useStore();
-    return { ...DEFAULT_PROFILE, ...meta.profile };
+    return useMemo(() => courseProfile(meta.profile, course), [meta.profile, course]);
+};
+
+// The store narrowed to the current course: its lessons, practice, cards, notes, checkpoints and mocks.
+// The profile and daily minutes are shared by every course.
+export const useCourseStore = () => {
+    const course = useCourse();
+    const state = useStore();
+    return useMemo(() => filterState(state, course.id), [state, course]);
 };

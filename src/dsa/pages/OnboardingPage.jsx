@@ -120,7 +120,7 @@ const OnboardingPage = () => {
 
     const start = () => {
         const correct = Object.values(answers).filter(Boolean).length;
-        actions.saveProfile({
+        actions.saveCourseProfile(course, {
             goal,
             minutesPerDay,
             daysPerWeek,

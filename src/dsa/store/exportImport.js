@@ -2,7 +2,8 @@
 import { COLLECTIONS } from './store.js';
 
 const FORMAT = 'maneet-dsa-backup';
-const VERSION = 1;
+// Version 2 added design exercises (the `designs` collection). Older backups import with it empty.
+const VERSION = 2;
 
 export const exportBackup = (state) => {
     const backup = {
@@ -29,7 +30,7 @@ export const parseBackup = (text) => {
     } catch {
         throw new Error('That file isn’t valid JSON.');
     }
-    if (data?.format !== FORMAT) throw new Error('That file isn’t a DSA console backup.');
+    if (data?.format !== FORMAT) throw new Error('That file isn’t a backup of this console.');
     if (data.version > VERSION) throw new Error('That backup comes from a newer version of the console.');
     return Object.fromEntries(COLLECTIONS.map((name) => {
         const docs = data[name] ?? {};

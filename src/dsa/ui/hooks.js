@@ -1,6 +1,8 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
 import { usePageMeta } from '../../hooks/usePageMeta';
 import { useCourse } from '../course/context.js';
+import { courseList } from '../course/courses.js';
+import { filterState } from '../course/ownership.js';
 import { pathFor } from '../engine/path.js';
 import { activeDays, rankFor, streakFrom, xpFrom } from '../engine/stats.js';
 import { useActions, useProfile, useStore } from '../store/store.js';
@@ -37,15 +39,15 @@ export const useNow = (refreshMs = 60_000) => {
     return now;
 };
 
+// XP and the streak cover every course: each course scores its own items, and any study day counts
 export const useStats = () => {
-    const course = useCourse();
     const state = useStore();
     const now = useNow();
     return useMemo(() => {
-        const xp = xpFrom(state, course);
+        const xp = courseList.reduce((sum, item) => sum + xpFrom(filterState(state, item.id), item), 0);
         const days = activeDays(state);
         return { xp, rank: rankFor(xp), days, streak: streakFrom(days, now) };
-    }, [state, now, course]);
+    }, [state, now]);
 };
 
 export const lessonContext = (lesson, course) => ({
