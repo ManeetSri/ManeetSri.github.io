@@ -1,7 +1,7 @@
 import { useState } from 'react';
 import { Link } from 'react-router-dom';
 import { Award, CheckCircle2, ChevronDown, Circle, CircleDot, Clock3, SkipForward } from 'lucide-react';
-import { GOALS, LEVELS, modulesInPart, parts, TRACKS } from '../data/curriculum.js';
+import { useCourse } from '../course/context.js';
 import { completion, isOnPath, lessonState, moduleCompletion, nextOnPath } from '../engine/path.js';
 import { useProfile, useStore } from '../store/store.js';
 import { formatMinutes } from '../ui/format.js';
@@ -17,8 +17,9 @@ const STATE_ICONS = {
 };
 
 const ModuleRow = ({ module, progress, goal, showAll, open, onToggle, nextId, mastered }) => {
-    const { done, total, ratio } = moduleCompletion(module, progress, goal);
-    const visible = showAll ? module.lessons : module.lessons.filter((lesson) => isOnPath(lesson, goal));
+    const { GOALS, LEVELS, TRACKS, links } = useCourse();
+    const { done, total, ratio } = moduleCompletion(module, progress, goal, GOALS);
+    const visible = showAll ? module.lessons : module.lessons.filter((lesson) => isOnPath(lesson, goal, GOALS));
     const minutes = visible.reduce((sum, lesson) => sum + lesson.minutes, 0);
     if (visible.length === 0) return null;
 
@@ -42,10 +43,10 @@ const ModuleRow = ({ module, progress, goal, showAll, open, onToggle, nextId, ma
                     {visible.map((lesson, index) => {
                         const state = lessonState(lesson, progress);
                         const { icon: Icon, className, label } = STATE_ICONS[state];
-                        const offPath = !isOnPath(lesson, goal);
+                        const offPath = !isOnPath(lesson, goal, GOALS);
                         return (
                             <li key={lesson.id}>
-                                <Link to={`/dsa/learn/${lesson.id}`} className={`flex items-center gap-3 rounded-xl px-3 py-2.5 hover:bg-white/[0.04] ${lesson.id === nextId ? 'bg-amber/[0.07]' : ''}`}>
+                                <Link to={links.lesson(lesson.id)} className={`flex items-center gap-3 rounded-xl px-3 py-2.5 hover:bg-white/[0.04] ${lesson.id === nextId ? 'bg-amber/[0.07]' : ''}`}>
                                     <Icon size={18} aria-hidden="true" className={`shrink-0 ${className}`} />
                                     <span className="sr-only">{label}:</span>
                                     <span className="w-6 shrink-0 font-mono text-xs text-muted">{index + 1}</span>
@@ -59,7 +60,7 @@ const ModuleRow = ({ module, progress, goal, showAll, open, onToggle, nextId, ma
                     })}
                     {module.lessons.some((lesson) => lesson.status === 'ready') && (
                         <li>
-                            <Link to={`/dsa/checkpoint/${module.id}`} className="mt-1 flex items-center gap-3 rounded-xl px-3 py-2.5 text-amber hover:bg-white/[0.04]">
+                            <Link to={links.checkpoint(module.id)} className="mt-1 flex items-center gap-3 rounded-xl px-3 py-2.5 text-amber hover:bg-white/[0.04]">
                                 <Award size={18} aria-hidden="true" className="shrink-0" />
                                 <span className="flex-1">{mastered ? 'Retake the checkpoint' : 'Module checkpoint'}</span>
                                 <span className="font-mono text-xs text-muted">12 questions</span>
@@ -73,7 +74,8 @@ const ModuleRow = ({ module, progress, goal, showAll, open, onToggle, nextId, ma
 };
 
 const PathPage = () => {
-    useConsoleMeta('Path', '/dsa/path');
+    const { GOALS, parts, modulesInPart, links } = useCourse();
+    useConsoleMeta('Path', links.path);
     const { lessons: progress, checkpoints } = useStore();
     const { goal } = useProfile();
     const path = usePath();
@@ -91,7 +93,7 @@ const PathPage = () => {
 
     return (
         <div className="mx-auto max-w-4xl">
-            <PageHeader eyebrow={`Goal: ${GOALS[goal].label}`} title="Your learning path">
+            <PageHeader eyebrow={`Goal: ${(GOALS[goal] ?? Object.values(GOALS)[0]).label}`} title="Your learning path">
                 {overall.done} of {overall.total} lessons done. Lessons marked with a track are side quests outside your goal.
             </PageHeader>
 
@@ -100,7 +102,7 @@ const PathPage = () => {
                     <button type="button" aria-pressed={!showAll} onClick={() => setShowAll(false)} className={`h-9 rounded-full px-4 text-sm ${!showAll ? 'bg-white/15 font-medium' : 'text-muted'}`}>My path</button>
                     <button type="button" aria-pressed={showAll} onClick={() => setShowAll(true)} className={`h-9 rounded-full px-4 text-sm ${showAll ? 'bg-white/15 font-medium' : 'text-muted'}`}>Everything</button>
                 </div>
-                <Link to="/dsa/settings" className="text-sm text-amber hover:underline">Change goal</Link>
+                <Link to={links.settings} className="text-sm text-amber hover:underline">Change goal</Link>
             </div>
 
             <ol className="space-y-12">

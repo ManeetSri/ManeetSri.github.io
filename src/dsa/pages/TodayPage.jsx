@@ -1,7 +1,6 @@
 import { ArrowRight, Award, CalendarClock, CheckCircle2, Circle, Code2, Compass, Flame, Hourglass, Layers, Sparkles, Target } from 'lucide-react';
 import { Link } from 'react-router-dom';
-import { GOALS, moduleById, modules, partByNumber } from '../data/curriculum.js';
-import { DIFFICULTIES } from '../data/problems.js';
+import { useCourse } from '../course/context.js';
 import { completion, isDone, isOnPath, projection } from '../engine/path.js';
 import { planToday } from '../engine/today.js';
 import { useProfile, useStore } from '../store/store.js';
@@ -36,13 +35,15 @@ const Stat = ({ icon: Icon, label, value, children, tone = 'text-amber' }) => (
 );
 
 const TodayPage = () => {
+    const course = useCourse();
+    const { GOALS, moduleById, modules, partByNumber, DIFFICULTIES, links, onboarding } = course;
     useConsoleMeta('Today');
     const state = useStore();
     const profile = useProfile();
     const path = usePath();
     const { xp, rank, streak } = useStats();
     const now = useNow();
-    const plan = planToday({ path, lessons: state.lessons, problems: state.problems, cards: state.cards, minutesPerDay: profile.minutesPerDay, now });
+    const plan = planToday({ path, lessons: state.lessons, problems: state.problems, cards: state.cards, minutesPerDay: profile.minutesPerDay, now, practiceById: course.practiceById, cardMinutes: course.cardMinutes });
     const progress = completion(path, state.lessons);
     const pace = projection({ path, progress: state.lessons, minutesPerDay: profile.minutesPerDay, daysPerWeek: profile.daysPerWeek, now });
     const next = plan.next;
@@ -52,7 +53,7 @@ const TodayPage = () => {
     const behind = profile.targetDate && pace.finish > new Date(profile.targetDate).getTime();
     // The first module whose path lessons are all done but whose checkpoint isn't passed yet
     const checkpointDue = modules.find((module) => {
-        const onPath = module.lessons.filter((lesson) => lesson.status === 'ready' && isOnPath(lesson, profile.goal));
+        const onPath = module.lessons.filter((lesson) => lesson.status === 'ready' && isOnPath(lesson, profile.goal, GOALS));
         return onPath.length > 0 && onPath.every((lesson) => isDone(lesson.id, state.lessons)) && !state.checkpoints[module.id]?.passedAt;
     });
 
@@ -64,7 +65,7 @@ const TodayPage = () => {
                     <h1 className="font-display text-[clamp(2rem,5vw,3.25rem)] font-semibold leading-[1.05] tracking-tight">{greeting()}, Maneet.</h1>
                     <p className="mt-2 text-muted">
                         {GOALS[profile.goal]?.label} · {formatMinutes(profile.minutesPerDay)} a day, {profile.daysPerWeek} days a week ·{' '}
-                        <Link to="/dsa/settings" className="text-amber hover:underline">Change</Link>
+                        <Link to={links.settings} className="text-amber hover:underline">Change</Link>
                     </p>
                 </div>
                 <ProgressRing value={itemsTotal ? itemsDone / itemsTotal : 0} size={64} stroke={6} label={`${itemsDone} of ${itemsTotal} planned items done today`}>
@@ -77,9 +78,9 @@ const TodayPage = () => {
                     <Compass size={26} aria-hidden="true" className="shrink-0 text-amber" />
                     <div className="min-w-48 flex-1">
                         <p className="font-semibold">Set up your path first</p>
-                        <p className="text-sm text-muted">Pick your goal and pace, and optionally skip Swift you already know. It takes two minutes.</p>
+                        <p className="text-sm text-muted">{onboarding.setupPrompt}</p>
                     </div>
-                    <ButtonLink to="/dsa/start" variant="primary" size="sm">Set up <ArrowRight size={16} aria-hidden="true" /></ButtonLink>
+                    <ButtonLink to={links.start} variant="primary" size="sm">Set up <ArrowRight size={16} aria-hidden="true" /></ButtonLink>
                 </Card>
             )}
 
@@ -97,7 +98,7 @@ const TodayPage = () => {
                                     Meanwhile, keep your reviews going and revisit the practice problems.
                                 </p>
                             ) : (
-                                <ButtonLink to={`/dsa/learn/${next.id}`} variant="primary" className="mt-5">
+                                <ButtonLink to={links.lesson(next.id)} variant="primary" className="mt-5">
                                     {state.lessons[next.id]?.openedAt ? 'Continue lesson' : 'Start lesson'} <ArrowRight size={18} aria-hidden="true" />
                                 </ButtonLink>
                             )}
@@ -116,20 +117,20 @@ const TodayPage = () => {
                                 <PlanRow
                                     done={plan.reviews.planned === 0}
                                     icon={Layers}
-                                    to="/dsa/review"
+                                    to={links.review}
                                     title={plan.reviews.planned > 0 ? `Review ${plan.reviews.planned} card${plan.reviews.planned === 1 ? '' : 's'}` : `Reviewed ${plan.reviews.doneToday} card${plan.reviews.doneToday === 1 ? '' : 's'}`}
                                     detail={plan.reviews.due > plan.reviews.planned ? `${plan.reviews.due} due in total` : 'Spaced repetition keeps it fresh'}
                                     action="Review"
                                 />
                             )}
                             {plan.lessons.map(({ lesson, done }) => (
-                                <PlanRow key={lesson.id} done={done} icon={Target} to={`/dsa/learn/${lesson.id}`} title={lesson.title} detail={`${moduleById[lesson.module].code} · ${formatMinutes(lesson.minutes)}`} action="Learn" />
+                                <PlanRow key={lesson.id} done={done} icon={Target} to={links.lesson(lesson.id)} title={lesson.title} detail={`${moduleById[lesson.module].code} · ${formatMinutes(lesson.minutes)}`} action="Learn" />
                             ))}
                             {checkpointDue && (
-                                <PlanRow done={false} icon={Award} to={`/dsa/checkpoint/${checkpointDue.id}`} title={`Checkpoint: ${checkpointDue.title}`} detail={`${checkpointDue.code} · 12 questions · about 10 min`} action="Take it" />
+                                <PlanRow done={false} icon={Award} to={links.checkpoint(checkpointDue.id)} title={`Checkpoint: ${checkpointDue.title}`} detail={`${checkpointDue.code} · 12 questions · about 10 min`} action="Take it" />
                             )}
                             {plan.practice.map(({ problem, done }) => (
-                                <PlanRow key={problem.id} done={done} icon={Code2} to={`/dsa/practice/${problem.id}`} title={problem.title} detail={`${DIFFICULTIES[problem.difficulty].label} · ${formatMinutes(problem.minutes)}`} action="Solve" />
+                                <PlanRow key={problem.id} done={done} icon={Code2} to={links.item(problem.id)} title={problem.title} detail={`${DIFFICULTIES[problem.difficulty].label} · ${formatMinutes(problem.minutes)}`} action="Solve" />
                             ))}
                             {itemsTotal === 0 && <li className="px-3 py-6 text-center text-sm text-muted">Nothing planned. Enjoy the day off, or open the path.</li>}
                         </ul>

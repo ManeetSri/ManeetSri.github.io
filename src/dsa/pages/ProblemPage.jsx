@@ -1,8 +1,7 @@
 import { useEffect, useState } from 'react';
 import { Link, useParams } from 'react-router-dom';
 import { ArrowLeft, Eye, LoaderCircle, Pause, Play, RotateCcw, TerminalSquare } from 'lucide-react';
-import { lessonById } from '../data/curriculum.js';
-import { DIFFICULTIES, PATTERNS, problemById } from '../data/problems.js';
+import { useCourse } from '../course/context.js';
 import { useContent } from '../content/index.js';
 import { reviewCard, RATINGS } from '../engine/srs.js';
 import { CopyButton } from '../mdx/CodeBlock.jsx';
@@ -36,6 +35,7 @@ const Stopwatch = ({ seconds, running, onToggle, onReset }) => (
 );
 
 const Workspace = ({ problem }) => {
+    const { swift } = useCourse();
     const { problems, cards } = useStore();
     const actions = useActions();
     const record = problems[problem.id];
@@ -74,8 +74,8 @@ const Workspace = ({ problem }) => {
                 <p className="mb-2 flex items-center gap-2 font-semibold"><TerminalSquare size={17} aria-hidden="true" className="text-amber" /> Run the tests</p>
                 <p className="mb-3 text-sm text-muted">
                     {import.meta.env.DEV
-                        ? <>Save to package puts your code in <code className="font-mono text-amber">Sources/Exercises</code>. Then, in <code className="font-mono text-amber">dsa-swift</code>, run:</>
-                        : <>Your code is saved here. To test it, put it in the matching file in <code className="font-mono text-amber">dsa-swift/Sources/Exercises</code> (Download names it for you), then run:</>}
+                        ? <>Save to package puts your code in <code className="font-mono text-amber">Sources/Exercises</code>. Then, in <code className="font-mono text-amber">{swift.dir}</code>, run:</>
+                        : <>Your code is saved here. To test it, put it in the matching file in <code className="font-mono text-amber">{swift.dir}/Sources/Exercises</code> (Download names it for you), then run:</>}
                 </p>
                 <div className="flex items-center gap-1 rounded-xl bg-[#101217] py-1 pl-3 pr-1">
                     <code className="min-w-0 flex-1 overflow-x-auto whitespace-nowrap font-mono text-[12px]">swift test --filter {problem.swiftTest}</code>
@@ -133,14 +133,15 @@ const Workspace = ({ problem }) => {
 };
 
 const ProblemView = ({ problem }) => {
-    useConsoleMeta(problem.title, `/dsa/practice/${problem.id}`);
+    const { DIFFICULTIES, PATTERNS, lessonById, links } = useCourse();
+    useConsoleMeta(problem.title, links.item(problem.id));
     const content = useContent('problem', problem.id);
     const [showPatterns, setShowPatterns] = useState(false);
     const { Content } = content;
 
     return (
         <div className="mx-auto max-w-7xl">
-            <Link to="/dsa/practice" className="mb-4 inline-flex min-h-11 items-center gap-1.5 text-sm text-amber hover:underline"><ArrowLeft size={16} aria-hidden="true" /> All problems</Link>
+            <Link to={links.practice} className="mb-4 inline-flex min-h-11 items-center gap-1.5 text-sm text-amber hover:underline"><ArrowLeft size={16} aria-hidden="true" /> All problems</Link>
             {/* Wide screens put the statement and your code side by side */}
             <div className="grid grid-cols-1 gap-8 xl:grid-cols-[minmax(0,1.1fr)_minmax(0,1fr)]">
                 <article className="min-w-0 max-w-3xl">
@@ -154,7 +155,7 @@ const ProblemView = ({ problem }) => {
                     </div>
                     <p className="mt-3 text-sm text-muted">
                         From {problem.lessons.map((id, index) => (
-                            <span key={id}>{index > 0 && ', '}<Link to={`/dsa/learn/${id}`} className="text-amber hover:underline">{lessonById[id]?.title}</Link></span>
+                            <span key={id}>{index > 0 && ', '}<Link to={links.lesson(id)} className="text-amber hover:underline">{lessonById[id]?.title}</Link></span>
                         ))}
                         {problem.similar && <> · Similar: <a href={problem.similar.url} target="_blank" rel="noopener noreferrer" className="text-amber hover:underline">{problem.similar.label}</a></>}
                     </p>
@@ -174,8 +175,9 @@ const ProblemView = ({ problem }) => {
 };
 
 const ProblemPage = () => {
+    const { practiceById } = useCourse();
     const { problemId } = useParams();
-    const problem = problemById[problemId];
+    const problem = practiceById[problemId];
     if (!problem) return <ConsoleNotFound />;
     return <ProblemView key={problem.id} problem={problem} />;
 };

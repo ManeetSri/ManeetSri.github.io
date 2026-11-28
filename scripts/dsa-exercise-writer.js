@@ -7,7 +7,10 @@ import { fileURLToPath } from 'node:url';
 // Sources/Exercises can be written. Other sites can't use it: the custom header means a cross-site request
 // needs a CORS preflight, which Vite grants only to localhost pages, and a request whose Origin isn't this
 // server itself is refused here.
-const EXERCISES = fileURLToPath(new URL('../dsa-swift/Sources/Exercises', import.meta.url));
+// Each course's Swift package, by the name the console sends
+const PACKAGES = {
+    dsa: fileURLToPath(new URL('../dsa-swift/Sources/Exercises', import.meta.url)),
+};
 const FILE = /^[a-z0-9-]+\/[A-Za-z0-9]+\.swift$/;
 const MAX_BYTES = 256 * 1024;
 
@@ -52,9 +55,10 @@ export const dsaExerciseWriter = () => ({
                 } catch {
                     return reply(400, 'Not JSON');
                 }
-                const { file, code } = body ?? {};
-                if (typeof file !== 'string' || !FILE.test(file) || typeof code !== 'string') return reply(400, 'Bad request');
-                const path = join(EXERCISES, file);
+                const { package: name = 'dsa', file, code } = body ?? {};
+                const exercises = Object.hasOwn(PACKAGES, name) ? PACKAGES[name] : null;
+                if (!exercises || typeof file !== 'string' || !FILE.test(file) || typeof code !== 'string') return reply(400, 'Bad request');
+                const path = join(exercises, file);
                 if (!existsSync(path)) return reply(404, 'No such exercise');
                 writeFileSync(path, code.endsWith('\n') ? code : `${code}\n`);
                 reply(200, `Sources/Exercises/${file}`);
@@ -63,6 +67,6 @@ export const dsaExerciseWriter = () => ({
     },
     // The editor already shows what was written, so a changed exercise file doesn't reload the page
     handleHotUpdate({ file }) {
-        if (file.startsWith(EXERCISES)) return [];
+        if (Object.values(PACKAGES).some((exercises) => file.startsWith(exercises))) return [];
     },
 });

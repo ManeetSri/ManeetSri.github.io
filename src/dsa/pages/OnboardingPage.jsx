@@ -1,8 +1,7 @@
 import { useState } from 'react';
 import { useNavigate } from 'react-router-dom';
 import { ArrowLeft, ArrowRight, CheckCircle2, CircleX, Compass, GraduationCap, Rocket, Sprout } from 'lucide-react';
-import { GOALS, lessons as allLessons, moduleById, partByNumber } from '../data/curriculum.js';
-import { PLACEMENT_GROUPS } from '../data/placement.js';
+import { useCourse } from '../course/context.js';
 import { pathFor, projection } from '../engine/path.js';
 import Question from '../mdx/quiz/Question.jsx';
 import { useActions, useProfile } from '../store/store.js';
@@ -12,7 +11,12 @@ import { Button, Card, ProgressBar } from '../ui/primitives.jsx';
 
 const STEPS = ['welcome', 'goal', 'pace', 'placement', 'summary'];
 const MINUTE_OPTIONS = [15, 30, 45, 60, 90, 120];
-const QUESTIONS = PLACEMENT_GROUPS.flatMap((group) => group.questions.map((question) => ({ ...question, group: group.id })));
+// Every placement question in a course, built once per course
+const questionSets = new WeakMap();
+const questionsFor = (course) => {
+    if (!questionSets.has(course)) questionSets.set(course, course.placement.flatMap((group) => group.questions.map((question) => ({ ...question, group: group.id }))));
+    return questionSets.get(course);
+};
 
 const Choice = ({ selected, onSelect, title, detail, icon: Icon }) => (
     <button
@@ -47,10 +51,13 @@ const Pills = ({ label, options, value, onChange, format = (option) => option })
     </div>
 );
 
-const groupLessons = (group) => group.modules.flatMap((id) => moduleById[id].lessons.map((lesson) => lesson.id));
+const groupLessons = (group, moduleById) => group.modules.flatMap((id) => moduleById[id].lessons.map((lesson) => lesson.id));
 
 // The optional placement check: one question at a time, first answers only
 const Placement = ({ answers, setAnswers, onDone }) => {
+    const course = useCourse();
+    const QUESTIONS = questionsFor(course);
+    const PLACEMENT_GROUPS = course.placement;
     const [index, setIndex] = useState(() => Math.min(Object.keys(answers).length, QUESTIONS.length - 1));
     const question = QUESTIONS[index];
     const answered = question.id in answers;
@@ -79,7 +86,10 @@ const Placement = ({ answers, setAnswers, onDone }) => {
 };
 
 const OnboardingPage = () => {
-    useConsoleMeta('Set up your path', '/dsa/start');
+    const course = useCourse();
+    const { GOALS, lessons: allLessons, moduleById, partByNumber, placement: PLACEMENT_GROUPS, links, onboarding } = course;
+    const QUESTIONS = questionsFor(course);
+    useConsoleMeta('Set up your path', links.start);
     const navigate = useNavigate();
     const profile = useProfile();
     const actions = useActions();
@@ -95,8 +105,8 @@ const OnboardingPage = () => {
     const [skipGroups, setSkipGroups] = useState(() => new Set());
 
     const passedGroups = PLACEMENT_GROUPS.filter((group) => group.questions.every((question) => answers[question.id] === true));
-    const skippedLessons = new Set(PLACEMENT_GROUPS.filter((group) => skipGroups.has(group.id)).flatMap(groupLessons));
-    const path = pathFor(goal, allLessons);
+    const skippedLessons = new Set(PLACEMENT_GROUPS.filter((group) => skipGroups.has(group.id)).flatMap((group) => groupLessons(group, moduleById)));
+    const path = pathFor(goal, allLessons, GOALS);
     const remainingPath = path.filter((lesson) => !skippedLessons.has(lesson.id));
     const pace = projection({ path: remainingPath, progress: {}, minutesPerDay, daysPerWeek, now });
     const firstLesson = remainingPath[0];
@@ -119,7 +129,7 @@ const OnboardingPage = () => {
             placement: placementMode === 'check' ? { answered: Object.keys(answers).length, correct, testedOut: [...skipGroups] } : null,
         });
         if (skippedLessons.size) actions.testOut([...skippedLessons]);
-        navigate('/dsa');
+        navigate(links.today);
     };
 
     const next = () => {
@@ -153,7 +163,7 @@ const OnboardingPage = () => {
                         {[
                             'Your goal decides which lessons form your main path.',
                             'Your pace sizes each day’s plan and predicts when you’ll finish.',
-                            'The quick check lets you skip Swift topics you already know. Starting from zero is completely fine.',
+                            onboarding.skipPoint,
                         ].map((text) => (
                             <li key={text} className="flex gap-3 text-paper/85"><CheckCircle2 size={20} aria-hidden="true" className="mt-0.5 shrink-0 text-[#30D158]" /> {text}</li>
                         ))}
@@ -167,7 +177,7 @@ const OnboardingPage = () => {
                     <p className="mt-2 text-muted">You can change it any time in Settings, and your progress carries over.</p>
                     <div role="radiogroup" aria-labelledby="goal-title" className="mt-6 grid gap-2">
                         {Object.entries(GOALS).map(([key, value]) => (
-                            <Choice key={key} selected={goal === key} onSelect={() => setGoal(key)} title={value.label} detail={`${value.detail} ${pathFor(key, allLessons).length} lessons.`} />
+                            <Choice key={key} selected={goal === key} onSelect={() => setGoal(key)} title={value.label} detail={`${value.detail} ${pathFor(key, allLessons, GOALS).length} lessons.`} />
                         ))}
                     </div>
                 </section>
@@ -207,9 +217,9 @@ const OnboardingPage = () => {
             {current === 'placement' && !checking && (
                 <section aria-labelledby="placement-title">
                     <h1 id="placement-title" className="font-display text-4xl font-semibold tracking-tight">Where should you start?</h1>
-                    <p className="mt-2 text-muted">Part I teaches Swift from the very beginning. If you already know some of it, a quick check can skip those modules.</p>
+                    <p className="mt-2 text-muted">{onboarding.placementIntro}</p>
                     <div role="radiogroup" aria-labelledby="placement-title" className="mt-6 grid gap-2">
-                        <Choice selected={placementMode === 'zero'} onSelect={() => setPlacementMode('zero')} icon={Sprout} title="Start from zero (recommended)" detail="Begin with your first Swift program. Nothing is assumed." />
+                        <Choice selected={placementMode === 'zero'} onSelect={() => setPlacementMode('zero')} icon={Sprout} title="Start from zero (recommended)" detail={onboarding.zeroDetail} />
                         <Choice selected={placementMode === 'check'} onSelect={() => setPlacementMode('check')} icon={GraduationCap} title={`Take a quick check (${QUESTIONS.length} questions, about 6 minutes)`} detail="Two questions per topic. Get both right and you can skip that topic’s lessons, which stay open whenever you want them." />
                     </div>
                 </section>
@@ -221,7 +231,7 @@ const OnboardingPage = () => {
                 <section aria-labelledby="summary-title" className="space-y-6">
                     <div>
                         <h1 id="summary-title" className="font-display text-4xl font-semibold tracking-tight">Your path is ready.</h1>
-                        <p className="mt-2 text-muted">{GOALS[goal].label} · {formatMinutes(minutesPerDay)} a day, {daysPerWeek} days a week.</p>
+                        <p className="mt-2 text-muted">{(GOALS[goal] ?? Object.values(GOALS)[0]).label} · {formatMinutes(minutesPerDay)} a day, {daysPerWeek} days a week.</p>
                     </div>
 
                     {placementMode === 'check' && Object.keys(answers).length > 0 && (
@@ -231,7 +241,7 @@ const OnboardingPage = () => {
                             <ul className="mt-4 space-y-2">
                                 {PLACEMENT_GROUPS.map((group) => {
                                     const passed = passedGroups.includes(group);
-                                    const count = groupLessons(group).length;
+                                    const count = groupLessons(group, moduleById).length;
                                     return (
                                         <li key={group.id}>
                                             <label className={`flex items-center gap-3 rounded-xl border px-3 py-2.5 ${passed ? 'cursor-pointer border-line' : 'border-transparent opacity-60'}`}>

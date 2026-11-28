@@ -1,9 +1,10 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { lessons } from '../data/curriculum.js';
+import { dsaData } from '../data/courseData.js';
 import { badgesFor, longestStreak, masteryByPart } from './badges.js';
 
-const earned = (facts) => badgesFor(facts).filter((badge) => badge.isEarned).map((badge) => badge.id);
+const earned = (facts) => badgesFor(facts, dsaData).filter((badge) => badge.isEarned).map((badge) => badge.id);
 
 test('nothing is earned at the start', () => {
     assert.deepEqual(earned({}), []);
@@ -31,9 +32,9 @@ test('longest streak finds the longest run of consecutive days', () => {
 });
 
 test('mastery grows with finished lessons', () => {
-    const before = masteryByPart({}).find((entry) => entry.part === 1).value;
+    const before = masteryByPart({}, dsaData).find((entry) => entry.part === 1).value;
     const done = Object.fromEntries(lessons.filter((lesson) => lesson.part === 1).map((lesson) => [lesson.id, { completedAt: 1 }]));
-    const after = masteryByPart({ lessons: done }).find((entry) => entry.part === 1);
+    const after = masteryByPart({ lessons: done }, dsaData).find((entry) => entry.part === 1);
     assert.equal(before, 0);
     assert.ok(after.value >= 0.75, String(after.value));
     assert.equal(after.lessons.done, after.lessons.total);

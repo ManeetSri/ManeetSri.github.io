@@ -1,4 +1,5 @@
 import { Link } from 'react-router-dom';
+import { isPrivatePath } from '../../utils/privatePaths';
 import { slugify } from './slug.js';
 
 // How plain markdown looks in lessons and problems
@@ -13,10 +14,10 @@ export const InlineCode = ({ children }) => <code className="rounded-md bg-white
 export const Quote = ({ children }) => <blockquote className="my-6 border-l-2 border-amber pl-4 italic text-paper/80">{children}</blockquote>;
 export const Rule = () => <hr className="my-10 border-line" />;
 
-// Links inside the console stay in the app; anything else opens in a new tab
+// Links inside the console (any course) stay in the app; anything else opens in a new tab
 export const Anchor = ({ href = '', children }) => {
     const className = 'text-amber underline decoration-amber/40 underline-offset-2 hover:decoration-amber';
-    if (href.startsWith('/dsa')) return <Link to={href} className={className}>{children}</Link>;
+    if (isPrivatePath(href.split(/[?#]/)[0])) return <Link to={href} className={className}>{children}</Link>;
     return <a href={href} target="_blank" rel="noopener noreferrer" className={className}>{children}</a>;
 };
 

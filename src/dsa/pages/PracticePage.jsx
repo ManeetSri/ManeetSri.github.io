@@ -1,8 +1,7 @@
 import { useState } from 'react';
 import { Link, useNavigate } from 'react-router-dom';
 import { ArrowRight, CheckCircle2, Circle, CircleDot, Code2, Search, Shuffle } from 'lucide-react';
-import { lessonById, lessons as allLessons, moduleById } from '../data/curriculum.js';
-import { DIFFICULTIES, LISTS, PATTERNS, problems } from '../data/problems.js';
+import { useCourse } from '../course/context.js';
 import { isDue } from '../engine/srs.js';
 import { cardId, useStore } from '../store/store.js';
 import { useConsoleMeta, useNow } from '../ui/hooks.js';
@@ -26,7 +25,8 @@ const Select = ({ label, value, onChange, options }) => (
 );
 
 const PracticePage = () => {
-    useConsoleMeta('Practice', '/dsa/practice');
+    const { lessonById, lessons: allLessons, moduleById, DIFFICULTIES, LISTS, PATTERNS, practice: problems, links, practiceIntro } = useCourse();
+    useConsoleMeta('Practice', links.practice);
     const navigate = useNavigate();
     const { problems: records, cards, lessons } = useStore();
     const [query, setQuery] = useState('');
@@ -72,7 +72,7 @@ const PracticePage = () => {
     const randomFromLearned = () => {
         const candidates = problems.filter((problem) => statusOf(problem.id) !== 'solved' && problem.lessons.some((id) => lessons[id]?.completedAt));
         const pool = candidates.length ? candidates : problems.filter((problem) => statusOf(problem.id) !== 'solved');
-        if (pool.length) navigate(`/dsa/practice/${pool[Math.floor(Math.random() * pool.length)].id}`);
+        if (pool.length) navigate(links.item(pool[Math.floor(Math.random() * pool.length)].id));
     };
 
     const solved = problems.filter((problem) => statusOf(problem.id) === 'solved').length;
@@ -80,7 +80,7 @@ const PracticePage = () => {
     return (
         <div className="mx-auto max-w-5xl">
             <PageHeader eyebrow={`${solved} of ${problems.length} solved`} title="Practice">
-                Every problem has hints, several approaches, an editor that saves your code, and tests you run in the companion Swift package.
+                {practiceIntro}
             </PageHeader>
 
             {listProgress.length > 0 && (
@@ -150,7 +150,7 @@ const PracticePage = () => {
                         const { icon: Icon, className, label } = STATUS[statusOf(problem.id)];
                         return (
                             <li key={problem.id}>
-                                <Link to={`/dsa/practice/${problem.id}`} className="flex items-center gap-3 px-4 py-3.5 hover:bg-white/[0.03]">
+                                <Link to={links.item(problem.id)} className="flex items-center gap-3 px-4 py-3.5 hover:bg-white/[0.03]">
                                     <Icon size={20} aria-hidden="true" className={`shrink-0 ${className}`} />
                                     <span className="sr-only">{label}:</span>
                                     <span className="min-w-0 flex-1">

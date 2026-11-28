@@ -1,15 +1,13 @@
 // The learner's path: lessons in curriculum order (modules are listed after the modules they require),
-// keeping the ones whose tracks match the chosen goal.
-import { GOALS, lessons as allLessons } from '../data/curriculum.js';
+// keeping the ones whose tracks match the chosen goal. Goals come from the course; its first goal is the
+// fallback for one that no longer exists.
 
-export const DEFAULT_GOAL = 'foundations';
-
-export const isOnPath = (lesson, goal = DEFAULT_GOAL) => {
-    const tracks = (GOALS[goal] ?? GOALS[DEFAULT_GOAL]).tracks;
+export const isOnPath = (lesson, goal, goals) => {
+    const tracks = (goals[goal] ?? Object.values(goals)[0]).tracks;
     return lesson.tracks.some((track) => tracks.includes(track));
 };
 
-export const pathFor = (goal, lessons = allLessons) => lessons.filter((lesson) => isOnPath(lesson, goal));
+export const pathFor = (goal, lessons, goals) => lessons.filter((lesson) => isOnPath(lesson, goal, goals));
 
 // A lesson is done once it's completed, or tested out of in the placement check
 export const isDone = (lessonId, progress) => Boolean(progress[lessonId]?.completedAt || progress[lessonId]?.testedOutAt);
@@ -29,8 +27,8 @@ export const completion = (lessons, progress) => {
     return { done, total: lessons.length, ratio: lessons.length ? done / lessons.length : 0 };
 };
 
-export const moduleCompletion = (module, progress, goal) => completion(
-    goal ? module.lessons.filter((lesson) => isOnPath(lesson, goal)) : module.lessons,
+export const moduleCompletion = (module, progress, goal, goals) => completion(
+    goal ? module.lessons.filter((lesson) => isOnPath(lesson, goal, goals)) : module.lessons,
     progress,
 );
 

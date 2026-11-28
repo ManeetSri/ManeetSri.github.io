@@ -1,7 +1,6 @@
 import { Link } from 'react-router-dom';
 import { Bookmark, CircleAlert, Flag, NotebookPen } from 'lucide-react';
-import { lessonById, moduleById } from '../data/curriculum.js';
-import { problemById } from '../data/problems.js';
+import { useCourse } from '../course/context.js';
 import { mockMistakes, problemMistakes, quizMistakes } from '../engine/mistakes.js';
 import { useStore } from '../store/store.js';
 import { formatDate } from '../ui/format.js';
@@ -22,7 +21,8 @@ const LinkList = ({ items }) => (
 );
 
 const NotesPage = () => {
-    useConsoleMeta('Notes', '/dsa/notes');
+    const { lessonById, moduleById, practiceById: problemById, links } = useCourse();
+    useConsoleMeta('Notes', links.notes);
     const { notes, lessons, problems, mocks } = useStore();
 
     const lessonNotes = Object.entries(notes)
@@ -31,14 +31,14 @@ const NotesPage = () => {
     const problemNotes = Object.entries(problems).filter(([id, record]) => problemById[id] && record.notes?.trim());
     const bookmarked = Object.entries(lessons).filter(([id, record]) => record.bookmarked && lessonById[id]).map(([id]) => lessonById[id]);
     const confusing = Object.entries(lessons).filter(([id, record]) => record.confusing && lessonById[id]).map(([id]) => lessonById[id]);
-    const lessonLink = (lesson) => ({ to: `/dsa/learn/${lesson.id}`, title: lesson.title, detail: moduleById[lesson.module].code });
+    const lessonLink = (lesson) => ({ to: links.lesson(lesson.id), title: lesson.title, detail: moduleById[lesson.module].code });
     const missedQuizzes = quizMistakes(lessons, lessonById);
     const shakyProblems = problemMistakes(problems, problemById);
     const roughMocks = mockMistakes(mocks ?? {});
     const mistakes = [
-        ...shakyProblems.map((entry) => ({ to: `/dsa/practice/${entry.problemId}`, title: problemById[entry.problemId].title, detail: entry.reason })),
-        ...roughMocks.map((mock) => ({ key: `mock-${mock.at}`, to: '/dsa/mock', title: `Mock: ${problemById[mock.problemId]?.title ?? mock.problemId}`, detail: `${mock.average.toFixed(1)} / 4${mock.weakest ? ` · weakest: ${mock.weakest}` : ''}` })),
-        ...missedQuizzes.map((entry) => ({ to: `/dsa/learn/${entry.lessonId}`, title: lessonById[entry.lessonId].title, detail: `${entry.missed} missed first time${entry.stillWrong ? `, ${entry.stillWrong} still wrong` : ''}` })),
+        ...shakyProblems.map((entry) => ({ to: links.item(entry.problemId), title: problemById[entry.problemId].title, detail: entry.reason })),
+        ...roughMocks.map((mock) => ({ key: `mock-${mock.at}`, to: links.mock, title: `Mock: ${problemById[mock.problemId]?.title ?? mock.problemId}`, detail: `${mock.average.toFixed(1)} / 4${mock.weakest ? ` · weakest: ${mock.weakest}` : ''}` })),
+        ...missedQuizzes.map((entry) => ({ to: links.lesson(entry.lessonId), title: lessonById[entry.lessonId].title, detail: `${entry.missed} missed first time${entry.stillWrong ? `, ${entry.stillWrong} still wrong` : ''}` })),
     ];
     const nothing = !lessonNotes.length && !problemNotes.length && !bookmarked.length && !confusing.length && !mistakes.length;
 
@@ -77,7 +77,7 @@ const NotesPage = () => {
                         {lessonNotes.map(([id, note]) => (
                             <li key={id}>
                                 <Card className="p-4">
-                                    <Link to={`/dsa/learn/${id}`} className="font-semibold hover:text-amber">{lessonById[id].title}</Link>
+                                    <Link to={links.lesson(id)} className="font-semibold hover:text-amber">{lessonById[id].title}</Link>
                                     <p className="mt-0.5 font-mono text-xs text-muted">{moduleById[lessonById[id].module].code} · {formatDate(note.updatedAt)}</p>
                                     <p className="mt-2 whitespace-pre-wrap text-sm leading-relaxed text-paper/85">{note.text}</p>
                                 </Card>
@@ -94,7 +94,7 @@ const NotesPage = () => {
                         {problemNotes.map(([id, record]) => (
                             <li key={id}>
                                 <Card className="p-4">
-                                    <Link to={`/dsa/practice/${id}`} className="font-semibold hover:text-amber">{problemById[id].title}</Link>
+                                    <Link to={links.item(id)} className="font-semibold hover:text-amber">{problemById[id].title}</Link>
                                     <p className="mt-2 whitespace-pre-wrap text-sm leading-relaxed text-paper/85">{record.notes}</p>
                                 </Card>
                             </li>

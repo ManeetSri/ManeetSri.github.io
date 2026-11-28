@@ -1,8 +1,10 @@
 import { lazy, Suspense } from 'react';
-import { Route, Routes } from 'react-router-dom';
+import { Outlet, Route, Routes } from 'react-router-dom';
 import { LoaderCircle } from 'lucide-react';
 import './dsa.css';
 import AuthGate from './auth/AuthGate.jsx';
+import { CourseContext } from './course/context.js';
+import { COURSES } from './course/courses.js';
 import Shell from './ui/Shell.jsx';
 import { useConsoleMeta } from './ui/hooks.js';
 import TodayPage from './pages/TodayPage.jsx';
@@ -29,13 +31,19 @@ const PageLoading = () => (
     </p>
 );
 
-// The private DSA-in-Swift learning console. Not linked from the portfolio, never indexed, and
-// behind a passphrase. Everything it needs loads in its own chunks.
-const DsaApp = () => {
+// The default title and noindex meta for the course's pages, until a page sets its own
+const CourseMeta = () => {
     useConsoleMeta();
+    return null;
+};
+
+// One course's pages. Every course shares the same pages, which read their data from CourseContext.
+export const CourseRoutes = ({ course: id }) => {
+    const course = COURSES[id];
     return (
-        <AuthGate>
-            <Shell>
+        <CourseContext.Provider value={course}>
+            <CourseMeta />
+            <Shell key={course.id}>
                 <Suspense fallback={<PageLoading />}>
                     <Routes>
                         <Route index element={<TodayPage />} />
@@ -56,8 +64,17 @@ const DsaApp = () => {
                     </Routes>
                 </Suspense>
             </Shell>
-        </AuthGate>
+        </CourseContext.Provider>
     );
 };
 
-export default DsaApp;
+// The private learning console. Not linked from the portfolio, never indexed, and behind a passphrase.
+// The gate and the progress store sit above every course, so switching courses keeps the same session
+// and the same Firestore listeners. Everything it needs loads in its own chunks.
+const ConsoleApp = () => (
+    <AuthGate>
+        <Outlet />
+    </AuthGate>
+);
+
+export default ConsoleApp;

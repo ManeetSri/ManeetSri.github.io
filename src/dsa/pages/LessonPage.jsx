@@ -1,8 +1,7 @@
 import { useEffect, useMemo, useState } from 'react';
 import { Link, useParams } from 'react-router-dom';
 import { ArrowLeft, ArrowRight, Award, Bookmark, CheckCircle2, Clock3, Code2, Flag, LoaderCircle, RotateCcw } from 'lucide-react';
-import { lessonById, lessons as allLessons, LEVELS, TRACKS } from '../data/curriculum.js';
-import { DIFFICULTIES, problemById } from '../data/problems.js';
+import { useCourse } from '../course/context.js';
 import { useContent } from '../content/index.js';
 import { mdxComponents } from '../mdx/components.js';
 import { LessonContext } from '../mdx/lessonContext.js';
@@ -43,8 +42,9 @@ const OnThisPage = ({ headings }) => {
 };
 
 const Practice = ({ lesson }) => {
+    const { practiceById, DIFFICULTIES, links } = useCourse();
     const { problems } = useStore();
-    const list = lesson.problems.map((id) => problemById[id]).filter(Boolean);
+    const list = lesson.problems.map((id) => practiceById[id]).filter(Boolean);
     if (!list.length) return null;
     return (
         <section aria-labelledby="practice-problems" className="mt-12">
@@ -54,7 +54,7 @@ const Practice = ({ lesson }) => {
                     const status = problems[problem.id]?.status;
                     return (
                         <li key={problem.id}>
-                            <Link to={`/dsa/practice/${problem.id}`} className="flex items-center gap-3 rounded-2xl border border-line bg-surface px-4 py-3.5 hover:border-white/25">
+                            <Link to={links.item(problem.id)} className="flex items-center gap-3 rounded-2xl border border-line bg-surface px-4 py-3.5 hover:border-white/25">
                                 <Code2 size={18} aria-hidden="true" className="shrink-0 text-amber" />
                                 <span className="min-w-0 flex-1 font-medium">{problem.title}</span>
                                 {status === 'solved' && <Chip tone="green">solved</Chip>}
@@ -89,13 +89,15 @@ const PlannedLesson = ({ lesson, module, part }) => (
 );
 
 const LessonView = ({ lesson }) => {
-    useConsoleMeta(lesson.title, `/dsa/learn/${lesson.id}`);
+    const course = useCourse();
+    const { lessons: allLessons, LEVELS, TRACKS, links } = course;
+    useConsoleMeta(lesson.title, links.lesson(lesson.id));
     const content = useContent('lesson', lesson.id);
     const { lessons: progress, notes } = useStore();
     const actions = useActions();
     const { textSize } = useProfile();
     const path = usePath();
-    const { module, part } = lessonContext(lesson);
+    const { module, part } = lessonContext(lesson, course);
     const record = progress[lesson.id];
     const done = Boolean(record?.completedAt);
 
@@ -114,7 +116,7 @@ const LessonView = ({ lesson }) => {
         <div className="mx-auto max-w-6xl xl:grid xl:grid-cols-[minmax(0,1fr)_220px] xl:gap-12">
             <article className={`min-w-0 max-w-3xl ${textSize === 'large' ? 'text-[1.125rem]' : ''}`}>
                 <nav aria-label="Breadcrumb" className="mb-4 flex flex-wrap items-center gap-1.5 font-mono text-xs text-muted">
-                    <Link to="/dsa/path" className="hover:text-paper">Part {part.number}</Link>
+                    <Link to={links.path} className="hover:text-paper">Part {part.number}</Link>
                     <span aria-hidden="true">›</span>
                     <span>{module.code} {module.title}</span>
                     <span aria-hidden="true">›</span>
@@ -159,7 +161,7 @@ const LessonView = ({ lesson }) => {
                                     <p className="font-semibold">That’s the end of {module.code}, {module.title}</p>
                                     <p className="text-sm text-muted">Take the checkpoint: 12 questions from the whole module. Score 80% to master it.</p>
                                 </div>
-                                <ButtonLink to={`/dsa/checkpoint/${module.id}`} size="sm" variant="primary">Take the checkpoint</ButtonLink>
+                                <ButtonLink to={links.checkpoint(module.id)} size="sm" variant="primary">Take the checkpoint</ButtonLink>
                             </Card>
                         )}
 
@@ -186,13 +188,13 @@ const LessonView = ({ lesson }) => {
 
                 <nav aria-label="Lessons" className="mt-8 grid gap-3 sm:grid-cols-2">
                     {previous ? (
-                        <Link to={`/dsa/learn/${previous.id}`} className="rounded-2xl border border-line p-4 hover:border-white/25">
+                        <Link to={links.lesson(previous.id)} className="rounded-2xl border border-line p-4 hover:border-white/25">
                             <span className="flex items-center gap-1 font-mono text-xs text-muted"><ArrowLeft size={13} aria-hidden="true" /> Previous</span>
                             <span className="mt-1 block font-medium">{previous.title}</span>
                         </Link>
                     ) : <span />}
                     {next && (
-                        <Link to={`/dsa/learn/${next.id}`} className="rounded-2xl border border-line p-4 text-right hover:border-white/25">
+                        <Link to={links.lesson(next.id)} className="rounded-2xl border border-line p-4 text-right hover:border-white/25">
                             <span className="flex items-center justify-end gap-1 font-mono text-xs text-muted">Next <ArrowRight size={13} aria-hidden="true" /></span>
                             <span className="mt-1 block font-medium">{next.title}</span>
                         </Link>
@@ -203,7 +205,7 @@ const LessonView = ({ lesson }) => {
             <aside className="hidden xl:block">
                 <div className="sticky top-24 space-y-6">
                     {content.status === 'ready' && <OnThisPage headings={data.headings} />}
-                    {content.status === 'ready' && done && <ButtonLink to={next ? `/dsa/learn/${next.id}` : '/dsa/path'} size="sm" variant="primary">Next lesson <ArrowRight size={15} aria-hidden="true" /></ButtonLink>}
+                    {content.status === 'ready' && done && <ButtonLink to={next ? links.lesson(next.id) : links.path} size="sm" variant="primary">Next lesson <ArrowRight size={15} aria-hidden="true" /></ButtonLink>}
                 </div>
             </aside>
         </div>
@@ -211,6 +213,7 @@ const LessonView = ({ lesson }) => {
 };
 
 const LessonPage = () => {
+    const { lessonById } = useCourse();
     const { lessonId } = useParams();
     const lesson = lessonById[lessonId];
     if (!lesson) return <ConsoleNotFound />;

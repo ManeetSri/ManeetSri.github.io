@@ -2,6 +2,7 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { activeDays, rankFor, streakFrom, xpFrom } from './stats.js';
 import { dayKey } from './dates.js';
+import { dsaData } from '../data/courseData.js';
 
 const day = (date) => new Date(2026, 10, date, 12).getTime();
 
@@ -10,16 +11,16 @@ test('XP adds lessons, first-try answers, solved problems and reviews', () => {
         lessons: { a: { completedAt: 1, quiz: { q1: { firstTry: true }, q2: { firstTry: false } } } },
         problems: { 'largest-element': { status: 'solved' }, 'hello-swift': { status: 'helped' } },
         cards: { c: { reviews: 3 } },
-    });
+    }, dsaData);
     assert.equal(xp, 50 + 10 + 30 + 8 + 15);
 });
 
 test('a passed checkpoint is worth 200 XP, once', () => {
-    assert.equal(xpFrom({ checkpoints: { m: { passedAt: 1, attempts: { 1: { at: 1 }, 2: { at: 2 } } }, n: { attempts: { 3: { at: 3 } } } } }), 200);
+    assert.equal(xpFrom({ checkpoints: { m: { passedAt: 1, attempts: { 1: { at: 1 }, 2: { at: 2 } } }, n: { attempts: { 3: { at: 3 } } } } }, dsaData), 200);
 });
 
 test('testing out of a lesson earns no XP', () => {
-    assert.equal(xpFrom({ lessons: { a: { testedOutAt: 1 } } }), 0);
+    assert.equal(xpFrom({ lessons: { a: { testedOutAt: 1 } } }, dsaData), 0);
 });
 
 test('ranks climb with XP', () => {

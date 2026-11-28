@@ -1,6 +1,6 @@
 // Everything here is calculated from recorded facts (completions, attempts, reviews, minutes), never
 // stored as counters, so two devices syncing after being offline can't lose each other's progress.
-import { DIFFICULTIES, problemById } from '../data/problems.js';
+// XP takes a course's data (its practice items and difficulties), so each course scores its own items.
 import { addDays, dayKey } from './dates.js';
 
 export const XP = { lesson: 50, firstTryAnswer: 10, review: 5, checkpoint: 200, mock: 50 };
@@ -14,20 +14,20 @@ export const RANKS = [
     { min: 30000, title: 'Grandmaster' },
 ];
 
-const problemXp = (id, record) => {
-    const difficulty = DIFFICULTIES[problemById[id]?.difficulty];
+const problemXp = (id, record, { practiceById, DIFFICULTIES }) => {
+    const difficulty = DIFFICULTIES[practiceById[id]?.difficulty];
     if (!difficulty || !record) return 0;
     if (record.status === 'solved') return difficulty.xp;
     if (record.status === 'helped') return Math.round(difficulty.xp / 2);
     return 0;
 };
 
-export const xpFrom = ({ lessons = {}, problems = {}, cards = {}, checkpoints = {}, mocks = {} }) => {
+export const xpFrom = ({ lessons = {}, problems = {}, cards = {}, checkpoints = {}, mocks = {} }, course) => {
     const lessonXp = Object.values(lessons).reduce((sum, record) => {
         const answers = Object.values(record.quiz ?? {}).filter((answer) => answer.firstTry).length;
         return sum + (record.completedAt ? XP.lesson : 0) + answers * XP.firstTryAnswer;
     }, 0);
-    const solvedXp = Object.entries(problems).reduce((sum, [id, record]) => sum + problemXp(id, record), 0);
+    const solvedXp = Object.entries(problems).reduce((sum, [id, record]) => sum + problemXp(id, record, course), 0);
     const reviewXp = Object.values(cards).reduce((sum, card) => sum + (card.reviews ?? 0) * XP.review, 0);
     const checkpointXp = Object.values(checkpoints).filter((record) => record.passedAt).length * XP.checkpoint;
     return lessonXp + solvedXp + reviewXp + checkpointXp + Object.keys(mocks).length * XP.mock;

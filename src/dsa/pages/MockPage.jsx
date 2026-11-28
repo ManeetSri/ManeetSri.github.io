@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useMemo, useState } from 'react';
 import { Link } from 'react-router-dom';
 import { ArrowRight, Clock3, LoaderCircle, Mic, RotateCcw } from 'lucide-react';
-import { DIFFICULTIES, problemById, problems } from '../data/problems.js';
+import { useCourse } from '../course/context.js';
 import { useContent } from '../content/index.js';
 import { isDone } from '../engine/path.js';
 import { mdxComponents } from '../mdx/components.js';
@@ -96,14 +96,15 @@ const Rubric = ({ problem, seconds, onSaved }) => {
 };
 
 const MockPage = () => {
-    useConsoleMeta('Mock interview', '/dsa/mock');
+    const { DIFFICULTIES, problemById, problems, links } = useCourse();
+    useConsoleMeta('Mock interview', links.mock);
     const { lessons, problems: records, mocks } = useStore();
     const [duration, setDuration] = useState(45);
     const [difficulty, setDifficulty] = useState('any');
     const [stage, setStage] = useState('setup');
     const [session, setSession] = useState(null);
 
-    const learned = useMemo(() => problems.filter((problem) => problem.lessons.some((id) => isDone(id, lessons))), [lessons]);
+    const learned = useMemo(() => problems.filter((problem) => problem.lessons.some((id) => isDone(id, lessons))), [problems, lessons]);
     const pool = learned.filter((problem) => difficulty === 'any' || problem.difficulty === difficulty);
     const history = Object.values(mocks).sort((a, b) => b.at - a.at);
 
@@ -155,7 +156,7 @@ const MockPage = () => {
             {stage === 'saved' && (
                 <Card className="mb-6 flex flex-wrap items-center gap-3 border-[#30D158]/40 p-5">
                     <p className="flex-1">Saved, and the problem is scheduled for a re-solve. Now read the full solutions with fresh eyes.</p>
-                    <Link to={`/dsa/practice/${session.problem.id}`} className="inline-flex items-center gap-1 text-amber hover:underline">Open {session.problem.title} <ArrowRight size={15} aria-hidden="true" /></Link>
+                    <Link to={links.item(session.problem.id)} className="inline-flex items-center gap-1 text-amber hover:underline">Open {session.problem.title} <ArrowRight size={15} aria-hidden="true" /></Link>
                 </Card>
             )}
 
@@ -192,7 +193,7 @@ const MockPage = () => {
                                 <li key={mock.at} className="px-4 py-3 text-sm">
                                     <div className="flex flex-wrap items-center gap-3">
                                         <span className="font-mono text-xs text-muted">{formatDate(mock.at)}</span>
-                                        <Link to={`/dsa/practice/${mock.problemId}`} className="flex-1 hover:text-amber">{problemById[mock.problemId]?.title ?? mock.problemId}</Link>
+                                        <Link to={links.item(mock.problemId)} className="flex-1 hover:text-amber">{problemById[mock.problemId]?.title ?? mock.problemId}</Link>
                                         <span className="font-mono text-xs text-muted">{formatDuration(mock.seconds)}</span>
                                         <Chip tone={average >= 3 ? 'green' : average >= 2 ? 'amber' : 'red'}>{average.toFixed(1)} / 4</Chip>
                                     </div>

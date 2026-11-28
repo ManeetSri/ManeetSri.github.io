@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState } from 'react';
 import { Download, FolderInput, LoaderCircle, RotateCcw } from 'lucide-react';
 import { loadStarter } from '../content/index.js';
+import { useCourse } from '../course/context.js';
 import { CopyButton } from '../mdx/CodeBlock.jsx';
 import { useActions, useStore } from '../store/store.js';
 import { CodeEditor } from './CodeEditor.jsx';
@@ -16,11 +17,11 @@ const download = (name, text) => {
 };
 
 // Development only: writes the code into the exercise stub, so `swift test` runs it (see scripts/dsa-exercise-writer.js)
-const writeToPackage = async (file, code) => {
+const writeToPackage = async (pkg, file, code) => {
     const response = await fetch('/__dsa/exercise', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json', 'X-DSA-Exercise': '1' },
-        body: JSON.stringify({ file, code }),
+        body: JSON.stringify({ package: pkg, file, code }),
     });
     if (!response.ok) throw new Error(await response.text());
 };
@@ -28,6 +29,7 @@ const writeToPackage = async (file, code) => {
 // Your solution, written on the page. It starts as the problem's exercise stub and autosaves with the rest of
 // your progress, so it follows you between devices. Only code that differs from the stub is stored.
 export const SolutionEditor = ({ problem, compact = false }) => {
+    const course = useCourse();
     const { problems, ready } = useStore();
     const actions = useActions();
     const stored = problems[problem.id]?.solution ?? '';
@@ -49,13 +51,13 @@ export const SolutionEditor = ({ problem, compact = false }) => {
 
     useEffect(() => {
         let cancelled = false;
-        loadStarter(problem)
+        loadStarter(course, problem)
             .then((loaded) => !cancelled && setStarter(loaded ? { status: 'ready', ...loaded } : { status: 'missing' }))
             .catch(() => !cancelled && setStarter({ status: 'error' }));
         return () => {
             cancelled = true;
         };
-    }, [problem]);
+    }, [course, problem]);
 
     // Between edits, the editor takes in whatever is stored: progress that loads late, or an edit made on
     // another device. An echo of one of your own earlier saves, arriving after you've typed more, is ignored.
@@ -106,7 +108,7 @@ export const SolutionEditor = ({ problem, compact = false }) => {
         flush();
         setPackageStatus({ busy: true });
         try {
-            await writeToPackage(starter.file, text);
+            await writeToPackage(course.swift.package, starter.file, text);
             setPackageStatus({ message: `Written to Sources/Exercises/${starter.file}. Run the tests now.` });
         } catch (error) {
             setPackageStatus({ message: `Couldn’t write the file: ${error.message || 'the dev server refused'}.`, failed: true });

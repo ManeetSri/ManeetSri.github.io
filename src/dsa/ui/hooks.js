@@ -1,21 +1,25 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
 import { usePageMeta } from '../../hooks/usePageMeta';
-import { lessons as allLessons, partByNumber, moduleById } from '../data/curriculum.js';
+import { useCourse } from '../course/context.js';
 import { pathFor } from '../engine/path.js';
 import { activeDays, rankFor, streakFrom, xpFrom } from '../engine/stats.js';
 import { useActions, useProfile, useStore } from '../store/store.js';
 
 // Every console page is private: never indexed, and titled for the browser tab only
-export const useConsoleMeta = (title, path = '/dsa') => usePageMeta({
-    title: title ? `${title} · DSA in Swift` : 'DSA in Swift',
-    description: 'Private learning console.',
-    path,
-    noindex: true,
-});
+export const useConsoleMeta = (title, path) => {
+    const course = useCourse();
+    usePageMeta({
+        title: title ? `${title} · ${course.title}` : course.title,
+        description: 'Private learning console.',
+        path: path ?? course.base,
+        noindex: true,
+    });
+};
 
 export const usePath = () => {
+    const course = useCourse();
     const { goal } = useProfile();
-    return useMemo(() => pathFor(goal, allLessons), [goal]);
+    return useMemo(() => pathFor(goal, course.lessons, course.GOALS), [goal, course]);
 };
 
 // The current time, refreshed every so often, so "today" and "due" stay right on a page left open
@@ -34,18 +38,19 @@ export const useNow = (refreshMs = 60_000) => {
 };
 
 export const useStats = () => {
+    const course = useCourse();
     const state = useStore();
     const now = useNow();
     return useMemo(() => {
-        const xp = xpFrom(state);
+        const xp = xpFrom(state, course);
         const days = activeDays(state);
         return { xp, rank: rankFor(xp), days, streak: streakFrom(days, now) };
-    }, [state, now]);
+    }, [state, now, course]);
 };
 
-export const lessonContext = (lesson) => ({
-    module: moduleById[lesson.module],
-    part: partByNumber[lesson.part],
+export const lessonContext = (lesson, course) => ({
+    module: course.moduleById[lesson.module],
+    part: course.partByNumber[lesson.part],
 });
 
 const IDLE_AFTER_MS = 3 * 60_000;

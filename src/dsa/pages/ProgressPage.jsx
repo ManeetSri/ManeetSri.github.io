@@ -1,6 +1,5 @@
 import { Award, Clock3, Code2, Flame, Layers, Lock, Radar, Sparkles, Target } from 'lucide-react';
-import { lessons as allLessons, parts } from '../data/curriculum.js';
-import { DIFFICULTIES, problems } from '../data/problems.js';
+import { useCourse } from '../course/context.js';
 import { addDays, dayKey, startOfDay } from '../engine/dates.js';
 import { completion } from '../engine/path.js';
 import { minutesOn, RANKS } from '../engine/stats.js';
@@ -50,7 +49,9 @@ const Heatmap = ({ days, minutesByDay, now }) => {
 };
 
 const ProgressPage = () => {
-    useConsoleMeta('Progress', '/dsa/progress');
+    const course = useCourse();
+    const { lessons: allLessons, parts, DIFFICULTIES, practice: problems, links } = course;
+    useConsoleMeta('Progress', links.progress);
     const state = useStore();
     const path = usePath();
     const { xp, rank, streak, days } = useStats();
@@ -64,8 +65,8 @@ const ProgressPage = () => {
         solved: problems.filter((problem) => problem.difficulty === key && state.problems[problem.id]?.status === 'solved').length,
     })).filter((entry) => entry.total > 0);
     const { goal } = useProfile();
-    const mastery = masteryByPart({ lessons: state.lessons, problems: state.problems, goal });
-    const badges = badgesFor({ ...state, streak, bestStreak: longestStreak(days), goal });
+    const mastery = masteryByPart({ lessons: state.lessons, problems: state.problems, goal }, course);
+    const badges = badgesFor({ ...state, streak, bestStreak: longestStreak(days), goal }, course);
     const earnedCount = badges.filter((badge) => badge.isEarned).length;
     const answers = Object.values(state.lessons).flatMap((record) => Object.values(record.quiz ?? {}));
     const firstTry = answers.length ? answers.filter((answer) => answer.firstTry).length / answers.length : 0;

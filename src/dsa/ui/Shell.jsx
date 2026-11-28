@@ -4,26 +4,32 @@ import {
     BarChart3, BookOpen, ChevronDown, Code2, Flame, Layers, ListTree, Map as MapIcon, Mic, NotebookPen,
     ScrollText, Search, Settings, Sparkles, Sun, X,
 } from 'lucide-react';
-import { lessons, modules, modulesInPart, parts } from '../data/curriculum.js';
-import { problems } from '../data/problems.js';
+import { useCourse } from '../course/context.js';
 import { moduleCompletion } from '../engine/path.js';
 import { useProfile, useStore } from '../store/store.js';
 import { useStats, useStudyTimer } from './hooks.js';
 import { Kbd, ProgressRing } from './primitives.jsx';
 
-const NAV = [
-    { to: '/dsa', label: 'Today', icon: Sun, end: true },
-    { to: '/dsa/path', label: 'Path', icon: MapIcon },
-    { to: '/dsa/practice', label: 'Practice', icon: Code2 },
-    { to: '/dsa/review', label: 'Review', icon: Layers },
-    { to: '/dsa/mock', label: 'Mock interview', icon: Mic },
-    { to: '/dsa/progress', label: 'Progress', icon: BarChart3 },
-    { to: '/dsa/notes', label: 'Notes', icon: NotebookPen },
-    { to: '/dsa/sheets', label: 'Cheat sheets', icon: ScrollText },
-    { to: '/dsa/settings', label: 'Settings', icon: Settings },
-];
-
-const TABS = [NAV[0], NAV[1], NAV[2], NAV[3], { to: '/dsa/progress', label: 'Me', icon: BarChart3 }];
+// The console's pages for a course, built once per course
+const navs = new WeakMap();
+const navFor = (course) => {
+    if (navs.has(course)) return navs.get(course);
+    const { links } = course;
+    const nav = [
+        { to: links.today, label: 'Today', icon: Sun, end: true },
+        { to: links.path, label: 'Path', icon: MapIcon },
+        { to: links.practice, label: 'Practice', icon: Code2 },
+        { to: links.review, label: 'Review', icon: Layers },
+        { to: links.mock, label: 'Mock interview', icon: Mic },
+        { to: links.progress, label: 'Progress', icon: BarChart3 },
+        { to: links.notes, label: 'Notes', icon: NotebookPen },
+        { to: links.sheets, label: 'Cheat sheets', icon: ScrollText },
+        { to: links.settings, label: 'Settings', icon: Settings },
+    ];
+    const tabs = [nav[0], nav[1], nav[2], nav[3], { to: links.progress, label: 'Me', icon: BarChart3 }];
+    navs.set(course, { nav, tabs });
+    return navs.get(course);
+};
 
 const SYNC = {
     synced: { label: 'Synced', className: 'bg-[#30D158]' },
@@ -32,13 +38,14 @@ const SYNC = {
     local: { label: 'Local dev data', className: 'bg-sky-400' },
 };
 
-const currentLessonId = (pathname) => pathname.match(/^\/dsa\/learn\/([^/]+)/)?.[1] ?? null;
+const currentLessonId = (pathname, base) => (pathname.startsWith(`${base}/learn/`) ? pathname.slice(base.length + 7).split('/')[0] : null);
 
 const ModuleTree = ({ onNavigate }) => {
+    const { lessons, parts, modulesInPart, GOALS, links, base } = useCourse();
     const { pathname } = useLocation();
     const { lessons: progress } = useStore();
     const { goal } = useProfile();
-    const activeLesson = lessons.find((lesson) => lesson.id === currentLessonId(pathname));
+    const activeLesson = lessons.find((lesson) => lesson.id === currentLessonId(pathname, base));
     const [openParts, setOpenParts] = useState(() => new Set([activeLesson?.part ?? 0]));
     const [openModule, setOpenModule] = useState(activeLesson?.module ?? null);
     const [followedLesson, setFollowedLesson] = useState(activeLesson?.id);
@@ -76,7 +83,7 @@ const ModuleTree = ({ onNavigate }) => {
                         {open && (
                             <ul className="mb-2 space-y-0.5">
                                 {modulesInPart(part.number).map((module) => {
-                                    const { ratio, done, total } = moduleCompletion(module, progress, goal);
+                                    const { ratio, done, total } = moduleCompletion(module, progress, goal, GOALS);
                                     const expanded = openModule === module.id;
                                     return (
                                         <li key={module.id}>
@@ -97,7 +104,7 @@ const ModuleTree = ({ onNavigate }) => {
                                                         return (
                                                             <li key={lesson.id}>
                                                                 <NavLink
-                                                                    to={`/dsa/learn/${lesson.id}`}
+                                                                    to={links.lesson(lesson.id)}
                                                                     onClick={onNavigate}
                                                                     className={({ isActive }) => `flex items-center gap-2 rounded-md px-2 py-1 text-[13px] leading-snug ${isActive ? 'bg-white/10 text-paper' : 'text-muted hover:text-paper'} ${lesson.status === 'stub' ? 'opacity-60' : ''}`}
                                                                 >
@@ -125,7 +132,7 @@ const ModuleTree = ({ onNavigate }) => {
 
 const PrimaryNav = ({ onNavigate }) => (
     <nav aria-label="Console" className="space-y-0.5">
-        {NAV.map(({ to, label, icon: Icon, end }) => (
+        {navFor(useCourse()).nav.map(({ to, label, icon: Icon, end }) => (
             <NavLink
                 key={to}
                 to={to}
@@ -162,22 +169,24 @@ const Sheet = ({ open, onClose, label, children, className = '' }) => {
     );
 };
 
-const searchIndex = [
-    ...NAV.map((item) => ({ id: `page-${item.to}`, label: item.label, detail: 'Page', to: item.to })),
-    ...modules.map((module) => ({ id: `module-${module.id}`, label: module.title, detail: `${module.code} · Module`, to: `/dsa/learn/${module.lessons[0].id}`, keywords: module.summary })),
-    ...lessons.map((lesson) => ({ id: `lesson-${lesson.id}`, label: lesson.title, detail: `${modules.find((module) => module.id === lesson.module).code} · Lesson${lesson.status === 'stub' ? ' · soon' : ''}`, to: `/dsa/learn/${lesson.id}` })),
-    ...problems.map((problem) => ({ id: `problem-${problem.id}`, label: problem.title, detail: 'Problem', to: `/dsa/practice/${problem.id}` })),
-    ...[
-        ['big-o', 'Big-O reference', 'complexity table sorting costs'],
-        ['swift-collections', 'Swift collections cheat sheet', 'array set dictionary string api'],
-        ['templates', 'Code templates', 'binary search bfs dfs dijkstra union find backtracking dp'],
-        ['patterns', 'Pattern chooser', 'which technique signals'],
-        ['glossary', 'Glossary', 'terms definitions'],
-    ].map(([id, label, keywords]) => ({ id: `sheet-${id}`, label, detail: 'Cheat sheet', to: `/dsa/sheets/${id}`, keywords })),
-];
+// Everything the palette can find in a course, built once per course
+const indexes = new WeakMap();
+const searchIndexFor = (course) => {
+    if (indexes.has(course)) return indexes.get(course);
+    const { modules, moduleById, lessons, practice, sheets, links } = course;
+    const index = [
+        ...navFor(course).nav.map((item) => ({ id: `page-${item.to}`, label: item.label, detail: 'Page', to: item.to })),
+        ...modules.map((module) => ({ id: `module-${module.id}`, label: module.title, detail: `${module.code} · Module`, to: links.lesson(module.lessons[0].id), keywords: module.summary })),
+        ...lessons.map((lesson) => ({ id: `lesson-${lesson.id}`, label: lesson.title, detail: `${moduleById[lesson.module].code} · Lesson${lesson.status === 'stub' ? ' · soon' : ''}`, to: links.lesson(lesson.id) })),
+        ...practice.map((item) => ({ id: `practice-${item.id}`, label: item.title, detail: course.kindLabels?.[item.kind] ?? 'Problem', to: links.item(item.id) })),
+        ...sheets.map((sheet) => ({ id: `sheet-${sheet.id}`, label: sheet.title, detail: 'Cheat sheet', to: links.sheet(sheet.id), keywords: sheet.keywords })),
+    ];
+    indexes.set(course, index);
+    return index;
+};
 
 // Every word of the query has to appear, and titles that start with the query rank first
-const search = (query) => {
+const search = (searchIndex, query) => {
     const words = query.toLowerCase().split(/\s+/).filter(Boolean);
     if (!words.length) return searchIndex.slice(0, 8);
     return searchIndex
@@ -196,10 +205,11 @@ const search = (query) => {
 
 // Mounted only while the palette is open, so every opening starts with an empty search
 const PaletteBody = ({ onClose }) => {
+    const course = useCourse();
     const navigate = useNavigate();
     const [query, setQuery] = useState('');
     const [active, setActive] = useState(0);
-    const results = useMemo(() => search(query), [query]);
+    const results = useMemo(() => search(searchIndexFor(course), query), [course, query]);
 
     const go = (item) => {
         onClose();
@@ -271,6 +281,7 @@ const CommandPalette = ({ open, onClose }) => (
 );
 
 const TopBar = ({ onSearch, onModules }) => {
+    const { brand, links } = useCourse();
     const { sync } = useStore();
     const { xp, rank, streak } = useStats();
     const status = SYNC[sync] ?? SYNC.synced;
@@ -285,8 +296,8 @@ const TopBar = ({ onSearch, onModules }) => {
                 <button type="button" onClick={onModules} aria-label="Browse modules" className="flex h-10 w-10 shrink-0 items-center justify-center rounded-full bg-white/8 hover:bg-white/12 lg:hidden">
                     <ListTree size={18} aria-hidden="true" />
                 </button>
-                <Link to="/dsa" className="mr-2 hidden items-center gap-2 font-display text-lg font-semibold tracking-tight sm:flex">
-                    <BookOpen size={18} aria-hidden="true" className="text-swift" /> DSA <span className="text-muted">in</span> <span className="swift-gradient-text">Swift</span>
+                <Link to={links.today} className="mr-2 hidden items-center gap-2 font-display text-lg font-semibold tracking-tight sm:flex">
+                    <BookOpen size={18} aria-hidden="true" className="text-swift" /> {brand.lead} {brand.joiner && <span className="text-muted">{brand.joiner}</span>} <span className="swift-gradient-text">{brand.accent}</span>
                 </Link>
 
                 <button
@@ -305,7 +316,7 @@ const TopBar = ({ onSearch, onModules }) => {
                         <Flame size={15} aria-hidden="true" className={streak > 0 ? 'text-swift' : 'text-muted'} />
                         <span className="sr-only">Streak:</span> {streak}
                     </span>
-                    <Link to="/dsa/progress" className="hidden h-9 items-center gap-1 rounded-full bg-white/8 px-2.5 font-mono text-sm text-amber hover:bg-white/12 sm:flex" title={rank.title}>
+                    <Link to={links.progress} className="hidden h-9 items-center gap-1 rounded-full bg-white/8 px-2.5 font-mono text-sm text-amber hover:bg-white/12 sm:flex" title={rank.title}>
                         <Sparkles size={14} aria-hidden="true" />
                         <span className="sr-only">Experience points:</span> {xp.toLocaleString('en-GB')}
                     </Link>
@@ -322,7 +333,7 @@ const TopBar = ({ onSearch, onModules }) => {
 const MobileTabs = () => (
     <nav aria-label="Console" className="fixed inset-x-0 bottom-0 z-40 border-t border-line bg-ink/90 pb-[env(safe-area-inset-bottom)] backdrop-blur-md lg:hidden">
         <ul className="mx-auto grid max-w-lg grid-cols-5">
-            {TABS.map(({ to, label, icon: Icon, end }) => (
+            {navFor(useCourse()).tabs.map(({ to, label, icon: Icon, end }) => (
                 <li key={label}>
                     <NavLink
                         to={to}

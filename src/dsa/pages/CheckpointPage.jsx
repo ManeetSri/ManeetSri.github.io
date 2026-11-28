@@ -1,9 +1,10 @@
 import { useEffect, useState } from 'react';
 import { Link, useParams } from 'react-router-dom';
 import { ArrowRight, Award, CheckCircle2, CircleX, LoaderCircle, RotateCcw, SkipForward } from 'lucide-react';
-import { moduleById } from '../data/curriculum.js';
 import { loadContent } from '../content/index.js';
+import { useCourse } from '../course/context.js';
 import { isDone } from '../engine/path.js';
+import { XP } from '../engine/stats.js';
 import Question from '../mdx/quiz/Question.jsx';
 import { useActions, useStore } from '../store/store.js';
 import { formatDate } from '../ui/format.js';
@@ -15,9 +16,9 @@ const QUESTION_COUNT = 12;
 const PASS_MARK = 0.8;
 
 // Questions from every written lesson in the module. Self-graded ones are left out, so the score is objective.
-const loadQuestions = async (module) => {
+const loadQuestions = async (course, module) => {
     const loaded = await Promise.all(module.lessons.filter((lesson) => lesson.status === 'ready').map(async (lesson) => {
-        const content = await loadContent('lesson', lesson.id);
+        const content = await loadContent(course, 'lesson', lesson.id);
         return (content?.data.questions ?? [])
             .filter((question) => question.type !== 'recall')
             .map((question) => ({ ...question, key: `${lesson.id}~${question.id}`, lesson }));
@@ -31,6 +32,7 @@ const loadQuestions = async (module) => {
 };
 
 const Results = ({ module, questions, answers, onRetake }) => {
+    const { links } = useCourse();
     const { lessons } = useStore();
     const { testOut } = useActions();
     const [testedOut, setTestedOut] = useState(false);
@@ -45,7 +47,7 @@ const Results = ({ module, questions, answers, onRetake }) => {
                 {passed ? <Award size={40} aria-hidden="true" className="mx-auto text-amber" /> : <RotateCcw size={36} aria-hidden="true" className="mx-auto text-muted" />}
                 <p className="mt-3 font-display text-5xl font-semibold tracking-tight">{score} / {questions.length}</p>
                 <p className="mt-2 text-lg">{passed ? `${module.title} mastered.` : `Not quite: you need ${Math.ceil(questions.length * PASS_MARK)} to pass.`}</p>
-                <p className="mt-1 text-sm text-muted">{passed ? 'That’s worth 200 XP the first time.' : 'Revisit the lessons below, then try again. The questions change each time.'}</p>
+                <p className="mt-1 text-sm text-muted">{passed ? `That’s worth ${XP.checkpoint} XP the first time.` : 'Revisit the lessons below, then try again. The questions change each time.'}</p>
             </Card>
 
             {passed && unfinished.length > 0 && (
@@ -65,7 +67,7 @@ const Results = ({ module, questions, answers, onRetake }) => {
                         {missed.map((question) => (
                             <li key={question.key} className="flex items-start gap-2 text-sm">
                                 <CircleX size={16} aria-hidden="true" className="mt-0.5 shrink-0 text-[#FF9D96]" />
-                                <span><Link to={`/dsa/learn/${question.lesson.id}`} className="text-amber hover:underline">{question.lesson.title}</Link></span>
+                                <span><Link to={links.lesson(question.lesson.id)} className="text-amber hover:underline">{question.lesson.title}</Link></span>
                             </li>
                         ))}
                     </ul>
@@ -74,14 +76,15 @@ const Results = ({ module, questions, answers, onRetake }) => {
 
             <div className="flex flex-wrap gap-2">
                 <Button onClick={onRetake}><RotateCcw size={16} aria-hidden="true" /> Take it again</Button>
-                <ButtonLink to="/dsa/path" variant="primary">Back to the path <ArrowRight size={16} aria-hidden="true" /></ButtonLink>
+                <ButtonLink to={links.path} variant="primary">Back to the path <ArrowRight size={16} aria-hidden="true" /></ButtonLink>
             </div>
         </div>
     );
 };
 
 const CheckpointView = ({ module }) => {
-    useConsoleMeta(`${module.code} checkpoint`, `/dsa/checkpoint/${module.id}`);
+    const course = useCourse();
+    useConsoleMeta(`${module.code} checkpoint`, course.links.checkpoint(module.id));
     const { checkpoints } = useStore();
     const { recordCheckpoint } = useActions();
     const record = checkpoints[module.id];
@@ -96,7 +99,7 @@ const CheckpointView = ({ module }) => {
     useEffect(() => {
         if (stage !== 'loading') return undefined;
         let cancelled = false;
-        loadQuestions(module).then((picked) => {
+        loadQuestions(course, module).then((picked) => {
             if (cancelled) return;
             setQuestions(picked);
             setIndex(0);
@@ -106,7 +109,7 @@ const CheckpointView = ({ module }) => {
         return () => {
             cancelled = true;
         };
-    }, [stage, module, round]);
+    }, [stage, course, module, round]);
 
     const question = questions[index];
     const answered = question && question.key in answers;
@@ -170,6 +173,7 @@ const CheckpointView = ({ module }) => {
 };
 
 const CheckpointPage = () => {
+    const { moduleById } = useCourse();
     const { moduleId } = useParams();
     const module = moduleById[moduleId];
     if (!module) return <ConsoleNotFound />;

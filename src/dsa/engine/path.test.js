@@ -6,22 +6,22 @@ import { completion, isOnPath, lessonState, nextOnPath, pathFor, projection } fr
 test('every goal includes every core lesson', () => {
     const core = lessons.filter((lesson) => lesson.tracks.includes('core'));
     Object.keys(GOALS).forEach((goal) => {
-        assert.ok(core.every((lesson) => isOnPath(lesson, goal)), goal);
+        assert.ok(core.every((lesson) => isOnPath(lesson, goal, GOALS)), goal);
     });
 });
 
 test('wider goals are supersets of narrower ones', () => {
-    const ids = (goal) => new Set(pathFor(goal).map((lesson) => lesson.id));
+    const ids = (goal) => new Set(pathFor(goal, lessons, GOALS).map((lesson) => lesson.id));
     const subset = (a, b) => [...ids(a)].every((id) => ids(b).has(id));
     assert.ok(subset('foundations', 'interview'));
     assert.ok(subset('interview', 'ios'));
     assert.ok(subset('interview', 'cp'));
     assert.ok(subset('cp', 'everything'));
-    assert.equal(pathFor('everything').length, lessons.length);
+    assert.equal(pathFor('everything', lessons, GOALS).length, lessons.length);
 });
 
 test('the path keeps curriculum order', () => {
-    const path = pathFor('interview');
+    const path = pathFor('interview', lessons, GOALS);
     const order = new Map(lessons.map((lesson, index) => [lesson.id, index]));
     path.slice(1).forEach((lesson, index) => assert.ok(order.get(lesson.id) > order.get(path[index].id)));
 });
@@ -35,7 +35,7 @@ test('modules only require modules listed before them', () => {
 });
 
 test('next lesson and states follow progress', () => {
-    const path = pathFor('foundations');
+    const path = pathFor('foundations', lessons, GOALS);
     const progress = { [path[0].id]: { completedAt: 1 }, [path[1].id]: { openedAt: 2 } };
     assert.equal(nextOnPath(path, progress).id, path[1].id);
     assert.equal(lessonState(path[0], progress), 'done');
@@ -44,7 +44,7 @@ test('next lesson and states follow progress', () => {
 });
 
 test('tested-out lessons count as done but keep their own state', () => {
-    const path = pathFor('foundations');
+    const path = pathFor('foundations', lessons, GOALS);
     const progress = { [path[0].id]: { testedOutAt: 1 } };
     assert.equal(lessonState(path[0], progress), 'skipped');
     assert.equal(nextOnPath(path, progress).id, path[1].id);

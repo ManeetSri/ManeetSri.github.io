@@ -1,9 +1,8 @@
 import { useState } from 'react';
 import { Link } from 'react-router-dom';
 import { ArrowRight, Eye, Layers, LoaderCircle, PartyPopper } from 'lucide-react';
-import { lessonById } from '../data/curriculum.js';
-import { problemById } from '../data/problems.js';
 import { useContent } from '../content/index.js';
+import { useCourse } from '../course/context.js';
 import { isDue, RATINGS, reviewCard } from '../engine/srs.js';
 import { Inline } from '../mdx/inline.jsx';
 import Question from '../mdx/quiz/Question.jsx';
@@ -44,6 +43,7 @@ const RateButtons = ({ card, onRate, suggested, now }) => (
 );
 
 const LessonCard = ({ card, onRate, now }) => {
+    const { lessonById, links } = useCourse();
     const content = useContent('lesson', card.lessonId);
     const [revealed, setRevealed] = useState(false);
     const [suggested, setSuggested] = useState(null);
@@ -65,7 +65,7 @@ const LessonCard = ({ card, onRate, now }) => {
 
     return (
         <div className="space-y-4">
-            <p className="font-mono text-xs text-muted">From <Link to={`/dsa/learn/${lesson.id}`} className="text-amber hover:underline">{lesson.title}</Link></p>
+            <p className="font-mono text-xs text-muted">From <Link to={links.lesson(lesson.id)} className="text-amber hover:underline">{lesson.title}</Link></p>
             {card.kind === 'takeaway' ? (
                 <Card className="p-5 sm:p-6">
                     <p className="text-xl font-semibold leading-snug"><Inline text={item.front} /></p>
@@ -84,7 +84,8 @@ const LessonCard = ({ card, onRate, now }) => {
 };
 
 const ProblemCard = ({ card, onRate, now }) => {
-    const problem = problemById[card.ref];
+    const { practiceById, links } = useCourse();
+    const problem = practiceById[card.ref];
     if (!problem) return <EmptyState title="This problem was retired"><Button size="sm" className="mt-3" onClick={() => onRate('easy')}>Skip it</Button></EmptyState>;
     return (
         <div className="space-y-4">
@@ -92,7 +93,7 @@ const ProblemCard = ({ card, onRate, now }) => {
                 <p className="font-mono text-xs text-muted">Re-solve from scratch</p>
                 <p className="mt-2 font-display text-2xl font-semibold tracking-tight">{problem.title}</p>
                 <p className="mt-2 text-sm leading-relaxed text-muted">Solve it again without looking at your old solution, then rate how it went.</p>
-                <ButtonLink to={`/dsa/practice/${problem.id}`} className="mt-4" size="sm">Open the problem <ArrowRight size={15} aria-hidden="true" /></ButtonLink>
+                <ButtonLink to={links.item(problem.id)} className="mt-4" size="sm">Open the problem <ArrowRight size={15} aria-hidden="true" /></ButtonLink>
             </Card>
             <RateButtons card={card} onRate={onRate} now={now} />
         </div>
@@ -100,7 +101,8 @@ const ProblemCard = ({ card, onRate, now }) => {
 };
 
 const ReviewPage = () => {
-    useConsoleMeta('Review', '/dsa/review');
+    const { links } = useCourse();
+    useConsoleMeta('Review', links.review);
     const { cards } = useStore();
     const { review } = useActions();
     const now = useNow(30_000);

@@ -24,7 +24,8 @@ import { isPrivatePath } from './utils/privatePaths';
 const BlogsPage = lazy(() => import('./pages/BlogsPage'));
 const PrivacyPage = lazy(() => import('./pages/PrivacyPage'));
 const BuildPage = lazy(() => import('./pages/BuildPage'));
-const DsaApp = lazy(() => import('./dsa/DsaApp'));
+const ConsoleApp = lazy(() => import('./dsa/ConsoleApp'));
+const CourseRoutes = lazy(() => import('./dsa/ConsoleApp').then((module) => ({ default: module.CourseRoutes })));
 
 // The game page and the private learning console are their own focused spaces, without the portfolio's navigation
 const PortfolioChrome = () => {
@@ -85,7 +86,10 @@ function App() {
           <Route path="/blogs" element={<Suspense fallback={<div className="min-h-svh bg-ink" />}><BlogsPage /></Suspense>} />
           <Route path="/privacy" element={<Suspense fallback={<div className="min-h-svh bg-ink" />}><PrivacyPage /></Suspense>} />
           <Route path="/build" element={<Suspense fallback={<div className="min-h-svh bg-ink" />}><BuildPage /></Suspense>} />
-          <Route path="/dsa/*" element={<Suspense fallback={<div className="min-h-svh bg-ink" />}><DsaApp /></Suspense>} />
+          {/* The private console: one gate and store, with a set of routes per course */}
+          <Route element={<Suspense fallback={<div className="min-h-svh bg-ink" />}><ConsoleApp /></Suspense>}>
+            <Route path="/dsa/*" element={<Suspense fallback={<div className="min-h-svh bg-ink" />}><CourseRoutes course="dsa" /></Suspense>} />
+          </Route>
           <Route path="*" element={<NotFoundPage />} />
         </Routes>
         </ErrorBoundary>

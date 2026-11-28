@@ -1,14 +1,19 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
 import { KeyRound, Laptop, LoaderCircle } from 'lucide-react';
+import { usePageMeta } from '../../hooks/usePageMeta';
 import { OWNER_EMAIL } from '../services/owner';
 import { createStore, StoreContext } from '../store/store.js';
 import { Button } from '../ui/primitives.jsx';
 
-const Centered = ({ children }) => (
-    <main className="flex min-h-svh items-center justify-center bg-[radial-gradient(70%_50%_at_50%_0%,rgba(240,81,56,0.14),transparent_70%)] px-5">
-        <div className="w-full max-w-sm">{children}</div>
-    </main>
-);
+// Every screen before sign-in. The course's own title takes over once its pages render.
+const Centered = ({ children }) => {
+    usePageMeta({ title: 'Private console', description: 'Private learning console.', path: window.location.pathname, noindex: true });
+    return (
+        <main className="flex min-h-svh items-center justify-center bg-[radial-gradient(70%_50%_at_50%_0%,rgba(240,81,56,0.14),transparent_70%)] px-5">
+            <div className="w-full max-w-sm">{children}</div>
+        </main>
+    );
+};
 
 const PassphraseScreen = ({ services, onLocal }) => {
     const [passphrase, setPassphrase] = useState('');

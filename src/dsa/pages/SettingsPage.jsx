@@ -1,6 +1,6 @@
 import { useContext, useRef, useState } from 'react';
 import { Compass, Download, LogOut, Trash2, Upload } from 'lucide-react';
-import { GOALS } from '../data/curriculum.js';
+import { useCourse } from '../course/context.js';
 import { exportBackup, parseBackup } from '../store/exportImport.js';
 import { StoreContext, useActions, useProfile, useStore } from '../store/store.js';
 import { useConsoleMeta } from '../ui/hooks.js';
@@ -34,7 +34,8 @@ const Segmented = ({ label, options, value, onChange }) => (
 );
 
 const SettingsPage = () => {
-    useConsoleMeta('Settings', '/dsa/settings');
+    const { GOALS, links, placementName } = useCourse();
+    useConsoleMeta('Settings', links.settings);
     const state = useStore();
     const profile = useProfile();
     const actions = useActions();
@@ -67,8 +68,8 @@ const SettingsPage = () => {
         <div className="mx-auto max-w-3xl space-y-5">
             <PageHeader title="Settings" />
 
-            <Section title="Guided setup" detail="Go through goal, pace and the optional Swift placement check again.">
-                <ButtonLink to="/dsa/start"><Compass size={17} aria-hidden="true" /> Redo setup</ButtonLink>
+            <Section title="Guided setup" detail={`Go through goal, pace and the optional ${placementName} again.`}>
+                <ButtonLink to={links.start}><Compass size={17} aria-hidden="true" /> Redo setup</ButtonLink>
             </Section>
 
             <Section title="Your goal" detail="It decides which lessons make up your main path. Everything else stays open as side quests.">
