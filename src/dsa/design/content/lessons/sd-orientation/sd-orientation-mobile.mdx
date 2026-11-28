@@ -1,0 +1,211 @@
+## Why it matters
+
+Most system design material is written for backend engineers: load balancers, databases, millions of requests a second. A mobile app shares some of those problems and adds its own. It runs on a device you don't control, over a network you can't trust, under rules you didn't write, and long after you shipped it. Mobile system design interviews probe exactly those differences, and so does every real user on a train.
+
+## What's different on a phone
+
+### The network is slow, flaky and sometimes paid for
+
+A server talks to its database over a data-centre network that almost never drops a packet. Your app talks to its server over café Wi-Fi, over 5G that falls to one bar in a lift, or through a captive portal on a train that answers every request with a login page. Round trips on a mobile network are often several times slower than on office Wi-Fi, and they change from one minute to the next.
+
+People also pay for data. iOS has **Low Data Mode**, and `URLSession` can tell you when a connection is expensive (cellular, a personal hotspot) or constrained. A design that downloads 5 MB of images on every launch is spending someone's money.
+
+So mobile designs favour fewer, larger requests, small payloads, timeouts and careful retries, and caching. Every screen needs an answer to one question: what does it show when the request never comes back?
+
+### Battery, memory and CPU are small and shared
+
+Every request wakes the cellular radio, and the radio stays in a high-power state for several seconds after the last byte. Ten small requests spread over a minute can cost far more battery than one batched request. Location, Bluetooth and background work all have similar costs, and users notice an app that drains their battery.
+
+Memory is tight too. An iPhone doesn't write your app's memory out to disk when RAM runs short: iOS warns the app, then terminates apps to reclaim it. That's called **jetsam**. A decoded image takes width × height × 4 bytes, so one 12-megapixel photo is about 48 MB in memory. A feed that decodes full-size photos can be killed while the user scrolls it.
+
+### Your app doesn't decide when it runs
+
+A server process runs until someone stops it. An iOS app runs when iOS lets it. When the user leaves, the app gets a few seconds in the background, then it's **suspended**: frozen in memory, running no code. A suspended app can be terminated at any moment, without being told. Step through one ordinary day:
+
+```visual states
+title: An app's day, as iOS sees it
+states:
+  - { id: notRunning, label: Not running, at: [0, 0] }
+  - { id: inactive, label: Inactive, at: [1, 0] }
+  - { id: active, label: Active, at: [2, 0] }
+  - { id: background, label: Background, at: [1, 1.5] }
+  - { id: suspended, label: Suspended, at: [0, 1.5] }
+initial: notRunning
+transitions:
+  - [notRunning, inactive, launch]
+  - [inactive, active, activate]
+  - [active, inactive, resign]
+  - [inactive, background, enterBackground]
+  - [background, inactive, enterForeground]
+  - [background, suspended, suspend]
+  - [suspended, background, wake]
+  - [suspended, notRunning, terminate]
+intro: "The app starts **not running**: no process and no memory."
+events:
+  - { event: launch, say: "The user taps the icon. iOS starts the process, and the scene appears **inactive**: on screen, but not yet receiving touches." }
+  - { event: activate, say: "Now it's **active** (`scenePhase` is `.active`): the only state where it gets touches and can assume the user is looking." }
+  - { event: resign, say: "A call comes in. The app goes **inactive**: still visible and running, but not in control. Pause timers and games here." }
+  - { event: activate, say: "The user declines the call, and the app is active again." }
+  - { event: resign, say: "Now the user swipes home. Every way out of the app passes through inactive first." }
+  - { event: enterBackground, say: "In the **background** it's off screen, with a few seconds to save work, or a little longer if it asks with `beginBackgroundTask`." }
+  - { event: suspend, say: "iOS **suspends** it: still in memory, but no code runs. A request on an ordinary `URLSession` stalls; a transfer on a background session carries on in a system process." }
+  - { event: wake, say: "A silent push or a background refresh can wake it into the background for about 30 seconds of work. Whether and when that happens is up to iOS." }
+  - { event: suspend, say: "Its work done, it's suspended again." }
+  - { event: terminate, say: "Memory runs short, so iOS **terminates** the suspended app. Your code gets no callback at all." }
+  - { event: launch, say: "The next tap is a cold launch. Anything that wasn't saved before the app went to the background is gone." }
+```
+
+So every mobile design has to answer two questions. What must be saved before the app leaves the screen? And what work must survive suspension? Long uploads and downloads go to a **background URLSession**, which the system runs outside your process. Deferrable work goes to **BGTaskScheduler**, which runs it when iOS judges the moment right, not when you ask. You'll design with both in D52.
+
+Saving at the right moment is usually a few lines. In SwiftUI, watch the scene phase:
+
+```swift check ios title="ComposeView.swift"
+import SwiftUI
+
+struct ComposeView: View {
+    @Environment(\.scenePhase) private var scenePhase
+    @State private var draft = ""
+    let saveDraft: (String) -> Void
+
+    var body: some View {
+        TextEditor(text: $draft)
+            .onChange(of: scenePhase) { _, phase in
+                // After this the app may be suspended, then terminated without another word
+                if phase == .background {
+                    saveDraft(draft)
+                }
+            }
+    }
+}
+```
+
+### Shipped code is out of your hands
+
+A backend team can deploy a fix in minutes and roll back a bad release just as fast. Once a build is on people's phones, it stays there.
+
+- **No hot fixes.** The App Store's rules don't let an app download code that adds or changes features. A fix is a new build through App Review, which usually takes a day or so and isn't guaranteed.
+- **Slow rollouts.** A phased release reaches users with automatic updates over seven days, and plenty of people update late or never.
+- **Many versions at once.** Next year your server will still be answering the app you ship today. Rename a JSON field or remove an endpoint and every phone still running the old version breaks.
+
+That's why mobile designs lean on what *can* change after release: remote configuration, feature flags and kill switches, server-driven content, and APIs that stay backward compatible. You'll meet them in D34 and D54.
+
+### Privacy is enforced by the platform
+
+On a server, privacy is mostly policy. On iOS, much of it is enforced for you. You get the user's location, photos, contacts or camera only after a system prompt that shows a purpose string you wrote, and the user can refuse, or change their mind later in Settings. Tracking people across other companies' apps needs App Tracking Transparency consent. Since May 2024, apps and the SDKs inside them must declare in a **privacy manifest** why they use certain APIs, such as `UserDefaults` or file timestamps. A design that assumes it always has the user's location is a broken design.
+
+### Offline is a normal state, not an error
+
+A server is expected to be up. A phone is expected to be offline sometimes: on a plane, underground, in a basement gym. People still expect the app to open, show what they saw last time, and keep what they type. Designing for offline changes where the truth lives: a cache that's shown first, or a local database that *is* the source of truth and syncs later. That's D39.
+
+## What stays the same
+
+Most of the thinking carries over. You still start from requirements and numbers, divide the system into parts with clear jobs, design the API and the data model, cache what's expensive, plan for failure and weigh trade-offs out loud. Caching, consistency, idempotency, rate limits and backoff mean the same thing on both sides. The app is one more participant in the system: an unusually unreliable one that you can't redeploy.
+
+## What mobile system design interviews ask
+
+A backend interview might ask you to design a URL shortener and spend most of the hour on databases and sharding. A mobile interview asks for a product or a component, seen from the client:
+
+- a news feed, a chat app or a photo-sharing app;
+- an image-loading library or an offline-first notes app;
+- the rider app for a ride-hailing service.
+
+Interviewers expect depth on the client: architecture, state, caching, persistence, offline behaviour, pagination, background work, battery and memory. They also expect you to sketch the backend contract the app needs: the API, real-time updates, push, and roughly how the server stores and serves the data. You'll practise all of these in Part X.
+
+## How much backend you need
+
+Enough to design the contract and reason about the server's side of it, but not enough to run it.
+
+| Depth | Topics |
+| --- | --- |
+| Know it well | API design (resources, pagination, errors, versioning), HTTP caching, auth tokens, push notifications, real-time options, idempotency, estimating load |
+| Know the shape | Load balancers, CDNs, SQL vs NoSQL, replication, queues, rate limiting, consistent hashing, observability |
+| Leave to specialists | Consensus algorithms, storage-engine internals, running a database cluster |
+
+Part VI covers the first two rows. The third is out of scope for this course.
+
+## Trade-offs
+
+Many mobile design decisions come down to one question: does this logic live in the app or on the server?
+
+| Where it lives | Can change after release | Works offline | Same on iOS, Android and web | Private data |
+| --- | --- | --- | --- | --- |
+| In the app | Only with a new build | Yes | Each platform builds it again | Can stay on the device |
+| On the server | Any time | No | One implementation | Must leave the device |
+| In the app, configured by the server | Within what the build supports | With the last config it saw | Shared rules, separate code | Only the config travels |
+
+Rules that change often, like prices or which features are switched on, belong on the server or in remote config. Behaviour that must work offline, or that touches private data, belongs in the app. Most real features split the difference.
+
+<Callout kind="interview">
+
+**Say** early that you're designing for a phone: "I'll assume a flaky network, so the feed shows cached posts first," or "Uploads must survive the app being suspended, so they go through a background session." **Ask** how old the oldest supported app version is, and whether you own the backend. **Red flags:** treating the network as reliable, ignoring suspension and termination, and an API that can't change without breaking last year's app.
+
+</Callout>
+
+<Callout kind="gotcha" title="iOS gotcha: the Simulator has your Mac's network">
+
+The Simulator uses your Mac's fast, reliable connection, so a design that only works on good networks looks fine at your desk. On a device set up for development, **Settings → Developer → Network Link Conditioner** simulates 3G, high latency and lost packets. Test offline with Airplane Mode, and test suspension by leaving the app in the middle of a request.
+
+</Callout>
+
+```cards
+- id: suspension
+  front: "What happens to an iOS app shortly after it leaves the screen?"
+  back: "It gets a few seconds in the background, then iOS suspends it: frozen in memory, running no code. A suspended app can be terminated without any callback."
+- id: no-hot-fixes
+  front: "Why can't a mobile team fix a bug as fast as a backend team?"
+  back: "A fix needs a new build through App Review, updates roll out over days, and old versions stay in use for years. Remote config, flags and backward-compatible APIs are the levers that change at once."
+- id: backend-depth
+  front: "How much backend does a mobile system design interview expect?"
+  back: "Enough to design the API contract and sketch how the server stores, serves and pushes the data, but not how to run a database cluster."
+```
+
+```quiz
+- id: q1
+  type: multi
+  prompt: "Which of these are mobile-specific problems that a backend design rarely has to solve? Choose all that apply."
+  options:
+    - "The process can be suspended or terminated at any moment"
+    - "Last year's version of the code is still calling your API"
+    - "Requests sometimes fail and need retrying"
+    - "A bug fix can take days to reach users"
+    - "Caching is needed to keep latency low"
+  answer: [0, 1, 3]
+  explain: "Servers aren't frozen by an operating system, run one version at a time, and can be redeployed in minutes. Failed requests and caching matter on both sides."
+- id: q2
+  type: mcq
+  prompt: "Someone writes a long review in your app, then switches to Messages. Twenty minutes later they come back, the app cold-launches, and the review is gone. What should the design have done?"
+  options:
+    - "Saved the draft in `applicationWillTerminate(_:)`"
+    - "Saved the draft when the scene moved to the background"
+    - "Kept the draft in the view model, which stays in memory"
+    - "Asked iOS not to suspend the app while a draft exists"
+  answer: 1
+  explain: "The app was suspended, then terminated to free memory, and a suspended app gets no callback when that happens, so `applicationWillTerminate(_:)` never ran. The view model's memory went with the process. The background transition is the last reliable moment to save."
+- id: q3
+  type: sort
+  prompt: "Where would you put each piece of logic?"
+  buckets: [In the app, On the server]
+  items:
+    - [Which promotions appear this week, 1]
+    - [Showing the inbox you loaded last time while on a plane, 0]
+    - [Finding faces in the user's private photos, 0]
+    - [Deciding whether a coupon code is valid, 1]
+    - [Undoing the last edit to a note, 0]
+  explain: "Promotions change often, so the server decides. A coupon check must be trusted, and anything in the app can be tampered with. Offline display, private photos and instant undo belong on the device."
+- id: q4
+  type: mcq
+  prompt: "Your team renames the JSON field `title` to `headline` in the API's response. What breaks?"
+  options:
+    - "Nothing: apps update automatically"
+    - "Every installed copy of the app that still decodes `title`, until its owner updates, which some never will"
+    - "Only new installs"
+    - "Only the Android app"
+  answer: 1
+  explain: "Old app versions stay in use for months or years. A backward-compatible change keeps `title`, adds `headline`, and removes `title` only once almost nobody runs a version that reads it."
+- id: q5
+  type: estimate
+  prompt: "A decoded image takes 4 bytes per pixel. Roughly how much memory does one 12-megapixel photo take once decoded?"
+  answer: 48
+  unit: MB
+  explain: "12 million pixels × 4 bytes = 48 million bytes, about 48 MB. A feed that keeps a few of those decoded is a jetsam risk, which is why image pipelines downsample to the size on screen."
+```

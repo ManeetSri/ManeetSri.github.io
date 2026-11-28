@@ -222,7 +222,7 @@ const OnboardingPage = () => {
                     <p className="mt-2 text-muted">{onboarding.placementIntro}</p>
                     <div role="radiogroup" aria-labelledby="placement-title" className="mt-6 grid gap-2">
                         <Choice selected={placementMode === 'zero'} onSelect={() => setPlacementMode('zero')} icon={Sprout} title="Start from zero (recommended)" detail={onboarding.zeroDetail} />
-                        <Choice selected={placementMode === 'check'} onSelect={() => setPlacementMode('check')} icon={GraduationCap} title={`Take a quick check (${QUESTIONS.length} questions, about 6 minutes)`} detail="Two questions per topic. Get both right and you can skip that topic’s lessons, which stay open whenever you want them." />
+                        <Choice selected={placementMode === 'check'} onSelect={() => setPlacementMode('check')} icon={GraduationCap} title={`Take a quick check (${QUESTIONS.length} questions, about ${onboarding.placementMinutes ?? 6} minutes)`} detail="Two questions per topic. Get both right and you can skip that topic’s lessons, which stay open whenever you want them." />
                     </div>
                 </section>
             )}

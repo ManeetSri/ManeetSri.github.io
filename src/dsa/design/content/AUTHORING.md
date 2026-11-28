@@ -60,7 +60,7 @@ Use `##` for sections (they become "On this page") and `###` inside them.
 | ` ```swift ` (no meta) | Deliberately partial or pseudo code. Use sparingly. | not checked |
 | ` ```json `, ` ```http `, ` ```graphql `, ` ```yaml `, ` ```sql `, ` ```bash ` | Payloads, requests, schemas, commands | not checked |
 
-Rules for `run` blocks: deterministic output (no dates, randomness, timing or unordered collections), no crashes, no input, quick. Swift 6 mode means top-level code runs on the main actor; concurrency examples must be data-race free or they won't compile, which is exactly the lesson. Show code that's *meant* to fail (a data race, a retain cycle) without `run`/`check`, and show the compiler's message in a ` ```text title="What you'll see" ` block.
+Rules for `run` blocks: deterministic output (no dates, randomness, timing or unordered collections), no crashes, no input, quick. Swift 6 mode means top-level code runs on the main actor; concurrency examples must be data-race free or they won't compile, which is exactly the lesson. Show code that's *meant* to fail (a data race, a retain cycle) without `run`/`check`, and show the compiler's message in a ` ```text title="What you'll see" ` block. `check` blocks are compiled as far as SIL, so data-race (region isolation) errors, missing returns and use-before-initialisation fail the check just as they would in Xcode: a fragment with an elided body (`// …`) must still return something.
 
 ## Diagrams and simulators (` ```visual <name> `)
 

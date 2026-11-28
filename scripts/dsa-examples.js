@@ -134,11 +134,14 @@ const runSwift = (file) => new Promise((resolve) => {
     });
 });
 
-// macOS fragments use the host SDK; iOS ones the simulator SDK, so UIKit and friends resolve
+// macOS fragments use the host SDK; iOS ones the simulator SDK, so UIKit and friends resolve.
+// In Swift 6 mode a fragment is lowered to SIL as well: data-race (region isolation) errors, missing returns and
+// use-before-initialisation are only diagnosed there, and -typecheck alone would let them through.
+const checkMode = course.swiftVersion === '6' ? ['-emit-sil', '-o', '/dev/null'] : ['-typecheck'];
 const typecheck = (file, ios) => new Promise((resolve) => {
     const [command, commandArgs] = ios
-        ? ['xcrun', ['--sdk', 'iphonesimulator', 'swiftc', '-typecheck', '-target', IOS_TARGET, '-swift-version', course.swiftVersion, file]]
-        : ['swiftc', ['-typecheck', '-swift-version', course.swiftVersion, file]];
+        ? ['xcrun', ['--sdk', 'iphonesimulator', 'swiftc', ...checkMode, '-target', IOS_TARGET, '-swift-version', course.swiftVersion, file]]
+        : ['swiftc', [...checkMode, '-swift-version', course.swiftVersion, file]];
     execFile(command, commandArgs, { timeout: RUN_TIMEOUT_MS * 2 }, (error, stdout, stderr) => {
         resolve({ ok: !error, stderr: stderr || error?.message || '' });
     });

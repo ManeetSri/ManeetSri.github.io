@@ -38,6 +38,8 @@ export const designCourse = {
     patternLabel: 'Topic',
     onboarding: {
         skipPoint: 'The quick check lets you skip foundations you already know from shipping apps. Starting from the beginning is completely fine.',
+        // Questions with code take longer to read than DSA's
+        placementMinutes: 10,
         placementIntro: 'Parts I to IV cover design foundations, patterns and iOS architecture. If you already work with them, a quick check can skip those modules.',
         zeroDetail: 'Begin with what makes software good. Nothing is assumed beyond some Swift.',
         setupPrompt: 'Pick your goal and pace, and optionally skip foundations you already know. It takes two minutes.',
